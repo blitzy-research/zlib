@@ -33,8 +33,9 @@
 //!
 //! # Safety
 //!
-//! This module contains **zero `unsafe`** (AAP §0.6.2 — only `fast.rs` may use
-//! `unsafe` in the inflate layer) and is `no_std`-compatible: it references only
+//! This module contains **zero `unsafe`** (AAP §0.6.2 — the whole inflate layer
+//! is free of `unsafe`; the boundary is `src/ffi/**` and the `src/lib.rs`
+//! runtime block) and is `no_std`-compatible: it references only
 //! `core`, `alloc`, and the crate's own safe modules.
 
 use alloc::boxed::Box;
@@ -397,7 +398,7 @@ pub struct InflateState {
     ///   caller hook is installed (one `zalloc`, matching C's state `ZALLOC`);
     /// * an empty [`AllocBuffer::default`] under the global allocator, so no
     ///   extra allocation is made and the crate's ~7 KB inflate memory-bounds
-    ///   parity is preserved (AAP §0.7.1); and
+    ///   parity is preserved (AAP §0.6.5); and
     /// * left empty for `inflateBack` — whose single hook allocation is its own
     ///   window — because that path builds the state through
     ///   [`new_in`](InflateState::new_in) directly (not the regular init path),

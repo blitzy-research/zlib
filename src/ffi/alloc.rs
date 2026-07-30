@@ -9,7 +9,7 @@
 //! raw pointer as a slice, and releasing it through the matching `zfree` on drop
 //! — all `unsafe` operations.
 //!
-//! Per the migration's unsafe-isolation strategy (AAP §0.6.2 / §0.7.2), **all**
+//! Per the migration's unsafe-isolation strategy (AAP §0.6.2 / §0.7.2 standard S2), **all**
 //! `unsafe` in the crate is confined to the `ffi` tree. This module is that
 //! confinement point for the allocator hook: it defines [`CForeignBuffer`], the
 //! sole implementor of the safe [`ForeignBuffer`] interface consumed by
