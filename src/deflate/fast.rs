@@ -26,7 +26,7 @@
 //!
 //! # Safety
 //!
-//! This module contains **zero** `unsafe` (AAP §0.6.2, §0.7.2): all window and
+//! This module contains **zero** `unsafe` (AAP §0.6.2, §0.7.2 standard S2): all window and
 //! buffer access goes through bounds-checked indexing, and all cleanup is
 //! handled by ownership in [`DeflateState`]. The two `usize` subtractions that
 //! could in principle underflow — `strstart - hash_head` and

@@ -10,7 +10,7 @@
 //!
 //! The decoded output and the error/recovery behaviour of this module are
 //! **byte-identical** to reference zlib for the same compressed input — that is
-//! the defining acceptance criterion (AAP §0.6.1, §0.6.4, §0.7.1). Every check,
+//! the defining acceptance criterion (AAP §0.6.1, §0.6.4, §0.8.1 directive D-1). Every check,
 //! every diagnostic message string, and the exact order of bit reads are
 //! preserved verbatim from `inflate.c`. In particular:
 //!
@@ -699,8 +699,8 @@ pub fn inflate_prime<A: Allocator>(strm: &mut ZStream<A>, bits: i32, value: i32)
 /// # Byte-exact fidelity
 /// Every state transition, bounds test, checksum fold, and diagnostic string is
 /// reproduced verbatim from `inflate.c`; the reported [`ZStream::data_type`]
-/// uses the exact C formula (L1147-L1149). The `unsafe`-free slow path here plus
-/// the single `unsafe` fast path in [`fast::inflate_fast`] together decode
+/// uses the exact C formula (L1147-L1149). The slow path here and the fast path
+/// in [`fast::inflate_fast`] are both free of `unsafe`, and together decode
 /// byte-identically to reference zlib.
 #[allow(clippy::too_many_lines)]
 pub fn inflate<A: Allocator>(
@@ -1405,8 +1405,8 @@ pub fn inflate<A: Allocator>(
             }
             InflateMode::Len => {
                 // Fast path: with at least 6 input bytes and 258 output bytes
-                // available, decode in bulk (this is the only place `unsafe`
-                // lives, inside `fast::inflate_fast`).
+                // available, decode in bulk in `fast::inflate_fast`, which — like
+                // the rest of the inflate layer — contains no `unsafe`.
                 if io.have() >= 6 && io.left() >= 258 {
                     // RESTORE the bit accumulator so the fast path can read it.
                     state.hold = io.hold;
