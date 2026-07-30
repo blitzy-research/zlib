@@ -31,11 +31,15 @@
 //!
 //! # Idiomatic wins over C
 //!
-//! * `Drop` (via owned `Vec`s inside [`DeflateState`]) subsumes `deflateEnd`'s
-//!   manual reverse-order frees; [`deflate_end`] only reports the residual
-//!   `Z_DATA_ERROR`-if-busy status.
-//! * `#[derive(Clone)]` on [`DeflateState`] subsumes `deflateCopy`'s pointer
-//!   fix-ups: [`deflate_copy`] is a deep clone with no manual re-basing.
+//! * `Drop` (via the owned buffers inside [`DeflateState`]) subsumes
+//!   `deflateEnd`'s manual reverse-order frees; [`deflate_end`] only reports the
+//!   residual `Z_DATA_ERROR`-if-busy status.
+//! * `DeflateState::try_clone` subsumes `deflateCopy`'s pointer fix-ups:
+//!   [`deflate_copy`] is a deep copy with no manual re-basing. It is fallible
+//!   rather than a [`Clone`] impl because every working buffer is re-allocated
+//!   through the **same** caller `zalloc` as the source, so an exhausted arena
+//!   surfaces as `Z_MEM_ERROR` instead of silently relocating the copy into the
+//!   global heap (AAP §0.6.5).
 //! * The integer state tags become the [`DeflateStatus`] enum with exhaustive
 //!   `match`, and the C `configuration_table` of function pointers becomes the
 //!   [`CompressFunc`] enum dispatched through a `match`.
@@ -65,8 +69,6 @@ pub use strategy::{BlockState, CONFIGURATION_TABLE, CompressFunc};
 // ---------------------------------------------------------------------------
 // Imports.
 // ---------------------------------------------------------------------------
-use alloc::boxed::Box;
-
 use crate::checksum::adler32;
 #[cfg(feature = "gzip")]
 use crate::checksum::crc32;
@@ -83,18 +85,28 @@ use crate::deflate::state::{BUF_SIZE, MIN_MATCH, NIL};
 use crate::deflate::strategy::rank;
 
 // ---------------------------------------------------------------------------
-// Local constants — mirrors of `zutil.h` macros that no other module exports.
+// Shared `zutil.h` constants.
+//
+// These are NOT redefined here: `crate::util` is their single canonical home,
+// so the values this module writes into a stream header cannot drift from the
+// values the rest of the crate publishes. That matters most for `OS_CODE`,
+// which is genuinely platform-dependent — C picks it through the `#ifdef`
+// cascade at `zutil.h` L98-L189 (Windows 10, Apple 19, Unix 3) — so a local
+// hard-coded copy would emit the wrong gzip OS byte on any non-Unix target and
+// break byte-identity with reference zlib there.
 // ---------------------------------------------------------------------------
 
 /// `PRESET_DICT` (`zutil.h` L96): the preset-dictionary flag bit set in the
-/// zlib header FLG byte when the stream was primed with a dictionary.
-const PRESET_DICT: u32 = 0x20;
+/// zlib header FLG byte when the stream was primed with a dictionary. Widened
+/// to `u32` at the point of use because the FLG byte is assembled in `u32`
+/// arithmetic.
+const PRESET_DICT: u32 = crate::util::PRESET_DICT as u32;
 
-/// `OS_CODE` (`zutil.h` L188): the operating-system byte written into the gzip
-/// header. `3` is the "Unix" code, the portable default used by zlib on all
-/// non-legacy platforms.
+/// `OS_CODE` (`zutil.h` L98-L189): the operating-system byte written into the
+/// gzip header, re-exported from its canonical home so the value emitted here
+/// is always the one selected for the active target.
 #[cfg(feature = "gzip")]
-const OS_CODE: u8 = 3;
+use crate::util::OS_CODE;
 
 /// The internal `Result` alias used throughout the deflate API surface: `Ok`
 /// carries a success [`ReturnCode`] (typically [`ReturnCode::Ok`] or
@@ -1377,19 +1389,43 @@ pub fn deflate_end<A: Allocator>(strm: &mut ZStream<A>) -> DeflateResult {
 /// independent stream that continues identically.
 ///
 /// Port of C `deflateCopy` (`deflate.c` L1317-L1377). Because [`DeflateState`]
-/// derives [`Clone`] and holds its buffers as owned `Vec`s (and its tree
-/// arrays are `Copy`), a deep copy is a single `clone()` with no manual
-/// pointer re-basing — the large `zmemcpy`/pointer-fix-up body of C collapses
-/// away. The stream-level bookkeeping (totals, checksum, data type, message)
-/// is copied to match C's whole-`z_stream` copy.
+/// holds its buffers as owned [`AllocBuffer`](crate::stream::AllocBuffer)s (and
+/// its tree arrays are `Copy`), a deep copy is a single
+/// [`DeflateState::try_clone`] with no manual pointer re-basing — the large
+/// `zmemcpy`/pointer-fix-up body of C collapses away. The stream-level
+/// bookkeeping (totals, checksum, data type, message) is copied to match C's
+/// whole-`z_stream` copy.
 ///
+/// The copy is allocator-preserving: all six buffers — the state-object
+/// reservation mirroring C's `ZALLOC(strm, 1, sizeof(deflate_state))`
+/// (`deflate.c` L1330-L1333) plus the five working buffers — are re-allocated
+/// through the **same** `AllocHook` as the source, so a caller who installed a
+/// custom arena does not find the copy living in the global heap, and the
+/// caller observes the same request count C issues (AAP §0.6.5).
+/// The copy is fallible for the same reason C's is: the state object and each
+/// buffer are re-allocated through the allocator that backs them — via the
+/// state's internal `try_copy` helper, which combines the field-by-field
+/// [`DeflateState::try_clone`] with a fallible box allocation — so a
+/// caller-supplied `zalloc` reporting out-of-memory aborts the copy with
+/// [`ZlibError::MemError`] instead of silently producing a destination backed by
+/// different storage (`deflate.c` L1348-L1350; AAP §0.6.3, §0.6.5). `dest` is
+/// left untouched in that case, matching C's `deflateEnd(dest)` teardown before
+/// it returns. An infallible [`Clone`] could not express that failure, which is
+/// why neither the state nor its buffers implement it.
 /// # Errors
 ///
-/// [`ZlibError::StreamError`] if `source` has no deflate state installed.
+/// [`ZlibError::StreamError`] if `source` has no deflate state installed, or
+/// [`ZlibError::MemError`] when an active caller allocator reports
+/// out-of-memory while copying a working buffer. In the latter case `dest` is
+/// left completely untouched — C reaches the equivalent state by calling
+/// `deflateEnd(dest)` before `return Z_MEM_ERROR`, which likewise leaves the
+/// destination with no usable state.
 pub fn deflate_copy<A: Allocator>(dest: &mut ZStream<A>, source: &ZStream<A>) -> DeflateResult {
+    // Perform the whole deep copy BEFORE touching `dest`, so an active
+    // allocator's OOM leaves the destination stream unmodified.
     let cloned = {
         let src = source.deflate_state().ok_or(ZlibError::StreamError)?;
-        Box::new(src.clone())
+        src.try_copy().ok_or(ZlibError::MemError)?
     };
     dest.total_in = source.total_in;
     dest.total_out = source.total_out;

@@ -988,8 +988,11 @@ pub unsafe extern "C" fn inflatePrime(strm: z_streamp, bits: c_int, value: c_int
 // ===========================================================================
 
 /// C `inflateCopy` — deep-copy an active decompression stream (state, window,
-/// and observable fields) from `source` into `dest`. Returns `Z_MEM_ERROR` if a
-/// clone allocation fails, or `Z_STREAM_ERROR` on invalid arguments.
+/// and observable fields) from `source` into `dest`. The history window and the
+/// state reservation are re-allocated through the **same** `zalloc` as the
+/// source (AAP §0.6.5). Returns `Z_MEM_ERROR` if a copy allocation fails — in
+/// which case `dest` is left entirely untouched — or `Z_STREAM_ERROR` on invalid
+/// arguments.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn inflateCopy(dest: z_streamp, source: z_streamp) -> c_int {
     guard_int(Z_STREAM_ERROR, move || {
@@ -1940,6 +1943,151 @@ mod tests {
         assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
     }
 
+    /// A budget carried through the caller's `opaque` cookie so each test drives
+    /// its own allocator with no shared global state — which is precisely what
+    /// zlib's `opaque` field is for.
+    struct Budget {
+        /// Allocations still permitted before `zalloc` reports out-of-memory.
+        remaining: core::sync::atomic::AtomicUsize,
+    }
+
+    /// Bytes reserved ahead of each payload so `zfree` can recover the size.
+    const BUDGET_HDR: usize = 16;
+
+    /// An honest allocator that really allocates and frees, but only while the
+    /// budget in `opaque` lasts — then reports OOM as a C `zalloc` does under
+    /// memory pressure.
+    unsafe extern "C" fn budget_zalloc(
+        opaque: *mut c_void,
+        items: c_uint,
+        size: c_uint,
+    ) -> *mut c_void {
+        // SAFETY: every stream in these tests sets `opaque` to a live `&Budget`
+        // that outlives the stream, and zlib forwards the cookie unchanged.
+        let budget = unsafe { &*(opaque as *const Budget) };
+        if budget
+            .remaining
+            .fetch_update(
+                core::sync::atomic::Ordering::SeqCst,
+                core::sync::atomic::Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            )
+            .is_err()
+        {
+            return ptr::null_mut();
+        }
+
+        let bytes = (items as usize) * (size as usize);
+        let layout = alloc::alloc::Layout::from_size_align(BUDGET_HDR + bytes, BUDGET_HDR)
+            .expect("test layout is valid");
+        // SAFETY: `layout` has a non-zero size (`BUDGET_HDR` is 16).
+        let base = unsafe { alloc::alloc::alloc(layout) };
+        if base.is_null() {
+            return ptr::null_mut();
+        }
+        // SAFETY: `base` addresses `BUDGET_HDR + bytes` writable, 16-byte aligned
+        // bytes, so the header write is aligned and in bounds.
+        unsafe {
+            base.cast::<usize>().write(bytes);
+            base.add(BUDGET_HDR).cast::<c_void>()
+        }
+    }
+
+    unsafe extern "C" fn budget_zfree(_opaque: *mut c_void, address: *mut c_void) {
+        if address.is_null() {
+            return;
+        }
+        // SAFETY: `address` is a payload pointer from `budget_zalloc`, so its size
+        // header sits `BUDGET_HDR` bytes below it and the block is live.
+        unsafe {
+            let base = address.cast::<u8>().sub(BUDGET_HDR);
+            let bytes = base.cast::<usize>().read();
+            let layout = alloc::alloc::Layout::from_size_align(BUDGET_HDR + bytes, BUDGET_HDR)
+                .expect("test layout is valid");
+            alloc::alloc::dealloc(base, layout);
+        }
+    }
+
+    /// Installs the budgeted allocator on `strm`, pointing `opaque` at `budget`.
+    fn attach_budget(strm: &mut z_stream, budget: &Budget) {
+        strm.zalloc = Some(budget_zalloc);
+        strm.zfree = Some(budget_zfree);
+        strm.opaque = (budget as *const Budget).cast_mut().cast::<c_void>();
+    }
+
+    /// F-03 regression: when the caller's `zalloc` cannot satisfy the copy,
+    /// `inflateCopy` must report `Z_MEM_ERROR` — matching C's
+    /// `ZFREE(copy); return Z_MEM_ERROR` (`inflate.c` L1343-L1349) — rather than
+    /// reporting success with a destination backed by the Rust global allocator
+    /// (AAP §0.6.3, §0.6.5).
+    #[test]
+    fn copy_reports_mem_error_when_caller_allocator_is_exhausted() {
+        let budget = Budget {
+            remaining: core::sync::atomic::AtomicUsize::new(16),
+        };
+
+        let mut src = zeroed_stream();
+        attach_budget(&mut src, &budget);
+        assert_eq!(
+            unsafe { inflateInit_(&mut src, VERSION.as_ptr(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+
+        // Decode the stream so the lazily allocated window exists too, then
+        // starve the allocator before attempting the copy.
+        let mut out = vec![0u8; 128];
+        src.next_in = ZLIB_STREAM.as_ptr();
+        src.avail_in = ZLIB_STREAM.len() as c_uint;
+        src.next_out = out.as_mut_ptr();
+        src.avail_out = out.len() as c_uint;
+        assert_eq!(unsafe { inflate(&mut src, Z_NO_FLUSH) }, Z_STREAM_END);
+
+        budget
+            .remaining
+            .store(0, core::sync::atomic::Ordering::SeqCst);
+
+        let mut dst = zeroed_stream();
+        attach_budget(&mut dst, &budget);
+        assert_eq!(
+            unsafe { inflateCopy(&mut dst, &mut src) },
+            ReturnCode::MemError.as_c_int(),
+            "an exhausted caller allocator must fail the copy, not silently \
+             substitute global-allocator storage"
+        );
+        assert!(
+            dst.state.is_null(),
+            "a failed copy must leave the destination without a state"
+        );
+
+        // The source is untouched and still terminates cleanly.
+        assert!(!src.state.is_null());
+        assert_eq!(unsafe { inflateEnd(&mut src) }, Z_OK);
+    }
+
+    /// The same allocator with budget to spare copies successfully, proving the
+    /// test above fails for want of memory and for no other reason.
+    #[test]
+    fn copy_succeeds_when_caller_allocator_has_budget() {
+        let budget = Budget {
+            remaining: core::sync::atomic::AtomicUsize::new(64),
+        };
+
+        let mut src = zeroed_stream();
+        attach_budget(&mut src, &budget);
+        assert_eq!(
+            unsafe { inflateInit_(&mut src, VERSION.as_ptr(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+
+        let mut dst = zeroed_stream();
+        attach_budget(&mut dst, &budget);
+        assert_eq!(unsafe { inflateCopy(&mut dst, &mut src) }, Z_OK);
+        assert!(!dst.state.is_null());
+
+        assert_eq!(unsafe { inflateEnd(&mut dst) }, Z_OK);
+        assert_eq!(unsafe { inflateEnd(&mut src) }, Z_OK);
+    }
+
     /// C4: `inflateBackEnd` must reject a stream whose handle is NOT an
     /// `inflateBack` handle (here a regular `inflate` handle) with
     /// `Z_STREAM_ERROR`, WITHOUT freeing it (no layout-mismatched free); the
@@ -1988,5 +2136,169 @@ mod tests {
         );
         // The genuine terminator still works.
         assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
+    }
+
+    /// F6 / M7 end-to-end: with the caller's arena exhausted part-way through
+    /// `inflateCopy`, the C entry point reports `Z_MEM_ERROR`, leaves `dest`
+    /// untouched, releases whatever it did allocate, and leaves `source` able to
+    /// finish decoding — never completing the copy on the global allocator.
+    #[test]
+    fn copy_reports_mem_error_when_the_caller_arena_is_exhausted() {
+        use crate::ffi::alloc::test_hook::HookStats;
+
+        let stats = HookStats::new();
+        let hook = stats.hook();
+
+        let mut src = zeroed_stream();
+        src.zalloc = hook.zalloc();
+        src.zfree = hook.zfree();
+        src.opaque = hook.opaque();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut src,
+                    15,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+
+        // Decode the first half so the history window and the dynamic code
+        // tables are populated before the copy is attempted.
+        let mut out = vec![0u8; MSG.len() * 2];
+        let split = ZLIB_STREAM.len() / 2;
+        src.next_in = ZLIB_STREAM.as_ptr();
+        src.avail_in = split as c_uint;
+        src.next_out = out.as_mut_ptr();
+        src.avail_out = out.len() as c_uint;
+        assert_eq!(unsafe { inflate(&mut src, Z_NO_FLUSH) }, Z_OK);
+
+        let base_allocs = stats.allocs();
+        assert!(
+            base_allocs >= 2,
+            "init and the first decode must both allocate through the caller's zalloc (got {base_allocs})"
+        );
+        assert_eq!(stats.frees(), 0);
+
+        // Allow exactly one of the copy's two buffer allocations to succeed.
+        stats.set_budget(1);
+        let mut dst = zeroed_stream();
+        assert_eq!(
+            unsafe { inflateCopy(&mut dst, &mut src) },
+            ReturnCode::MemError.as_c_int(),
+            "an exhausted caller arena must surface Z_MEM_ERROR"
+        );
+
+        // `dest` is untouched — C allocates before writing anything to it.
+        assert!(dst.state.is_null(), "a failed copy must not install state");
+        assert_eq!(dst.total_out, 0);
+        assert!(dst.zalloc.is_none() && dst.zfree.is_none());
+
+        assert_eq!(
+            stats.allocs() - base_allocs,
+            1,
+            "only the budgeted allocation may succeed"
+        );
+        assert_eq!(stats.ooms(), 1, "the second copy allocation reported OOM");
+        assert_eq!(
+            stats.frees(),
+            1,
+            "the partially built copy must be released through the caller's zfree"
+        );
+
+        // The source survived and still decodes the remainder correctly.
+        stats.set_budget(usize::MAX);
+        src.next_in = ZLIB_STREAM[split..].as_ptr();
+        src.avail_in = (ZLIB_STREAM.len() - split) as c_uint;
+        assert_eq!(unsafe { inflate(&mut src, Z_NO_FLUSH) }, Z_STREAM_END);
+        assert_eq!(&out[..src.total_out as usize], MSG);
+
+        assert_eq!(unsafe { inflateEnd(&mut src) }, Z_OK);
+        assert_eq!(
+            stats.live_bytes(),
+            0,
+            "the caller's arena must be perfectly balanced"
+        );
+    }
+
+    /// The success path: a mid-stream copy is allocated entirely from the
+    /// caller's arena, decodes independently of the source even when the two are
+    /// fed different remainders, and both streams balance on `inflateEnd`.
+    #[test]
+    fn copy_allocates_from_the_callers_arena_and_decodes_independently() {
+        use crate::ffi::alloc::test_hook::HookStats;
+
+        let stats = HookStats::new();
+        let hook = stats.hook();
+
+        let mut src = zeroed_stream();
+        src.zalloc = hook.zalloc();
+        src.zfree = hook.zfree();
+        src.opaque = hook.opaque();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut src,
+                    15,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+
+        // Populate the window and the dynamic tables.
+        let mut out_src = vec![0u8; MSG.len() * 2];
+        let split = ZLIB_STREAM.len() / 2;
+        src.next_in = ZLIB_STREAM.as_ptr();
+        src.avail_in = split as c_uint;
+        src.next_out = out_src.as_mut_ptr();
+        src.avail_out = out_src.len() as c_uint;
+        assert_eq!(unsafe { inflate(&mut src, Z_NO_FLUSH) }, Z_OK);
+        let base_allocs = stats.allocs();
+        // Bytes already produced when the snapshot is taken; `inflateCopy`
+        // mirrors this into `dest.total_out`.
+        let produced = src.total_out;
+
+        let mut dst = zeroed_stream();
+        assert_eq!(unsafe { inflateCopy(&mut dst, &mut src) }, Z_OK);
+        assert!(
+            stats.allocs() > base_allocs,
+            "the copy's buffers must come from the caller's zalloc"
+        );
+        assert_eq!(stats.ooms(), 0);
+        assert!(dst.zalloc.is_some() && dst.zfree.is_some());
+        assert_eq!(dst.opaque, src.opaque);
+        assert_eq!(dst.total_out, produced, "C mirrors the whole z_stream");
+
+        // Give the copy its own output buffer and finish it independently. It
+        // resumes exactly where the snapshot was taken, so the bytes it emits are
+        // the tail of the plaintext — reconstructed from the copy's *own* history
+        // window and code tables.
+        let mut out_dst = vec![0u8; MSG.len() * 2];
+        dst.next_in = ZLIB_STREAM[split..].as_ptr();
+        dst.avail_in = (ZLIB_STREAM.len() - split) as c_uint;
+        dst.next_out = out_dst.as_mut_ptr();
+        dst.avail_out = out_dst.len() as c_uint;
+        assert_eq!(unsafe { inflate(&mut dst, Z_NO_FLUSH) }, Z_STREAM_END);
+        let tail = (dst.total_out - produced) as usize;
+        assert_eq!(&out_dst[..tail], &MSG[produced as usize..]);
+
+        // Finish the source too; both reproduce the same plaintext from their own
+        // buffers, proving the window and code tables are not shared.
+        src.next_in = ZLIB_STREAM[split..].as_ptr();
+        src.avail_in = (ZLIB_STREAM.len() - split) as c_uint;
+        assert_eq!(unsafe { inflate(&mut src, Z_NO_FLUSH) }, Z_STREAM_END);
+        assert_eq!(&out_src[..src.total_out as usize], MSG);
+
+        assert_eq!(unsafe { inflateEnd(&mut dst) }, Z_OK);
+        assert_eq!(unsafe { inflateEnd(&mut src) }, Z_OK);
+        assert_eq!(
+            stats.live_bytes(),
+            0,
+            "every region must reach the caller's zfree"
+        );
     }
 }

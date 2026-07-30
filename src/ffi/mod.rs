@@ -15,7 +15,7 @@
 //! * `#[unsafe(no_mangle)] extern "C"` **shims** — one per public `zlib.h`
 //!   prototype — that validate raw C inputs, bridge to the safe engines, and
 //!   re-materialize zlib's integer return codes at the boundary. They are defined
-//!   in the submodules [`util`], [`deflate`](mod@deflate), [`inflate`](mod@inflate), and [`gz`].
+//!   in the submodules [`util`], [`deflate`](mod@deflate), [`inflate`](mod@inflate), and `gz`.
 //! * `#[repr(C)]` **struct mirrors** ([`z_stream`], [`gz_header`], [`gzFile_s`])
 //!   whose field order and widths match `zlib.h` exactly, the C scalar aliases
 //!   ([`Bytef`], [`uInt`], [`uLong`], …), the C function-pointer typedefs
@@ -30,7 +30,7 @@
 //! Per the migration's unsafe-isolation strategy (AAP §0.6.2 / §0.7.2), **all**
 //! `unsafe` in the crate is confined to this `ffi` tree. The compression,
 //! decompression, checksum, gzip-I/O, and one-call engines — [`crate::deflate`],
-//! [`crate::inflate`], [`crate::checksum`], [`crate::gz`], and [`crate::util`] —
+//! [`crate::inflate`], [`crate::checksum`], `crate::gz`, and [`crate::util`] —
 //! contain the actual logic and are written in fully safe Rust (the deflate
 //! engine has **zero** `unsafe`). Every `unsafe` operation in the sibling shim
 //! files carries a `// SAFETY:` justification, and every fallible shim body is
@@ -54,14 +54,14 @@
 //! | [`util`]    | `compress.c`, `uncompr.c`, `adler32.c`, `crc32.c`, `zutil.c`   | one-call, checksum, and version/error shims                |
 //! | [`deflate`](mod@deflate) | `deflate.c`, `zlib.h`                                          | `deflate*` compression shims                               |
 //! | [`inflate`](mod@inflate) | `inflate.c`, `infback.c`, `zlib.h`                             | `inflate*` / `inflateBack*` decompression shims            |
-//! | [`gz`]      | `gzlib.c`, `gzread.c`, `gzwrite.c`, `gzclose.c`, `gzguts.h`    | `gz*` file-I/O shims (Cargo feature `gz-io`)               |
+//! | `gz`        | `gzlib.c`, `gzread.c`, `gzwrite.c`, `gzclose.c`, `gzguts.h`    | `gz*` file-I/O shims (Cargo feature `gz-io`)               |
 //!
 //! ## Feature gating
 //!
-//! The [`gz`] submodule maps zlib's gzip file-I/O layer, which fundamentally
+//! The `gz` submodule maps zlib's gzip file-I/O layer, which fundamentally
 //! requires the standard library for filesystem access. It is therefore compiled
 //! only when the `gz-io` Cargo feature is enabled (which implies `std` and
-//! `gzip`), matching the gating in [`crate::gz`] and the `#[cfg(feature =
+//! `gzip`), matching the gating in `crate::gz` and the `#[cfg(feature =
 //! "gz-io")] pub mod gz;` declaration in `src/lib.rs`. The `#[cfg(feature =
 //! "gz-io")]` attribute on the `pub mod gz;` declaration below is the single
 //! gate for `src/ffi/gz.rs`: that file deliberately does **not** repeat it as a

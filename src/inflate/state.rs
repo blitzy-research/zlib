@@ -6,7 +6,8 @@
 //! persist between `inflate()` calls. The driver ([`crate::inflate`] `mod.rs`),
 //! the fast decode loop (`fast.rs`), and the raw-callback back-inflate
 //! (`back.rs`) all operate on an [`InflateState`], and the public streaming
-//! type [`crate::stream`] owns one as `Option<Box<InflateState>>`.
+//! type [`crate::stream::ZStream`] owns one as its
+//! `StreamState::Inflate(Box<InflateState>)` variant.
 //!
 //! # Relationship to the C model
 //!
@@ -15,13 +16,18 @@
 //! `fast.rs`) expressible in **safe** Rust:
 //!
 //! * **No back-pointer.** The C struct stores `z_streamp strm` — a pointer back
-//!   to the owning stream. Ownership is inverted here: the stream owns the
-//!   state (`Option<Box<InflateState>>`, per AAP §0.6.3), so the back-pointer is
-//!   omitted entirely rather than modelled as a raw pointer.
+//!   to the owning stream. Ownership is inverted here: the stream owns the state
+//!   as the `StreamState::Inflate(Box<InflateState>)` variant (per AAP §0.6.3),
+//!   which is where the C `internal_state *state` pointer went, so the
+//!   back-pointer is omitted entirely rather than modelled as a raw pointer.
 //! * **Owned window.** The C `unsigned char FAR *window` (manually
-//!   `ZALLOC`/`ZFREE`-managed) becomes an owned [`Vec<u8>`]. Dropping the
-//!   [`InflateState`] frees the window automatically, so RAII subsumes the
-//!   `ZFREE(state->window)` performed by C `inflateEnd` (AAP §0.3.2).
+//!   `ZALLOC`/`ZFREE`-managed) becomes an owned
+//!   [`AllocBuffer<u8>`](crate::stream::AllocBuffer), which routes the
+//!   allocation through the caller's `zalloc`/`zfree` hook when the `z_stream`
+//!   installs an active pair and through the global allocator otherwise.
+//!   Dropping the [`InflateState`] frees the window automatically, so RAII
+//!   subsumes the `ZFREE(state->window)` performed by C `inflateEnd`
+//!   (AAP §0.3.2).
 //! * **Table offsets, not self-referential pointers.** The C `lencode` /
 //!   `distcode` are `code const FAR *` pointers that may point *into* the
 //!   state's own `codes[]` arena (dynamic Huffman blocks) or into the
@@ -33,16 +39,34 @@
 //!
 //! # Safety
 //!
-//! This module contains **zero `unsafe`** (AAP §0.6.2 — the whole inflate layer
-//! is free of `unsafe`; the boundary is `src/ffi/**` and the `src/lib.rs`
-//! runtime block) and is `no_std`-compatible: it references only
-//! `core`, `alloc`, and the crate's own safe modules.
+//! This module contains **zero `unsafe`**, and that is *enforced*, not merely
+//! asserted (AAP §0.6.2 / §0.7.2 standard S2, satisfying User Constraint 3
+//! "zero unsafe blocks in core compression logic"). Three independent mechanisms
+//! hold the line:
+//!
+//! 1. `src/lib.rs` carries a crate-wide `#![deny(unsafe_code)]`, so an `unsafe`
+//!    block, `unsafe fn`, `unsafe impl`, `unsafe trait`, or `unsafe extern` block
+//!    anywhere in this file is a **compile error**. Exactly two narrowly scoped
+//!    `#[allow(unsafe_code)]` carve-outs exist — `mod no_std_support` (the
+//!    freestanding `libc` allocator plus abort panic handler) and `pub mod ffi`
+//!    (the C ABI boundary) — and neither covers the inflate layer.
+//! 2. The crate-root boundary tests
+//!    (`executable_unsafe_is_confined_to_the_designated_boundary` and
+//!    `unsafe_code_denial_has_exactly_two_scoped_carve_outs`) re-derive the
+//!    boundary from the source text, so smuggling in a *third* carve-out —
+//!    which would still compile — fails the test suite.
+//! 3. The `unsafe-boundary` CI job repeats the same assertions in a
+//!    toolchain-independent shell check, so the gate still bites if the tests are
+//!    weakened or removed.
+//!
+//! The module is also `no_std`-compatible: it references only `core`, `alloc`,
+//! and the crate's own safe modules.
 
 use alloc::boxed::Box;
 
 use crate::gz_header::GzHeader;
 use crate::inflate::tables::{Code, ENOUGH};
-use crate::stream::{AllocBuffer, AllocHook};
+use crate::stream::{AllocBuffer, AllocHook, try_box};
 
 /// The possible inflate modes maintained between `inflate()` calls.
 ///
@@ -203,16 +227,19 @@ pub enum TableSource {
 /// to 32 KB.
 ///
 /// Because the struct is large, it is normally kept behind a [`Box`] (see
-/// [`InflateState::new`]); the owning [`crate::stream`] type holds it as
-/// `Option<Box<InflateState>>`.
+/// [`InflateState::new`]); the owning [`crate::stream::ZStream`] holds it as its
+/// `StreamState::Inflate(Box<InflateState>)` variant.
 ///
 /// # Ownership and cleanup
 ///
-/// All buffers are owned (the [`window`](InflateState::window) is a [`Vec<u8>`];
-/// the tables are inline arrays). No manual teardown is required: dropping the
-/// `Box<InflateState>` frees the window automatically, which is precisely how
-/// Rust ownership subsumes the `ZFREE(state->window)` that C `inflateEnd`
-/// performs (AAP §0.3.2). No explicit [`Drop`] implementation is needed.
+/// All buffers are owned: the [`window`](InflateState::window) is an
+/// [`AllocBuffer<u8>`](crate::stream::AllocBuffer) — so a caller-installed
+/// `zalloc`/`zfree` pair backs it when one is active, and the global allocator
+/// does otherwise — and the decode tables are inline arrays. No manual teardown
+/// is required: dropping the `Box<InflateState>` frees the window
+/// automatically, which is precisely how Rust ownership subsumes the
+/// `ZFREE(state->window)` that C `inflateEnd` performs (AAP §0.3.2). No explicit
+/// [`Drop`] implementation is needed.
 ///
 /// # Field width notes
 ///
@@ -224,8 +251,14 @@ pub enum TableSource {
 ///   accumulator holds every value the algorithm produces without truncation.
 ///   All `NEEDBITS`/`DROPBITS` arithmetic in `mod.rs` / `back.rs` must therefore
 ///   also use [`u32`].
-/// * [`total`](InflateState::total) is [`u64`] to match the 64-bit `z_size_t` /
-///   `unsigned long total` used by reference zlib and by `inflateMark`.
+/// * [`total`](InflateState::total) is deliberately widened to [`u64`]. C
+///   declares it `unsigned long total; /* protected copy of output count */`
+///   (`inflate.h` L93), whose width is platform-dependent — 32 bits on Windows
+///   LLP64, 64 bits on LP64 Unix. Fixing it at [`u64`] makes the counter behave
+///   identically on every target, and it costs nothing observably because the
+///   only place the value is compared against the wire is the gzip `ISIZE`
+///   check, which masks it first (C `hold != (state->total & 0xffffffff)`,
+///   `inflate.c` L1100) — a mask this port reproduces.
 /// * [`back`](InflateState::back) is signed ([`i32`]) because it holds the
 ///   sentinel `-1` ("no unprocessed length/literal code yet").
 pub struct InflateState {
@@ -276,7 +309,7 @@ pub struct InflateState {
     /// `state->window`. When a caller installed `zalloc`/`zfree` through the FFI
     /// `z_stream`, the window is routed through those hooks via the
     /// [`alloc_hook`](InflateState::alloc_hook) stored at construction time
-    /// (AAP §0.6.3; QA FINDING-3); otherwise it is a plain global allocation.
+    /// (AAP §0.6.3 has-hook clause); otherwise it is a plain global allocation.
     /// Being owned, it is freed automatically on drop — through the caller's
     /// `zfree` for a hook-backed buffer, or the global allocator otherwise —
     /// subsuming C's `ZFREE(state->window)`.
@@ -375,7 +408,7 @@ pub struct InflateState {
     /// [`new_in`](InflateState::new_in)) and consulted whenever the window is
     /// lazily (re)allocated. It is [`AllocHook::none`] under the Rust global
     /// allocator, or the caller's `zalloc`/`zfree`/`opaque` when one was
-    /// installed through the FFI `z_stream` (AAP §0.6.3; QA FINDING-3).
+    /// installed through the FFI `z_stream` (AAP §0.6.3 has-hook clause).
     pub alloc_hook: AllocHook,
 
     /// Hook-backed reservation mirroring reference zlib's allocation of the
@@ -406,9 +439,9 @@ pub struct InflateState {
     ///
     /// Being an owned [`AllocBuffer`], it is released automatically on drop —
     /// through the caller's `zfree` for a hook-backed reservation — subsuming
-    /// C's `ZFREE(strm, state)` at `inflateEnd` (AAP §0.6.3/§0.6.5). This closes
-    /// the QA finding that the inflate state allocation bypassed the caller's
-    /// allocator hook.
+    /// C's `ZFREE(strm, state)` at `inflateEnd` (AAP §0.6.3/§0.6.5). The
+    /// invariant this field exists to hold is that the inflate state allocation
+    /// never bypasses the caller's allocator hook.
     pub state_alloc: AllocBuffer<u8>,
 }
 
@@ -423,10 +456,17 @@ impl InflateState {
     ///
     /// `wrap` is the already-decoded wrapper selector (bit 0 = zlib, bit 1 =
     /// gzip, bit 2 = validate check value) and `wbits` is the base-2 logarithm
-    /// of the window size; both are computed by the driver from the caller's
-    /// overloaded `windowBits` argument (see
-    /// [`crate::constants::parse_window_bits`]). The returned state reproduces
-    /// the field values reference zlib leaves after
+    /// of the window size. Both are computed by
+    /// [`crate::inflate::inflate_reset2`], which decodes the caller's overloaded
+    /// `windowBits` argument itself — `wrap = (windowBits >> 4) + 5` for
+    /// non-negative values, `wrap = 0` with `wbits = -windowBits` for raw
+    /// streams — exactly as C `inflateReset2` does (`inflate.c`), and which
+    /// accepts `wbits == 0` to mean "take the window size from the zlib header".
+    /// The deflate side has its own decoder,
+    /// [`crate::constants::parse_window_bits`]; the two are intentionally
+    /// separate because the accepted domains differ (deflate rejects `0` and
+    /// applies the special 8-bit-window rule). The returned state reproduces the
+    /// field values reference zlib leaves after
     /// `inflateInit2_` + `inflateReset2` + `inflateResetKeep`:
     ///
     /// * [`mode`](InflateState::mode) = [`InflateMode::Head`],
@@ -442,9 +482,9 @@ impl InflateState {
     ///   lazy `ZALLOC`.
     ///
     /// The state is returned already boxed because it is large (~7 KB): keeping
-    /// it behind a [`Box`] matches the `Option<Box<InflateState>>` the owning
-    /// [`crate::stream`] type holds, and avoids moving the arrays around by
-    /// value.
+    /// it behind a [`Box`] matches the `StreamState::Inflate(Box<InflateState>)`
+    /// variant the owning [`crate::stream::ZStream`] holds, and avoids moving the
+    /// arrays around by value.
     ///
     /// # Allocator
     ///
@@ -465,14 +505,38 @@ impl InflateState {
     /// the caller's `zalloc`/`zfree` when active, or the global allocator
     /// otherwise. See [`new`](Self::new) for the full field-initialization
     /// contract; this is the same constructor with an explicit allocator hook
-    /// (AAP §0.6.3 has-hook clause; QA FINDING-3).
+    /// (AAP §0.6.3 has-hook clause).
     ///
     /// The window is *not* allocated here — it is sized on demand by the
     /// driver's `updatewindow`, which consults the stored
     /// [`alloc_hook`](InflateState::alloc_hook) at that time.
+    ///
+    /// This spelling boxes the state with [`Box::new`], which aborts if the Rust
+    /// global heap is exhausted. The FFI init paths use
+    /// [`try_new_in`](Self::try_new_in) instead so that condition becomes
+    /// `Z_MEM_ERROR`.
     #[must_use]
     pub fn new_in(hook: AllocHook, wrap: i32, wbits: u32) -> Box<InflateState> {
-        Box::new(InflateState {
+        Box::new(Self::build(hook, wrap, wbits))
+    }
+
+    /// Fallible counterpart of [`new_in`](Self::new_in): boxes the state through
+    /// a checked global allocation, yielding [`None`] instead of aborting when
+    /// the heap cannot satisfy it.
+    ///
+    /// C `inflateInit2_` reports a failed state allocation as `Z_MEM_ERROR`
+    /// (`inflate.c` L198-L200), so the init paths must be able to surface it.
+    /// The field-initialization contract is identical to [`new`](Self::new).
+    #[must_use]
+    pub fn try_new_in(hook: AllocHook, wrap: i32, wbits: u32) -> Option<Box<InflateState>> {
+        try_box(Self::build(hook, wrap, wbits))
+    }
+
+    /// Builds the unboxed initial state shared by [`new_in`](Self::new_in) and
+    /// [`try_new_in`](Self::try_new_in), so the field-initialization contract
+    /// exists in exactly one place.
+    fn build(hook: AllocHook, wrap: i32, wbits: u32) -> InflateState {
+        InflateState {
             // reset-managed fields (see `reset_keep`)
             mode: InflateMode::Head,
             last: false,
@@ -519,7 +583,7 @@ impl InflateState {
             // `inflateBack` constructor (`inflate_back_init_in`) retain its
             // single-allocation (window-only) parity with C.
             state_alloc: AllocBuffer::default(),
-        })
+        }
     }
 
     /// Resets the per-stream decoding fields while **keeping** the sliding
@@ -612,6 +676,28 @@ impl InflateState {
     /// module and free of any `unsafe` self-referential borrow: the returned
     /// slice borrows from either `self` or `fixed`, both tied to the `'a`
     /// lifetime.
+    ///
+    /// # Preconditions
+    ///
+    /// When [`lentable`](InflateState::lentable) is [`TableSource::Dynamic`],
+    /// [`lencode`](InflateState::lencode) must be a valid offset into
+    /// [`codes`](InflateState::codes), i.e. `lencode <= codes.len()`
+    /// (which is [`ENOUGH`]). Both fields are
+    /// public, so this cannot be enforced by the type system; the invariant is
+    /// maintained by the only writers — `reset_keep`, which sets the offset to
+    /// `0`, and the driver's table-building step, which advances
+    /// [`next`](InflateState::next) strictly within the `ENOUGH`-sized arena
+    /// because [`crate::inflate::tables::inflate_table`] refuses to overflow it.
+    /// This is the port of C's rule that `state->lencode` always points inside
+    /// `state->codes[]`; the C version keeps a raw pointer and has no way to
+    /// check it at all.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the precondition is violated, because the [`TableSource::Dynamic`]
+    /// arm is a checked slice range. That is the deliberate trade: a corrupted
+    /// offset aborts here rather than handing the decoder a table built from
+    /// out-of-bounds memory, which is what the equivalent C pointer would do.
     #[must_use]
     #[inline]
     pub fn lencode_slice<'a>(&'a self, fixed: &'a [Code]) -> &'a [Code] {
@@ -629,6 +715,17 @@ impl InflateState {
     /// [`disttable`](InflateState::disttable) is [`TableSource::Fixed`];
     /// otherwise the sub-slice of [`codes`](InflateState::codes) beginning at
     /// [`distcode`](InflateState::distcode) is returned.
+    ///
+    /// # Preconditions
+    ///
+    /// The same rule as [`lencode_slice`](InflateState::lencode_slice), applied
+    /// to [`distcode`](InflateState::distcode): in [`TableSource::Dynamic`] mode
+    /// it must satisfy `distcode <= codes.len()`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if that precondition is violated — the [`TableSource::Dynamic`] arm
+    /// is a checked slice range.
     #[must_use]
     #[inline]
     pub fn distcode_slice<'a>(&'a self, fixed: &'a [Code]) -> &'a [Code] {
@@ -666,46 +763,116 @@ mod tests {
         assert_eq!(InflateMode::Sync as u16 - InflateMode::Head as u16, 31);
     }
 
+    /// Every one of the 32 variants of `inflate.h`'s `inflate_mode`, in
+    /// declaration order. Shared by the mode tests so a single list is the one
+    /// place a new variant has to be registered — and [`mode_ordinal`] makes
+    /// forgetting to register it a compile error.
+    const ALL_MODES: [InflateMode; 32] = [
+        InflateMode::Head,
+        InflateMode::Flags,
+        InflateMode::Time,
+        InflateMode::Os,
+        InflateMode::ExLen,
+        InflateMode::Extra,
+        InflateMode::Name,
+        InflateMode::Comment,
+        InflateMode::Hcrc,
+        InflateMode::DictId,
+        InflateMode::Dict,
+        InflateMode::Type,
+        InflateMode::TypeDo,
+        InflateMode::Stored,
+        InflateMode::CopyUnderscore,
+        InflateMode::Copy,
+        InflateMode::Table,
+        InflateMode::LenLens,
+        InflateMode::CodeLens,
+        InflateMode::LenUnderscore,
+        InflateMode::Len,
+        InflateMode::LenExt,
+        InflateMode::Dist,
+        InflateMode::DistExt,
+        InflateMode::Match,
+        InflateMode::Lit,
+        InflateMode::Check,
+        InflateMode::Length,
+        InflateMode::Done,
+        InflateMode::Bad,
+        InflateMode::Mem,
+        InflateMode::Sync,
+    ];
+
+    /// The position each mode occupies in [`ALL_MODES`].
+    ///
+    /// The `match` deliberately has **no wildcard arm**: adding a variant to
+    /// [`InflateMode`] makes this function fail to compile until the variant is
+    /// classified, and [`every_mode_is_enumerated_exactly_once`] then requires it
+    /// to appear in [`ALL_MODES`] at the matching index. Together they are the
+    /// count/match guard that stops a new mode from escaping the mode tests.
+    fn mode_ordinal(mode: InflateMode) -> usize {
+        match mode {
+            InflateMode::Head => 0,
+            InflateMode::Flags => 1,
+            InflateMode::Time => 2,
+            InflateMode::Os => 3,
+            InflateMode::ExLen => 4,
+            InflateMode::Extra => 5,
+            InflateMode::Name => 6,
+            InflateMode::Comment => 7,
+            InflateMode::Hcrc => 8,
+            InflateMode::DictId => 9,
+            InflateMode::Dict => 10,
+            InflateMode::Type => 11,
+            InflateMode::TypeDo => 12,
+            InflateMode::Stored => 13,
+            InflateMode::CopyUnderscore => 14,
+            InflateMode::Copy => 15,
+            InflateMode::Table => 16,
+            InflateMode::LenLens => 17,
+            InflateMode::CodeLens => 18,
+            InflateMode::LenUnderscore => 19,
+            InflateMode::Len => 20,
+            InflateMode::LenExt => 21,
+            InflateMode::Dist => 22,
+            InflateMode::DistExt => 23,
+            InflateMode::Match => 24,
+            InflateMode::Lit => 25,
+            InflateMode::Check => 26,
+            InflateMode::Length => 27,
+            InflateMode::Done => 28,
+            InflateMode::Bad => 29,
+            InflateMode::Mem => 30,
+            InflateMode::Sync => 31,
+        }
+    }
+
+    /// [`ALL_MODES`] lists every mode exactly once, in order, with nothing
+    /// missing and nothing repeated.
+    #[test]
+    fn every_mode_is_enumerated_exactly_once() {
+        // Ordering and uniqueness, cross-checked against the wildcard-free match.
+        for (i, mode) in ALL_MODES.iter().enumerate() {
+            assert_eq!(
+                mode_ordinal(*mode),
+                i,
+                "ALL_MODES[{i}] is out of order or duplicated"
+            );
+        }
+        // Count, tied to the discriminant span rather than to a literal, so the
+        // array cannot drift away from the enum: 16211 - 16180 + 1 == 32.
+        assert_eq!(
+            ALL_MODES.len(),
+            (InflateMode::Sync as u16 - InflateMode::Head as u16 + 1) as usize,
+            "ALL_MODES must cover the entire discriminant span"
+        );
+    }
+
     #[test]
     fn all_32_variants_are_contiguous() {
-        // Every variant, listed in the exact C order, must be exactly one more
-        // than the previous, and there must be exactly 32 of them.
-        let variants = [
-            InflateMode::Head,
-            InflateMode::Flags,
-            InflateMode::Time,
-            InflateMode::Os,
-            InflateMode::ExLen,
-            InflateMode::Extra,
-            InflateMode::Name,
-            InflateMode::Comment,
-            InflateMode::Hcrc,
-            InflateMode::DictId,
-            InflateMode::Dict,
-            InflateMode::Type,
-            InflateMode::TypeDo,
-            InflateMode::Stored,
-            InflateMode::CopyUnderscore,
-            InflateMode::Copy,
-            InflateMode::Table,
-            InflateMode::LenLens,
-            InflateMode::CodeLens,
-            InflateMode::LenUnderscore,
-            InflateMode::Len,
-            InflateMode::LenExt,
-            InflateMode::Dist,
-            InflateMode::DistExt,
-            InflateMode::Match,
-            InflateMode::Lit,
-            InflateMode::Check,
-            InflateMode::Length,
-            InflateMode::Done,
-            InflateMode::Bad,
-            InflateMode::Mem,
-            InflateMode::Sync,
-        ];
-        assert_eq!(variants.len(), 32);
-        for (i, mode) in variants.iter().enumerate() {
+        // Every variant, in the exact C order, must be exactly one more than the
+        // previous, and there must be exactly 32 of them.
+        assert_eq!(ALL_MODES.len(), 32);
+        for (i, mode) in ALL_MODES.iter().enumerate() {
             assert_eq!(*mode as u16, 16180 + i as u16);
         }
     }
@@ -765,18 +932,15 @@ mod tests {
 
     #[test]
     fn is_valid_is_true_for_every_mode() {
-        // The closed enum can only hold valid modes, so is_valid is always true;
-        // check a representative set including the terminal error modes.
+        // `is_valid` is C's `inflateStateCheck` range test (`HEAD <= mode <=
+        // SYNC`), so it must hold for every mode the closed enum can hold —
+        // including the terminal `Bad`/`Mem`/`Sync` states. Driving the whole of
+        // `ALL_MODES` (guarded by `every_mode_is_enumerated_exactly_once`) means
+        // a newly added mode is covered here automatically.
         let mut state = InflateState::new(0, 15);
-        for mode in [
-            InflateMode::Head,
-            InflateMode::Len,
-            InflateMode::Bad,
-            InflateMode::Mem,
-            InflateMode::Sync,
-        ] {
+        for mode in ALL_MODES {
             state.mode = mode;
-            assert!(state.is_valid());
+            assert!(state.is_valid(), "is_valid must hold for {mode:?}");
         }
     }
 
@@ -947,12 +1111,16 @@ mod tests {
 
     #[test]
     fn state_is_boxable_matching_stream_model() {
-        // `new` already yields a `Box<InflateState>`; inspect it before moving
-        // it into the `Option<Box<InflateState>>` shape held by `src/stream.rs`.
+        // `new` already yields a `Box<InflateState>`; inspect it before moving it
+        // into the `StreamState::Inflate(Box<InflateState>)` variant that
+        // `src/stream.rs` actually holds — the place C keeps its
+        // `internal_state *state` pointer.
         let state: Box<InflateState> = InflateState::new(2, 15);
         assert_eq!(state.mode, InflateMode::Head);
         assert_eq!(state.wrap, 2);
-        let boxed: Option<Box<InflateState>> = Some(state);
-        assert!(boxed.is_some());
+        let owned = crate::stream::StreamState::Inflate(state);
+        assert!(owned.is_inflate());
+        assert!(!owned.is_deflate());
+        assert!(!owned.is_none());
     }
 }

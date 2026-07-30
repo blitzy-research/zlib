@@ -77,7 +77,7 @@ use crate::constants::{DEF_WBITS, MAX_WBITS, Z_BLOCK, Z_DEFLATED, Z_FINISH, Z_TR
 use crate::error::{ReturnCode, ZlibError};
 #[cfg(feature = "gzip")]
 use crate::gz_header::GzHeader;
-use crate::stream::{AllocBuffer, Allocator, StreamState, ZStream};
+use crate::stream::{AllocBuffer, Allocator, StreamState, ZStream, try_box};
 
 use crate::inflate::fast::inflate_fast;
 use crate::inflate::fixed::{DISTFIX, LENFIX};
@@ -561,7 +561,7 @@ pub fn inflate_reset2<A: Allocator>(strm: &mut ZStream<A>, window_bits: i32) -> 
 /// `zalloc` reports out-of-memory therefore surfaces [`ZlibError::MemError`]
 /// here — matching C's allocation count (one at init for a single-shot inflate)
 /// and failure timing. Under the global allocator no extra allocation is made,
-/// keeping the crate's ~7 KB inflate memory-bounds parity (AAP §0.7.1). The
+/// keeping the crate's ~7 KB inflate memory-bounds parity (AAP §0.6.5). The
 /// `inflateBack` init path does not go through here, so its single
 /// (window-only) allocation is unaffected.
 ///
@@ -578,18 +578,22 @@ pub fn inflate_init2<A: Allocator>(strm: &mut ZStream<A>, window_bits: i32) -> I
     // a no-op under the global allocator) is threaded in so the lazily-allocated
     // window is later routed through it (AAP §0.6.3; QA FINDING-3).
     let hook = strm.allocator().hook();
-    let mut state = InflateState::new_in(hook, 0, 0);
+    // `try_new_in` boxes the state through a checked global allocation, so heap
+    // exhaustion becomes `Z_MEM_ERROR` rather than an abort.
+    let mut state = InflateState::try_new_in(hook, 0, 0).ok_or(ZlibError::MemError)?;
     // Route the inflate *state* allocation through the caller's hook, mirroring
     // C `inflateInit2_`'s `ZALLOC(strm, 1, sizeof(struct inflate_state))`. The
     // idiomatic state lives in a global `Box`; this reserves the equivalent
     // footprint through an active caller hook so a limited/failing `zalloc`
     // surfaces `Z_MEM_ERROR` at init — before the window is needed — matching
-    // C's allocation count and failure timing (AAP §0.6.3/§0.6.5). Under the
-    // global allocator (`!hook.is_active()`) no extra allocation is made, so the
-    // ~7 KB inflate memory-bounds parity is preserved (AAP §0.7.1). This closes
-    // the QA finding that the inflate state allocation bypassed the hook.
+    // C's allocation count and failure timing (AAP §0.6.3/§0.6.5). The
+    // `(1, size_of)` split is the exact argument pair C passes, so a caller that
+    // inspects `items`/`size` sees the same values. Under the global allocator
+    // (`!hook.is_active()`) no extra allocation is made, so the ~7 KB inflate
+    // memory-bounds parity is preserved (AAP §0.6.5). This closes the QA finding
+    // that the inflate state allocation bypassed the hook.
     if hook.is_active() {
-        match AllocBuffer::try_zeroed(core::mem::size_of::<InflateState>(), hook) {
+        match AllocBuffer::try_zeroed_items(1, core::mem::size_of::<InflateState>(), hook) {
             Some(cell) => state.state_alloc = cell,
             // The state was not installed on the stream yet, so nothing to tear
             // down; report OOM exactly as C's failed state `ZALLOC` does.
@@ -2015,7 +2019,8 @@ pub fn inflate_sync_point<A: Allocator>(strm: &ZStream<A>) -> Result<bool, ZlibE
     Ok(state.mode == InflateMode::Stored && state.bits == 0)
 }
 
-/// Deep-clones an [`InflateState`] into a fresh [`Box`].
+/// Deep-clones an [`InflateState`] into a fresh [`Box`], or returns
+/// [`ZlibError::MemError`] if the copy's buffers cannot be allocated.
 ///
 /// This is the safe-Rust replacement for the pointer fix-up dance in C
 /// `inflateCopy`: because the state records the active decode tables as `usize`
@@ -2024,8 +2029,34 @@ pub fn inflate_sync_point<A: Allocator>(strm: &ZStream<A>) -> Result<bool, ZlibE
 /// fields verbatim already yields a correct, independent clone. No offsets need
 /// to be re-based. (`InflateState` deliberately does not derive [`Clone`], so
 /// the copy is written out explicitly.)
-fn clone_inflate_state(s: &InflateState) -> Box<InflateState> {
-    Box::new(InflateState {
+///
+/// # Allocator fidelity
+///
+/// C `inflateCopy` allocates the destination state and its window through the
+/// source stream's own `zalloc` and returns `Z_MEM_ERROR` if either fails
+/// (`inflate.c` L1340-L1350, including the `ZFREE(copy)` that releases the state
+/// when the window allocation fails). The window and the state reservation are
+/// therefore copied through [`AllocBuffer::try_clone`], which re-allocates through
+/// the allocator that backs them, and the state itself is boxed with
+/// [`try_box`] so global-heap exhaustion is reported rather than aborting.
+///
+/// A caller-supplied `zalloc` reporting out-of-memory fails the copy with
+/// [`ZlibError::MemError`] — exactly what C does — instead of completing it with
+/// global-allocator storage. There is no global-allocator fallback, so a caller
+/// who installed a bounded arena observes the failure instead of silently
+/// receiving a copy in the global heap (AAP §0.6.3, §0.6.5); an infallible
+/// [`Clone`] would return `Z_OK` while quietly escaping that arena, which is the
+/// behavior AAP §0.6.5 forbids — and is why neither `AllocBuffer` nor the engine
+/// states implement it.
+fn try_clone_inflate_state(s: &InflateState) -> Result<Box<InflateState>, ZlibError> {
+    // Fallible work first, so a failure abandons the copy before any state is
+    // built; the partial clone is released by its own `Drop` (C's `ZFREE(copy)`).
+    // C's order: the state reservation first (`inflate.c` L1340), then the window
+    // (L1346).
+    let state_alloc = s.state_alloc.try_clone().ok_or(ZlibError::MemError)?;
+    let window = s.window.try_clone().ok_or(ZlibError::MemError)?;
+
+    try_box(InflateState {
         mode: s.mode,
         last: s.last,
         wrap: s.wrap,
@@ -2039,7 +2070,7 @@ fn clone_inflate_state(s: &InflateState) -> Box<InflateState> {
         wsize: s.wsize,
         whave: s.whave,
         wnext: s.wnext,
-        window: s.window.clone(),
+        window,
         hold: s.hold,
         bits: s.bits,
         length: s.length,
@@ -2064,17 +2095,16 @@ fn clone_inflate_state(s: &InflateState) -> Box<InflateState> {
         was: s.was,
         // Carry the caller's allocator hook into the clone so the copied
         // window (already re-allocated through the same hook by
-        // `AllocBuffer::clone`) and any future re-allocation stay routed
-        // through the caller's `zalloc`/`zfree` (AAP §0.6.3; QA FINDING-3).
+        // `AllocBuffer::try_clone`) and any future re-allocation stay routed
+        // through the caller's `zalloc`/`zfree` (AAP §0.6.3).
         alloc_hook: s.alloc_hook,
-        // Give the copy its own state reservation, re-allocated through the same
-        // hook — mirroring C `inflateCopy`, which `ZALLOC`s a fresh state for the
+        // The copy's own state reservation, re-allocated through the same hook —
+        // mirroring C `inflateCopy`, which `ZALLOC`s a fresh state for the
         // destination. It is empty when the source has none (global-allocator
-        // streams), so no-hook copies stay allocation-free. `AllocBuffer::clone`
-        // is infallible: it degrades to a sound global copy only if the hook
-        // reports OOM, which keeps this `deflateCopy`-style clone total.
-        state_alloc: s.state_alloc.clone(),
+        // streams), so no-hook copies stay allocation-free.
+        state_alloc,
     })
+    .ok_or(ZlibError::MemError)
 }
 
 /// Copies a complete inflate stream — the Rust port of C `inflateCopy`
@@ -2087,13 +2117,20 @@ fn clone_inflate_state(s: &InflateState) -> Box<InflateState> {
 ///
 /// Unlike C — which must re-base the `lencode`/`distcode`/`next` pointers into
 /// the copied `codes` array — no fix-up is required here: those are `usize`
-/// offsets, so `clone_inflate_state` produces a correct clone directly.
+/// offsets, so `try_clone_inflate_state` produces a correct clone directly.
 ///
 /// # Errors
-/// Returns [`ZlibError::StreamError`] if `source` has no inflate state.
+/// * [`ZlibError::StreamError`] — `source` has no inflate state.
+/// * [`ZlibError::MemError`] — the copy's window or state reservation could not
+///   be allocated through the allocator backing the source's, mirroring C's
+///   `ZFREE(copy); return Z_MEM_ERROR` (`inflate.c` L1343-L1349). `dest` is left
+///   untouched in that case, because the copy is allocated in full before
+///   anything is written to the destination.
 pub fn inflate_copy<A: Allocator>(dest: &mut ZStream<A>, source: &ZStream<A>) -> InflateResult {
     let state = source.inflate_state().ok_or(ZlibError::StreamError)?;
-    let copy = clone_inflate_state(state);
+    // Allocate the copy FIRST and bail out before touching `dest`, exactly as C
+    // does — so an OOM leaves the destination stream unmodified.
+    let copy = try_clone_inflate_state(state)?;
     // Mirror C `zmemcpy(dest, source, sizeof(z_stream))` for the observable
     // stream bookkeeping (the allocator and I/O cursors are the caller's).
     dest.total_in = source.total_in;
@@ -2375,18 +2412,306 @@ mod tests {
         assert_eq!(inflate_prime(&mut strm, 17, 0), Err(ZlibError::StreamError));
     }
 
+    /// A payload that forces the decoder onto its realistic paths: the repeated
+    /// phrases guarantee length/distance back-references into the history window,
+    /// while the varied vocabulary makes a **dynamic** Huffman block the cheapest
+    /// encoding, so `inflate` builds real dynamic code tables in `codes[]` rather
+    /// than pointing at the module-static fixed ones.
+    fn varied_payload() -> Vec<u8> {
+        const WORDS: [&[u8]; 8] = [
+            b"alpha ",
+            b"bravo ",
+            b"charlie ",
+            b"delta ",
+            b"echo ",
+            b"foxtrot ",
+            b"golf ",
+            b"hotel ",
+        ];
+        let mut v = Vec::new();
+        let mut i = 0usize;
+        while v.len() < 6000 {
+            v.extend_from_slice(WORDS[(i * 7 + 3) % 8]);
+            if i % 11 == 0 {
+                v.extend_from_slice(b"the quick brown fox jumps over the lazy dog; ");
+            }
+            i += 1;
+        }
+        v
+    }
+
+    /// Compresses `data` as a zlib stream at level 6 with the crate's own
+    /// encoder, whose output is byte-identical to reference zlib.
+    fn zlib_compress(data: &[u8]) -> Vec<u8> {
+        use crate::constants::{Strategy, Z_DEFLATED};
+        let mut strm = ZStream::new();
+        crate::deflate::deflate_init2(&mut strm, 6, Z_DEFLATED, 15, 8, Strategy::Default)
+            .expect("deflate init");
+        let mut out = alloc::vec![0u8; data.len() * 2 + 128];
+        let r = crate::deflate::deflate(&mut strm, data, &mut out, Z_FINISH);
+        assert_eq!(r.code, ReturnCode::StreamEnd);
+        assert_eq!(r.consumed, data.len());
+        out.truncate(r.produced);
+        crate::deflate::deflate_end(&mut strm).expect("deflate end");
+        out
+    }
+
+    /// Drives `strm` to `Z_STREAM_END`, offering at most `in_chunk` input bytes
+    /// and at most `out_chunk` output bytes per call, and returns everything
+    /// produced.
+    ///
+    /// Two streams that share a history can be driven with completely different
+    /// `in_chunk`/`out_chunk` values, which is how the copy test diverges the call
+    /// pattern of the original and its snapshot.
+    fn resume_to_end(
+        strm: &mut ZStream,
+        input: &[u8],
+        in_chunk: usize,
+        out_chunk: usize,
+    ) -> Vec<u8> {
+        let mut got = Vec::new();
+        let mut in_off = 0usize;
+        let mut buf = alloc::vec![0u8; out_chunk];
+        loop {
+            let end_in = (in_off + in_chunk).min(input.len());
+            let r = inflate(strm, &input[in_off..end_in], &mut buf, Z_NO_FLUSH);
+            in_off += r.consumed;
+            got.extend_from_slice(&buf[..r.produced]);
+            match r.code {
+                ReturnCode::StreamEnd => return got,
+                ReturnCode::Ok => assert!(
+                    r.consumed > 0 || r.produced > 0 || in_off < input.len(),
+                    "inflate made no progress with input exhausted (truncated stream?)"
+                ),
+                other => panic!("unexpected inflate return code {other:?}"),
+            }
+        }
+    }
+
+    /// Decodes `comp` until `stop` output bytes exist, leaving the stream **live**
+    /// mid-block with a populated history window and populated dynamic code
+    /// tables. Returns the input offset at which decoding must resume.
+    fn drive_to_midstream(strm: &mut ZStream, comp: &[u8], stop: usize) -> usize {
+        let mut out = alloc::vec![0u8; stop];
+        let r = inflate(strm, comp, &mut out, Z_NO_FLUSH);
+        assert_eq!(
+            r.code,
+            ReturnCode::Ok,
+            "must stop for output space, not end"
+        );
+        assert_eq!(r.produced, stop, "output buffer should be filled exactly");
+        r.consumed
+    }
+
+    /// `inflateCopy` produces a genuinely independent snapshot of a **live**
+    /// decoder — one whose history window and dynamic Huffman tables are already
+    /// populated — not a shallow alias.
+    ///
+    /// The previous version of this test decoded four bytes of a fixed-table
+    /// stream, copied, and asserted only that a state was installed and that
+    /// `total_out` matched, which a shallow copy sharing every buffer would also
+    /// have passed. This version:
+    ///
+    /// 1. decodes a dynamic-Huffman stream part-way, so `codes[]` holds real
+    ///    tables, `lencode`/`distcode` are non-trivial offsets into that arena
+    ///    with [`TableSource::Dynamic`] selected, and the sliding window holds
+    ///    history (`wsize`/`whave` non-zero);
+    /// 2. takes the copy and asserts field-for-field fidelity, including the
+    ///    offsets and table discriminants that replace C's interior pointers
+    ///    (AAP §0.6.3) — the very fields C's `inflateCopy` has to re-base by hand;
+    /// 3. mutates the copy's window **and** its live decode table and observes
+    ///    that the source is byte-for-byte unchanged, proving distinct storage;
+    /// 4. resumes the two with **divergent chunking** — the source in one call,
+    ///    the copy in small input and output slices — observes that their progress
+    ///    genuinely diverges, and asserts both reconstruct the payload exactly;
+    ///    and
+    /// 5. drops each side while the other still has work outstanding, in **both
+    ///    orders**, proving neither state owns the other's buffers.
     #[test]
     fn copy_produces_independent_streams() {
+        let payload = varied_payload();
+        let comp = zlib_compress(&payload);
+        let stop = 2000usize;
+
         let mut src = ZStream::new();
         assert_eq!(inflate_init2(&mut src, 15), Ok(ReturnCode::Ok));
-        // Partially decode into a tight buffer so the source holds live state.
-        let mut out = [0u8; 4];
-        let _ = inflate(&mut src, ZLIB_STREAM, &mut out, Z_NO_FLUSH);
+        let resume = drive_to_midstream(&mut src, &comp, stop);
 
-        let mut dest = ZStream::new();
-        assert_eq!(inflate_copy(&mut dest, &src), Ok(ReturnCode::Ok));
-        assert!(dest.is_inflate(), "destination received a cloned state");
-        assert_eq!(dest.total_out, src.total_out);
+        // (1) The snapshot point is realistic: dynamic tables and live history.
+        {
+            let st = src.inflate_state().expect("state installed");
+            assert_eq!(
+                st.lentable,
+                TableSource::Dynamic,
+                "the length table must be a dynamic one built into codes[]"
+            );
+            assert_eq!(st.disttable, TableSource::Dynamic, "distance table dynamic");
+            assert!(st.wsize > 0, "the window must be allocated");
+            assert!(st.whave > 0, "the window must hold history");
+            assert!(
+                st.distcode > 0,
+                "the distance table must sit past the length table in codes[]"
+            );
+            assert_ne!(
+                st.codes[st.lencode],
+                Code::default(),
+                "codes[] must hold a built table"
+            );
+            assert!(st.lenbits > 0 && st.distbits > 0, "table root bits are set");
+        }
+
+        let mut cpy = ZStream::new();
+        assert_eq!(inflate_copy(&mut cpy, &src), Ok(ReturnCode::Ok));
+        assert!(cpy.is_inflate(), "destination received a cloned state");
+        assert_eq!(cpy.total_out, src.total_out);
+        assert_eq!(cpy.total_in, src.total_in);
+        assert_eq!(cpy.adler, src.adler);
+
+        // (2) Field-for-field fidelity, asserted directly rather than inferred
+        //     from the decoded output, so a field a future edit forgets to carry
+        //     over is caught even when it happens to be reconstructible.
+        {
+            let a = src.inflate_state().expect("source state");
+            let b = cpy.inflate_state().expect("copy state");
+
+            assert_eq!(b.mode, a.mode, "mode");
+            assert_eq!(b.last, a.last, "last");
+            assert_eq!(b.wrap, a.wrap, "wrap");
+            assert_eq!(b.havedict, a.havedict, "havedict");
+            assert_eq!(b.flags, a.flags, "flags");
+            assert_eq!(b.dmax, a.dmax, "dmax");
+            assert_eq!(b.check, a.check, "check");
+            assert_eq!(b.total, a.total, "total");
+            assert_eq!(b.wbits, a.wbits, "wbits");
+            assert_eq!(b.wsize, a.wsize, "wsize");
+            assert_eq!(b.whave, a.whave, "whave");
+            assert_eq!(b.wnext, a.wnext, "wnext");
+            assert_eq!(b.hold, a.hold, "hold");
+            assert_eq!(b.bits, a.bits, "bits");
+            assert_eq!(b.length, a.length, "length");
+            assert_eq!(b.offset, a.offset, "offset");
+            assert_eq!(b.extra, a.extra, "extra");
+            // The offset-plus-discriminant pair that replaces C's self-referential
+            // `lencode`/`distcode`/`next` interior pointers (AAP §0.6.3): getting
+            // these wrong is exactly the defect C must hand-patch after its
+            // `zmemcpy`, and is what makes a deep clone sound here.
+            // `lencode` is structurally 0 in this port — the length table always
+            // begins at the base of the `codes` arena, mirroring C's
+            // `state->lencode = state->next` while `next == codes` (`inflate.c`
+            // L811, L889) — so this assertion is a guard against a future arena
+            // layout change rather than a live discriminator. `distcode` below is
+            // the non-trivial offset, and it is asserted too.
+            assert_eq!(b.lencode, a.lencode, "lencode offset");
+            assert_eq!(b.distcode, a.distcode, "distcode offset");
+            assert_eq!(b.lentable, a.lentable, "lentable source");
+            assert_eq!(b.disttable, a.disttable, "disttable source");
+            assert_eq!(b.lenbits, a.lenbits, "lenbits");
+            assert_eq!(b.distbits, a.distbits, "distbits");
+            assert_eq!(b.ncode, a.ncode, "ncode");
+            assert_eq!(b.nlen, a.nlen, "nlen");
+            assert_eq!(b.ndist, a.ndist, "ndist");
+            assert_eq!(b.have, a.have, "have");
+            assert_eq!(b.next, a.next, "next");
+            assert_eq!(b.sane, a.sane, "sane");
+            assert_eq!(b.back, a.back, "back");
+            assert_eq!(b.was, a.was, "was");
+            assert_eq!(b.lens, a.lens, "lens");
+            assert_eq!(b.work, a.work, "work");
+            assert_eq!(b.codes, a.codes, "codes arena");
+            assert_eq!(&*b.window, &*a.window, "window contents");
+        }
+
+        // (3) Distinct storage: mutating the copy's window and its live decode
+        //     table leaves the source untouched.
+        {
+            let (w0, code, hold) = {
+                let a = src.inflate_state().expect("source state");
+                (a.window[0], a.codes[a.lencode], a.hold)
+            };
+
+            let b = cpy.inflate_state_mut().expect("copy state");
+            let lencode = b.lencode;
+            b.window[0] = w0 ^ 0xFF;
+            b.codes[lencode].val = code.val ^ 0xBEEF;
+            b.hold = hold ^ 0xDEAD_BEEF;
+
+            let a = src.inflate_state().expect("source state");
+            assert_eq!(a.window[0], w0, "window is shared!");
+            assert_eq!(a.codes[a.lencode], code, "codes arena is shared!");
+            assert_eq!(a.hold, hold, "bit accumulator is shared!");
+
+            // Restore so step (4) decodes honestly.
+            let b = cpy.inflate_state_mut().expect("copy state");
+            b.window[0] = w0;
+            b.codes[lencode] = code;
+            b.hold = hold;
+        }
+
+        // (4) Divergent chunking: the source finishes in one call; the copy is fed
+        //     11 input bytes at a time into a 13-byte output window. Their
+        //     progress therefore diverges, yet both must reconstruct the payload.
+        let tail = &payload[stop..];
+        let got_src = resume_to_end(&mut src, &comp[resume..], comp.len(), payload.len());
+        assert_eq!(
+            got_src, tail,
+            "the source must decode its remainder exactly"
+        );
+
+        let mid_out = cpy.total_out;
+        assert_ne!(
+            mid_out, src.total_out,
+            "the copy must not have advanced with the source"
+        );
+        assert_eq!(
+            mid_out as usize, stop,
+            "the copy is still parked at the snapshot point"
+        );
+
+        let got_cpy = resume_to_end(&mut cpy, &comp[resume..], 11, 13);
+        assert_eq!(
+            got_cpy, tail,
+            "the copy must decode the same remainder under a different call pattern"
+        );
+        assert_eq!(
+            cpy.total_out, src.total_out,
+            "both consumed the whole stream"
+        );
+        assert_eq!(cpy.adler, src.adler, "both verified the same Adler-32");
+
+        assert_eq!(inflate_end(&mut cpy), Ok(ReturnCode::Ok));
+        assert_eq!(inflate_end(&mut src), Ok(ReturnCode::Ok));
+        drop(cpy);
+        drop(src);
+
+        // (5a) Drop order A — release the SOURCE while the copy still has the
+        //      whole remainder outstanding; the copy must finish correctly.
+        {
+            let mut a = ZStream::new();
+            assert_eq!(inflate_init2(&mut a, 15), Ok(ReturnCode::Ok));
+            let resume_a = drive_to_midstream(&mut a, &comp, stop);
+            let mut b = ZStream::new();
+            assert_eq!(inflate_copy(&mut b, &a), Ok(ReturnCode::Ok));
+            assert_eq!(inflate_end(&mut a), Ok(ReturnCode::Ok));
+            drop(a);
+            let got = resume_to_end(&mut b, &comp[resume_a..], 29, 37);
+            assert_eq!(got, tail, "the copy outlives its source intact");
+            assert_eq!(inflate_end(&mut b), Ok(ReturnCode::Ok));
+        }
+
+        // (5b) Drop order B — release the COPY while the source still has the
+        //      whole remainder outstanding; the source must finish correctly.
+        {
+            let mut a = ZStream::new();
+            assert_eq!(inflate_init2(&mut a, 15), Ok(ReturnCode::Ok));
+            let resume_a = drive_to_midstream(&mut a, &comp, stop);
+            let mut b = ZStream::new();
+            assert_eq!(inflate_copy(&mut b, &a), Ok(ReturnCode::Ok));
+            assert_eq!(inflate_end(&mut b), Ok(ReturnCode::Ok));
+            drop(b);
+            let got = resume_to_end(&mut a, &comp[resume_a..], 5, 7);
+            assert_eq!(got, tail, "the source survives the copy being released");
+            assert_eq!(inflate_end(&mut a), Ok(ReturnCode::Ok));
+        }
     }
 
     #[test]

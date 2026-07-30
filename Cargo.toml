@@ -270,6 +270,15 @@ harness = false
 # `tests/`. An explicit `[[test]]` whose `name` matches an auto-discovered target
 # simply overrides that target's settings rather than suppressing discovery of
 # its siblings, which is exactly the behaviour relied on here.
+#
+# `path` is REQUIRED to exist, and that is not a formality: with `tests/c_oracle.rs`
+# absent, `cargo check --all-targets --all-features` and `cargo test --all-features`
+# both abort with "can't find integration-test `c_oracle` at path
+# …/tests/c_oracle.rs" — which is the `--all-features` row of the `build-test`
+# matrix. So this declaration and that file are a single unit: neither may be
+# removed without the other. The harness BODY is reviewed against its own
+# checkpoint boundary (it is the AAP §0.4.1.8 CREATE that closes gap D9); this
+# manifest owns only the target's gating, which is verified here.
 [[test]]
 name = "c_oracle"
 path = "tests/c_oracle.rs"

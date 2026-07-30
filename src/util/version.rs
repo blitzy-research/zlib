@@ -107,6 +107,27 @@ fn size_code(n: usize) -> u32 {
     }
 }
 
+/// Packs the four C-ABI type widths into bits 0-7 of the compile-flags word,
+/// mirroring the four consecutive `switch (sizeof(...))` blocks of C
+/// `zlibCompileFlags` (`zutil.c` L35-L58).
+///
+/// The widths are parameters rather than being read from
+/// [`core::mem::size_of`] inside this function so that the slot assignment is
+/// directly testable for ABI shapes other than the host's. On an LP64 host
+/// `voidpf` and `z_off_t` are both 8 bytes, which would make a swap of those
+/// two slots invisible to any test that could only observe the host widths —
+/// yet that swap is a real defect on LLP64 (Windows x86_64), where C `long`
+/// stays 32-bit while pointers are 64-bit.
+///
+/// Slot layout, matching C exactly:
+/// * bits 0-1 — `uInt`
+/// * bits 2-3 — `uLong`
+/// * bits 4-5 — `voidpf`
+/// * bits 6-7 — `z_off_t`
+fn type_size_bits(uint: usize, ulong: usize, voidpf: usize, z_off_t: usize) -> u32 {
+    size_code(uint) | (size_code(ulong) << 2) | (size_code(voidpf) << 4) | (size_code(z_off_t) << 6)
+}
+
 /// Returns a bitfield describing the compile-time configuration of the
 /// library, mirroring the C `zlibCompileFlags` function.
 ///
@@ -149,10 +170,12 @@ pub fn zlib_compile_flags() -> u32 {
     // Type-size bits (0-7): computed from the real C-ABI widths of the Rust
     // `core::ffi` types standing in for zlib's `uInt`, `uLong`, `voidpf`, and
     // `z_off_t`, mirroring the four `switch (sizeof(...))` blocks in C.
-    flags |= size_code(core::mem::size_of::<c_uint>());
-    flags |= size_code(core::mem::size_of::<c_ulong>()) << 2;
-    flags |= size_code(core::mem::size_of::<*const c_void>()) << 4;
-    flags |= size_code(core::mem::size_of::<c_long>()) << 6;
+    flags |= type_size_bits(
+        core::mem::size_of::<c_uint>(),
+        core::mem::size_of::<c_ulong>(),
+        core::mem::size_of::<*const c_void>(),
+        core::mem::size_of::<c_long>(),
+    );
 
     // bit 8: ZLIB_DEBUG. Mirror the Rust `debug_assertions` build profile so
     // the flag reflects whether debug checks are compiled in.
@@ -290,17 +313,258 @@ mod tests {
         assert_eq!(zlib_compile_flags() & RESERVED, 0);
     }
 
+    /// The C `zlibCompileFlags` width-to-code mapping, transcribed directly from
+    /// the `switch` case labels in `zutil.c` L35-L58 rather than delegating to
+    /// this module's [`size_code`].
+    ///
+    /// Writing the expectation out independently is the whole point: a test that
+    /// asks [`size_code`] what it thinks the answer is would agree with a broken
+    /// [`size_code`]. C uses `case 2 -> +0`, `case 4 -> +1`, `case 8 -> +2` and
+    /// `default -> +3`, and each slot is shifted left by `2 * slot_index`.
+    fn expected_size_code(width: usize) -> u32 {
+        match width {
+            2 => 0,
+            4 => 1,
+            8 => 2,
+            _ => 3,
+        }
+    }
+
     #[test]
-    fn compile_flags_low_byte_on_lp64() {
-        // On an LP64 target (c_uint=4, c_ulong=8, pointer=8, c_long=8) the low
-        // byte is 0xA9 — exactly as the C `zlibCompileFlags` produces:
-        // uInt->1, uLong->2<<2=8, ptr->2<<4=32, z_off_t->2<<6=128 => 169.
-        let lp64 = core::mem::size_of::<c_uint>() == 4
-            && core::mem::size_of::<c_ulong>() == 8
-            && core::mem::size_of::<*const c_void>() == 8
-            && core::mem::size_of::<c_long>() == 8;
-        if lp64 {
-            assert_eq!(zlib_compile_flags() & 0xFF, 0xA9);
+    fn compile_flags_low_byte_always_matches_the_active_target() {
+        // The four C types whose widths occupy the low byte, in C's slot order:
+        // uInt (bits 0-1), uLong (bits 2-3), voidpf (bits 4-5), z_off_t (bits
+        // 6-7). `z_off_t` is `c_long` in this port.
+        let uint = core::mem::size_of::<c_uint>();
+        let ulong = core::mem::size_of::<c_ulong>();
+        let ptr = core::mem::size_of::<*const c_void>();
+        let off = core::mem::size_of::<c_long>();
+
+        // Derive the expectation for whatever target is actually being compiled,
+        // then assert it UNCONDITIONALLY. There is deliberately no `if` here: the
+        // predecessor of this test hid its only assertion behind a runtime LP64
+        // check and therefore passed vacuously on every non-LP64 target.
+        let expected = expected_size_code(uint)
+            | (expected_size_code(ulong) << 2)
+            | (expected_size_code(ptr) << 4)
+            | (expected_size_code(off) << 6);
+        let actual = zlib_compile_flags() & 0xFF;
+        assert_eq!(
+            actual, expected,
+            "low byte mismatch for widths uInt={uint} uLong={ulong} voidpf={ptr} z_off_t={off}"
+        );
+
+        // Assert each 2-bit slot in isolation as well, so a compensating error
+        // across two slots cannot cancel out in the aggregate comparison. The
+        // tally guards against a future edit dropping a slot from the table.
+        let slots = [
+            ("uInt", uint),
+            ("uLong", ulong),
+            ("voidpf", ptr),
+            ("z_off_t", off),
+        ];
+        let mut checked = 0_usize;
+        for (slot, (name, width)) in slots.into_iter().enumerate() {
+            let shift = 2 * slot as u32;
+            assert_eq!(
+                (actual >> shift) & 0b11,
+                expected_size_code(width),
+                "slot {slot} ({name}, width {width}) occupies bits {shift}-{}",
+                shift + 1
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 4, "all four type-size slots must be checked");
+
+        // Additionally pin the documented literal for each ABI shape this crate
+        // is built for, so the derivation above cannot drift as a whole. The
+        // catch-all arm still asserts, so an unrecognised target is never
+        // silently skipped.
+        match (uint, ulong, ptr, off) {
+            // LP64: Linux/macOS x86_64, aarch64, s390x. 1 + 2<<2 + 2<<4 + 2<<6.
+            (4, 8, 8, 8) => assert_eq!(actual, 0xA9, "LP64 low byte"),
+            // ILP32: i686, armv7 and other 32-bit targets. 1 + 1<<2 + 1<<4 + 1<<6.
+            (4, 4, 4, 4) => assert_eq!(actual, 0x55, "ILP32 low byte"),
+            // LLP64: Windows x86_64, where C `long` stays 32-bit. 1 + 1<<2 + 2<<4 + 1<<6.
+            (4, 4, 8, 4) => assert_eq!(actual, 0x65, "LLP64 low byte"),
+            other => {
+                // Not a shape with a hard-coded literal, but the unconditional
+                // assertion above has already checked this target exactly.
+                assert_eq!(
+                    actual, expected,
+                    "unrecognised ABI shape {other:?}; derived low byte still applies"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn type_size_bits_packs_every_abi_shape() {
+        // Each expected value below is computed by hand from `zutil.c` L35-L58
+        // and written as a literal, so this test is an INDEPENDENT anchor rather
+        // than a restatement of the implementation. Because the widths are
+        // parameters, shapes the host does not use — ILP32, LLP64, and the
+        // 2-byte and over-wide `default` arms — are all exercised here on every
+        // target, including the slot swap that is invisible at LP64 widths.
+        const CASES: [(usize, usize, usize, usize, u32, &str); 8] = [
+            // uInt uLong voidpf z_off_t  expected  shape
+            (4, 8, 8, 8, 0xA9, "LP64: 1 + 2<<2 + 2<<4 + 2<<6"),
+            (4, 4, 4, 4, 0x55, "ILP32: 1 + 1<<2 + 1<<4 + 1<<6"),
+            (4, 4, 8, 4, 0x65, "LLP64: 1 + 1<<2 + 2<<4 + 1<<6"),
+            (
+                4,
+                8,
+                8,
+                4,
+                0x69,
+                "LP64 with 32-bit z_off_t: 1 + 2<<2 + 2<<4 + 1<<6",
+            ),
+            (2, 2, 2, 2, 0x00, "all 2-byte: every slot codes 0"),
+            (2, 4, 4, 4, 0x54, "16-bit uInt: 0 + 1<<2 + 1<<4 + 1<<6"),
+            (
+                16,
+                4,
+                4,
+                4,
+                0x57,
+                "over-wide uInt hits `default`: 3 + 1<<2 + 1<<4 + 1<<6",
+            ),
+            (8, 8, 8, 8, 0xAA, "all 8-byte: 2 + 2<<2 + 2<<4 + 2<<6"),
+        ];
+
+        for (uint, ulong, voidpf, z_off_t, expected, shape) in CASES {
+            assert_eq!(
+                type_size_bits(uint, ulong, voidpf, z_off_t),
+                expected,
+                "{shape} (widths {uint}/{ulong}/{voidpf}/{z_off_t})"
+            );
+        }
+
+        // The packing must occupy only the low byte: no slot may bleed into the
+        // option bits at 8 and above.
+        for (uint, ulong, voidpf, z_off_t, _, shape) in CASES {
+            assert_eq!(
+                type_size_bits(uint, ulong, voidpf, z_off_t) & !0xFF,
+                0,
+                "{shape} must not set any bit above bit 7"
+            );
+        }
+
+        // Each slot must be independently addressable: varying one width may
+        // only ever change its own 2-bit field. This is what pins the shift
+        // amounts and catches two slots being transposed.
+        // The expected deltas are hard-coded rather than derived from `slot`, so
+        // this check carries information independent of the packing it verifies.
+        // Widening one slot from 4 to 8 flips its code from 1 to 2 -- both of its
+        // bits -- giving 0b11 positioned at that slot: 0x03, 0x0C, 0x30, 0xC0.
+        const BASE: (usize, usize, usize, usize) = (4, 4, 4, 4);
+        const DELTAS: [u32; 4] = [0x03, 0x0C, 0x30, 0xC0];
+        let base_bits = type_size_bits(BASE.0, BASE.1, BASE.2, BASE.3);
+        assert_eq!(base_bits, 0x55, "the ILP32 base must pack to 0x55");
+        for (slot, expected_delta) in DELTAS.into_iter().enumerate() {
+            let mut w = BASE;
+            match slot {
+                0 => w.0 = 8,
+                1 => w.1 = 8,
+                2 => w.2 = 8,
+                _ => w.3 = 8,
+            }
+            assert_eq!(
+                type_size_bits(w.0, w.1, w.2, w.3) ^ base_bits,
+                expected_delta,
+                "widening only slot {slot} must alter only bits {}-{}",
+                2 * slot,
+                2 * slot + 1
+            );
+        }
+    }
+
+    #[test]
+    fn the_low_byte_contract_cannot_be_silently_weakened() {
+        // Two ways to break this contract are *observationally identical* on an
+        // LP64 host and so cannot be caught by any runtime assertion here:
+        //
+        //  1. hard-coding `flags |= 0xA9` instead of computing the widths, which
+        //     is correct on LP64 and wrong on ILP32 and LLP64; and
+        //  2. re-hiding the low-byte assertion behind a runtime width check,
+        //     which is exactly the vacuous-test defect this test set replaced.
+        //
+        // Both are therefore pinned structurally against this file's own source.
+        let source = include_str!("version.rs");
+
+        // (1) The production function must derive the low byte, not assert it.
+        let producer = source
+            .split_once("pub fn zlib_compile_flags()")
+            .expect("zlib_compile_flags must exist")
+            .1;
+        let producer = producer
+            .split_once("\n}\n")
+            .expect("zlib_compile_flags must be delimited")
+            .0;
+        assert!(
+            producer.contains("type_size_bits("),
+            "zlib_compile_flags must obtain bits 0-7 from type_size_bits, so the \
+             packing stays width-derived and testable for non-host ABI shapes"
+        );
+        for literal in ["0xA9", "0x55", "0x65", "169", "0xFF"] {
+            assert!(
+                !producer.contains(literal),
+                "zlib_compile_flags must not hard-code the low byte ({literal}); \
+                 that is correct only on one ABI shape"
+            );
+        }
+
+        // (2) The active-target test must assert unconditionally. A `match` on
+        // the ABI shape is fine (every arm asserts); an `if` is not, because it
+        // is how an assertion gets skipped.
+        let needle = "fn compile_flags_low_byte_always_matches_the_active_target";
+        let body = source
+            .split_once(needle)
+            .expect("the active-target test must exist")
+            .1;
+        let body = body
+            .split_once("\n    }\n")
+            .expect("the active-target test must be delimited")
+            .0;
+        assert!(
+            body.contains("let actual = zlib_compile_flags() & 0xFF;"),
+            "the active-target test must read the real flags word directly"
+        );
+        for line in body.lines() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            assert!(
+                !code.starts_with("if ") && !code.contains(" if "),
+                "the active-target test must contain no conditional, or its \
+                 assertions can pass vacuously on some target; found: {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_size_code_matches_the_c_case_labels() {
+        // Guards the independent mapping used above against the C source, and in
+        // doing so also pins `size_code` from outside itself.
+        assert_eq!(expected_size_code(2), 0, "zutil.c `case 2: break`");
+        assert_eq!(expected_size_code(4), 1, "zutil.c `case 4: flags += 1`");
+        assert_eq!(expected_size_code(8), 2, "zutil.c `case 8: flags += 2`");
+        for odd in [0_usize, 1, 3, 5, 6, 7, 12, 16] {
+            assert_eq!(
+                expected_size_code(odd),
+                3,
+                "zutil.c `default: flags += 3` for width {odd}"
+            );
+        }
+        // The independent transcription and the production mapping must agree on
+        // every width the C switch can observe.
+        for width in [0_usize, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16] {
+            assert_eq!(
+                expected_size_code(width),
+                size_code(width),
+                "size_code disagrees with the C case labels at width {width}"
+            );
         }
     }
 

@@ -1,270 +1,126 @@
 # `.cargo/config.toml` -- Cargo per-project configuration for the `zlib-rs`
-# crate: the documented home for target-specific rustflags and link arguments.
+# crate: the documented home for target-specific rustflags and link arguments
+# (migration gap D7).
 #
-# Read this before editing. The file is deliberately almost empty, and every
-# table in it is intentionally inert, so the reasoning has to live here or it
-# will be lost -- and the most likely way this file causes damage is a
-# well-meaning maintainer adding a setting that quietly invalidates one of the
-# guarantees documented below.
+# Every table here is an intentionally EMPTY, documented anchor, so this file
+# changes nothing observable today: no codegen, no emitted compressed bytes, no
+# exported symbol set, no dependency resolution, no panic strategy, no test
+# outcome. It exists so that when a cross-compiled, emulated, or bare-metal row
+# does land, its wiring has one obvious home instead of scattering through
+# per-job workflow environment variables -- which is the defect D7 describes.
+# The consumers are not here yet: CI runs every job on `ubuntu-latest` and its
+# `build-test` matrix varies features only. Keep the tables empty until a real
+# consumer lands.
 #
-# Section references of the form `AAP 0.10.1` point at section 0.10.1 of the
-# Agent Action Plan for the C-to-Rust migration of zlib 1.3.2.1-motley. The
-# section sign is spelled out this way so the file stays plain ASCII.
-#
-#
-# WHY THIS FILE EXISTS -- migration gap D7
-# ========================================
-# The migration plan recorded this file as a verified-absent (confirmed by
-# `ls`) production-readiness artifact of LOW severity, and says so in five
-# mutually consistent places:
-#
-#   * AAP 0.10.1, the authoritative gap register, row D7:
-#       "`.cargo/config.toml` -- no location currently exists to carry
-#        target-specific rustflags or link arguments."
-#   * AAP 0.2.1.7, Verified-Absent Artifacts (CREATE mode), row D7:
-#       "`.cargo/config.toml` | No location currently exists to carry
-#        target-specific rustflags or link arguments."
-#   * AAP 0.3.1, the target file and folder layout:
-#       `.cargo/` -> `config.toml  [CREATE] target rustflags / link args (D7)`
-#   * AAP 0.4.1.9, Build, Packaging, and Policy:
-#       "`.cargo/config.toml` | CREATE | -- | Carry target-specific rustflags
-#        and link arguments (D7)".
-#   * AAP 0.5.2, external reference updates, which lists it among the new
-#     build and packaging artifacts beside `rust-toolchain.toml` (D4),
-#     `deny.toml` (D1), `clippy.toml`, and `rustfmt.toml` (D11).
-#
-# "No location currently exists" was literally true. There is no `env:`, no
-# `RUSTFLAGS`, and no `CARGO_*` variable anywhere in
-# `.github/workflows/ci.yml` or `.github/workflows/fuzz.yml`, and there was no
-# `.cargo/` directory at all. This file is that location, and it is the only
-# file that belongs in `.cargo/`.
-#
-#
-# NEIGHBOURING GAP IDENTIFIERS (AAP 0.10.2 corrections)
-# =====================================================
-# The plan's own reconciliation section corrects three mis-citations that
-# appear in its later prose. Use these identifiers, not the mistaken ones:
-#
-#   D4    `rust-toolchain.toml`, which pins the toolchain. Cited once as
-#         "D11"; D11 is `clippy.toml` / `rustfmt.toml`.
-#   D10   real-hardware / bare-metal `no_std` validation. Cited twice as
-#         "D6"; D6 is `SECURITY.md` / `CONTRIBUTING.md`.
-#   D12   release and publish governance, which owns verification of
-#         `Cargo.toml`'s `exclude` list under `cargo package`. Cited once as
-#         "D5"; D5 is `CHANGELOG.md`.
-#
-# Also referenced below: D1 `deny.toml`, D2 the `cargo-audit` / `cargo-deny`
-# workflow, D3 the cross-platform CI matrix, D8 cdylib symbol versioning.
-#
-#
-# WHY IT DELIBERATELY SETS NOTHING TODAY
-# ======================================
-# Every table below is an empty, documented ANCHOR. That is the design, not an
-# omission:
-#
-#   * `.github/workflows/ci.yml` runs all five of its jobs -- `build-test`,
-#     `no-std-tests`, `lint`, `msrv`, `benches` -- on `ubuntu-latest`, and the
-#     `build-test` matrix varies FEATURES ONLY: each of its five rows already
-#     carries an explicit `os: ubuntu-latest`, and the matrix has no `target:`
-#     key at all. No cross-compiled, emulated, or bare-metal build exists yet,
-#     so no cross-compilation setting has an observed need.
-#   * The consumers that would read such settings have not landed either:
-#     there is no cross-platform matrix row (D3), no bare-metal `no_std` row
-#     (D10), no `cargo package` verification step (D12), and no `audit.yml`
-#     (D2). The workflow directory currently holds exactly `ci.yml` and
-#     `fuzz.yml`.
-#   * Writing settings for a platform nobody builds would be configuration
-#     asserted rather than configuration verified. Anchors cost nothing, and
-#     they give that wiring one obvious home instead of letting it scatter
-#     through per-job workflow environment variables -- which is precisely the
-#     defect D7 describes.
-#
-# Adding this file therefore changes NOTHING observable: not codegen, not the
-# emitted compressed bytes, not the exported symbol set, not dependency
-# resolution, not the panic strategy, not a single test outcome. It contains
-# zero active configuration keys. Keep it that way until a real consumer
-# lands.
-#
-#
-# GOVERNANCE NOTE
-# ===============
-# No user-specified rules were provided for this project (`review_rules`
-# returns exactly "No user rules provided."). Enterprise-standard best
-# practice therefore governs, and the absence of rules is NOT a licence to
-# lower the bar. Where a comment below appeals to a preservation directive or
-# an engineering standard, that is one of the Agent Action Plan's OWN
-# commitments -- never a user-supplied rule, and never to be presented as one.
+# Section references of the form `AAP 0.8.1` point at the Agent Action Plan for
+# the C-to-Rust migration of zlib 1.3.2.1-motley; the section sign is spelled
+# out so the file stays plain ASCII. Where a comment appeals to a preservation
+# directive or an engineering standard, that is one of the plan's own
+# commitments, never a user-supplied rule.
 
 
 # ---------------------------------------------------------------------------
-# DO NOT ADD
+# SCOPE -- why nothing global is set here
 # ---------------------------------------------------------------------------
-# Each entry below is here because adding it would break something specific
-# and already-measured. None of them is a matter of taste.
-#
-#  1. No `[build]` table -- no `target`, no `rustflags`, no `rustdocflags`.
-#     `[build] target` retargets EVERY invocation in this directory tree and
-#     would break every quality gate at once. `[build] rustflags` applies to
-#     every target, including ones nobody reviewed for it.
-#
-#  2. No `[profile.*]` table. Profiles live in `Cargo.toml`, which sets
-#     `opt-level = 3`, `lto = true`, and `codegen-units = 1` for release.
-#     Cargo lets a config profile OVERRIDE the manifest's, so a table here
-#     would quietly win over the reviewed settings next door.
-#
-#  3. Nothing that touches the panic strategy -- no `-C panic=...`, in any
-#     table. `Cargo.toml` sets `panic = "abort"` in BOTH `[profile.release]`
-#     and `[profile.dev]` and documents it as required rather than merely
-#     preferred, because a stable-toolchain `no_std` `cdylib`/`staticlib`
-#     cannot link an unwinding runtime. The library's own `no_std` switch is
-#     `#![cfg_attr(all(not(feature = "std"), not(test), panic = "abort"),
-#     no_std)]`, so the crate's freestanding mode is literally CONDITIONED on
-#     `panic = "abort"`: overriding the strategy here would silently drop
-#     `#![no_std]` -- and with it the private libc-backed global allocator and
-#     abort panic handler, which are gated on the very same predicate.
-#
-#  4. No codegen tuning -- no `-C target-cpu=...` (including `native`), no
-#     `-C target-feature=...`, no `-C opt-level=...`, no `-C lto=...`, no
-#     `-C codegen-units=...`, and no `-Z` flag of any kind. Compressed output
-#     is byte-for-byte identical to reference zlib across the measured
-#     conformance grid, and that identity -- not throughput -- is the
-#     acceptance criterion of this migration. A faster build that emits
-#     different bytes is a regression.
-#
-#  5. Nothing that weakens a diagnostic -- no `-A...`, no `--cap-lints...`,
-#     no lint-level downgrade. The lint gate runs
-#     `cargo clippy --all-targets --all-features -- -D warnings` and must stay
-#     exactly that strict. No warning is downgraded to land a change.
-#
-#  6. No `[alias]` table. An alias that shadows `fmt`, `clippy`, `build`,
-#     `test`, `bench`, or `doc` can silently drop `-D warnings` or
-#     `--all-targets` and make a gate look green while checking less.
-#
-#  7. No `[env]` table at all -- and in particular nothing that sets the
-#     version-script opt-in variable that `build.rs` reads (see "SYMBOL
-#     VERSIONING" below). `[env]` also applies to build scripts, so a key here
-#     can silently change what `build.rs` emits, for this workspace and for
-#     the detached `fuzz/` one.
-#
-#  8. No `[source]`, `[patch]`, or `[registries]` table, and no
-#     `[net] offline`. Dependency resolution must not move and `Cargo.lock`
-#     must stay byte-identical; `deny.toml`'s `[sources]` section allows only
-#     `https://github.com/rust-lang/crates.io-index` and denies unknown
-#     registries and git sources outright.
-#
-#  9. No unstable Cargo configuration key. Unstable keys need `-Z` and a
-#     nightly Cargo, which would break the `msrv` job. Use only keys that are
-#     valid on BOTH the pinned MSRV (1.85.0, see `rust-toolchain.toml`) and
-#     current stable.
-#
-# 10. No `runner` for the host triple. It would route the entire host test
-#     suite through a wrapper. The suite passes 487 tests with 0 failed and 0
-#     ignored by default and 363 under `--no-default-features`; the ignored
-#     count is zero and stays zero.
-#
-# 11. Nothing except `linker`, `runner`, `rustflags`, `rustdocflags`, and `ar`
-#     inside a `[target.<triple>]` table. Neither kind of mistake is loud
-#     here: Cargo reinterprets a `[target.<triple>.<name>]` SUB-table as a
-#     build-script LINK OVERRIDE for a crate declaring `links = "<name>"`, and
-#     it accepts an unrecognised scalar key without complaint. A wrong name
-#     therefore does nothing, or something else, but never errors.
-#
-# 12. No credentials, tokens, or secrets, here or anywhere in `.cargo/`. No
-#     `credentials.toml`, no `credentials`. `Cargo.toml`'s `exclude` list does
-#     not exclude `.cargo/**`, so this file SHIPS inside the published
-#     `.crate`; it must contain nothing you would not publish. (That is
-#     otherwise harmless: Cargo discovers configuration by walking UP from the
-#     invocation directory, so a dependency's bundled config never applies to
-#     a consumer's build.)
-#
-# 13. No `.cargo/config` alongside this file. The extensionless form is the
-#     legacy spelling; Cargo prefers `config.toml` and warns when both exist.
-#
-#
-# IF YOU EDIT THIS FILE
-# =====================
-# Any edit here can affect every crate unit, so re-observe the gates rather
-# than reasoning about them -- a change is not done because it parses, it is
-# done when the gate has been seen to pass:
-#
-#   cargo fmt --all -- --check
-#   cargo clippy --all-targets --all-features -- -D warnings
-#   cargo build
-#   cargo test                              # expect 487 passed, 0 ignored
-#   cargo test --no-default-features        # expect 363 passed
-#   cargo doc
-#   cargo +1.85.0 build && cargo +1.85.0 check --all-targets
-#   cargo build --release                   # rlib + cdylib + staticlib
-#   git status --porcelain Cargo.lock       # must stay empty
-#
-# Note that `cargo build --all-targets` is NOT a usable gate for this crate,
-# independently of anything in this file: the profiles set `panic = "abort"`
-# while Cargo forces `unwind` for libtest harnesses, so the test targets
-# refuse to link against the abort-strategy library. Use `cargo test` and
-# `cargo check --all-targets` instead, which is what CI does.
-
-
-# ---------------------------------------------------------------------------
-# HOW CARGO FINDS THIS FILE -- and why nothing global is set in it
-# ---------------------------------------------------------------------------
-# Cargo does not bind configuration to a package. It walks UP from the
-# directory the command was invoked in, reading a `.cargo/config.toml` at every
-# level plus `$CARGO_HOME/config.toml`, and merges what it finds with the
-# deepest directory winning per key.
-#
-# Two consequences matter here:
-#
-#   * This file governs every `cargo` invocation made anywhere at or below the
-#     repository root -- not just those run from the root itself.
-#   * That INCLUDES the detached fuzz workspace. `fuzz/Cargo.toml` declares its
-#     own empty `[workspace]` table (the root manifest declares none), so root
-#     `cargo build`/`test`/`clippy`/`fmt` never touch `fuzz/` -- but `fuzz/` is
-#     still a subdirectory of this root, so `cargo fuzz build` and
-#     `cargo fuzz run` executed there DO discover this file. Those commands run
-#     on a nightly toolchain with `-Z` sanitizer and coverage instrumentation,
-#     and `fuzz/Cargo.lock` is the only place in the project where a
-#     C-toolchain driver chain (`cc`, `jobserver`, `shlex`, `find-msvc-tools`)
-#     enters any dependency graph.
-#
-# A global `[build]` or `[env]` setting here would therefore silently reshape
-# an instrumented nightly fuzzing build that no gate in `ci.yml` covers. That
-# is the reason this file confines itself to per-triple anchors and sets
-# nothing global.
+# Cargo does not bind configuration to a package: it walks UP from the
+# invocation directory, reading a `.cargo/config.toml` at every level plus
+# `$CARGO_HOME/config.toml`, deepest directory winning per key. So this file
+# governs every `cargo` invocation at or below the repository root -- including
+# the detached `fuzz/` workspace, which root `cargo build`/`test`/`clippy` never
+# touch but which is still a subdirectory of this root. A global `[build]` or
+# `[env]` setting here would therefore silently reshape an instrumented nightly
+# `cargo fuzz` build that no CI gate covers. Hence per-triple anchors only.
 
 
 # ---------------------------------------------------------------------------
 # RUSTFLAGS PRECEDENCE -- the sources do NOT concatenate
 # ---------------------------------------------------------------------------
-# This is the single most common way a config file like this one surprises
-# people. Cargo takes rustflags from the FIRST of these that is present and
-# ignores the rest entirely; it does not append them together:
+# Cargo takes rustflags from the FIRST source present and ignores the rest:
+# (1) `RUSTFLAGS` (`CARGO_ENCODED_RUSTFLAGS` outranks even that), then
+# (2) `target.<triple>.rustflags` / `target.<cfg>.rustflags` -- which join with
+# each other but, as one source, still lose to (1) -- then (3)
+# `build.rustflags`. A CI step exporting `RUSTFLAGS` for an unrelated reason
+# therefore discards every `rustflags` entry here outright. `rustdocflags`
+# behaves the same way with `RUSTDOCFLAGS`.
 #
-#   1. the `RUSTFLAGS` environment variable
-#      (`CARGO_ENCODED_RUSTFLAGS` outranks even that)
-#   2. `target.<triple>.rustflags` and `target.<cfg>.rustflags` from config
-#      -- these join with EACH OTHER, but as one source they still lose to 1
-#   3. `build.rustflags` from config
-#
-# So a CI step that exports `RUSTFLAGS` for an unrelated reason silently
-# discards every `rustflags` entry in this file, and conversely an entry here
-# would silently discard a `build.rustflags` default. Whichever source wins,
-# wins outright. `rustdocflags` follows the same shape with `RUSTDOCFLAGS`.
-#
-# Two further properties worth knowing before adding any flag:
-#
-#   * Rustflags are part of every unit's fingerprint, so changing them
-#     invalidates the whole build cache and forces a full recompile -- of the
-#     dependency graph as well as this crate.
-#   * When cross-compiling, `target.<triple>.rustflags` applies to the TARGET
-#     artifacts only. Build scripts and proc macros are compiled for the host
-#     and do not receive them, so `build.rs` cannot be configured this way.
+# Also: rustflags are part of every unit's fingerprint, so changing them forces
+# a full recompile of the whole graph; and when cross-compiling they apply to
+# TARGET artifacts only, so `build.rs` (host-compiled) cannot be configured
+# this way.
 
 
 # ---------------------------------------------------------------------------
-# SYMBOL VERSIONING (gap D8) IS `build.rs`'s JOB, NOT THIS FILE'S
+# DO NOT ADD -- each item breaks something specific
 # ---------------------------------------------------------------------------
-# It is tempting to reach for a link argument here, so this boundary is stated
-# explicitly.
+#  1. No `[build]` table. `target` retargets every invocation in this tree;
+#     `rustflags`/`rustdocflags` apply to every target, reviewed or not.
+#  2. No `[profile.*]` table -- a config profile OVERRIDES the manifest's, so
+#     it would quietly win over the reviewed settings in `Cargo.toml`.
+#  3. Nothing touching the panic strategy, in any table. `Cargo.toml` sets
+#     `panic = "abort"` for dev and release because a stable-toolchain `no_std`
+#     `cdylib`/`staticlib` cannot link an unwinding runtime, and the library's
+#     switch is `#![cfg_attr(all(not(feature = "std"), not(test),
+#     panic = "abort"), no_std)]`. Overriding it silently drops `#![no_std]`
+#     and, with it, the private allocator and panic handler gated on the same
+#     predicate.
+#  4. No codegen tuning -- no `-C target-cpu`/`target-feature`/`opt-level`/
+#     `lto`/`codegen-units`, no `-Z`. Byte-identical compressed output, not
+#     throughput, is this migration's acceptance criterion (AAP 0.8.1 D-1); a
+#     faster build emitting different bytes is a regression.
+#  5. Nothing weakening a diagnostic -- no `-A`, no `--cap-lints`. The gate is
+#     `cargo clippy --all-targets --all-features -- -D warnings` and stays
+#     exactly that strict.
+#  6. No `[alias]` table -- an alias shadowing `fmt`/`clippy`/`test`/`doc` can
+#     drop `-D warnings` or `--all-targets` and make a gate look green.
+#  7. No `[env]` table at all. `[env]` applies to build scripts as well as to
+#     compilation, here and in `fuzz/`, so a key here can change what a build
+#     script sees without appearing on any command line. `build.rs` reads
+#     exactly one variable today -- the `OUT_DIR` Cargo sets for it -- and it
+#     must stay that way: an environment-gated build-script behaviour is
+#     untestable by CI and was already removed once (see SYMBOL VERSIONING).
+#  8. No `[source]`, `[patch]`, `[registries]`, or `[net] offline`. Resolution
+#     must not move and `Cargo.lock` must stay byte-identical; `deny.toml`
+#     allows only the crates.io index.
+#  9. No unstable Cargo key -- it needs `-Z` and a nightly Cargo, breaking the
+#     `msrv` job. Use only keys valid on both the pinned MSRV
+#     (`rust-toolchain.toml`) and current stable.
+# 10. No `runner` for the host triple; it routes the whole host test suite
+#     through a wrapper.
+# 11. Inside `[target.<triple>]`, nothing but `linker`, `runner`, `rustflags`,
+#     `rustdocflags`, `ar`. Neither mistake is loud: Cargo reads a
+#     `[target.<triple>.<name>]` SUB-table as a build-script LINK OVERRIDE for
+#     a crate declaring `links = "<name>"`, and accepts an unrecognised scalar
+#     key silently. A wrong name does nothing, or something else, never errors.
+# 12. No credentials, tokens, or secrets anywhere in `.cargo/`. `Cargo.toml`'s
+#     `exclude` list does not cover `.cargo/**`, so this file SHIPS in the
+#     published `.crate`.
+# 13. No legacy extensionless `.cargo/config` beside this file; Cargo warns
+#     when both exist.
+#
+# After any edit, re-observe the gates rather than reasoning about them:
+#
+#   cargo fmt --all -- --check
+#   cargo clippy --all-targets --all-features -- -D warnings
+#   cargo build && cargo build --release
+#   cargo test && cargo test --no-default-features
+#   cargo doc
+#   cargo +1.85.0 build && cargo +1.85.0 check --all-targets
+#   git status --porcelain Cargo.lock       # must stay empty
+#
+# `cargo build --all-targets` is NOT a usable gate for this crate, independently
+# of anything here: the profiles set `panic = "abort"` while Cargo forces
+# `unwind` for libtest harnesses, so the test targets refuse to link against the
+# abort-strategy library. CI uses `cargo test` and `cargo check --all-targets`.
+
+
+# ---------------------------------------------------------------------------
+# SYMBOL VERSIONING (gap D8) IS NOT WIRED UP -- NOT HERE, AND NOT IN `build.rs`
+# ---------------------------------------------------------------------------
+# The retained C baseline links `libz.so` through `zlib.map`, a GNU-ld version
+# script. Only GNU `ld` and `lld` understand `--version-script`; Mach-O's
+# `ld64` wants `-exported_symbols_list` and MSVC's `link.exe` wants a `.def`
+# file -- which is why the upstream C build applies `zlib.map` only on Unix
+# that is not Apple, AIX, or SunOS.
 #
 # The retained C baseline links `libz.so` through `zlib.map`, a genuine GNU-ld
 # version script: 16 version nodes from `ZLIB_1.2.0` to `ZLIB_1.3.2`, 54
@@ -274,28 +130,34 @@
 # wants a `.def` file. The upstream C build draws the same boundary, applying
 # `zlib.map` only on Unix that is not Apple, AIX, or SunOS.
 #
-# `build.rs` is the designated owner. It emits the required pair of
-# `rustc-cdylib-link-arg` values (`-Wl,--undefined-version` followed by
-# `-Wl,--version-script=<absolute path to zlib.map>`) but ONLY when its
-# explicit opt-in environment variable is set, ONLY for a `target_os` of
-# `linux` or `android` outside the `musl` environment, and it skips tolerantly
-# when `zlib.map` is absent -- which it is in the published `.crate`, because
-# `Cargo.toml`'s `exclude` list contains `*.map`.
+# The Rust build reproduces none of it, deliberately. `build.rs` emits no link
+# argument of any kind and reads no environment variable other than `OUT_DIR`;
+# the emitted `cdylib` therefore carries an unversioned symbol table. That is
+# AAP 0.8.2 Divergence 4, which ranks D8 LOW, notes it "carries
+# linker-portability risk", states it is "deliberately deferred behind D3" --
+# the cross-platform CI matrix that would be needed to test it -- and instructs
+# that the divergence be KEPT rather than "fixed". The symbol SET is already
+# exactly right: 95 exported symbols on Linux, all 54 `zlib.map` globals
+# present, none of the 10 locals leaked. Only the version tags are absent, and
+# a drop-in replacement links, resolves through `pkg-config`, and `LD_PRELOAD`s
+# without them.
 #
-# It is opt-in for good reason. AAP 0.8.2 ranks D8 LOW, notes it "carries
-# linker-portability risk", and states it is "deliberately deferred behind D3"
-# -- the cross-platform CI matrix that would be needed to test it. Measured
-# behaviour backs that up: whether the link succeeds depends on which linker
-# the toolchain defaults to, and with the option on, `rustc`'s
-# `linker_messages` lint reports one warning per listed symbol, so a build that
-# promotes warnings to errors fails -- and this crate's gates run with
-# `-D warnings`.
+# An environment-gated opt-in for this once existed in `build.rs` and was
+# removed after measurement, because it was fatal on one supported toolchain
+# and ineffective on the other: on the pinned MSRV (1.85.0, GNU `ld`) the link
+# FAILED outright -- "anonymous version tag cannot be combined with other
+# version tags", since `rustc` already passes an anonymous-node version script
+# of its own -- while on current stable (1.97.1, `rust-lld`) it linked but
+# produced ZERO per-symbol tags (`nm -D --defined-only | grep -c @` = 0) and one
+# `linker_messages` warning per listed symbol, which fails a `-D warnings` gate.
+# The full measurements live in the "No cdylib symbol versioning" section of
+# `build.rs`; do not re-add the option from either file (see DO NOT ADD item 7).
 #
-# Therefore: do NOT enable that opt-in from this file (see DO NOT ADD item 7).
-# If a maintainer ever needs the documented escape hatch on a toolchain whose
-# default linker refuses the combination -- selecting an LLD-flavoured linker
-# through a link argument -- the per-triple anchors below are the right home
-# for it: one explicit, reviewed entry for one platform, never a global
+# If a maintainer ever does re-open D8 -- behind D3, with `.symver` directives,
+# because link arguments alone provably do not produce per-symbol tags -- and
+# needs an LLD-flavoured linker on a toolchain whose default `ld` refuses the
+# combination, the per-triple anchors below are the right home for that one
+# link argument: one explicit, reviewed entry for one platform, never a global
 # default.
 
 
@@ -303,30 +165,18 @@
 # TARGET-SPECIFIC WIRING
 # ---------------------------------------------------------------------------
 # Cargo reads a `[target.<triple>]` table ONLY when building for that exact
-# triple, so every table below is completely inert for the host build and for
-# each other.
+# triple, so every table below is inert for the host build and for each other.
+# A NATIVE runner (`os: windows-latest`, `os: macos-latest`) builds for its own
+# host triple with its own linker and needs NOTHING here; a CROSS build
+# (`--target <triple>`) generally needs a `linker`, and a `runner` only if its
+# tests are actually EXECUTED rather than merely compiled.
 #
-# NATIVE vs CROSS -- the asymmetry that decides what belongs here:
-#
-#   * A NATIVE runner (an `os: windows-latest` or `os: macos-latest` row)
-#     builds for its own host triple with its own system linker. It needs
-#     NOTHING from this file.
-#   * A CROSS build (`--target <triple>`) generally needs a `linker`, and needs
-#     a `runner` only if its tests are actually EXECUTED rather than merely
-#     compiled.
-#
-# So the Windows and macOS entries below exist as documentation of what those
-# rows would first exercise, not because a native row needs configuring.
-#
-# The five triples are exactly the five platforms `deny.toml` names, in the
-# order it names them, as the platform set for the cross-platform CI matrix
-# (D3) plus the bare-metal `no_std` row (D10) -- so the supply-chain policy and
-# the build configuration describe the same platforms. One nuance: `deny.toml`
-# deliberately leaves its own `[graph] targets` list EMPTY so that no
-# target-gated crate can escape review (an empty list is a strict superset of
-# these five, and pruning to them would hide the only potentially-copyleft
-# license expression in the graph). The alignment here is therefore on the
-# platform SET, not on a literal key value -- but keep the two files in step.
+# The five triples are the platform set `deny.toml` names for the
+# cross-platform CI matrix (D3) plus the bare-metal `no_std` row (D10), so the
+# supply-chain policy and the build configuration describe the same platforms.
+# `deny.toml` deliberately leaves its own `[graph] targets` list EMPTY so no
+# target-gated crate escapes review, so the alignment is on the platform SET,
+# not on a literal key value -- but keep the two in step.
 
 [target.x86_64-unknown-linux-gnu]
 # Host triple of every current CI job and of local development. Intentionally
@@ -338,57 +188,58 @@
 # The cross target a future aarch64 CI row (D3) would use, and the first entry
 # here that would genuinely need wiring. Uncomment and adjust ONLY when such a
 # row exists AND the named tools are installed where it runs -- naming a
-# linker that is not present turns every build into a link failure. A `runner`
-# is needed only if the tests are to be executed under emulation; a build-only
-# row needs just the linker.
+# linker that is not present turns every build into a link failure.
 # linker = "aarch64-linux-gnu-gcc"
 # runner = "qemu-aarch64 -L /usr/aarch64-linux-gnu"
 
 [target.x86_64-pc-windows-msvc]
 # Reached NATIVELY by an `os: windows-latest` row, which needs nothing here.
-# Listed because it is the row that would first exercise two paths that have
-# never run in this repository:
-#   * `OS_CODE = 10`, the `#[cfg(windows)]` branch in `src/util/mod.rs`. Only
-#     the Unix default of `3` has ever been compiled, yet `OS_CODE` is written
-#     into every gzip header.
-#   * `gzopen_w` in `src/ffi/gz.rs`, which is `#[cfg(windows)]`-gated and is
-#     the single symbol behind the 96 declared `#[unsafe(no_mangle)]`
-#     functions versus 95 emitted `T` symbols on Linux.
-# Both paths are unexercised today. Note also that `zlib.map` is meaningless
-# here: MSVC's `link.exe` uses `.def` files (see SYMBOL VERSIONING above).
+# Listed because it is the row that would first COMPILE two Windows-only paths
+# never built in this repository: `gzopen_w` in `src/ffi/gz.rs`, the single
+# `#[cfg(windows)]`-gated symbol behind 96 declared `#[unsafe(no_mangle)]`
+# functions versus 95 emitted `T` symbols on Linux; and the `#[cfg(windows)]`
+# arm of `src/util/mod.rs`'s `OS_CODE`, which the gzip encoder in
+# `src/deflate/mod.rs` genuinely consumes -- `put_byte(s, OS_CODE)`, exactly as
+# `deflate.c` does. So this row would be the first to emit an OS byte of `10`
+# instead of `3`, and that is CORRECT rather than a byte-identity problem: C's
+# `zutil.h` selects the same platform value, so parity with a Windows-built
+# reference `libz` requires it. Hard-coding `3` on every target is the thing that
+# would break parity, and an earlier revision of the encoder did exactly that
+# with a private `const OS_CODE: u8 = 3` shadowing the real constant. Byte
+# identity (AAP 0.8.1 D-1) is defined against the reference C library built for
+# the SAME target, never across targets. `zlib.map` is meaningless here anyway:
+# `link.exe` uses `.def` files.
 
 [target.aarch64-apple-darwin]
 # Reached NATIVELY by a macOS arm64 runner, which needs nothing here. Listed
-# because it is the row that would first exercise `OS_CODE = 19`, the
-# `#[cfg(all(not(windows), target_vendor = "apple"))]` branch in
-# `src/util/mod.rs` -- likewise unexercised today. As with MSVC, `zlib.map`
-# does not apply: Mach-O's `ld64` has no `--version-script`.
+# because it is the row that would first compile the
+# `cfg(all(not(windows), target_vendor = "apple"))` arm of `src/util/mod.rs`'s
+# `OS_CODE` -- likewise unbuilt today, and likewise consumed by the gzip encoder
+# once it is, emitting `19` exactly as a macOS-built reference `libz` does.
+# As with MSVC, `zlib.map` does not apply: `ld64` has no `--version-script`.
 
 [target.thumbv7em-none-eabihf]
 # Bare-metal Cortex-M4F target for the real-hardware `no_std` validation
 # (D10). Build only: there is no host to run libtest on, so no `runner`.
-#
-# Three things whoever lands that row should expect. First, install the target
+# Whoever lands that row should expect three things. Install the target
 # (`rustup target add thumbv7em-none-eabihf`) -- an absent target is a build
-# error, not something this file can paper over. Second, Cargo drops the
-# unsupported `cdylib` crate type for a bare-metal target and warns about it;
-# that is expected and must NOT be compensated for with rustflags. Third, this
-# is the row that first exercises the private libc-backed global allocator and
-# abort panic handler in `src/lib.rs`, which resolve against `malloc`,
-# `calloc`, `realloc`, `free`, and `posix_memalign` -- a freestanding target
-# has no hosted libc, so a `linker` supplying one (an `arm-none-eabi` GCC with
-# newlib, for instance) is the most likely thing this anchor will need to
-# carry.
+# error this file cannot paper over. Cargo drops the unsupported `cdylib` crate
+# type for a bare-metal target and warns; that is expected and must NOT be
+# compensated for with rustflags. And this is the row that first exercises the
+# private libc-backed global allocator and abort panic handler in `src/lib.rs`,
+# which resolve against `malloc`, `calloc`, `realloc`, `free`, and
+# `posix_memalign` -- a freestanding target has no hosted libc, so a `linker`
+# supplying one (an `arm-none-eabi` GCC with newlib) is the most likely thing
+# this anchor will need to carry.
 # linker = "arm-none-eabi-gcc"
 # rustflags = []
 
-# BIG-ENDIAN: no big-endian triple appears above, and none appears in the
-# platform set `deny.toml` names. If such a row is ever added -- for example
-# `s390x-unknown-linux-gnu` or `powerpc64-unknown-linux-gnu` -- add it HERE as
-# a sixth anchor and keep `deny.toml` in step, so the build configuration and
-# the supply-chain policy continue to describe the same platforms. Be precise
-# about what is known when you do: `build.rs` performs no host or target
-# detection and deterministically emits both the little-endian and big-endian
-# CRC braid tables, so its OUTPUT is byte-identical on every platform, but no
-# big-endian target has ever been built or tested here. Treat any endianness
-# claim about the runtime as unverified until such a row actually runs.
+# BIG-ENDIAN: no big-endian triple appears above or in the platform set
+# `deny.toml` names. If one is ever added -- `s390x-unknown-linux-gnu`,
+# `powerpc64-unknown-linux-gnu` -- add it HERE as a sixth anchor and keep
+# `deny.toml` in step. Be precise about what is known: `build.rs` performs no
+# host or target detection and emits the same tables everywhere, so its OUTPUT
+# is byte-identical on every platform, and the checksum runtime consumes only
+# the endian-independent byte-wise table. No big-endian target has ever been
+# built or tested here; treat any endianness claim about the runtime as
+# unverified until such a row actually runs.

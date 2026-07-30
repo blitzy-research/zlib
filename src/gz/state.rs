@@ -565,4 +565,405 @@ mod tests {
         assert_eq!(s.err, ReturnCode::Ok);
         assert_eq!(s.msg, None);
     }
+
+    // -----------------------------------------------------------------------
+    // The non-finishing `Drop` contract
+    //
+    // `impl Drop for GzState` (above) is deliberately empty of finishing logic:
+    // a destructor cannot surface a deferred compression or I/O error, so the
+    // final `deflate(..., Z_FINISH)` flush and the gzip trailer are emitted only
+    // by an explicit `gzclose`/`gzclose_w`. That mirrors reference zlib, whose
+    // `gzclose_w` performs `gz_comp(state, Z_FINISH)` (`gzwrite.c` L685-L686)
+    // and reports its error to the caller.
+    //
+    // The decision reads like a defect to a Rust engineer, and "fixing" it would
+    // silently change the bytes this library writes without breaking compilation
+    // or any round-trip that closes properly. The pair of tests below pin it from
+    // both sides: the negative case proves a dropped writer leaves an
+    // *unfinished* member on disk, and the control case proves the very same data
+    // round-trips once `gzclose_w` is called. If a future `Drop` ever finished the
+    // stream, the negative test fails.
+    //
+    // Both tests write to a uniquely named temporary file guarded by
+    // [`TempGz`], which removes it on every exit path — normal return, early
+    // return, or unwind.
+    // -----------------------------------------------------------------------
+
+    use crate::gz::close::gzclose_w;
+    use crate::gz::write::gz_write;
+    use std::io::Read as _;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// An owned temporary `.gz` path that is deleted when the guard is dropped.
+    ///
+    /// The name embeds the `blitzy_adhoc_test_` prefix (so the file can never be
+    /// mistaken for a tracked artifact), the `CLONE_INDEX` of the checkout, the
+    /// process id, and a monotonic counter. That makes it unique across parallel
+    /// test threads, across concurrent `cargo test` invocations, and across
+    /// sibling clones of this repository sharing one `/tmp`.
+    struct TempGz {
+        path: PathBuf,
+    }
+
+    impl TempGz {
+        fn new(tag: &str) -> Self {
+            static CTR: AtomicU32 = AtomicU32::new(0);
+            let n = CTR.fetch_add(1, Ordering::Relaxed);
+            let clone = std::env::var("CLONE_INDEX").unwrap_or_else(|_| String::from("x"));
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "blitzy_adhoc_test_gzdrop_{tag}_{clone}_{}_{n}.gz",
+                std::process::id()
+            ));
+            // A stale file from an earlier aborted run must not be mistaken for
+            // output produced by this test.
+            let _ = std::fs::remove_file(&path);
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn exists(&self) -> bool {
+            self.path.exists()
+        }
+
+        /// The bytes currently on disk, or empty if the file does not exist.
+        fn bytes(&self) -> Vec<u8> {
+            std::fs::read(&self.path).unwrap_or_default()
+        }
+    }
+
+    impl Drop for TempGz {
+        fn drop(&mut self) {
+            // Best effort on every path, including an unwinding one: failing to
+            // clean up must never mask the original failure.
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// Builds a fresh write-mode [`GzState`] backed by a real, truncated file.
+    ///
+    /// `size` is left `0` so the write path lazily allocates its buffers and
+    /// initializes the deflate engine on first use, exactly as a real `gzopen`
+    /// would — matching C's `state->size = 0` sentinel (`gzguts.h` L172).
+    fn drop_contract_write_state(path: &Path) -> Box<GzState> {
+        let file = File::create(path).expect("create writable temp file");
+        Box::new(GzState {
+            have: 0,
+            next: 0,
+            pos: 0,
+            mode: GzMode::Write,
+            file,
+            path: path.display().to_string(),
+            size: 0,
+            want: DROP_CONTRACT_WANT,
+            in_buf: Vec::new(),
+            out_buf: Vec::new(),
+            direct: 0,
+            how: How::Look,
+            junk: 0,
+            again: false,
+            in_next: 0,
+            in_avail: 0,
+            start: 0,
+            eof: false,
+            past: false,
+            level: 6,
+            strategy: 0,
+            reset: false,
+            skip: 0,
+            err: ReturnCode::Ok,
+            msg: None,
+            msg_c: None,
+            strm: ZStream::new(),
+        })
+    }
+
+    /// Number of payload bytes the two `Drop`-contract tests write.
+    ///
+    /// Deliberately far larger than the 8 KiB `want` buffer so that several
+    /// `gz_comp(Z_NO_FLUSH)` rounds reach the file before the state is dropped.
+    /// A payload small enough to sit entirely in `in_buf` would leave only the
+    /// 10-byte gzip header on disk, and the negative test would then prove
+    /// merely "nothing was written" rather than the much stronger and more
+    /// relevant "a real member was started and left unfinished".
+    /// The write buffer size used by [`drop_contract_write_state`]. `gz_init`
+    /// copies `want` into `size`, and `size` is what `gz_write` compares each
+    /// incoming write against, so this single constant fixes both the state
+    /// under test and the branch-coverage invariant asserted over it.
+    const DROP_CONTRACT_WANT: usize = 8192;
+
+    const DROP_CONTRACT_LEN: usize = 500_000;
+
+    /// Incompressible pseudo-random payload from a fixed-seed LCG.
+    ///
+    /// Incompressible on purpose: highly compressible input would let `deflate`
+    /// buffer almost everything internally under `Z_NO_FLUSH`, so little or
+    /// nothing would reach the file before the drop. Deterministic on purpose:
+    /// the assertions must not depend on a random seed.
+    fn drop_contract_payload() -> Vec<u8> {
+        let mut lcg: u32 = 0x1234_5678;
+        (0..DROP_CONTRACT_LEN)
+            .map(|_| {
+                lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (lcg >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// Feeds `payload` through `gz_write` in `chunk` -sized pieces, asserting
+    /// full acceptance of each.
+    ///
+    /// The chunk size selects which branch of `gz_write` runs, and both matter
+    /// here. A chunk smaller than `state.size` takes the buffer-then-
+    /// compress-when-full branch (C L205-L226); a chunk at least as large takes
+    /// the feed-the-engine-directly branch (C L229-L247). The `Drop` contract must
+    /// hold on both, so [`assert_bare_drop_leaves_member_unfinished`] drives each.
+    fn feed(state: &mut GzState, payload: &[u8], chunk: usize) {
+        for piece in payload.chunks(chunk) {
+            assert_eq!(
+                gz_write(state, piece),
+                piece.len(),
+                "gz_write must accept the whole chunk"
+            );
+        }
+    }
+
+    /// Decompresses a complete gzip member, or reports how far it got.
+    ///
+    /// Uses the reference `flate2` decoder (its pure-Rust `miniz_oxide` backend),
+    /// so "is this a valid gzip member?" is answered by an independent
+    /// implementation rather than by this crate's own inflate.
+    fn gunzip(bytes: &[u8]) -> (std::io::Result<()>, Vec<u8>) {
+        let mut out = Vec::new();
+        let result = flate2::read::GzDecoder::new(bytes)
+            .read_to_end(&mut out)
+            .map(|_| ());
+        (result, out)
+    }
+
+    /// Drives one bare-drop scenario at the given `gz_write` chunk size and
+    /// asserts every property of an unfinished member.
+    fn assert_bare_drop_leaves_member_unfinished(tag: &str, chunk: usize) {
+        let temp = TempGz::new(tag);
+        let payload = drop_contract_payload();
+
+        {
+            let mut state = drop_contract_write_state(temp.path());
+            feed(&mut state, &payload, chunk);
+            // The whole point: no `gzclose_w`, no `gzflush`, no `Z_FINISH`. Only
+            // `Drop` runs, and `Drop` must not finish the member.
+            drop(state);
+        }
+
+        let bytes = temp.bytes();
+
+        // A real member was *started*: the gzip magic and the DEFLATE method byte
+        // reached the file, so this test is not passing merely because nothing was
+        // written.
+        assert!(
+            bytes.len() > 1024,
+            "the writer must have flushed real compressed output before the drop,              got {} bytes",
+            bytes.len()
+        );
+        assert_eq!(
+            &bytes[..3],
+            &[0x1f, 0x8b, 0x08],
+            "RFC 1952 magic and CM=deflate must be present"
+        );
+        // The payload must be genuinely incompressible for the assertions below to
+        // mean anything: a compressible payload would fit entirely in the write
+        // buffer and reach disk only at close, degrading this test into the far
+        // weaker "nothing was written". Pinning the *property* rather than the
+        // generator's seed keeps the test honest if the payload is ever changed.
+        assert!(
+            bytes.len() * 5 > payload.len() * 4,
+            "payload compressed to {} of {} bytes, so it is not incompressible;              this test needs an incompressible payload to prove that a real member              was started and then abandoned",
+            bytes.len(),
+            payload.len()
+        );
+
+        // ...and it was left *unfinished*. An independent gzip decoder cannot
+        // complete it, because the final DEFLATE block and the 8-byte
+        // CRC-32/ISIZE trailer were never emitted.
+        let (result, recovered) = gunzip(&bytes);
+        let error = result.expect_err(
+            "a dropped-without-close writer must not leave a decodable gzip member;              if this now succeeds, `Drop for GzState` has started finishing the              stream, which silently swallows the write errors `gzclose_w` exists              to report",
+        );
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "the member must fail as truncated, not as corrupt: {error}"
+        );
+        assert!(
+            recovered.len() < payload.len(),
+            "an unfinished member cannot yield the whole payload ({} of {})",
+            recovered.len(),
+            payload.len()
+        );
+        // Whatever the decoder did recover must still be a correct prefix — the
+        // bytes already on disk are valid, they are merely incomplete.
+        assert_eq!(
+            recovered.as_slice(),
+            &payload[..recovered.len()],
+            "the truncated member's contents must be a prefix of the payload"
+        );
+
+        // The trailer specifically is absent. Reference zlib appends CRC-32 then
+        // ISIZE, both little-endian; neither can be sitting at the end of the
+        // file, because `Drop` emitted no trailer at all.
+        let mut trailer = [0u8; 8];
+        trailer[..4].copy_from_slice(&crate::checksum::crc32::crc32(0, &payload).to_le_bytes());
+        trailer[4..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        assert_ne!(
+            &bytes[bytes.len() - 8..],
+            &trailer[..],
+            "no CRC-32/ISIZE trailer may be present after a bare drop"
+        );
+
+        assert!(
+            temp.exists(),
+            "the temporary file must still exist for the guard to remove"
+        );
+    }
+
+    #[test]
+    fn dropping_a_writer_without_gzclose_leaves_the_member_unfinished() {
+        // Both `gz_write` branches: buffered small writes, and a single write
+        // large enough to be handed straight to the engine. Neither may end up
+        // with a finished member, because neither calls `gzclose_w`.
+        // Both `gz_write` branches must be exercised. The branch is selected by
+        // `buf.len() < state.size` (`src/gz/write.rs`, porting `gzwrite.c`
+        // L205-L247): a short write is staged in `in_buf` and drained by
+        // `gz_comp`, while a write at or above the buffer size is handed to
+        // `gz_comp_slice` directly. A bare drop must leave the member unfinished
+        // on *either* path, so the table below is asserted to straddle the
+        // predicate -- deleting a row fails the invariant rather than silently
+        // shrinking coverage.
+        const SCENARIOS: [(&str, usize); 2] = [
+            ("nofinish_buffered", 3_000),
+            ("nofinish_direct", DROP_CONTRACT_LEN),
+        ];
+
+        let threshold = DROP_CONTRACT_WANT;
+        assert!(
+            SCENARIOS.iter().any(|&(_, chunk)| chunk < threshold),
+            "no scenario exercises gz_write's buffered branch (chunk < {threshold})"
+        );
+        assert!(
+            SCENARIOS.iter().any(|&(_, chunk)| chunk >= threshold),
+            "no scenario exercises gz_write's direct branch (chunk >= {threshold})"
+        );
+
+        // Count what was actually exercised rather than trusting the loop: this
+        // closes the gap where the table still straddles the predicate but the
+        // iteration skips a row.
+        let mut buffered = 0_usize;
+        let mut direct = 0_usize;
+        for (tag, chunk) in SCENARIOS {
+            assert_bare_drop_leaves_member_unfinished(tag, chunk);
+            if chunk < threshold {
+                buffered += 1;
+            } else {
+                direct += 1;
+            }
+        }
+        assert!(
+            buffered > 0 && direct > 0,
+            "both gz_write branches must actually run, got {buffered} buffered and \
+             {direct} direct"
+        );
+        assert_eq!(
+            buffered + direct,
+            SCENARIOS.len(),
+            "every scenario in the table must be exercised"
+        );
+    }
+
+    #[test]
+    fn gzclose_w_finishes_the_member_that_a_bare_drop_leaves_unfinished() {
+        let temp = TempGz::new("finish");
+        let payload = drop_contract_payload();
+
+        let mut state = drop_contract_write_state(temp.path());
+        feed(&mut state, &payload, 3_000);
+        // The control: the same state, the same payload, closed explicitly.
+        assert_eq!(
+            gzclose_w(state),
+            ReturnCode::Ok.as_c_int(),
+            "gzclose_w must report success"
+        );
+
+        let bytes = temp.bytes();
+        assert_eq!(&bytes[..3], &[0x1f, 0x8b, 0x08]);
+
+        let (result, recovered) = gunzip(&bytes);
+        result.expect("an explicitly closed member must decode");
+        assert_eq!(
+            recovered, payload,
+            "the closed member must round-trip byte-for-byte"
+        );
+
+        // And the trailer this time *is* the correct CRC-32/ISIZE pair — the
+        // exact eight bytes the bare-drop test asserted were absent.
+        let mut trailer = [0u8; 8];
+        trailer[..4].copy_from_slice(&crate::checksum::crc32::crc32(0, &payload).to_le_bytes());
+        trailer[4..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        assert_eq!(
+            &bytes[bytes.len() - 8..],
+            &trailer[..],
+            "gzclose_w must append the RFC 1952 CRC-32 and ISIZE trailer"
+        );
+
+        assert!(temp.exists());
+    }
+
+    #[test]
+    fn the_temporary_file_guard_cleans_up_on_every_path() {
+        // Normal return.
+        let path = {
+            let temp = TempGz::new("cleanup_ok");
+            let mut state = drop_contract_write_state(temp.path());
+            feed(&mut state, b"a short write that stays buffered", 3_000);
+            drop(state);
+            assert!(
+                temp.exists(),
+                "the file must exist while the guard is alive"
+            );
+            temp.path().to_path_buf()
+        };
+        assert!(
+            !path.exists(),
+            "{} must be removed when the guard is dropped",
+            path.display()
+        );
+
+        // Unwinding path. `cargo` forces `panic = "unwind"` for the test profile
+        // regardless of `[profile.dev] panic = "abort"`, so a guard's `Drop` does
+        // run while a test unwinds — which is exactly the path a failing
+        // assertion in the two tests above would take.
+        let escaped: PathBuf = {
+            let leaked = std::sync::Arc::new(std::sync::Mutex::new(PathBuf::new()));
+            let sink = std::sync::Arc::clone(&leaked);
+            let outcome = std::panic::catch_unwind(move || {
+                let temp = TempGz::new("cleanup_panic");
+                let mut state = drop_contract_write_state(temp.path());
+                feed(&mut state, b"pending output that is never finished", 3_000);
+                drop(state);
+                *sink.lock().expect("poison-free mutex") = temp.path().to_path_buf();
+                panic!("deliberate unwind to exercise the guard");
+            });
+            assert!(outcome.is_err(), "the closure must have unwound");
+            leaked.lock().expect("poison-free mutex").clone()
+        };
+        assert_ne!(escaped, PathBuf::new(), "the path must have been recorded");
+        assert!(
+            !escaped.exists(),
+            "{} must be removed even when the scope unwinds",
+            escaped.display()
+        );
+    }
 }

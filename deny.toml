@@ -4,10 +4,11 @@
 # PURPOSE
 # -------
 # This file is the machine-enforced supply-chain policy for the C -> Rust
-# migration of zlib 1.3.2.1-motley. It closes AAP gap D1 ("no `cargo-deny`
-# policy exists for licenses, advisories, bans, or sources across the 89 + 13 =
-# 102-package closure"), which the plan's authoritative gap register ranks
-# HIGH severity -- joint-highest alongside D2, the `cargo-audit` CI job.
+# migration of zlib 1.3.2.1-motley. Together with `fuzz/deny.toml` it closes AAP
+# gap D1 ("no `cargo-deny` policy exists for licenses, advisories, bans, or
+# sources across the 89 + 13 = 102-package closure"), which the plan's
+# authoritative gap register ranks HIGH severity -- joint-highest alongside D2,
+# the `cargo-audit` CI job.
 #
 # It governs four independent questions, one per `cargo deny check` subcommand:
 #
@@ -16,24 +17,61 @@
 #   bans        -- are the crate-level architectural boundaries still intact?
 #   sources     -- did every crate come from a registry we trust?
 #
+# TWO INVOCATIONS ARE REQUIRED -- THIS FILE ALONE IS NOT THE 102-PACKAGE CLOSURE
+# -----------------------------------------------------------------------------
+# The closure D1 names is split across two lockfiles, and cargo-deny resolves one
+# graph per invocation. This file governs the 89 packages of the root
+# `Cargo.lock`. It CANNOT govern the 13 in `fuzz/Cargo.lock`: `fuzz/` declares its
+# own empty `[workspace]` table, so it is a detached workspace that the root graph
+# never resolves -- and this policy would REJECT four of those 13 if it did,
+# correctly, because the harness legitimately needs a C-toolchain build dependency
+# and an NCSA-licensed libFuzzer runtime that the crate proper must never acquire.
+# Both commands must run, and both must pass:
+#
+#     cargo deny check                                   # these 89 packages
+#     cargo deny --manifest-path fuzz/Cargo.toml check    # the other 13
+#
+# The second one needs no `--config` flag: cargo-deny resolves its configuration
+# next to the manifest it is pointed at, and `fuzz/` is its own workspace root, so
+# `fuzz/deny.toml` is discovered automatically. That file is a genuine policy, not
+# a rubber stamp. It is STRICTER than this one on duplicate versions (`deny` rather
+# than `warn`, affordable because the fuzz graph is measurably duplicate-free while
+# this one legitimately carries two `rand` majors), and it diverges in exactly four
+# places, each forced by the graph and documented there: `cc` is denied but scoped
+# with `wrappers = ["libfuzzer-sys"]` rather than banned outright; `NCSA` is
+# permitted through a crate-scoped `[[licenses.exceptions]]` entry, because
+# `libfuzzer-sys 0.4.13` declares the CONJUNCTION `(MIT OR Apache-2.0) AND NCSA`;
+# `allow-wildcard-paths` is true, because the harness depends on the crate under
+# test by `path = ".."` with no version; and `Unicode-3.0` is absent, because
+# nothing in that graph uses it. Verified: both invocations report
+# "advisories ok, bans ok, licenses ok, sources ok".
+#
 # CONSUMERS
 # ---------
-#   * `.github/workflows/audit.yml` (AAP gap D2) runs `cargo deny check all`
-#     in CI. That workflow is the blocking gate; this file is its rulebook.
-#   * Locally: `cargo deny check all`. See `CONTRIBUTING.md` for the full list
-#     of quality gates and how to run them.
-#   * To report a vulnerability in THIS crate rather than in a dependency, see
-#     `SECURITY.md` -- do not open a public issue.
+#   * The fuzz invocation IS wired into CI today: the `supply-chain` job in
+#     `.github/workflows/fuzz.yml` runs it, and the `cargo-fuzz` job `needs` it,
+#     so the harnesses are never built against an unaudited graph.
+#   * The ROOT invocation is NOT yet wired into any job -- `.github/workflows/ci.yml`
+#     runs neither cargo-deny nor cargo-audit, and `.github/workflows/audit.yml`
+#     (AAP gap D2) does not exist. That is the open half of D2, and it is the
+#     blocking gate this file is the rulebook for. Whoever adds it MUST wire up
+#     BOTH commands above and fail if either fails; a job that runs only one of
+#     them silently leaves the other graph ungoverned and makes D1's own claim
+#     false again. Until then, run `cargo deny check` by hand.
+#   * `CONTRIBUTING.md` (AAP gap D6) is where the full list of quality gates
+#     belongs; it does not exist yet.
+#   * To report a vulnerability in THIS crate rather than in a dependency, a
+#     `SECURITY.md` disclosure policy (also gap D6) is the intended channel --
+#     likewise still to be written. Until then, do not open a public issue.
 #
 # GOVERNANCE NOTE
 # ---------------
-# No user-specified rules were provided for this project (`review_rules`
-# returns exactly "No user rules provided."). Enterprise-standard best
-# practice therefore governs, and the absence of rules is NOT a licence to
-# lower the bar. Where the comments below cite a "plan-adopted standard"
-# (S1 evidence over assertion, S6 supply-chain hygiene, S10 gates stay green),
-# those are the Agent Action Plan's OWN engineering commitments, not
-# user-supplied rules, and must never be represented as such.
+# This project has no user-specified rules, so enterprise-standard best practice
+# governs -- and that absence is NOT a licence to lower the bar. Where the
+# comments below cite a "plan-adopted standard" (S1 evidence over assertion, S6
+# supply-chain hygiene, S10 gates stay green), those are the Agent Action Plan's
+# OWN engineering commitments; they must never be represented as user-supplied
+# rules.
 #
 # SCHEMA VERSION
 # --------------
@@ -56,28 +94,36 @@
 #   * Root `Cargo.lock` pins exactly **89** packages. Every one carries
 #     `source = "registry+https://github.com/rust-lang/crates.io-index"`
 #     except the single no-source self-entry `zlib-rs 1.3.2`.
-#   * `fuzz/Cargo.lock` pins **13** more (total governed closure: 102).
+#   * `fuzz/Cargo.lock` pins **13** more -- 89 + 13 = the 102-package closure.
+#     Those 13 are governed by `fuzz/deny.toml` under the second invocation
+#     described above, NOT by this file, which cannot see them at all. Both
+#     invocations are REQUIRED and neither substitutes for the other; together
+#     they are what closes AAP gap D1 over the full closure. See the `cc` entry
+#     under `[bans] deny` for why the two policies must differ.
 #   * The RUNTIME closure is just two crates: `cfg-if 1.0.4` (required) and
 #     `crc32fast 1.5.0` (optional, behind the `simd` feature, with
-#     `default-features = false`). Everything else -- 86 of the 89 -- is
-#     dev-only, reached through `criterion 0.5.1`, `flate2 1.1.9`,
-#     `quickcheck 1.1.0`, and `rand 0.9.4`.
+#     `default-features = false`). Everything else -- all but those three,
+#     counting `zlib-rs` itself -- is dev-only, reached through
+#     `criterion 0.5.1`, `flate2 1.1.9`, `quickcheck 1.1.0`, and `rand 0.9.4`.
 #   * `flate2` uses its default pure-Rust `miniz_oxide` backend, so the test
 #     suite requires no C toolchain. Its `zlib` / `zlib-ng` C backends stay
 #     disabled -- see the `libz-sys` bans below, which enforce that
 #     mechanically rather than by convention.
 #
-# That 86-of-89 dev-only ratio is the single most important fact about this
+# That all-but-three dev-only ratio is the single most important fact about this
 # file. cargo-deny EXCLUDES dev-dependencies by default from both the license
 # check and duplicate-version detection, so a policy that does not explicitly
 # opt them in is very nearly a no-op here. Two measurements make the point:
 #
 #   * With `[licenses] include-dev` at its default, `cargo deny list` reports
-#     3 crates and the license check examines only those 3. With it set,
-#     `cargo deny check licenses` reports 89 notes -- one per package.
+#     3 crates (`cfg-if`, `crc32fast`, `zlib-rs`) and the license check examines
+#     only those 3. With it set, it reports the 86 packages reachable for the 9
+#     triples in `[graph].targets` -- which is what governing this half of the
+#     closure has to mean. (89 is the number of packages `Cargo.lock` PINS; 86 is
+#     how many of them any governed target actually resolves.)
 #   * With `[bans] multiple-versions-include-dev` at its default, even
-#     `multiple-versions = "deny"` reports `bans ok`, because all four duplicate
-#     majors in this graph are dev-only and therefore invisible.
+#     `multiple-versions = "deny"` reports `bans ok`, because all three
+#     duplicate majors in this graph are dev-only and therefore invisible.
 #
 # Do not remove either setting. Without them this file looks like governance
 # while enforcing almost nothing.
@@ -86,33 +132,75 @@
 # [graph] -- which crates the checks are performed against
 # -----------------------------------------------------------------------------
 [graph]
-# `targets = []` means "do not prune by platform": with zero triples specified,
-# cargo-deny evaluates every target, so no target-gated crate can escape
-# review. This is DELIBERATE and was chosen over an explicit triple list after
-# measuring the consequence of pruning.
+# The five platforms named by the plan's CI matrix expansion (gap D3) and its
+# bare-metal `no_std` row (gap D10) are stated first and in that order, so the
+# supported platform set is machine-readable here and not merely described in a
+# comment. They are the same five triples `.cargo/config.toml` anchors a
+# `[target.<triple>]` table for, and all five were verified to be triples
+# cargo-deny recognises -- a bogus triple emits `warning: unknown target ...
+# specified`, and these emit nothing.
 #
-# The plan's CI matrix expansion (gap D3) plus its bare-metal `no_std` row
-# (gap D10) name five platforms, and all five were verified to be triples
-# cargo-deny recognises (a bogus triple emits `warning: unknown target ...
-# specified`; these five emit nothing):
+# The four that follow are coverage-only. They are not platforms this project
+# claims to support; they are listed because each one is the only way to keep a
+# target-gated crate inside the policy's view. Measured with
+# `cargo deny list` over the 89-package root graph:
 #
-#     x86_64-unknown-linux-gnu      aarch64-unknown-linux-gnu
-#     x86_64-pc-windows-msvc        aarch64-apple-darwin
-#     thumbv7em-none-eabihf         (bare-metal, exercises the private
-#                                    libc-backed allocator in src/lib.rs)
+#     targets = []                  89 of 89 packages governed
+#     the five supported triples    70 of 89   (19 pruned)
+#     the nine triples below        86 of 89   (3 pruned)
 #
-# But restricting `targets` to exactly those five PRUNES `r-efi` 5.3.0 and
-# 6.0.0 out of the graph -- they are reachable only under `target_os = "uefi"`,
-# via `getrandom`. The measured effect was a `warning[unmatched-skip]` plus two
-# of the 89 packages silently un-governed, and those two happen to carry the
-# only `LGPL-2.1-or-later` disjunct in the whole closure. A supply-chain policy
-# that cannot see the one potentially-copyleft expression in the graph is
-# worthless, so the unpruned graph wins.
+# `wasm32-unknown-unknown` and `wasm32-wasip2` retain the `wasm-bindgen` /
+# `js-sys` / `web-sys` / `wasip2` / `wit-bindgen` group that `criterion` pulls
+# in for its web backend, `x86_64-unknown-hermit` retains `hermit-abi`, and
+# `x86_64-unknown-uefi` retains the `getrandom` UEFI path. Adding them costs
+# nothing -- no crate is evaluated more strictly for being visible -- and each
+# one converts packages that would otherwise be silently un-reviewed into
+# governed ones.
 #
-# The empty list is a strict SUPERSET of the five triples above, so platform
-# coverage is not weakened. Verifying that the crate actually BUILDS and PASSES
-# on those five platforms is `.github/workflows/ci.yml`'s job, not this file's.
-targets = []
+# The three that remain pruned, and why that is acceptable rather than merely
+# tolerated:
+#
+#   * `crunchy 0.2.4` -- reachable only under `cfg(target_arch = "spirv")` via
+#     `half 2.7.1`. It is `MIT`, so nothing in the licence policy turns on it,
+#     and `spirv-unknown-vulkan1.2` is not a triple cargo-deny accepts
+#     (`warning: unknown target`), so no entry here could retain it.
+#   * `r-efi 5.3.0` and `r-efi 6.0.0` -- CANNOT be retained by any triple.
+#     `getrandom` gates them on `cfg(all(target_os = "uefi", getrandom_backend
+#     = "efi_rng"))`, and that second conjunct is a custom cfg, not a target
+#     property. A `[graph].targets` entry accepts only `triple` and `features`;
+#     supplying `cfg` is rejected with `error[unexpected-keys]`. Listing
+#     `x86_64-unknown-uefi` above is therefore necessary but not sufficient,
+#     and no configuration of this file can make it sufficient.
+#
+# The licence question deserves stating precisely, because it is the one that
+# looks alarming and is not. `r-efi` is the only crate in the closure whose
+# licence text mentions any copyleft term, and its expression is
+# `MIT OR Apache-2.0 OR LGPL-2.1-or-later`. The LGPL term is a DISJUNCT of an
+# `OR`, already satisfied by two permissive alternatives that dozens of other
+# crates here also supply, so it carries no copyleft obligation and pruning
+# `r-efi` removes no copyleft exposure from view. It was verified separately
+# that pruning these three strands none of the four allowed licences --
+# `Unicode-3.0` comes from `unicode-ident`, `Zlib` from `zlib-rs` and
+# `miniz_oxide`, all retained -- which matters because
+# `unused-allowed-license = "deny"` below makes an unused allowance a hard
+# error.
+#
+# Verifying that the crate actually BUILDS and PASSES on the five supported
+# platforms is `.github/workflows/ci.yml`'s job, not this file's.
+targets = [
+    # -- supported platforms (gaps D3 and D10; mirrors .cargo/config.toml) ----
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+    # Bare-metal: exercises the private libc-backed allocator in src/lib.rs.
+    "thumbv7em-none-eabihf",
+    # -- coverage-only: each retains crates that would otherwise be pruned ----
+    "wasm32-unknown-unknown",
+    "wasm32-wasip2",
+    "x86_64-unknown-hermit",
+    "x86_64-unknown-uefi",
+]
 # Collect metadata with `--all-features` so no feature-gated dependency hides
 # from the policy. This currently reaches the `simd` feature's `crc32fast`, and
 # it keeps `gzip`, `gz-io`, `no-std`, `inflate_strict`, and `c-oracle` in view
@@ -138,45 +226,40 @@ feature-depth = 1
 # [advisories] -- `cargo deny check advisories`
 # -----------------------------------------------------------------------------
 #
-# THE FINDING THIS SECTION EXISTS TO CLOSE
-# ----------------------------------------
-# `Cargo.toml` pins `rand = "0.9.4"` specifically to stay above the patched
-# range for RustSec advisory RUSTSEC-2026-0097. But the graph contains TWO
-# `rand` majors, and only one of them is governed by that declared floor:
+# WHY THIS SECTION EXPOSES THE WHOLE CLOSURE
+# ------------------------------------------
+# `Cargo.toml` pins `rand = "0.9.4"` to stay above the patched range for RustSec
+# advisory RUSTSEC-2026-0097. But the graph contains TWO `rand` majors, and only
+# one is governed by that declared floor:
 #
 #     rand 0.9.4   -- the DIRECT dev-dependency of zlib-rs
 #     rand 0.10.2  -- TRANSITIVE, pulled in by quickcheck 1.1.0
 #
 # (`cargo tree -i rand` refuses to run at all -- "specification `rand` is
-# ambiguous" -- which is itself proof both are resolved. Measured aside: the
-# plan's prose attributes the second major to `criterion 0.5.1`; the actual
-# graph shows `criterion` depends on `oorandom 11.1.5` and not on `rand` at
-# all. The provenance recorded here is the measured one.)
+# ambiguous" -- which is itself proof both are resolved. Note that `criterion
+# 0.5.1` is NOT the second major's source: it depends on `oorandom`, not `rand`.)
 #
-# The transitive 0.10.2 line is bounded by no floor we declare, and that
-# asymmetry is exactly the class of drift a cargo-deny / cargo-audit gate
-# exists to catch. Plan-adopted standard S6 puts it bluntly: "A policy written
-# against a single assumed `rand` version would be wrong on contact." The
-# settings below therefore deliberately expose the WHOLE closure -- both `rand`
-# lines, and all 86 dev-only packages -- to the advisory database.
+# The transitive line is bounded by no floor we declare, and that asymmetry is
+# exactly the class of drift this gate exists to catch -- plan-adopted standard
+# S6: "A policy written against a single assumed `rand` version would be wrong on
+# contact." The scopes below therefore deliberately expose the WHOLE governed
+# graph -- both `rand` lines and every dev-only package -- to the advisory
+# database, and the `ignore` list below stays empty so nothing is silently
+# excused.
 #
-# Measured status at the time of authoring, against a freshly fetched
-# rustsec/advisory-db (1180 advisories): 17 root-lock crates have advisory
-# files and EVERY resolved version already sits inside a patched range, so
-# `cargo deny check advisories` reports `0 errors, 0 warnings, 0 notes`.
-# RUSTSEC-2026-0097 declares
-# `patched = [">= 0.10.1", "< 0.10.0, >= 0.9.3", "< 0.9.0, >= 0.8.6"]`;
-# `rand 0.9.4` satisfies the middle range and `rand 0.10.2` satisfies the
-# first, so BOTH lines are patched and there is nothing to ignore. Two further
-# measurements worth knowing:
+# Do not record an advisory-database snapshot here. Whether a given version is
+# patched is a fact about the database on the day you run the check, not a
+# property of this file; the authoritative answer always comes from
+# `cargo deny check advisories`. Two structural consequences are durable, though,
+# and worth knowing before you touch the lockfile:
 #
-#   * `crossbeam-epoch 0.9.20` is patched EXACTLY at its advisory boundary
-#     (RUSTSEC-2026-0204, `patched = [">= 0.9.20"]`). Any downgrade trips it.
-#     This is why `Cargo.lock` is committed and why this gate is blocking.
+#   * Some resolved versions sit EXACTLY at their advisory's patched boundary, so
+#     any downgrade trips the gate. That is a large part of why `Cargo.lock` is
+#     committed and why this check is meant to block.
 #   * Our package name collides with an unrelated published crate also called
-#     `zlib-rs`, which carries RUSTSEC-2024-0401 with `patched = [">= 0.4.0"]`.
-#     Our version is `1.3.2`, comfortably above 0.4.0, so it does not match --
-#     but do not be surprised to see the name in the advisory database.
+#     `zlib-rs`, which carries its own advisory. Our version is far above that
+#     advisory's patched floor so it does not match -- but do not be surprised to
+#     see the name in the database.
 [advisories]
 # The canonical RustSec database. Pinned explicitly rather than relying on the
 # default so the trust root of this check is visible in review (plan-adopted
@@ -184,8 +267,8 @@ feature-depth = 1
 db-urls = ["https://github.com/rustsec/advisory-db"]
 # Scope of `informational = "unmaintained"` advisories. `all` = every crate in
 # the graph, including transitive dev-dependencies. Anything narrower would
-# leave 86 of our 89 packages ungoverned, which for this project is nearly the
-# entire graph. Note these are SCOPE values in cargo-deny 0.20
+# leave 83 of the 86 governed packages unexamined, which for this project is
+# nearly the entire graph. Note these are SCOPE values in cargo-deny 0.20
 # (`all` / `workspace` / `transitive` / `none`), not lint levels.
 unmaintained = "all"
 # Scope of `informational = "unsound"` advisories -- likewise `all`. This one is
@@ -229,8 +312,8 @@ maximum-db-staleness = "P7D"
 #   1. the advisory ID,
 #   2. why it cannot affect this crate (which code path is unreachable, or why
 #      the vulnerable API is never called), and
-#   3. explicitly whether it is dev-dependency-only -- 86 of 89 packages here
-#      are, so this materially changes the risk assessment.
+#   3. explicitly whether it is dev-dependency-only -- 83 of the 86 governed
+#      packages are, so this materially changes the risk assessment.
 # A bare `"RUSTSEC-XXXX-YYYY"` string with no reason is not acceptable.
 # Shape:
 #   { id = "RUSTSEC-XXXX-YYYY", reason = "dev-only, reached solely via
@@ -250,59 +333,60 @@ unused-ignored-advisory = "deny"
 # THE ALLOW LIST BELOW WAS DERIVED, NOT GUESSED.
 #
 # Plan-adopted standard S1 requires evidence over assertion, so the list is the
-# output of `cargo deny list` over the real 89-package graph rather than a
-# plausible-looking set of permissive identifiers. The complete measured set of
-# SPDX identifiers appearing anywhere in the closure is:
+# output of `cargo deny list` over the real graph rather than a plausible-looking
+# set of permissive identifiers. Re-derive it the same way rather than trusting a
+# census pasted into a comment, which drifts on the next lockfile change:
 #
-#   0BSD                            (1)  adler2 2.0.1
-#   Apache-2.0                     (73)
-#   Apache-2.0 WITH LLVM-exception  (2)  wasip2, wit-bindgen
-#   BSD-2-Clause                    (2)  zerocopy, zerocopy-derive
-#   LGPL-2.1-or-later               (2)  r-efi 5.3.0, r-efi 6.0.0
-#   MIT                            (85)
-#   Unicode-3.0                     (1)  unicode-ident 1.0.24
-#   Unlicense                       (6)  aho-corasick, memchr, quickcheck,
-#                                        same-file, walkdir, winapi-util
-#   Zlib                            (2)  miniz_oxide 0.8.9, zlib-rs 1.3.2
+#     cargo deny list
 #
-# Four identifiers suffice to satisfy every expression in that set, so exactly
-# four are allowed. Notably ABSENT from the graph -- and therefore deliberately
-# absent from the allow list -- are `MIT-0`, `BSD-3-Clause`, `ISC`, and
-# `CC0-1.0`. They are the kind of entry a from-memory allow list would have
-# included, and including them would have widened the policy past what the
-# graph demands for no benefit.
+# The durable result is that exactly FOUR identifiers suffice to satisfy every
+# license expression in the closure, so exactly four are allowed. `MIT-0`,
+# `BSD-3-Clause`, `ISC`, and `CC0-1.0` do not appear in the graph at all and are
+# therefore deliberately absent -- they are exactly the entries a from-memory
+# allow list would have included, widening the policy past what the graph demands
+# for no benefit.
 #
-# `0BSD`, `BSD-2-Clause`, `Unlicense`, `Apache-2.0 WITH LLVM-exception`, and
-# `LGPL-2.1-or-later` are likewise NOT allowed. Every one of them occurs only as
-# an alternative inside an `OR` disjunction that also offers `MIT` or
-# `Apache-2.0`, so each expression is satisfied by a permissive option we do
-# allow, and the un-allowed alternative is simply never selected.
+# `0BSD`, `BSD-2-Clause`, `Unlicense`, and `Apache-2.0 WITH LLVM-exception` are
+# likewise NOT allowed. Every one of them occurs only as an alternative inside
+# an `OR` disjunction that also offers `MIT` or `Apache-2.0`, so each expression
+# is satisfied by a permissive option we do allow, and the un-allowed
+# alternative is simply never selected. (`LGPL-2.1-or-later` reaches the graph
+# only through `r-efi`, which the explicit `[graph].targets` list above prunes,
+# so it does not appear in the governed set at all.)
 #
-# `r-efi` is the case that needs saying out loud, because it is the only place a
-# copyleft identifier appears anywhere in the closure. Its expression is
+# COPYLEFT, stated explicitly because it is the question a reader will ask
+# first: no GPL, LGPL, AGPL, MPL, CDDL, or EPL identifier appears anywhere in
+# the governed set above. Across the wider unpruned closure of 89 packages there
+# is exactly one crate whose licence text mentions a copyleft term at all --
+# `r-efi` (5.3.0 and 6.0.0), which is
 #
 #     MIT OR Apache-2.0 OR LGPL-2.1-or-later
 #
-# which is a DISJUNCTION: satisfying any single option satisfies the whole
-# requirement. Because `MIT` and `Apache-2.0` are allowed, the LGPL option is
-# never selected and NO copyleft obligation attaches to this crate or to
-# anything that links it. This is verified, not assumed -- `cargo deny check
-# licenses` passes with `LGPL-2.1-or-later` absent from the allow list.
+# a DISJUNCTION, where satisfying any single option satisfies the whole
+# requirement. Both permissive options are allowed here, so even when `r-efi` is
+# in view the LGPL option is never selected and NO copyleft obligation attaches
+# to it or to anything that links it. Under the declared `[graph].targets` the
+# two `r-efi` copies are pruned entirely -- `getrandom` gates them behind a
+# custom cfg no triple can satisfy, as the `[graph]` comment explains -- so the
+# identifier does not reach this check either way.
+#
 # Consequently: do NOT add `LGPL-2.1-or-later`, or any other LGPL/GPL/AGPL
-# variant, to the list below. There is no expression in this graph that needs
-# it, and adding one would grant a copyleft obligation nobody reviewed.
-# (`r-efi` is reachable only under `target_os = "uefi"`; see the `[graph]`
-# comment for why the graph is left unpruned so it stays visible at all.)
+# variant, to the list below. No expression in this graph needs it; adding one
+# would grant a copyleft obligation nobody reviewed, and
+# `unused-allowed-license = "deny"` would reject it as unused in any case.
 [licenses]
 # CRITICAL -- do not remove either of the next two settings.
 #
 # cargo-deny 0.20 EXCLUDES dev-dependencies from the license check by default.
 # Measured on this repository: with `include-dev` unset, `cargo deny list`
-# reports 3 crates (cfg-if, crc32fast, zlib-rs) and the check passes while 86 of
-# 89 packages -- the entire benchmark, oracle, and property-testing graph -- go
-# completely unexamined. With it set, `cargo deny check licenses` reports 89
-# notes: one per package, which is what "a policy over the 102-package closure"
-# has to mean.
+# reports 3 crates (cfg-if, crc32fast, zlib-rs) and the check passes while 83 of
+# the 86 reachable packages -- the entire benchmark, oracle, and property-testing
+# graph -- go completely unexamined. With it set, `cargo deny list` reports all
+# 86, which together with the 13 governed by `fuzz/deny.toml` is what "a policy
+# over the 102-package closure" has to mean. (86 rather than the 89 `Cargo.lock`
+# pins: three pinned packages resolve for no triple in `[graph].targets`.)
+# `fuzz/deny.toml` sets the same key for the other half, where `include-build` is
+# the load-bearing one -- `cc` is a BUILD dependency of `libfuzzer-sys` there.
 include-dev = true
 # Build-dependencies too. This is future-proofing rather than current coverage:
 # the crate has NO `[build-dependencies]` table at all, by design -- `build.rs`
@@ -312,8 +396,9 @@ include-dev = true
 include-build = true
 # How closely a crate's license TEXT must match canonical SPDX text before the
 # identifier is accepted. Only consulted for crates that ship a `license-file`
-# instead of a machine-readable `license` field; all 89 packages currently
-# declare `license`, so this is a guard for future additions. 0.93 is strict
+# instead of a machine-readable `license` field; every governed package
+# currently declares `license`, so this is a guard for future additions. 0.93 is
+# strict
 # without rejecting the routine copyright-line substitutions that real license
 # files contain.
 confidence-threshold = 0.93
@@ -355,8 +440,8 @@ exceptions = []
 # No `[[licenses.clarify]]` blocks. A clarification overrides a crate's
 # declared licensing with our own reading of its files, and is only defensible
 # when a crate has no machine-readable metadata AND its actual license text has
-# been read. All 89 packages declare a `license` field, so there is nothing to
-# clarify and nothing has been invented.
+# been read. Every governed package declares a `license` field, so there is
+# nothing to clarify and nothing has been invented.
 #
 # Note also which keys are ABSENT by design. cargo-deny 0.20 still recognises
 # the names `copyleft`, `allow-osi-fsf-free`, `unlicensed`, `default`, and
@@ -411,10 +496,10 @@ registries = []
 #
 # cargo-deny 0.20 excludes dev-dependencies from duplicate detection by default.
 # Measured on this repository: with it unset, even `multiple-versions = "deny"`
-# reports `bans ok` -- all four duplications below are INVISIBLE and the four
-# `skip` entries are dead configuration that only *looks* like governance. With
-# it set, exactly `getrandom`, `r-efi`, `rand`, and `rand_core` surface, which
-# is the true state of the graph.
+# reports `bans ok` -- every duplication below is INVISIBLE and the `skip`
+# entries are dead configuration that only *looks* like governance. With it set,
+# exactly `getrandom`, `rand`, and `rand_core` surface under the declared
+# `[graph].targets`, which is the true state of the graph.
 multiple-versions = "warn"
 multiple-versions-include-dev = true
 #
@@ -434,9 +519,16 @@ multiple-versions-include-dev = true
 # `version = "0.0.0"` there is the harness package's own version rather than a
 # requirement on anything.)
 wildcards = "deny"
-# Path dependencies get no wildcard exemption either. The only path dependency
-# anywhere in the project is `fuzz/Cargo.toml`'s `zlib-rs { path = ".." }`, and
-# it names no version, so nothing relies on this loophole.
+# Path dependencies get no wildcard exemption either, and in THIS graph that
+# costs nothing: the root closure contains no path dependency at all, so the
+# strict setting is free. The project's only path dependency is
+# `fuzz/Cargo.toml`'s `zlib-rs { path = ".." }`, which lives in the detached
+# fuzz workspace and is therefore governed by `fuzz/deny.toml`, not by this
+# file. That policy is the one place `allow-wildcard-paths = true` appears, and
+# it documents why: a path dependency that names no version is indistinguishable
+# from a wildcard to cargo-deny, so the fuzz harness cannot depend on the crate
+# under test without it. Keep this setting `false` — relaxing it here would
+# extend a fuzz-only concession to the published dependency graph.
 allow-wildcard-paths = false
 # Highlight both the lowest-versioned and the simplest path when rendering a
 # duplicate-version graph, so a warning is actionable without re-running with
@@ -470,10 +562,29 @@ deny = [
     # declares its own empty `[workspace]` table, so it is not a member of the
     # root build graph and `cargo deny` run from the repository root never
     # resolves it. Verified: `cc` does not appear in the root `Cargo.lock`, and
-    # `cargo deny check bans` passes at the root with this entry active. If you
-    # ever want to police the fuzz workspace too, run cargo-deny a second time
-    # with `--manifest-path fuzz/Cargo.toml` and a separate config -- do NOT
-    # weaken this entry to accommodate it.
+    # `cargo deny check bans` passes at the root with this entry active.
+    #
+    # The fuzz workspace IS policed, by the second invocation documented at the
+    # top of this file: `fuzz/deny.toml` bans `cc` there too, with a single
+    # scoped exemption (`wrappers = ["libfuzzer-sys"]`) so that the only
+    # permitted path to it is the libFuzzer runtime shim. Any other route -- a
+    # new dependency, or a build script added to a harness -- is still a hard
+    # error there. Do NOT weaken this entry to accommodate the harness; that is
+    # exactly what the separate policy exists to prevent, and confining the
+    # allowance to that file is what keeps this ban ABSOLUTE: the C-toolchain
+    # chain is permitted only in a graph that is never published and never
+    # linked into a released artifact, so it cannot migrate into the shipped
+    # library by way of a relaxed shared policy.
+    #
+    # The two policies otherwise differ in only four documented places, all
+    # enumerated in `fuzz/deny.toml`'s header. Keep them in step when this list
+    # changes, and keep the divergence to those four points:
+    #
+    #     cargo deny check                                    # these 89
+    #     cargo deny --manifest-path fuzz/Cargo.toml check     # the other 13
+    #
+    # Both invocations are REQUIRED, and neither substitutes for the other. The
+    # audit workflow of gap D2 must run both and must fail if either fails.
     { crate = "cc", reason = "crate proper takes no C-toolchain build dependency; build.rs is pure std (cc is expected only in the detached fuzz workspace)" },
     # An FFI binding generator would mean the C ABI surface is machine-derived.
     # It is hand-written in `src/ffi/types.rs` precisely so that ABI drift is a
@@ -519,10 +630,10 @@ deny = [
 #
 # ACKNOWLEDGED DUPLICATE VERSIONS.
 #
-# All four duplications below are legitimate, dev-dependency-only, and absent
+# All three duplications below are legitimate, dev-dependency-only, and absent
 # from every shipped artifact (`lib`, `cdylib`, `staticlib`), which contain only
 # `cfg-if` and optionally `crc32fast`. They are skipped so the `warn` channel
-# stays signal rather than four permanent lines of noise -- an unacknowledged
+# stays signal rather than three permanent lines of noise -- an unacknowledged
 # recurring warning trains reviewers to ignore the check.
 #
 # Each entry names the TRANSITIVE copy, the one we do not control, rather than
@@ -540,15 +651,37 @@ skip = [
     { crate = "rand_core@0.10.1", reason = "dev-only; follows rand 0.10.2 down the quickcheck path" },
     # getrandom 0.3.4 follows rand_core 0.9.5.
     { crate = "getrandom@0.4.3", reason = "dev-only; follows rand_core 0.10.1 down the quickcheck path" },
-    # r-efi 5.3.0 follows getrandom 0.3.4. Both copies are the UEFI backend and
-    # are reachable only under `target_os = "uefi"`; they are in the graph at all
-    # only because `[graph] targets` is deliberately left unpruned.
-    { crate = "r-efi@6.0.0", reason = "dev-only, UEFI-target-gated; follows getrandom 0.4.3 down the quickcheck path" },
+    # r-efi is deliberately NOT skipped. The entry is kept below in deactivated
+    # form because its absence is a consequence of the `[graph].targets` list
+    # rather than an oversight, and that is worth being able to read here.
+    #
+    # It would be needed under `targets = []`: both `r-efi` 5.3.0 and 6.0.0
+    # would then be in the graph -- they follow `getrandom` 0.3.4 and 0.4.3 as
+    # the UEFI backend -- and `multiple-versions` would report them as a fourth
+    # duplicate major requiring justification. Under the explicit target list
+    # they are pruned instead, because `getrandom` gates them on a custom cfg no
+    # triple can satisfy (see `[graph]`), so no duplicate remains to justify and
+    # the entry would match nothing.
+    #
+    # A skip that matches nothing is itself reported, as
+    # `warning[unmatched-skip]: skipped crate 'r-efi = =6.0.0' was not
+    # encountered`, and `[bans]` has no severity key that could downgrade it
+    # (the accepted keys are multiple-versions, multiple-versions-include-dev,
+    # highlight, deny, allow, allow-workspace, features,
+    # external-default-features, workspace-default-features, skip, skip-tree,
+    # wildcards, allow-wildcard-paths, allow-build-scripts, build,
+    # workspace-dependencies, and std-replacements). Leaving it active would
+    # therefore put a permanent warning in every run and break the project's
+    # zero-warning gate.
+    #
+    # Restore this line if `r-efi` ever becomes reachable under a listed triple
+    # in more than one version:
+    # { crate = "r-efi@6.0.0", reason = "dev-only, UEFI-target-gated; follows getrandom 0.4.3 down the quickcheck path" },
 ]
 # `skip-tree` is intentionally empty. It suppresses duplicate detection for a
 # crate AND its entire transitive subtree, which is far broader than anything
-# needed here -- the four targeted `skip` entries above cover the real graph
-# exactly. Prefer adding a precise `skip` over reaching for `skip-tree`.
+# needed here -- the three targeted `skip` entries above cover the real graph
+# exactly, one per duplicate major. Prefer a precise `skip` over `skip-tree`.
 skip-tree = []
 
 # -----------------------------------------------------------------------------

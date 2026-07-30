@@ -5,8 +5,26 @@
 //! This module reifies the public integer `#define`s from the C headers
 //! `zlib.h` and `zconf.h` of **zlib 1.3.2.1-motley** as idiomatic Rust enums
 //! and plain constants. It is the single, authoritative *public constant
-//! surface* of the crate and is re-exported from the crate root into the public
-//! prelude (`use crate::constants::{FlushMode, Strategy, WrapMode, ...}`).
+//! surface* of the crate: `zlib_rs::constants` is the complete surface, and
+//! everything below is reachable through it.
+//!
+//! # What the crate root and the prelude re-export
+//!
+//! Both re-export sets are deliberately *selective* — this module remains the
+//! only place that has all of it.
+//!
+//! * The **crate root** (`zlib_rs::…`) re-exports the five type-safe enums
+//!   [`DataType`], [`FlushMode`], [`Method`], [`Strategy`] and [`WrapMode`],
+//!   plus the four compression-level constants [`Z_BEST_COMPRESSION`],
+//!   [`Z_BEST_SPEED`], [`Z_DEFAULT_COMPRESSION`] and [`Z_NO_COMPRESSION`].
+//! * The **prelude** (`zlib_rs::prelude::*`) re-exports only the five enums. It
+//!   carries no plain constants and no free functions at all, so a glob import
+//!   cannot pull the `Z_*` ABI-name bridge — or any raw-pointer entry point —
+//!   into scope by accident.
+//!
+//! Everything else here — the remaining `Z_*` names, the window and
+//! memory-level bounds, and [`parse_window_bits`] — is reached by naming this
+//! module: `use zlib_rs::constants::{Z_NO_FLUSH, MAX_WBITS};`.
 //!
 //! # Two representations, one contract
 //!
@@ -412,10 +430,18 @@ pub enum WrapMode {
 /// Decodes an overloaded `windowBits` value into its [`WrapMode`] and the
 /// effective window size in bits (always in `8..=15`).
 ///
-/// This is the crate's **single source of truth** for zlib/raw/gzip/auto
-/// framing selection, used by both the deflate and inflate engines. The four
-/// ranges below govern wire-format compatibility and must match zlib exactly
-/// (AAP §0.6.4):
+/// This is the **deflate side's** decoder for zlib/raw/gzip framing selection:
+/// its one non-test caller is `deflate_init2` in [`crate::deflate`], which
+/// converts the resulting [`WrapMode`] into the `wrap` value the encoder carries.
+/// The inflate side does **not** route through here — [`crate::inflate::inflate_reset2`]
+/// decodes `windowBits` itself (`wrap = (windowBits >> 4) + 5`, then `wb &= 15`),
+/// mirroring C `inflateReset2` — because the two directions accept different
+/// domains: inflate additionally accepts `0` and [`WrapMode::Auto`], while
+/// deflate rejects both and applies the special 8-bit-window rule. Keeping them
+/// separate is what lets each one reject exactly what its C counterpart rejects.
+///
+/// The four ranges below govern wire-format compatibility and must match zlib
+/// exactly (AAP §0.6.4):
 ///
 /// | `window_bits`  | [`WrapMode`]      | effective bits |
 /// |----------------|-------------------|----------------|
@@ -427,12 +453,16 @@ pub enum WrapMode {
 ///
 /// # `windowBits == 0`
 ///
-/// A value of `0` is **rejected here** (returns [`None`]). In the C API, `0` is
-/// accepted only by `inflateInit2()` and means "use the window size recorded in
-/// the stream's zlib header". That is an inflate-specific special case: the
-/// inflate engine substitutes [`DEF_WBITS`] (and zlib/auto framing) *before*
-/// consulting this decoder, keeping this function's contract free of
-/// direction-specific behavior.
+/// A value of `0` is **rejected here** (returns [`None`]), which is correct for
+/// the deflate direction: C `deflateInit2_` rejects `windowBits == 0` too. In
+/// the C API `0` is accepted only by `inflateInit2()`, where it means "use the
+/// window size recorded in the stream's zlib header". That case never reaches
+/// this function — [`crate::inflate::inflate_reset2`] accepts `0` in its own
+/// validation and stores it verbatim as `state.wbits`, and the driver later
+/// fills it in from the header: from the zlib CINFO nibble (`wbits = CINFO + 8`,
+/// C `inflate.c` L514) or as `15` on the gzip path (C `inflate.c` L540). So the
+/// `None` here is not a gap: it is this decoder declining an input its only
+/// caller must also decline.
 ///
 /// # Examples
 ///

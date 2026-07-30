@@ -455,4 +455,204 @@ mod tests {
         assert_eq!(BASE, 65_521);
         assert_eq!(NMAX, 5_552);
     }
+
+    // -----------------------------------------------------------------------
+    // Virtual 64-bit combine-length coverage.
+    //
+    // `adler32_combine` takes an `i64` length so a single entry point covers
+    // both C `z_off_t` and `z_off64_t`, and the only use it makes of that length
+    // is the reduction `len2 % BASE`. Every concatenation test above uses a
+    // length that fits comfortably in a `u32`, so a 32-bit truncation, a
+    // reduction performed at the wrong width, or a sign mix-up would pass all of
+    // them. The anchors below close that gap: each was produced by
+    // `adler32_combine64` in reference zlib 1.3.2.1-motley, compiled from the C
+    // sources retained in this repository with `-D_LARGEFILE64_SOURCE=1`.
+    // -----------------------------------------------------------------------
+
+    /// The two checksums every 64-bit anchor combines: the Adler-32 values of
+    /// the halves of "The quick brown fox jumps over the lazy dog" split at 20,
+    /// themselves pinned by `combine_matches_concatenation` above.
+    const CA1: u32 = 0x4c62_0734;
+    /// Second half of the anchor pair; see [`CA1`].
+    const CA2: u32 = 0x69d6_08a7;
+
+    /// `(len2, reference adler32_combine64(CA1, CA2, len2))` sampled across the
+    /// whole non-negative `i64` domain: zero, one, the real 22/23-byte split
+    /// lengths, either side of `BASE`, the second multiple of `BASE`, every
+    /// power of two from `2^28` to `2^62`, either side of `2^32`, and both ends
+    /// of `i64::MAX`.
+    const ADLER_COMBINE_ANCHORS: [(i64, u32); 21] = [
+        (0, 0xb638_0fda),
+        (1, 0xbd6b_0fda),
+        (22, 0x54a9_0fda),
+        (23, 0x5bdc_0fda),
+        (65_520, 0xaf05_0fda),
+        (65_521, 0xb638_0fda),
+        (65_522, 0xbd6b_0fda),
+        (131_041, 0xaf05_0fda),
+        (131_042, 0xb638_0fda),
+        (1_i64 << 28, 0xeb78_0fda),
+        ((1_i64 << 29) - 1, 0x1994_0fda),
+        (1_i64 << 29, 0x20c7_0fda),
+        ((1_i64 << 29) + 1, 0x27fa_0fda),
+        (1_i64 << 30, 0x8b47_0fda),
+        (1_i64 << 31, 0x6056_0fda),
+        ((1_i64 << 32) - 1, 0x0341_0fda),
+        (1_i64 << 32, 0x0a74_0fda),
+        ((1_i64 << 32) + 1, 0x11a7_0fda),
+        (1_i64 << 62, 0xf62d_0fda),
+        (i64::MAX - 1, 0x27cb_0fda),
+        (i64::MAX, 0x2efe_0fda),
+    ];
+
+    #[test]
+    fn combine_boundary_lengths_match_reference() {
+        for (len2, expected) in ADLER_COMBINE_ANCHORS {
+            assert_eq!(
+                adler32_combine(CA1, CA2, len2),
+                expected,
+                "adler32_combine at len2={len2}"
+            );
+        }
+    }
+
+    #[test]
+    fn combine_at_i64_max_matches_reference() {
+        // Called out separately from the table because `i64::MAX` is where a
+        // width defect is most likely to surface: its residue mod `BASE` is
+        // 58_072, which no shorter length used anywhere in this file produces.
+        assert_eq!(adler32_combine(CA1, CA2, i64::MAX), 0x2efe_0fda);
+        assert_eq!(adler32_combine(CA1, CA2, i64::MAX - 1), 0x27cb_0fda);
+
+        // A 32-bit truncation of `len2` is precisely the defect these anchors
+        // exist to catch: `i64::MAX as u32` is `u32::MAX`, whose residue is 224
+        // rather than 58_072, so the two must not agree.
+        assert_ne!(
+            adler32_combine(CA1, CA2, i64::MAX),
+            adler32_combine(CA1, CA2, i64::from(u32::MAX)),
+            "a 32-bit truncation of len2 must be observable"
+        );
+    }
+
+    #[test]
+    fn combine_depends_on_len2_only_modulo_base() {
+        // `len2` enters the derivation solely as `len2 % BASE`, so every anchor
+        // must be reproduced by its own reduced length. Checking the identity
+        // against the reference values (rather than against the implementation
+        // alone) means neither side can drift unnoticed.
+        for (len2, expected) in ADLER_COMBINE_ANCHORS {
+            let reduced = len2 % i64::from(BASE);
+            assert!(reduced < i64::from(BASE) && reduced >= 0);
+            assert_eq!(
+                adler32_combine(CA1, CA2, reduced),
+                expected,
+                "reduced length {reduced} must reproduce the len2={len2} anchor"
+            );
+        }
+
+        // Non-vacuity: reducing at 32 bits first would map `2^32` to zero, and
+        // the two lengths genuinely differ, so the identity above has teeth.
+        assert_ne!(
+            adler32_combine(CA1, CA2, 1_i64 << 32),
+            adler32_combine(CA1, CA2, 0)
+        );
+    }
+
+    #[test]
+    fn combine_real_split_around_base_matches_whole() {
+        // The same modulus boundary, now crossed with *real* concatenated data
+        // so the `rem` reduction and the conditional `sum1`/`sum2` corrections
+        // are driven by genuine checksums. `len2` sweeps `BASE - 1`, `BASE`
+        // (residue zero) and `BASE + 1` (residue one). Expected values are
+        // reference zlib over the byte pattern `((i * 131 + 7) & 0xff)`.
+        const L1: usize = 1_000;
+        /// Adler-32 of the fixed 1_000-byte first sequence.
+        const A1: u32 = 0x1347_efec;
+        let cases: [(usize, u32, u32); 3] = [
+            (65_520, 0x43ea_811a, 0x6737_7114),
+            (65_521, 0xc593_81a9, 0xd8da_71a3),
+            (65_522, 0x475d_81bb, 0x4a9e_71b5),
+        ];
+
+        for (l2, expected_a2, expected_whole) in cases {
+            let data: Vec<u8> = (0..L1 + l2).map(|i| ((i * 131 + 7) & 0xff) as u8).collect();
+            let (first, second) = data.split_at(L1);
+            let a1 = adler32(1, first);
+            let a2 = adler32(1, second);
+            let whole = adler32(1, &data);
+            assert_eq!(a1, A1, "first-sequence checksum at l2={l2}");
+            assert_eq!(a2, expected_a2, "second-sequence checksum at l2={l2}");
+            assert_eq!(whole, expected_whole, "whole-sequence checksum at l2={l2}");
+            assert_eq!(
+                adler32_combine(a1, a2, l2 as i64),
+                whole,
+                "combine must equal the whole-sequence checksum at l2={l2}"
+            );
+        }
+    }
+
+    #[test]
+    fn combine_reduction_ladder_is_fully_exercised() {
+        // The four conditional subtractions at the end of `adler32_combine` are
+        // not interchangeable: `sum1` can reach just under `3 * BASE` and so
+        // needs BOTH of its reductions, while `sum2` can reach just under
+        // `4 * BASE` and therefore needs the `2 * BASE` reduction *before* the
+        // `BASE` one. Collapsing the `2 * BASE` test into a second `BASE` test
+        // leaves every `sum2` in `[3 * BASE, 4 * BASE)` unreduced.
+        //
+        // Reaching that band requires both operands to carry a near-maximal
+        // second sum, which no short literal string produces. Each case below is
+        // a *real* concatenation of `0xff` bytes located with the reference C
+        // implementation, and each is annotated with the band it drives. Expected
+        // values are reference zlib (`adler32` / `adler32_combine64`).
+        //
+        // `(n1, n2, adler1, adler2, whole, sum1 band, sum2 band)` where a band of
+        // `n` means the pre-reduction value lies in `[n * BASE, (n + 1) * BASE)`.
+        let cases: [(usize, usize, u32, u32, u32, u32, u32); 6] = [
+            (3_083, 1, 0xffd4_ff9b, 0x0100_0100, 0x008c_00a9, 2, 3),
+            (3_083, 2, 0xffd4_ff9b, 0x02ff_01ff, 0x0234_01a8, 2, 3),
+            (3_083, 300, 0xffd4_ff9b, 0xb90f_2ae4, 0x52fe_2a8d, 2, 3),
+            (100, 1, 0xa7c7_639d, 0x0100_0100, 0x0c72_649c, 1, 2),
+            (1_000, 65_521, 0xe6e9_e446, 0x0000_0001, 0xe6e9_e446, 1, 1),
+            (2, 3, 0x02ff_01ff, 0x05fd_02fe, 0x0ef6_04fc, 1, 1),
+        ];
+
+        for (n1, n2, expected_a1, expected_a2, expected_whole, band1, band2) in cases {
+            let data = vec![0xffu8; n1 + n2];
+            let (first, second) = data.split_at(n1);
+            let a1 = adler32(1, first);
+            let a2 = adler32(1, second);
+            let whole = adler32(1, &data);
+            assert_eq!(a1, expected_a1, "adler1 for n1={n1}");
+            assert_eq!(a2, expected_a2, "adler2 for n2={n2}");
+            assert_eq!(whole, expected_whole, "whole for n1={n1} n2={n2}");
+
+            // Premise check: confirm this case really drives the band it claims,
+            // so the ladder coverage cannot silently degrade if a value is edited.
+            let rem = u64::try_from(n2).expect("length fits u64") % u64::from(BASE);
+            let base = u64::from(BASE);
+            let sum1_pre = u64::from(a1 & 0xffff) + u64::from(a2 & 0xffff) + base - 1;
+            let sum2_pre = (rem * u64::from(a1 & 0xffff)) % base
+                + u64::from((a1 >> 16) & 0xffff)
+                + u64::from((a2 >> 16) & 0xffff)
+                + base
+                - rem;
+            assert_eq!(
+                sum1_pre / base,
+                u64::from(band1),
+                "n1={n1} n2={n2}: sum1 band changed (pre-reduction {sum1_pre})"
+            );
+            assert_eq!(
+                sum2_pre / base,
+                u64::from(band2),
+                "n1={n1} n2={n2}: sum2 band changed (pre-reduction {sum2_pre})"
+            );
+
+            assert_eq!(
+                adler32_combine(a1, a2, n2 as i64),
+                whole,
+                "combine must equal the whole checksum for n1={n1} n2={n2}"
+            );
+        }
+    }
 }

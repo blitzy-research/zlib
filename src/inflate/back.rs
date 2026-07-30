@@ -357,7 +357,8 @@ pub fn inflate_back_init(window_bits: i32) -> Result<Box<InflateState>, ReturnCo
 ///
 /// # Errors
 ///
-/// Returns [`ReturnCode::StreamError`] if `window_bits` is outside `8..=15`.
+/// * [`ReturnCode::StreamError`] — `window_bits` is outside `8..=15`.
+/// * [`ReturnCode::MemError`] — the state or the window could not be allocated.
 pub fn inflate_back_init_in(
     hook: AllocHook,
     window_bits: i32,
@@ -367,9 +368,13 @@ pub fn inflate_back_init_in(
         return Err(ReturnCode::StreamError);
     }
 
-    // Raw stream: wrap = 0. `new_in` already sets dmax = 32768, sane = true, and
-    // records `hook` so any window (re)allocation routes through it.
-    let mut state = InflateState::new_in(hook, 0, window_bits as u32);
+    // Raw stream: wrap = 0. `try_new_in` already sets dmax = 32768, sane = true,
+    // and records `hook` so any window (re)allocation routes through it. Boxing
+    // is fallible so global-heap exhaustion becomes `Z_MEM_ERROR` — the code C
+    // returns when its state `ZALLOC` fails (`infback.c` L52-L53) — rather than
+    // an abort (M7).
+    let mut state =
+        InflateState::try_new_in(hook, 0, window_bits as u32).ok_or(ReturnCode::MemError)?;
 
     // C L56-L62: set the window geometry and allocate the owned window through
     // the caller's allocator hook (or the global allocator when no hook is

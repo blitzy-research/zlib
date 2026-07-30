@@ -61,7 +61,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::gz_header::GzHeader;
-use crate::stream::{AllocBuffer, AllocHook, Allocator, ZStream};
+use crate::stream::{AllocBuffer, AllocHook, Allocator, ZStream, ZeroValid};
 
 // ===========================================================================
 // Phase 2 — C scalar type aliases (mirror `zconf.h`)
@@ -376,17 +376,22 @@ impl Allocator for CAllocator {
     /// The returned [`AllocBuffer`] is a [`Foreign`](AllocBuffer::Foreign)
     /// region carved from the caller's `zalloc` (and released through their
     /// `zfree` on drop) whenever this [`CAllocator`] carries an active
-    /// [`hook`](Allocator::hook); otherwise — null hooks, an empty request, or a
-    /// `zalloc` reporting OOM — it falls back to a global-allocator
-    /// [`Vec`](AllocBuffer::Owned), matching AAP §0.6.3's "otherwise `std::alloc`
-    /// is used" clause. Soundness is preserved because the returned buffer knows
-    /// its own backing store and frees it the matching way on [`Drop`] — the
-    /// historical unsoundness of dropping a foreign-backed `Vec` through the
-    /// global allocator cannot occur.
+    /// [`hook`](Allocator::hook); with null hooks or an empty request it uses a
+    /// global-allocator [`Vec`](AllocBuffer::Owned), matching AAP §0.6.3's
+    /// "otherwise `std::alloc` is used" clause and C's substitution of `zcalloc`
+    /// for a null `zalloc` (`deflate.c` L401-L414). Soundness is preserved because
+    /// the returned buffer knows its own backing store and frees it the matching
+    /// way on [`Drop`] — the historical unsoundness of dropping a foreign-backed
+    /// `Vec` through the global allocator cannot occur.
+    ///
+    /// When an **active** hook's `zalloc` reports out-of-memory (or the request is
+    /// unrepresentable, or the returned region is unusably aligned) this returns
+    /// [`None`] and the caller surfaces `Z_MEM_ERROR`. There is deliberately no
+    /// global-allocator fallback on that path (M7).
     #[inline]
     fn allocate_zeroed<T>(&self, count: usize) -> Option<AllocBuffer<T>>
     where
-        T: Copy + Default + 'static,
+        T: Copy + Default + ZeroValid + 'static,
     {
         AllocBuffer::try_zeroed(count, self.hook())
     }
@@ -1142,7 +1147,7 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::mem::{align_of, offset_of, size_of};
+    use core::mem::{MaybeUninit, align_of, offset_of, size_of};
 
     /// The four C function-pointer typedefs must be pointer-sized, confirming
     /// the null-pointer optimization the `#[repr(C)]` structs rely on.
@@ -1431,6 +1436,311 @@ mod tests {
             "active-hook OOM at init must surface Z_MEM_ERROR (M7), got {:?}",
             result.as_ref().map(|_| "Ok(state)")
         );
+    }
+
+    /// A test-only `zalloc`/`zfree` pair backed by the Rust global allocator.
+    ///
+    /// Each block is prefixed with a `usize` size header (the same technique
+    /// `tests/inflate_coverage.rs` uses) so `zfree` can reconstruct the layout
+    /// and actually release the memory instead of leaking. The header size is
+    /// also the alignment, which keeps every returned pointer `usize`-aligned —
+    /// enough for the `u8`/`u16`/`u32` element types the engines request and for
+    /// the 4-byte-aligned probe type used below.
+    const HOOK_HEADER: usize = size_of::<usize>();
+
+    /// Allocates `bytes` usable bytes through the global allocator with a size
+    /// header, returning the pointer just past the header (or null).
+    fn hook_backing_alloc(bytes: usize) -> *mut c_void {
+        if bytes == 0 {
+            return ptr::null_mut();
+        }
+        let total = bytes + HOOK_HEADER;
+        let Ok(layout) = core::alloc::Layout::from_size_align(total, HOOK_HEADER) else {
+            return ptr::null_mut();
+        };
+        // SAFETY: `layout` has a non-zero size, which is `alloc`'s requirement.
+        let raw = unsafe { alloc::alloc::alloc(layout) };
+        if raw.is_null() {
+            return ptr::null_mut();
+        }
+        // SAFETY: `raw` owns `total` >= `HOOK_HEADER` bytes aligned for `usize`,
+        // so writing the header at offset 0 is in bounds and well aligned.
+        unsafe { *(raw as *mut usize) = total };
+        // SAFETY: the usable region starts one header inside the same allocation.
+        unsafe { raw.add(HOOK_HEADER) as *mut c_void }
+    }
+
+    /// Releases a block produced by [`hook_backing_alloc`].
+    fn hook_backing_free(address: *mut c_void) {
+        if address.is_null() {
+            return;
+        }
+        // SAFETY: `address` came from `hook_backing_alloc`, so its `usize` size
+        // header sits in the `HOOK_HEADER` bytes immediately before it; stepping
+        // back stays inside that same allocation.
+        let raw = unsafe { (address as *mut u8).sub(HOOK_HEADER) };
+        // SAFETY: `raw` points at the header written by `hook_backing_alloc`.
+        let total = unsafe { *(raw as *const usize) };
+        let layout =
+            core::alloc::Layout::from_size_align(total, HOOK_HEADER).expect("header is valid");
+        // SAFETY: `raw`/`layout` are exactly the pointer and layout the matching
+        // `hook_backing_alloc` allocated.
+        unsafe { alloc::alloc::dealloc(raw, layout) };
+    }
+
+    /// F1 soundness regression: a foreign region must be initialized with
+    /// `T::default()` for **every** element, not with a raw zero fill.
+    ///
+    /// `Copy + Default` does **not** promise that an all-zero bit pattern is an
+    /// inhabited — let alone the default — value of `T`, so writing zeros and
+    /// then exposing the region as `&[T]` would be unsound for any such type and
+    /// silently wrong for one whose `Default` is non-zero.
+    ///
+    /// Two independent remedies are in force and this test covers both.
+    ///
+    /// 1. The allocation path is initialized by *writing* `T::default()` values.
+    ///    That is [`fill_default`], exercised here for a `Copy + Default` element
+    ///    type whose default is `0xDEAD_BEEF` over a region pre-poisoned with
+    ///    `0xAAAA_AAAA`. The poison is what makes the assertion meaningful: a
+    ///    `write_bytes(0)` implementation would produce `Probe(0)`, and an
+    ///    implementation that forgot to initialize at all would leave
+    ///    `Probe(0xAAAA_AAAA)`.
+    /// 2. The element-type set reaching that path is additionally sealed by
+    ///    `ZeroValid`, so a type like `Probe` cannot be requested through
+    ///    `AllocBuffer::try_zeroed` at all — the `compile_fail` doctest on
+    ///    `crate::stream::ZeroValid` pins that. The engines' own element types are
+    ///    checked below end-to-end through a hook that hands back a region
+    ///    pre-filled with `0xAA` bytes, so a missing initialization would be
+    ///    visible there too.
+    #[test]
+    fn foreign_buffer_initializes_elements_to_default_not_zero() {
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        struct Probe(u32);
+
+        impl Default for Probe {
+            fn default() -> Self {
+                Probe(0xDEAD_BEEF)
+            }
+        }
+
+        unsafe extern "C" fn dirty_zalloc(
+            _opaque: *mut c_void,
+            items: c_uint,
+            size: c_uint,
+        ) -> *mut c_void {
+            let bytes = (items as usize) * (size as usize);
+            let p = hook_backing_alloc(bytes);
+            if p.is_null() {
+                return p;
+            }
+            // Poison the region so an uninitialized or zero-filled result is
+            // distinguishable from a correctly `Default`-initialized one.
+            // SAFETY: `p` owns `bytes` writable bytes.
+            unsafe { ptr::write_bytes(p as *mut u8, 0xAA, bytes) };
+            p
+        }
+        unsafe extern "C" fn plain_zfree(_opaque: *mut c_void, address: *mut c_void) {
+            hook_backing_free(address);
+        }
+
+        // (1) The initializer writes values, not bytes — over a poisoned region.
+        let mut slots = [MaybeUninit::new(Probe(0xAAAA_AAAA)); 8];
+        crate::ffi::alloc::fill_default(&mut slots);
+        for slot in &slots {
+            // SAFETY: `fill_default` wrote a valid `Probe` into every slot above,
+            // and `Probe` is `Copy`, so reading one out leaves the slot intact.
+            let value = unsafe { slot.assume_init() };
+            assert_eq!(
+                value,
+                Probe::default(),
+                "every element must be initialized to T::default()"
+            );
+            assert_ne!(value, Probe(0), "a byte-zeroing fill must not pass");
+            assert_ne!(value, Probe(0xAAAA_AAAA), "the poison must be overwritten");
+        }
+
+        // (2) End-to-end through the safe entry point, for the sealed element
+        // types the engines actually request: they keep exact zero-fill parity
+        // with C `zcalloc` because their `Default` *is* the all-zero pattern, and
+        // the `0xAA` poison would be visible if the fill were skipped.
+        let hook = AllocHook::new(Some(dirty_zalloc), Some(plain_zfree), ptr::null_mut());
+        assert!(hook.is_active());
+
+        let bytes: AllocBuffer<u8> =
+            AllocBuffer::try_zeroed(24, hook).expect("healthy hook allocates");
+        assert!(
+            bytes.is_foreign(),
+            "an active hook must produce a Foreign arm"
+        );
+        assert_eq!(bytes.len(), 24);
+        assert!(bytes.iter().all(|&b| b == 0));
+        let words: AllocBuffer<u16> =
+            AllocBuffer::try_zeroed(12, hook).expect("healthy hook allocates");
+        assert!(words.iter().all(|&w| w == 0));
+        let longs: AllocBuffer<u32> =
+            AllocBuffer::try_zeroed(6, hook).expect("healthy hook allocates");
+        assert!(longs.iter().all(|&l| l == 0));
+    }
+
+    /// F4 geometry regression: `DeflateState::new_in` must present the caller's
+    /// `zalloc` with the same `(items, size)` argument pairs — and in the same
+    /// order — that C `deflateInit2_` passes.
+    ///
+    /// A bounded or inspecting allocator (`infcover.c`'s is the canonical
+    /// example) legitimately reads both arguments, so flattening every request to
+    /// `(byte_count, 1)` is an observable ABI difference even though the total
+    /// byte count is unchanged. C's sequence is the state
+    /// (`ZALLOC(strm, 1, sizeof(deflate_state))`, `deflate.c` L440) followed by
+    /// `pending_buf` `(lit_bufsize, LIT_BUFS)` (L505), `window` `(w_size, 2)`
+    /// (L458), `prev` `(w_size, sizeof(Pos))` (L459) and `head`
+    /// `(hash_size, sizeof(Pos))` (L460); this port additionally owns a separate
+    /// `sym_buf` shaped `(lit_bufsize, 3)` (AAP §0.4.1.3).
+    #[test]
+    fn deflate_new_in_presents_c_zalloc_geometry() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::constants::{Strategy, Z_DEFLATED};
+        use crate::deflate::state::DeflateState;
+
+        /// Recorded `(items, size)` pairs, in call order. Sized generously so an
+        /// unexpected extra allocation shows up as a count mismatch rather than
+        /// an overflow.
+        const CAP: usize = 12;
+        static COUNT: AtomicUsize = AtomicUsize::new(0);
+        static ITEMS: [AtomicUsize; CAP] = [const { AtomicUsize::new(0) }; CAP];
+        static SIZES: [AtomicUsize; CAP] = [const { AtomicUsize::new(0) }; CAP];
+
+        unsafe extern "C" fn recording_zalloc(
+            _opaque: *mut c_void,
+            items: c_uint,
+            size: c_uint,
+        ) -> *mut c_void {
+            let i = COUNT.fetch_add(1, Ordering::SeqCst);
+            if i < CAP {
+                ITEMS[i].store(items as usize, Ordering::SeqCst);
+                SIZES[i].store(size as usize, Ordering::SeqCst);
+            }
+            hook_backing_alloc((items as usize) * (size as usize))
+        }
+        unsafe extern "C" fn recording_zfree(_opaque: *mut c_void, address: *mut c_void) {
+            hook_backing_free(address);
+        }
+
+        let hook = AllocHook::new(
+            Some(recording_zalloc),
+            Some(recording_zfree),
+            ptr::null_mut(),
+        );
+
+        // Reference parameters: level 6, 15-bit window, mem level 8 — the zlib
+        // defaults, and the configuration `deflateInit_` produces.
+        let state = DeflateState::new_in(hook, 6, Z_DEFLATED, 15, 8, Strategy::Default, 1)
+            .expect("healthy hook initializes the state");
+
+        let w_size = 1usize << 15;
+        let hash_size = 1usize << (8 + 7);
+        let lit_bufsize = 1usize << (8 + 6);
+        let expected: [(usize, usize); 6] = [
+            (1, size_of::<DeflateState>()), // C: ZALLOC(strm, 1, sizeof(deflate_state))
+            (lit_bufsize, 4),               // C: ZALLOC(strm, s->lit_bufsize, LIT_BUFS)
+            (w_size, 2),                    // C: ZALLOC(strm, s->w_size, 2 * sizeof(Byte))
+            (w_size, 2),                    // C: ZALLOC(strm, s->w_size, sizeof(Pos))
+            (hash_size, 2),                 // C: ZALLOC(strm, s->hash_size, sizeof(Pos))
+            (lit_bufsize, 3),               // this port's owned symbol buffer
+        ];
+
+        let observed = COUNT.load(Ordering::SeqCst);
+        assert_eq!(
+            observed,
+            expected.len(),
+            "deflateInit2_ must make exactly {} hook allocations",
+            expected.len()
+        );
+        for (i, &(items, size)) in expected.iter().enumerate() {
+            assert_eq!(
+                (
+                    ITEMS[i].load(Ordering::SeqCst),
+                    SIZES[i].load(Ordering::SeqCst)
+                ),
+                (items, size),
+                "hook allocation #{i} must be ({items}, {size}) as C passes it"
+            );
+        }
+
+        // Sanity: the byte totals still match the buffer geometry.
+        assert_eq!(state.pending_buf.len(), lit_bufsize * 4);
+        assert_eq!(state.window.len(), 2 * w_size);
+        assert_eq!(state.prev.len(), w_size);
+        assert_eq!(state.head.len(), hash_size);
+        assert_eq!(state.sym_buf.len(), lit_bufsize * 3);
+    }
+
+    /// F2 regression: `deflateCopy` must duplicate the state through the *same*
+    /// allocator and report an out-of-memory refusal, never silently relocate the
+    /// copy into the Rust global heap.
+    ///
+    /// C `deflateCopy` allocates the destination state and buffers through the
+    /// source stream's `zalloc` and returns `Z_MEM_ERROR` if any of them fails
+    /// (`deflate.c` L1317-L1377). The infallible `AllocBuffer: Clone` cannot
+    /// express that, so the copy path uses `DeflateState::try_copy`. This test
+    /// initializes a state through a healthy hook, checks the copy stays inside
+    /// the caller's arena, then makes the hook refuse and requires the copy to
+    /// fail rather than escape (AAP §0.6.5).
+    #[test]
+    fn deflate_try_copy_preserves_allocator_and_reports_oom() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+
+        use crate::constants::{Strategy, Z_DEFLATED};
+        use crate::deflate::state::DeflateState;
+
+        static REFUSE: AtomicBool = AtomicBool::new(false);
+
+        unsafe extern "C" fn flaky_zalloc(
+            _opaque: *mut c_void,
+            items: c_uint,
+            size: c_uint,
+        ) -> *mut c_void {
+            if REFUSE.load(Ordering::SeqCst) {
+                return ptr::null_mut();
+            }
+            hook_backing_alloc((items as usize) * (size as usize))
+        }
+        unsafe extern "C" fn flaky_zfree(_opaque: *mut c_void, address: *mut c_void) {
+            hook_backing_free(address);
+        }
+
+        let hook = AllocHook::new(Some(flaky_zalloc), Some(flaky_zfree), ptr::null_mut());
+
+        // Small geometry (9-bit window, mem level 1) keeps the test cheap.
+        let state = DeflateState::new_in(hook, 6, Z_DEFLATED, 9, 1, Strategy::Default, 1)
+            .expect("healthy hook initializes the state");
+        assert!(state.window.is_foreign());
+
+        {
+            let copy = state
+                .try_copy()
+                .expect("healthy hook duplicates the state and its buffers");
+            assert!(
+                copy.window.is_foreign()
+                    && copy.prev.is_foreign()
+                    && copy.head.is_foreign()
+                    && copy.pending_buf.is_foreign()
+                    && copy.sym_buf.is_foreign()
+                    && copy.state_alloc.is_foreign(),
+                "every buffer of the copy must stay in the caller's arena"
+            );
+            assert_eq!(copy.window.len(), state.window.len());
+            assert_eq!(&copy.window[..], &state.window[..]);
+        } // <- the copy's buffers are released through the caller's `zfree`
+
+        // Now make the caller's allocator refuse: the copy must fail instead of
+        // returning a state whose buffers escaped into the global heap.
+        REFUSE.store(true, Ordering::SeqCst);
+        assert!(
+            state.try_copy().is_none(),
+            "an allocator refusal during deflateCopy must surface as Z_MEM_ERROR"
+        );
+        REFUSE.store(false, Ordering::SeqCst);
     }
 
     /// `zstream_with_caller_alloc` produces a `ZStream<CAllocator>` carrying the

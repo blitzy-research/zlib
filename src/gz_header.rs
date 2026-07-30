@@ -38,8 +38,18 @@
 //!
 //! * **No trailing NUL.** The gzip file format terminates the `name` and
 //!   `comment` fields with a zero byte (RFC 1952 §2.3.1). [`GzHeader`] stores
-//!   the payload bytes *without* that terminating NUL; the FFI layer appends it
-//!   when materializing a C string and strips it when parsing one.
+//!   the payload bytes *without* that terminating NUL. Two distinct consumers
+//!   restore it, and they must not be confused:
+//!   * **Writing a gzip stream.** The deflate encoder's `Name` and `Comment`
+//!     header phases (`src/deflate/mod.rs`) emit the stored bytes and then a
+//!     `0` past their end, reproducing C's "copy the C string including its
+//!     terminator" loop. Termination of the *wire format* is the encoder's job.
+//!   * **Converting a C `gz_header`.** The FFI boundary (`src/ffi/types.rs`)
+//!     translates between this owned type and the caller's raw `Bytef *`
+//!     fields: it reads a caller pointer as a NUL-terminated C string and
+//!     drops the terminator, and when writing back into a caller-supplied
+//!     buffer it NUL-terminates within `name_max`/`comm_max`. That is C-string
+//!     marshalling, not gzip framing.
 //! * **`done` is a `bool` here.** The C field is tri-state: `inflateGetHeader`
 //!   sets it to `1` when the header is fully parsed and to `-1` when the stream
 //!   turns out to be a raw zlib stream with no gzip header. That `-1` sentinel
@@ -127,10 +137,27 @@ pub struct GzHeader {
 
     /// Operating-system code (gzip `OS`, RFC 1952 §2.3.1).
     ///
-    /// Mirrors C `gz_header.os`. The value `255` denotes "unknown". When a gzip
-    /// header is written without an explicit `os`, reference zlib emits the
-    /// code for the current operating system; when the OS is unspecified,
-    /// `255` is the conventional choice.
+    /// Mirrors C `gz_header.os`. RFC 1952 reserves the value `255` for
+    /// "unknown".
+    ///
+    /// Three cases determine what actually reaches the wire:
+    ///
+    /// * **No header installed.** With no `deflateSetHeader` call the encoder
+    ///   writes [`crate::util::OS_CODE`], the platform value C's `zutil.h`
+    ///   cascade selects for the same target — `10` on Windows, `19` on Apple,
+    ///   `3` (Unix) everywhere else. Reference zlib writes exactly the same byte
+    ///   on the same platform, so this is what keeps gzip output byte-identical;
+    ///   a hard-coded `3` would diverge from a Windows- or macOS-built `libz`.
+    /// * **A header installed.** The encoder writes the low byte of this field
+    ///   verbatim (`os & 0xff`), whatever it holds.
+    /// * **A default-constructed header.** [`GzHeader::new`] and
+    ///   [`GzHeader::default`] leave this field at `0`, so installing one
+    ///   unmodified emits `0` (FAT filesystem / MS-DOS), *not* `3` and not
+    ///   `255`. Call [`with_os`](GzHeader::with_os) to choose deliberately —
+    ///   `with_os(255)` for "unknown".
+    ///
+    /// When *reading* a header, `inflateGetHeader` stores whatever byte the
+    /// stream carried.
     pub os: i32,
 
     /// Optional gzip "extra" subfield block (`FEXTRA`, RFC 1952).
@@ -271,8 +298,10 @@ impl GzHeader {
 
     /// Sets the file [`name`](GzHeader::name) and returns the updated header.
     ///
-    /// The provided bytes should **not** include a trailing NUL terminator;
-    /// the FFI layer appends one when serializing to the gzip format.
+    /// The provided bytes should **not** include a trailing NUL terminator; the
+    /// deflate encoder appends the RFC 1952 terminator when it writes the gzip
+    /// header (and the FFI boundary appends one when marshalling this field
+    /// back into a caller's C `gz_header` buffer).
     ///
     /// # Examples
     ///
@@ -291,8 +320,10 @@ impl GzHeader {
 
     /// Sets the [`comment`](GzHeader::comment) and returns the updated header.
     ///
-    /// The provided bytes should **not** include a trailing NUL terminator;
-    /// the FFI layer appends one when serializing to the gzip format.
+    /// The provided bytes should **not** include a trailing NUL terminator; the
+    /// deflate encoder appends the RFC 1952 terminator when it writes the gzip
+    /// header (and the FFI boundary appends one when marshalling this field
+    /// back into a caller's C `gz_header` buffer).
     ///
     /// # Examples
     ///

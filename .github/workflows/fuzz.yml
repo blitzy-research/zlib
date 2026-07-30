@@ -13,13 +13,61 @@
 #   *nightly* toolchain: it relies on `-Z` sanitizer / coverage instrumentation
 #   that is not available on stable.
 #
+#   EVERY cargo invocation below says `+nightly` explicitly, and that is load
+#   bearing. Installing nightly is not the same as selecting it: the repository
+#   root carries a `rust-toolchain.toml` pinning `channel = "1.85.0"`, rustup
+#   resolves a toolchain file (precedence rank 4) BEFORE the default toolchain
+#   (rank 5) that `dtolnay/rust-toolchain` sets, and cargo-fuzz resolves its
+#   toolchain from the repository root even though `fuzz/` is a detached
+#   workspace -- so an unprefixed `cargo fuzz build` here would run the pinned
+#   MSRV and fail with "the option `Z` is only accepted on the nightly
+#   compiler". The `+nightly` shorthand is rank 1, the highest precedence there
+#   is, so it wins over the toolchain file, over any directory override, and
+#   over `RUSTUP_TOOLCHAIN`. Local runs need the same prefix, for the same
+#   reason; see the header of `fuzz/Cargo.toml` and the "VERSION RESOLUTION"
+#   section of `rust-toolchain.toml`.
+#
 #   The in-repo `fuzz/` crate is a DETACHED workspace (it carries its own
 #   `[workspace]` table, so root `cargo build`/`test`/`clippy`/`fmt` never touch
 #   it). It ships five libFuzzer targets: `fuzz_inflate`,
 #   `fuzz_deflate_roundtrip`, `fuzz_gzip`, `fuzz_checksum`, and
-#   `fuzz_ffi_roundtrip`. The job below builds all of them and then fuzzes each
-#   for a bounded budget; a discovered crash/timeout writes a reproducer under
-#   `fuzz/artifacts` and fails the pipeline.
+#   `fuzz_ffi_roundtrip`. The `cargo-fuzz` job below builds all of them and then
+#   fuzzes each for a bounded budget; a discovered crash/timeout writes a
+#   reproducer under `fuzz/artifacts` and fails the pipeline.
+#
+# TOOLCHAIN SELECTION - THIS WORKFLOW MUST OPT OUT OF THE REPOSITORY PIN
+# ======================================================================
+#   `rust-toolchain.toml` at the repository root pins `channel = "1.85.0"` (the
+#   MSRV floor). That is a rustup DIRECTORY-FILE override, which outranks the
+#   `rustup default` that `dtolnay/rust-toolchain` sets - and it is discovered by
+#   walking UP from the current directory, so it reaches the detached `fuzz/`
+#   workspace too.
+#
+#   Installing `@nightly` is therefore not sufficient on its own: a bare
+#   `cargo fuzz build` in this repository resolves to 1.85.0 and fails before any
+#   fuzzing happens, because cargo-fuzz injects nightly-only `-Z` sanitizer and
+#   coverage flags that a stable/MSRV compiler rejects ("... 1 nightly option
+#   were parsed"). The same applies to `cargo install cargo-fuzz`.
+#
+#   The `cargo-fuzz` job below therefore sets `RUSTUP_TOOLCHAIN: nightly` at job
+#   level - rustup override rank 2, which beats the directory file at rank 4 and
+#   is inherited by the nested `cargo build` invocations that cargo-fuzz spawns -
+#   and then ASSERTS the toolchain it got before building anything. Do NOT fix
+#   this by deleting the pin or by pointing `channel` at nightly: the first
+#   reopens the local/CI MSRV asymmetry, and the second would make every
+#   contributor build the library on an unstable compiler.
+#
+# SUPPLY-CHAIN GATE
+# =================
+#   `fuzz/Cargo.lock` pins 13 packages that the ROOT `cargo deny check` never
+#   resolves, precisely because `fuzz/` is a detached workspace - and the root
+#   policy would (correctly) reject four of them, since the harness legitimately
+#   needs a C-toolchain build dependency (`cc`, for the libFuzzer runtime shim)
+#   and an NCSA-licensed `libfuzzer-sys`, neither of which the crate proper may
+#   ever acquire. Those 13 are governed by the dedicated sibling policy
+#   `fuzz/deny.toml`, and the `supply-chain` job below enforces it. `cargo-fuzz`
+#   `needs:` that job, so the harnesses are only ever built from an audited
+#   dependency graph.
 
 name: Fuzz
 
@@ -46,9 +94,63 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Supply-chain audit of the DETACHED fuzz dependency graph, governed by
+  # `fuzz/deny.toml`. Runs on stable (cargo-deny is an ordinary Rust program and
+  # has no use for nightly) and gates the fuzzing job below.
+  supply-chain:
+    name: cargo-deny (fuzz workspace)
+    runs-on: ubuntu-latest
+    # Stable, not the MSRV floor pinned by rust-toolchain.toml: cargo-deny's own
+    # MSRV is its business, not this project's.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Assert active toolchain is stable
+        run: |
+          active="$(rustup show active-toolchain)"
+          echo "active-toolchain: ${active}"
+          rustc --version
+          case "${active}" in
+            stable-*) ;;
+            *) echo "::error::expected the stable toolchain (RUSTUP_TOOLCHAIN=stable); got '${active}'"; exit 1 ;;
+          esac
+
+      # `--locked` keeps the install reproducible against cargo-deny's own
+      # lockfile, matching the cargo-fuzz install idiom below.
+      - name: Install cargo-deny
+        run: cargo +stable install cargo-deny --locked
+
+      # cargo-deny resolves its configuration from the TARGET manifest's
+      # workspace root. `fuzz/` is its own workspace, so `fuzz/deny.toml` is
+      # discovered automatically and the root `deny.toml` is not consulted - no
+      # `--config` flag is needed or wanted here.
+      - name: Audit the fuzz dependency graph
+        run: cargo +stable deny --manifest-path fuzz/Cargo.toml check
+
   cargo-fuzz:
     name: cargo-fuzz (libFuzzer)
     runs-on: ubuntu-latest
+    # Do not fuzz an unaudited dependency graph.
+    needs: supply-chain
+    # MANDATORY. `rust-toolchain.toml` pins `channel = "1.85.0"`, and a toolchain
+    # FILE is overridden only by the `RUSTUP_TOOLCHAIN` environment variable — so
+    # this must be set explicitly. Installing nightly with
+    # `dtolnay/rust-toolchain@nightly` does NOT change which toolchain an
+    # unqualified `cargo` resolves to (rustup override rank 4 beats the `rustup
+    # default` the toolchain action sets); without this, `cargo install
+    # cargo-fuzz`, `cargo fuzz build`, and `cargo fuzz run` would all execute on
+    # 1.85.0 and fail, because cargo-fuzz needs the nightly `-Z` sanitizer flags
+    # (it reports "1 nightly option were parsed"). Setting it at JOB level also
+    # covers the nested `cargo build` invocations cargo-fuzz spawns. See
+    # "TOOLCHAIN SELECTION" in the header.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       # 1. Fetch the crate sources.
       - name: Checkout repository
@@ -59,17 +161,35 @@ jobs:
       - name: Install Rust nightly toolchain
         uses: dtolnay/rust-toolchain@nightly
 
+      # 2a. Fail loudly if the nightly override is ever lost — if anything
+      #     re-routes this job onto stable or the MSRV floor — instead of
+      #     discovering it as an opaque `-Z` parse error part-way through the
+      #     build.
+      - name: Verify the resolved toolchain is nightly
+        run: |
+          set -euo pipefail
+          rustc --version --verbose
+          cargo --version
+          active="$(rustup show active-toolchain)"
+          echo "active toolchain: $active"
+          case "$active" in
+            nightly-*) ;;
+            *) echo "::error::cargo-fuzz requires nightly (RUSTUP_TOOLCHAIN=nightly), but resolved '$active'."\
+               " The RUSTUP_TOOLCHAIN override was lost and rust-toolchain.toml won."; exit 1 ;;
+          esac
+
       # 3. Install the cargo-fuzz subcommand (the libFuzzer front-end).
       #    `--locked` keeps the install reproducible against cargo-fuzz's own
-      #    lockfile.
+      #    lockfile. Built with nightly so the installed binary matches the
+      #    toolchain it will drive.
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo +nightly install cargo-fuzz --locked
 
       # 4. Build every fuzz target first. This compiles all libFuzzer harnesses
       #    and fails fast on any build error before fuzzing begins. cargo-fuzz
       #    auto-detects the `fuzz/` crate at the repository root.
       - name: Build fuzz targets
-        run: cargo fuzz build
+        run: cargo +nightly fuzz build
 
       # 5. Fuzz each target for a bounded budget. `cargo fuzz list` is captured
       #    ONCE into a variable (avoids a `| head` SIGPIPE under the default
@@ -79,11 +199,11 @@ jobs:
       #    RSS) so the scheduled/PR run stays fast and deterministic.
       - name: Run bounded fuzzing (all targets)
         run: |
-          targets="$(cargo fuzz list)"
+          targets="$(cargo +nightly fuzz list)"
           echo "Fuzz targets: ${targets}"
           for target in ${targets}; do
             echo "::group::Fuzzing ${target}"
-            cargo fuzz run "${target}" -- \
+            cargo +nightly fuzz run "${target}" -- \
               -max_total_time=60 -max_len=65536 -rss_limit_mb=2048
             echo "::endgroup::"
           done

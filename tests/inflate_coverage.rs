@@ -1052,3 +1052,116 @@ fn mem_limit_forces_mem_error() {
         assert_eq!(end, ReturnCode::Ok.as_c_int(), "inflateEnd must succeed");
     }
 }
+
+/// `inflateCopy` must allocate the destination through the **source stream's**
+/// allocator and report `Z_MEM_ERROR` when that allocator refuses — it must never
+/// quietly relocate the copy into the Rust global heap.
+///
+/// Reference zlib allocates the destination state (and window) with
+/// `ZALLOC(source, ...)` and returns `Z_MEM_ERROR` on failure, freeing whatever it
+/// already obtained (`inflate.c` L1340-L1350). A caller who installed a bounded
+/// allocator therefore observes the copy failing once its budget is spent. This
+/// test pins both directions with the same capped allocator used above:
+///
+/// 1. **Budget for two states** — the copy succeeds and both streams can be
+///    torn down through the caller's `zfree`.
+/// 2. **Budget for one state** — the copy fails with `Z_MEM_ERROR` and installs
+///    nothing on the destination.
+#[test]
+fn inflate_copy_honors_the_caller_allocator_budget() {
+    const STATE_SIZE: usize = core::mem::size_of::<zlib_rs::inflate::InflateState>();
+
+    /// Initializes `strm` as a raw 8-bit-window inflate stream on `cap`.
+    ///
+    /// # Safety
+    ///
+    /// `strm` must be a valid, caller-owned `z_stream` and `cap` must outlive
+    /// every inflate call made on `strm`.
+    unsafe fn init_on(strm: &mut z_stream, cap: &MemCap) -> c_int {
+        strm.zalloc = Some(cap_alloc);
+        strm.zfree = Some(cap_free);
+        strm.opaque = (cap as *const MemCap) as *mut c_void;
+        // SAFETY: the caller guarantees `strm` is a valid `z_stream` with a live
+        // capped allocator; `c"1"` matches the library's major version byte and
+        // the reported size is the true `sizeof(z_stream)`.
+        unsafe {
+            inflateInit2_(
+                strm,
+                -8,
+                c"1".as_ptr(),
+                core::mem::size_of::<z_stream>() as c_int,
+            )
+        }
+    }
+
+    // --- Scenario 1: budget for two states => the copy succeeds ---------------
+    {
+        let cap = MemCap {
+            budget: core::cell::Cell::new(2 * STATE_SIZE),
+        };
+        let mut src = zeroed_stream();
+        // SAFETY: `src` is a live local `z_stream` and `cap` outlives it.
+        let src_rc = unsafe { init_on(&mut src, &cap) };
+        assert_eq!(
+            src_rc,
+            ReturnCode::Ok.as_c_int(),
+            "the source stream must initialize within budget"
+        );
+
+        let mut dst = zeroed_stream();
+        // SAFETY: both pointers are live, caller-owned `z_stream`s; `src` holds a
+        // valid inflate state and `dst` holds none yet.
+        let rc = unsafe { inflateCopy(&mut dst, &mut src) };
+        assert_eq!(
+            rc,
+            ReturnCode::Ok.as_c_int(),
+            "a budget covering a second state must let inflateCopy succeed"
+        );
+        assert!(!dst.state.is_null(), "a successful copy installs a state");
+        assert!(dst.zalloc.is_some(), "the copy inherits the allocator");
+
+        // SAFETY: both streams hold states installed by the calls above.
+        let dst_end_rc = unsafe { inflateEnd(&mut dst) };
+        assert_eq!(
+            dst_end_rc,
+            ReturnCode::Ok.as_c_int(),
+            "the copy must tear down cleanly"
+        );
+        // SAFETY: as above.
+        assert_eq!(unsafe { inflateEnd(&mut src) }, ReturnCode::Ok.as_c_int());
+    }
+
+    // --- Scenario 2: budget for one state => the copy reports Z_MEM_ERROR -----
+    {
+        let cap = MemCap {
+            // Exactly one state: after the source initializes, nothing is left,
+            // so the destination's state reservation cannot be obtained.
+            budget: core::cell::Cell::new(STATE_SIZE),
+        };
+        let mut src = zeroed_stream();
+        // SAFETY: `src` is a live local `z_stream` and `cap` outlives it.
+        let src_rc = unsafe { init_on(&mut src, &cap) };
+        assert_eq!(
+            src_rc,
+            ReturnCode::Ok.as_c_int(),
+            "the source stream must still initialize within budget"
+        );
+
+        let mut dst = zeroed_stream();
+        // SAFETY: both pointers are live, caller-owned `z_stream`s.
+        let rc = unsafe { inflateCopy(&mut dst, &mut src) };
+        assert_eq!(
+            rc,
+            ReturnCode::MemError.as_c_int(),
+            "an exhausted caller allocator must make inflateCopy return Z_MEM_ERROR \
+             instead of relocating the copy into the global heap",
+        );
+        assert!(
+            dst.state.is_null(),
+            "a failed copy must not install a state on the destination"
+        );
+
+        // SAFETY: `src` still holds the state installed by `init_on`.
+        assert_eq!(unsafe { inflateEnd(&mut src) }, ReturnCode::Ok.as_c_int());
+    }
+}

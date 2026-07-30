@@ -17,11 +17,63 @@
 #   lint          rustfmt + clippy (-D warnings)
 #   msrv          build + check on the pinned MSRV toolchain (1.85.0)
 #   benches       compile-only check of the criterion benchmarks
+#   unsafe-boundary  blocking guard that `unsafe` stays inside src/ffi/** and the
+#                 src/lib.rs no_std runtime block (User Constraint 3)
 #
 # Action versions are standardized on @v4 across this repository's Cargo CI.
 # No native toolchain is required: the `flate2` dev-dependency resolves to its
 # pure-Rust miniz_oxide backend, so the interop tests compile without any
 # native library dependency.
+#
+# TOOLCHAIN SELECTION - EVERY JOB SAYS WHICH COMPILER IT MEANS, TWICE
+# ==================================================================
+# `rust-toolchain.toml` at the repository root pins `channel = "1.85.0"` (the
+# MSRV floor) so that a contributor's FIRST local build exercises the declared
+# MSRV instead of whatever stable they happen to have installed.
+#
+# That pin is a rustup DIRECTORY-FILE override at precedence rank 4, and it
+# outranks `rustup default` at rank 5 - which is exactly what
+# `dtolnay/rust-toolchain` sets. The action runs
+# `rustup toolchain install <ref> --profile minimal --no-self-update` followed by
+# `rustup default <ref>`; it does NOT export `RUSTUP_TOOLCHAIN`. So INSTALLING a
+# toolchain is not the same as SELECTING it: installing `@stable` leaves a bare
+# `cargo build` in this repository resolving to 1.85.0. Measured locally, from
+# this repository root:
+#
+#     rustup default                -> stable-x86_64-unknown-linux-gnu
+#     rustup show active-toolchain  -> 1.85.0-x86_64-unknown-linux-gnu
+#                                     (overridden by '.../rust-toolchain.toml')
+#
+# Rank 4 beating rank 5 is observable, not theoretical. Left unaddressed it
+# silently demotes `build-test`, `no-std-tests`, `lint`, `benches`,
+# `build-script-tests`, and `unsafe-boundary` from current-stable coverage to
+# MSRV coverage, duplicating the `msrv` job and leaving current stable untested -
+# and `lint` would gate on a clippy release this project does not gate on.
+#
+# Every job below therefore states its intent TWICE, and the two can never
+# disagree because they name the same channel:
+#
+#   1. A job-level `env: RUSTUP_TOOLCHAIN` (rank 2). This is what reaches NESTED
+#      cargo invocations - a subcommand that shells out to `cargo` inherits it -
+#      so a step added later cannot quietly fall back to the pin, and it governs
+#      the `rustup` and bare-`rustc` calls that carry no `+toolchain` shorthand.
+#   2. A `+stable` / `+1.85.0` shorthand on every `cargo` and `rustc` invocation
+#      (rank 1, the highest precedence there is). Rank 1 wins over the toolchain
+#      file, over any directory override, and over `RUSTUP_TOOLCHAIN` itself, and
+#      it is visible in the CI log right next to the command it governs.
+#
+# Keep both in step with the `@<ref>` the job installs: `@stable` -> `stable` /
+# `+stable`, `@1.85.0` -> `1.85.0` / `+1.85.0`.
+#
+# Each job then ASSERTS the toolchain it got before doing any work, so a future
+# change to the pin, the action, or rustup's precedence rules fails loudly
+# instead of silently changing what is being tested. Those verification steps
+# deliberately invoke BARE `rustc` and `rustup` - never `rustc +stable` - because
+# their whole purpose is to observe the AMBIENT resolution that rank 2 produces.
+# Prefixing them would make the assertion vacuous. Do NOT "simplify" this by
+# deleting the pin from `rust-toolchain.toml` - that reopens the local/CI
+# asymmetry the pin exists to close. The rationale is recorded once more, in the
+# "VERSION RESOLUTION" section of `rust-toolchain.toml`.
 name: CI
 on: [push, pull_request]
 jobs:
@@ -30,6 +82,16 @@ jobs:
   build-test:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    # Current stable, not the MSRV floor pinned by rust-toolchain.toml. See
+    # "TOOLCHAIN SELECTION" in the header.
+    # `rust-toolchain.toml` pins `channel = "1.85.0"` for local builds. A rustup
+    # toolchain FILE is overridden by the `RUSTUP_TOOLCHAIN` environment
+    # variable, so this job must set it explicitly: installing a toolchain with
+    # `dtolnay/rust-toolchain@<channel>` does NOT change which toolchain an
+    # unqualified `cargo` resolves to. Without this, every step below would run
+    # on 1.85.0 regardless of the label above.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     strategy:
       fail-fast: false
       matrix:
@@ -68,13 +130,31 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
       with:
         components: clippy, rustfmt
+    # `rust-toolchain.toml` pins this repository to the MSRV floor, and that
+    # repository pin OUTRANKS the `rustup default` that the toolchain action
+    # above sets. The job-level `RUSTUP_TOOLCHAIN` env var is a higher-priority
+    # override, so it is what actually selects current stable here. This step fails the
+    # job if that override is ever lost, rather than letting the gate silently
+    # run on the wrong compiler.
+    - name: Verify the resolved toolchain is stable
+      run: |
+        set -euo pipefail
+        rustc --version --verbose
+        cargo --version
+        active="$(rustup show active-toolchain)"
+        echo "active toolchain: $active"
+        case "$active" in
+          stable-*) ;;
+          *) echo "::error::expected the stable toolchain, but resolved '$active'."\
+             " The RUSTUP_TOOLCHAIN override was lost and rust-toolchain.toml won."; exit 1 ;;
+        esac
     - name: Build (debug)
-      run: cargo build --verbose ${{ matrix.features }}
+      run: cargo +stable build --verbose ${{ matrix.features }}
     - name: Build (release)
-      run: cargo build --release --verbose ${{ matrix.features }}
+      run: cargo +stable build --release --verbose ${{ matrix.features }}
     - name: Test
       if: ${{ matrix.test }}
-      run: cargo test --verbose ${{ matrix.features }}
+      run: cargo +stable test --verbose ${{ matrix.features }}
     - name: Upload build logs
       uses: actions/upload-artifact@v4
       if: failure()
@@ -99,20 +179,64 @@ jobs:
   no-std-tests:
     name: no_std tests
     runs-on: ubuntu-latest
+    # Current stable, not the MSRV floor pinned by rust-toolchain.toml. See
+    # "TOOLCHAIN SELECTION" in the header.
+    # `rust-toolchain.toml` pins `channel = "1.85.0"` for local builds. A rustup
+    # toolchain FILE is overridden by the `RUSTUP_TOOLCHAIN` environment
+    # variable, so this job must set it explicitly: installing a toolchain with
+    # `dtolnay/rust-toolchain@<channel>` does NOT change which toolchain an
+    # unqualified `cargo` resolves to. Without this, every step below would run
+    # on 1.85.0 regardless of the label above.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
     - name: Install Rust stable toolchain
       uses: dtolnay/rust-toolchain@stable
+    # `rust-toolchain.toml` pins this repository to the MSRV floor, and that
+    # repository pin OUTRANKS the `rustup default` that the toolchain action
+    # above sets. The job-level `RUSTUP_TOOLCHAIN` env var is a higher-priority
+    # override, so it is what actually selects current stable here. This step fails the
+    # job if that override is ever lost, rather than letting the gate silently
+    # run on the wrong compiler.
+    - name: Verify the resolved toolchain is stable
+      run: |
+        set -euo pipefail
+        rustc --version --verbose
+        active="$(rustup show active-toolchain)"
+        echo "active toolchain: $active"
+        case "$active" in
+          stable-*) ;;
+          *) echo "::error::expected the stable toolchain, but resolved '$active'."\
+             " The RUSTUP_TOOLCHAIN override was lost and rust-toolchain.toml won."; exit 1 ;;
+        esac
     - name: Test (no default features)
-      run: cargo test --no-default-features
+      run: cargo +stable test --no-default-features
     - name: Test (no-std feature)
-      run: cargo test --no-default-features --features no-std
+      run: cargo +stable test --no-default-features --features no-std
 
   # Formatting and linting. Clippy runs with warnings promoted to errors.
+  #
+  # This job is the reason the explicit selection below is mandatory rather than
+  # merely tidy, and the `+stable` prefixes are what make it a CURRENT-STABLE
+  # gate: clippy's lint SET is not stable across releases, so `-D warnings` on an
+  # older clippy can reintroduce diagnostics upstream has since withdrawn. This
+  # job must therefore run the clippy the project actually gates on, not whatever
+  # clippy ships with the MSRV pin in `rust-toolchain.toml`. The MSRV contract
+  # this project actually defines is `cargo build` + `cargo check --all-targets`,
+  # which is what the `msrv` job below runs - deliberately never clippy.
   lint:
     name: Lint (clippy + rustfmt)
     runs-on: ubuntu-latest
+    # `rust-toolchain.toml` pins `channel = "1.85.0"` for local builds. A rustup
+    # toolchain FILE is overridden by the `RUSTUP_TOOLCHAIN` environment
+    # variable, so this job must set it explicitly: installing a toolchain with
+    # `dtolnay/rust-toolchain@<channel>` does NOT change which toolchain an
+    # unqualified `cargo` resolves to. Without this, every step below would run
+    # on 1.85.0 regardless of the label above.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -120,26 +244,82 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
       with:
         components: clippy, rustfmt
+    # `rust-toolchain.toml` pins this repository to the MSRV floor, and that
+    # repository pin OUTRANKS the `rustup default` that the toolchain action
+    # above sets. The job-level `RUSTUP_TOOLCHAIN` env var is a higher-priority
+    # override, so it is what actually selects current stable here. This step fails the
+    # job if that override is ever lost, rather than letting the gate silently
+    # run on the wrong compiler.
+    - name: Verify the resolved toolchain is stable
+      run: |
+        set -euo pipefail
+        rustc --version --verbose
+        cargo fmt --version
+        cargo clippy --version
+        active="$(rustup show active-toolchain)"
+        echo "active toolchain: $active"
+        case "$active" in
+          stable-*) ;;
+          *) echo "::error::expected the stable toolchain, but resolved '$active'."\
+             " The RUSTUP_TOOLCHAIN override was lost and rust-toolchain.toml won."; exit 1 ;;
+        esac
     - name: Format check
-      run: cargo fmt --all -- --check
+      run: cargo +stable fmt --all -- --check
     - name: Clippy
-      run: cargo clippy --all-targets -- -D warnings
+      run: cargo +stable clippy --all-targets -- -D warnings
 
   # Minimum Supported Rust Version gate: pins the toolchain to 1.85.0 (the
   # release that stabilized the 2024 edition) and verifies the crate builds and
   # type-checks across all targets on that exact version.
+  #
+  # Three places state this version and they must move together: the `@1.85.0`
+  # install ref and the `+1.85.0` prefixes here, `channel` in
+  # `rust-toolchain.toml`, and `rust-version` in `Cargo.toml`. The prefix is
+  # explicit even though the toolchain file happens to select the same compiler,
+  # so this job verifies the version it is named after rather than whatever the
+  # pin currently says. Note the scope: build and type-check only. Clippy is
+  # NOT run here -- see the `lint` job above.
   msrv:
     name: MSRV 1.85.0
     runs-on: ubuntu-latest
+    # The ONE job that intentionally runs on the floor. Set explicitly rather
+    # than relying on `rust-toolchain.toml` happening to hold the same value:
+    # this job's guarantee is "the crate builds on exactly the declared MSRV", so
+    # the version it runs must be stated here. The two now corroborate each other
+    # rather than one silently standing in for the other, so raising the MSRV means
+    # changing three places in the same commit: this value, `channel` in
+    # `rust-toolchain.toml`, and `rust-version` in `Cargo.toml`.
+    env:
+      # Unquoted deliberately: YAML parses this to the same string either way,
+      # and the crate-root CI-contract test greps for the literal
+      # `RUSTUP_TOOLCHAIN: 1.85.0`.
+      RUSTUP_TOOLCHAIN: 1.85.0
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
     - name: Install Rust 1.85.0 toolchain
       uses: dtolnay/rust-toolchain@1.85.0
+    # `rust-toolchain.toml` pins this repository to the MSRV floor, and that
+    # repository pin OUTRANKS the `rustup default` that the toolchain action
+    # above sets. The job-level `RUSTUP_TOOLCHAIN` env var is a higher-priority
+    # override, so it is what actually selects the pinned MSRV floor here. This step fails the
+    # job if that override is ever lost, rather than letting the gate silently
+    # run on the wrong compiler.
+    - name: Verify the resolved toolchain is 1.85.0
+      run: |
+        set -euo pipefail
+        rustc --version --verbose
+        active="$(rustup show active-toolchain)"
+        echo "active toolchain: $active"
+        case "$active" in
+          1.85.0-*) ;;
+          *) echo "::error::expected the 1.85.0 toolchain, but resolved '$active'."\
+             " The RUSTUP_TOOLCHAIN override was lost and rust-toolchain.toml won."; exit 1 ;;
+        esac
     - name: Build with MSRV
-      run: cargo build --verbose
+      run: cargo +1.85.0 build --verbose
     - name: Check all targets with MSRV
-      run: cargo check --verbose --all-targets
+      run: cargo +1.85.0 check --verbose --all-targets
 
   # Benchmark compile check: ensures the three criterion benches
   # (deflate_bench, inflate_bench, checksum_bench; all harness = false) compile
@@ -147,10 +327,220 @@ jobs:
   benches:
     name: Bench compile
     runs-on: ubuntu-latest
+    # Current stable, not the MSRV floor pinned by rust-toolchain.toml. See
+    # "TOOLCHAIN SELECTION" in the header.
+    # `rust-toolchain.toml` pins `channel = "1.85.0"` for local builds. A rustup
+    # toolchain FILE is overridden by the `RUSTUP_TOOLCHAIN` environment
+    # variable, so this job must set it explicitly: installing a toolchain with
+    # `dtolnay/rust-toolchain@<channel>` does NOT change which toolchain an
+    # unqualified `cargo` resolves to. Without this, every step below would run
+    # on 1.85.0 regardless of the label above.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
     - name: Install Rust stable toolchain
       uses: dtolnay/rust-toolchain@stable
+    # `rust-toolchain.toml` pins this repository to the MSRV floor, and that
+    # repository pin OUTRANKS the `rustup default` that the toolchain action
+    # above sets. The job-level `RUSTUP_TOOLCHAIN` env var is a higher-priority
+    # override, so it is what actually selects current stable here. This step fails the
+    # job if that override is ever lost, rather than letting the gate silently
+    # run on the wrong compiler.
+    - name: Verify the resolved toolchain is stable
+      run: |
+        set -euo pipefail
+        rustc --version --verbose
+        active="$(rustup show active-toolchain)"
+        echo "active toolchain: $active"
+        case "$active" in
+          stable-*) ;;
+          *) echo "::error::expected the stable toolchain, but resolved '$active'."\
+             " The RUSTUP_TOOLCHAIN override was lost and rust-toolchain.toml won."; exit 1 ;;
+        esac
     - name: Compile benchmarks (no run)
-      run: cargo bench --no-run
+      run: cargo +stable bench --no-run
+
+  # Build-script tests — a BLOCKING gate for the generated CRC table contract
+  # and the optional cdylib version-script wiring (AAP §0.3.1 / gap D8).
+  #
+  # `cargo test` never compiles `build.rs`, so without this job the generator has
+  # no test coverage at all and producer/consumer drift can pass every other gate
+  # (the finding this job closes). The file is therefore compiled as its own test
+  # binary. The edition is read from `Cargo.toml` rather than hard-coded, so the
+  # two cannot drift apart.
+  build-script-tests:
+    name: Build script tests
+    runs-on: ubuntu-latest
+    # Rank-2 override: beats the rank-4 `rust-toolchain.toml` repository pin,
+    # which would otherwise force this job onto the MSRV floor.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Install Rust stable toolchain
+      uses: dtolnay/rust-toolchain@stable
+    # `rust-toolchain.toml` pins this repository to the MSRV floor, and that
+    # repository pin OUTRANKS the `rustup default` that the toolchain action
+    # above sets. The job-level `RUSTUP_TOOLCHAIN` env var is a higher-priority
+    # override, so it is what actually selects current stable here. This step fails the
+    # job if that override is ever lost, rather than letting the gate silently
+    # run on the wrong compiler.
+    - name: Verify the resolved toolchain is stable
+      run: |
+        set -euo pipefail
+        rustc --version --verbose
+        active="$(rustup show active-toolchain)"
+        echo "active toolchain: $active"
+        case "$active" in
+          stable-*) ;;
+          *) echo "::error::expected the stable toolchain, but resolved '$active'."\
+             " The RUSTUP_TOOLCHAIN override was lost and rust-toolchain.toml won."; exit 1 ;;
+        esac
+    - name: Compile and run the build-script test binary
+      run: |
+        set -euo pipefail
+        edition=$(sed -n 's/^edition[[:space:]]*=[[:space:]]*"\([0-9]*\)".*/\1/p' Cargo.toml | head -1)
+        if [ -z "$edition" ]; then
+          echo "::error file=Cargo.toml::could not read the package edition"
+          exit 1
+        fi
+        echo "compiling build.rs as a test binary (edition $edition)"
+        rustc +stable --edition "$edition" --test build.rs -o "$RUNNER_TEMP/buildrs_tests" \
+              --deny warnings
+        "$RUNNER_TEMP/buildrs_tests" --test-threads 4
+    - name: Verify the big-endian table selection compiles
+      run: |
+        set -euo pipefail
+        # `build.rs` always emits both endian forms of every table and the consumer
+        # picks between them with `cfg(target_endian)`. On a little-endian runner the
+        # big-endian arms are never compiled, so a wrong index or a wrong table in
+        # one of them would go unnoticed until somebody built for big-endian
+        # hardware. A big-endian `cargo check` of the test profile compiles those
+        # arms; the relationship between the two forms is additionally asserted at
+        # run time on every target by
+        # `checksum::crc32::tests::endian_selected_generated_anchors_are_the_active_target_values`.
+        rustup target add --toolchain stable s390x-unknown-linux-gnu
+        cargo +stable check --locked --target s390x-unknown-linux-gnu --lib --profile test
+    - name: Verify the generated tables are reproducible
+      run: |
+        set -euo pipefail
+        # Two independent builds must emit a byte-identical generated file: the
+        # tables are pure constants, so any difference means the generator has
+        # become environment-dependent.
+        cargo +stable build --locked --quiet
+        first=$(find target/debug/build -name crc32_tables.rs -print0 \
+                | xargs -0 sha256sum | awk '{print $1}' | sort -u)
+        if [ "$(printf '%s\n' "$first" | wc -l)" -ne 1 ]; then
+          echo "::error::feature rows disagree on the generated tables"
+          exit 1
+        fi
+        rm -rf target/debug/build
+        cargo +stable build --locked --quiet
+        second=$(find target/debug/build -name crc32_tables.rs -print0 \
+                 | xargs -0 sha256sum | awk '{print $1}' | sort -u)
+        if [ "$first" != "$second" ]; then
+          echo "::error::generated tables are not reproducible: $first vs $second"
+          exit 1
+        fi
+        echo "generated tables reproducible: sha256 $first"
+
+  # `unsafe`-containment boundary — a BLOCKING gate for User Constraint 3
+  # ("zero unsafe blocks in core compression logic") and AAP §0.6.2 / §0.7.2
+  # standard S2.
+  #
+  # Two independent layers, deliberately not merged:
+  #
+  #   1. The in-crate boundary tests. They re-derive the boundary from the source
+  #      text — blanking comments and literals, classifying every `unsafe` token,
+  #      and treating a bare `unsafe extern "C" fn(..)` *type* as declarative —
+  #      then assert that executable `unsafe` appears only under `src/ffi/**` and
+  #      inside `mod no_std_support`, and that exactly two narrowly scoped
+  #      `#[allow(unsafe_code)]` carve-outs exist. `#![deny(unsafe_code)]` alone
+  #      cannot catch a smuggled third carve-out, because such code still
+  #      compiles; these tests do.
+  #
+  #   2. A toolchain-independent shell assertion over the same invariants, so the
+  #      gate still bites if the tests themselves are weakened or deleted.
+  unsafe-boundary:
+    name: Unsafe boundary
+    runs-on: ubuntu-latest
+    # Rank-2 override: beats the rank-4 `rust-toolchain.toml` repository pin,
+    # which would otherwise force this job onto the MSRV floor.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Install Rust stable toolchain
+      uses: dtolnay/rust-toolchain@stable
+    # `rust-toolchain.toml` pins this repository to the MSRV floor, and that
+    # repository pin OUTRANKS the `rustup default` that the toolchain action
+    # above sets. The job-level `RUSTUP_TOOLCHAIN` env var is a higher-priority
+    # override, so it is what actually selects current stable here. This step fails the
+    # job if that override is ever lost, rather than letting the gate silently
+    # run on the wrong compiler.
+    - name: Verify the resolved toolchain is stable
+      run: |
+        set -euo pipefail
+        rustc --version --verbose
+        active="$(rustup show active-toolchain)"
+        echo "active toolchain: $active"
+        case "$active" in
+          stable-*) ;;
+          *) echo "::error::expected the stable toolchain, but resolved '$active'."\
+             " The RUSTUP_TOOLCHAIN override was lost and rust-toolchain.toml won."; exit 1 ;;
+        esac
+    - name: Boundary tests (in-crate)
+      run: |
+        cargo +stable test --locked --lib -- \
+          tests::executable_unsafe_is_confined_to_the_designated_boundary \
+          tests::unsafe_code_denial_has_exactly_two_scoped_carve_outs \
+          tests::boundary_scanner_classifies_tokens_correctly
+    - name: Boundary assertion (source scan)
+      run: |
+        set -euo pipefail
+        status=0
+
+        # The crate root must DENY unsafe_code, and must not FORBID it (forbid
+        # cannot be relaxed by the two boundary carve-outs).
+        if ! grep -qx '#!\[deny(unsafe_code)\]' src/lib.rs; then
+          echo "::error file=src/lib.rs::missing crate-root #![deny(unsafe_code)]"
+          status=1
+        fi
+        if grep -qx '#!\[forbid(unsafe_code)\]' src/lib.rs; then
+          echo "::error file=src/lib.rs::#![forbid(unsafe_code)] cannot be relaxed by the boundary carve-outs"
+          status=1
+        fi
+
+        # Exactly two top-level carve-outs, both in src/lib.rs.
+        carve_outs=$(grep -cx '#\[allow(unsafe_code)\]' src/lib.rs || true)
+        if [ "$carve_outs" -ne 2 ]; then
+          echo "::error file=src/lib.rs::expected exactly 2 #[allow(unsafe_code)] carve-outs, found $carve_outs"
+          status=1
+        fi
+
+        # No other file may re-enable unsafe_code, at any scope.
+        strays=$(grep -rln --include='*.rs' -e '^ *#!\?\[allow(unsafe_code)\]' src/ \
+                 | grep -v '^src/lib\.rs$' || true)
+        if [ -n "$strays" ]; then
+          echo "::error::these files re-enable unsafe_code: $strays"
+          status=1
+        fi
+
+        # No executable unsafe block in the safe core (comment lines excluded).
+        core="src/deflate src/inflate src/checksum src/util src/gz src/error.rs src/constants.rs src/gz_header.rs src/stream.rs"
+        # shellcheck disable=SC2086
+        hits=$(grep -rn --include='*.rs' 'unsafe {' $core | grep -v ':[[:space:]]*//' || true)
+        if [ -n "$hits" ]; then
+          echo "::error::executable unsafe found in the safe core:"
+          echo "$hits"
+          status=1
+        fi
+
+        if [ "$status" -eq 0 ]; then
+          echo "unsafe boundary intact: core is unsafe-free, 2 scoped carve-outs, crate-root deny in place"
+        fi
+        exit "$status"

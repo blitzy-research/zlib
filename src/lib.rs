@@ -34,7 +34,7 @@
 //! | [`deflate`]   | `deflate.c`, `trees.c`                    | compression engine (zero `unsafe`)          |
 //! | [`inflate`]   | `inflate.c`, `inffast.c`, `infback.c`, …  | decompression engine incl. `inflateBack`    |
 //! | [`util`]      | `compress.c`, `uncompr.c`, `zutil.c`      | one-call wrappers and version reporting     |
-//! | [`gz`]        | `gzlib.c`, `gzread.c`, `gzwrite.c`, …     | gzip file-I/O (Cargo feature `gz-io`)       |
+//! | `gz`          | `gzlib.c`, `gzread.c`, `gzwrite.c`, …     | gzip file-I/O (Cargo feature `gz-io`)       |
 //! | [`ffi`]       | `zlib.h`, `zconf.h`, `zlib.map`           | `extern "C"` drop-in boundary               |
 //!
 //! ## `no_std`
@@ -58,7 +58,7 @@
 //! | `inflate_strict` |   no    | Stricter inflate distance validation (mirrors C `INFLATE_STRICT`). |
 //!
 //! Building with `--no-default-features` yields the `no_std` compression and
-//! decompression core without the gz file-I/O layer (the [`gz`] module is gated
+//! decompression core without the gz file-I/O layer (the `gz` module is gated
 //! behind `gz-io`, which implies `std`).
 //!
 //! ## Quick start
@@ -113,7 +113,8 @@
 // items"). This is a `warn`, never a `deny`, so it can never break the build.
 #![warn(missing_docs)]
 // Every `unsafe` block in SHIPPED crate code must carry an immediately-adjacent
-// `// SAFETY:` justification (AAP §0.7.2 / user rule R3). Like `missing_docs`
+// `// SAFETY:` justification (AAP §0.7.2 standard S2 / User Constraint 3). Like
+// `missing_docs`
 // this is a `warn` (never a `deny`) so it cannot break a plain build, but the
 // CI `-D warnings` gate promotes it to an error for the production library
 // target, preventing recurrence of the undocumented-`unsafe` finding across the
@@ -122,6 +123,28 @@
 // `src/ffi/**`), not the crate's inline `#[cfg(test)]` unit tests.
 #![warn(clippy::undocumented_unsafe_blocks)]
 #![cfg_attr(test, allow(clippy::undocumented_unsafe_blocks))]
+// `unsafe` is DENIED crate-wide, converting the migration's unsafe-containment
+// strategy (AAP §0.3.2 pattern C7 / §0.6.2 / §0.7.2 standard S2, satisfying User
+// Constraint 3 "zero unsafe blocks in core compression logic") from an
+// architectural convention plus a lint-assisted review check into a HARD COMPILE
+// ERROR. A stray `unsafe` block, `unsafe fn`, `unsafe impl`, or `unsafe extern`
+// anywhere in `src/deflate/**`, `src/inflate/**`, `src/checksum/**`,
+// `src/gz/**`, `src/util/**`, `src/stream.rs`, `src/error.rs`,
+// `src/constants.rs`, or `src/gz_header.rs` now fails the build outright rather
+// than surviving until code review.
+//
+// Exactly TWO carve-outs exist, and both are the designated boundaries the AAP
+// names:
+//   1. `mod no_std_support` below — the private `libc`-backed global allocator
+//      and abort panic handler that a freestanding `cdylib`/`staticlib` must
+//      supply; and
+//   2. `pub mod ffi` — the C ABI drop-in surface.
+// Each carries a narrowly scoped `#[allow(unsafe_code)]` at its declaration, so
+// the permission is granted per-module rather than crate-wide.
+//
+// `deny` (not `forbid`) is deliberate: `forbid` cannot be relaxed by an inner
+// `allow`, which would make the two boundary carve-outs impossible to express.
+#![deny(unsafe_code)]
 
 // `Box`, `Vec`, and `String` are provided by `alloc` in both `std` and `no_std`
 // builds. Importing the crate here makes those types available crate-wide
@@ -169,6 +192,11 @@ extern crate alloc;
 // (`src/deflate/**` remains 100% `unsafe`-free, honoring the "zero unsafe in
 // core compression logic" rule). Every `unsafe` operation is justified inline.
 #[cfg(all(not(feature = "std"), not(test), panic = "abort"))]
+// Carve-out 1 of 2 for the crate-wide `#![deny(unsafe_code)]` above. This module
+// is the freestanding runtime-support plumbing a `no_std` `cdylib`/`staticlib`
+// must supply (`libc` allocator + abort panic handler); it is NOT part of the
+// compression core, and the scope of this allow is exactly this module.
+#[allow(unsafe_code)]
 mod no_std_support {
     use core::alloc::{GlobalAlloc, Layout};
     use core::ffi::c_void;
@@ -363,6 +391,13 @@ pub mod gz;
 // `cdylib`/`staticlib` always presents the full zlib C symbol table for
 // linkage. Any part of `ffi` that needs `std` is gated internally; the module
 // declaration itself is never feature-gated.
+//
+// Carve-out 2 of 2 for the crate-wide `#![deny(unsafe_code)]` above: this is the
+// designated unsafe boundary (AAP §0.6.2). Reproducing the C ABI requires raw
+// pointers, `extern "C"` entry points, and caller-supplied allocator hooks, and
+// every such block carries a `// SAFETY:` justification. The scope of this allow
+// is exactly the `ffi` module tree — it does not leak into the safe core.
+#[allow(unsafe_code)]
 pub mod ffi;
 
 // ===========================================================================
@@ -516,5 +551,641 @@ mod tests {
         // default allocator satisfies it.
         fn needs_allocator<A: Allocator>() {}
         needs_allocator::<DefaultAllocator>();
+    }
+
+    // -----------------------------------------------------------------------
+    // Unsafe-containment boundary (F3 remediation)
+    //
+    // `#![deny(unsafe_code)]` at the crate root already makes a stray `unsafe` a
+    // compile error. The two `#[allow(unsafe_code)]` carve-outs, however, are
+    // ordinary attributes: a future edit could widen one, copy it onto a third
+    // module, or replace it with a crate-level `#![allow(unsafe_code)]`, and the
+    // crate would still compile. The check below independently re-derives the
+    // boundary from the source text, so any of those changes fails the suite.
+    //
+    // It classifies each `unsafe` token, ignoring comments and string/char
+    // literals, and treats a bare `unsafe extern "C" fn(..)` *type* (the
+    // `ZallocFn`/`ZfreeFn` hook aliases in `src/stream.rs`) as declarative
+    // rather than executable — which is exactly the distinction AAP §0.6.2
+    // draws when it records the safe core as containing zero `unsafe`.
+    // -----------------------------------------------------------------------
+
+    /// Replaces every comment, string literal, raw string literal, and character
+    /// literal with spaces, preserving byte offsets so ranges computed on the
+    /// result also address the original text.
+    ///
+    /// Keeping offsets stable is what lets the caller locate the
+    /// `mod no_std_support { .. }` block and test membership of an `unsafe`
+    /// token against it.
+    fn blank_comments_and_literals(src: &str) -> String {
+        let b = src.as_bytes();
+        let mut out = alloc::vec![b' '; b.len()];
+        let mut i = 0usize;
+        while i < b.len() {
+            match b[i] {
+                // Line comment.
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                // Block comment (nesting is legal in Rust).
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    let mut depth = 1usize;
+                    i += 2;
+                    while i < b.len() && depth > 0 {
+                        if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                            depth += 1;
+                            i += 2;
+                        } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                            depth -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                // Raw string: `r"..."`, `r#"..."#`, `br##"..."##`, ...
+                b'r' | b'b'
+                    if {
+                        let mut j = i;
+                        if b[j] == b'b' {
+                            j += 1;
+                        }
+                        if b.get(j) == Some(&b'r') {
+                            j += 1;
+                            while b.get(j) == Some(&b'#') {
+                                j += 1;
+                            }
+                            b.get(j) == Some(&b'"')
+                        } else {
+                            false
+                        }
+                    } =>
+                {
+                    let mut j = i;
+                    if b[j] == b'b' {
+                        j += 1;
+                    }
+                    j += 1; // `r`
+                    let mut hashes = 0usize;
+                    while b.get(j) == Some(&b'#') {
+                        hashes += 1;
+                        j += 1;
+                    }
+                    j += 1; // opening quote
+                    // Scan to the closing quote followed by `hashes` `#`s.
+                    while j < b.len() {
+                        if b[j] == b'"' {
+                            let mut k = j + 1;
+                            let mut seen = 0usize;
+                            while seen < hashes && b.get(k) == Some(&b'#') {
+                                seen += 1;
+                                k += 1;
+                            }
+                            if seen == hashes {
+                                j = k;
+                                break;
+                            }
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                }
+                // Ordinary (possibly byte) string literal.
+                b'"' => {
+                    i += 1;
+                    while i < b.len() {
+                        match b[i] {
+                            b'\\' => i += 2,
+                            b'"' => {
+                                i += 1;
+                                break;
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                }
+                // Character literal — but `'` also starts a lifetime, which must
+                // be preserved (blanking it would fuse neighbouring tokens).
+                b'\'' => {
+                    let is_char = if b.get(i + 1) == Some(&b'\\') {
+                        true
+                    } else {
+                        b.get(i + 2) == Some(&b'\'')
+                    };
+                    if is_char {
+                        i += 1;
+                        while i < b.len() {
+                            match b[i] {
+                                b'\\' => i += 2,
+                                b'\'' => {
+                                    i += 1;
+                                    break;
+                                }
+                                _ => i += 1,
+                            }
+                        }
+                    } else {
+                        // A lifetime: keep it verbatim.
+                        out[i] = b[i];
+                        i += 1;
+                    }
+                }
+                // Ordinary code byte: keep.
+                _ => {
+                    out[i] = b[i];
+                    i += 1;
+                }
+            }
+        }
+        alloc::string::String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Whether the text immediately following an `unsafe` keyword makes it a
+    /// mere *function-pointer type* (`unsafe extern "C" fn(..)` /
+    /// `unsafe fn(..)`) rather than executable `unsafe`.
+    fn is_fn_pointer_type(rest: &str) -> bool {
+        let mut t = rest.trim_start();
+        if let Some(r) = t.strip_prefix("extern") {
+            t = r.trim_start();
+        }
+        match t.strip_prefix("fn") {
+            Some(r) => r.trim_start().starts_with('('),
+            None => false,
+        }
+    }
+
+    /// Byte offsets of every executable `unsafe` token in already-blanked source.
+    fn executable_unsafe_offsets(blanked: &str) -> alloc::vec::Vec<usize> {
+        let bytes = blanked.as_bytes();
+        let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let mut hits = alloc::vec::Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = blanked[from..].find("unsafe") {
+            let at = from + rel;
+            from = at + "unsafe".len();
+            // Whole-word only: `unsafe_code` and `my_unsafe` must not match.
+            if at > 0 && ident(bytes[at - 1]) {
+                continue;
+            }
+            if bytes.get(from).is_some_and(|&c| ident(c)) {
+                continue;
+            }
+            if !is_fn_pointer_type(&blanked[from..]) {
+                hits.push(at);
+            }
+        }
+        hits
+    }
+
+    /// Every `.rs` file under `src/`, as `(relative path, contents)`.
+    fn crate_sources() -> alloc::vec::Vec<(std::string::String, std::string::String)> {
+        fn walk(
+            dir: &std::path::Path,
+            root: &std::path::Path,
+            out: &mut alloc::vec::Vec<(std::string::String, std::string::String)>,
+        ) {
+            let mut entries: alloc::vec::Vec<_> = std::fs::read_dir(dir)
+                .expect("src/ must be readable")
+                .map(|e| e.expect("directory entry").path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let rel = path
+                        .strip_prefix(root)
+                        .expect("path is under the manifest dir")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let text = std::fs::read_to_string(&path).expect("source file is UTF-8");
+                    out.push((rel, text));
+                }
+            }
+        }
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut out = alloc::vec::Vec::new();
+        walk(&root.join("src"), root, &mut out);
+        assert!(
+            out.len() > 30,
+            "expected the full src/ tree, found only {} files",
+            out.len()
+        );
+        out
+    }
+
+    /// The byte range of the `mod no_std_support { .. }` block in `src/lib.rs` —
+    /// the crate root's single permitted `unsafe` region.
+    fn no_std_support_range(blanked: &str) -> core::ops::Range<usize> {
+        let start = blanked
+            .find("mod no_std_support")
+            .expect("the no_std runtime-support module must exist in src/lib.rs");
+        let open = start
+            + blanked[start..]
+                .find('{')
+                .expect("the module must have a body");
+        let mut depth = 0usize;
+        for (i, c) in blanked[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return start..open + i + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces while delimiting mod no_std_support");
+    }
+
+    /// Executable `unsafe` exists **only** inside `src/ffi/**` and the crate
+    /// root's `no_std_support` runtime block — User Constraint 3 / AAP §0.6.2 /
+    /// §0.7.2 standard S2.
+    #[test]
+    fn executable_unsafe_is_confined_to_the_designated_boundary() {
+        let mut ffi_hits = 0usize;
+        let mut runtime_hits = 0usize;
+
+        for (rel, text) in crate_sources() {
+            let blanked = blank_comments_and_literals(&text);
+            let hits = executable_unsafe_offsets(&blanked);
+
+            if rel.starts_with("src/ffi/") {
+                ffi_hits += hits.len();
+                continue;
+            }
+
+            if rel == "src/lib.rs" {
+                let allowed = no_std_support_range(&blanked);
+                let stray: alloc::vec::Vec<usize> = hits
+                    .iter()
+                    .copied()
+                    .filter(|at| !allowed.contains(at))
+                    .collect();
+                assert!(
+                    stray.is_empty(),
+                    "src/lib.rs has executable `unsafe` outside `mod no_std_support` \
+                     at byte offsets {stray:?}"
+                );
+                runtime_hits += hits.len();
+                continue;
+            }
+
+            assert!(
+                hits.is_empty(),
+                "{rel} contains executable `unsafe` at byte offsets {:?}; the safe \
+                 core must contain none (User Constraint 3). Restructure instead, \
+                 or move the raw-pointer work into `src/ffi/**`.",
+                hits
+            );
+        }
+
+        // The boundary must not be empty, otherwise the test would pass
+        // vacuously if the classifier ever stopped matching anything.
+        assert!(
+            ffi_hits > 100,
+            "expected the FFI boundary to hold the crate's `unsafe`, found {ffi_hits}"
+        );
+        assert!(
+            runtime_hits > 0,
+            "expected the no_std runtime block to hold `unsafe`, found {runtime_hits}"
+        );
+    }
+
+    /// The enforcement attributes themselves are pinned: the crate root denies
+    /// `unsafe_code`, nothing re-enables it crate- or module-wide, and exactly two
+    /// narrowly scoped carve-outs exist — both in `src/lib.rs`.
+    #[test]
+    fn unsafe_code_denial_has_exactly_two_scoped_carve_outs() {
+        let mut total_allows = 0usize;
+
+        for (rel, text) in crate_sources() {
+            let blanked = blank_comments_and_literals(&text);
+            let allows = blanked.matches("#[allow(unsafe_code)]").count();
+            let inner_allows = blanked.matches("#![allow(unsafe_code)]").count();
+
+            assert_eq!(
+                inner_allows, 0,
+                "{rel} re-enables `unsafe_code` for a whole module or crate; only \
+                 narrowly scoped `#[allow(unsafe_code)]` on the two designated \
+                 boundaries is permitted"
+            );
+
+            if rel == "src/lib.rs" {
+                assert!(
+                    blanked.contains("#![deny(unsafe_code)]"),
+                    "the crate root must deny `unsafe_code`"
+                );
+                assert!(
+                    !blanked.contains("#![forbid(unsafe_code)]"),
+                    "`forbid` cannot be relaxed by the two boundary carve-outs"
+                );
+            } else {
+                assert_eq!(
+                    allows, 0,
+                    "{rel} carries an `#[allow(unsafe_code)]`; the only permitted \
+                     carve-outs are `mod no_std_support` and `pub mod ffi`, both in \
+                     src/lib.rs"
+                );
+            }
+            total_allows += allows;
+        }
+
+        assert_eq!(
+            total_allows, 2,
+            "exactly two `#[allow(unsafe_code)]` carve-outs must exist \
+             (mod no_std_support and pub mod ffi)"
+        );
+    }
+
+    /// `OS_CODE` — the gzip-header operating-system byte — is declared in exactly
+    /// one module, and the gzip emission path reads that one declaration.
+    ///
+    /// This has to be a *source-level* guard because no value assertion can catch
+    /// the defect it protects against. `OS_CODE` is `3` on Linux, so a module that
+    /// re-declares its own `const OS_CODE: u8 = 3` agrees with the canonical
+    /// constant on every currently exercised CI target while silently emitting `3`
+    /// where reference zlib emits `10` on Windows (`zutil.h` L156-L158) or `19` on
+    /// Apple (L168-L170). Counting declarations catches that on every platform.
+    /// Every CI job whose gate is meaningful only on a particular toolchain,
+    /// paired with the channel it must resolve to.
+    ///
+    /// `rust-toolchain.toml` pins this repository to the MSRV floor, and that
+    /// repository pin OUTRANKS the `rustup default` set by
+    /// `dtolnay/rust-toolchain`. Without a higher-priority override every one
+    /// of these jobs silently runs on 1.85.0 instead of its intended channel —
+    /// the stable rows would still pass while quietly not covering stable, and
+    /// `cargo fuzz build` would fail outright because cargo-fuzz needs nightly.
+    const TOOLCHAIN_JOBS: [(&str, &str, &str); 8] = [
+        (".github/workflows/ci.yml", "build-test", "stable"),
+        (".github/workflows/ci.yml", "no-std-tests", "stable"),
+        (".github/workflows/ci.yml", "lint", "stable"),
+        (".github/workflows/ci.yml", "msrv", "1.85.0"),
+        (".github/workflows/ci.yml", "benches", "stable"),
+        (".github/workflows/ci.yml", "build-script-tests", "stable"),
+        (".github/workflows/ci.yml", "unsafe-boundary", "stable"),
+        (".github/workflows/fuzz.yml", "cargo-fuzz", "nightly"),
+    ];
+
+    /// Returns the text of one job block from a workflow file.
+    ///
+    /// Jobs are the only two-space-indented mapping keys under `jobs:`, so a
+    /// block runs from its own key line to the next such key (or end of file).
+    fn workflow_job_block(workflow: &str, job: &str) -> std::string::String {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(root.join(workflow))
+            .unwrap_or_else(|e| panic!("{workflow} must be readable: {e}"));
+        let header = alloc::format!("\n  {job}:\n");
+        let start = text
+            .find(&header)
+            .unwrap_or_else(|| panic!("{workflow} must define the `{job}` job"))
+            + header.len();
+        let rest = &text[start..];
+        // The block ends at the next two-space-indented mapping key, i.e. the
+        // next sibling job.
+        let end = rest
+            .char_indices()
+            .filter(|&(_, c)| c == '\n')
+            .map(|(i, _)| i + 1)
+            .find(|&i| {
+                let line = rest[i..].split('\n').next().unwrap_or_default();
+                line.starts_with("  ") && !line.starts_with("   ") && line.trim_end().ends_with(':')
+            })
+            .map_or(rest.len(), |i| i - 1);
+        rest[..end].to_string()
+    }
+
+    #[test]
+    fn every_toolchain_specific_ci_job_pins_and_asserts_its_toolchain() {
+        for (workflow, job, channel) in TOOLCHAIN_JOBS {
+            let block = workflow_job_block(workflow, job);
+
+            // 1. A rank-2 `RUSTUP_TOOLCHAIN` override, which beats the rank-4
+            //    repository pin. Without it the job runs on the MSRV floor.
+            let needle = alloc::format!("RUSTUP_TOOLCHAIN: {channel}");
+            assert!(
+                block.contains(&needle),
+                "{workflow} job `{job}` must set `{needle}`, otherwise \
+                 rust-toolchain.toml silently forces it onto the MSRV floor"
+            );
+
+            // 2. A step that proves the override actually took effect, so losing
+            //    it fails the job loudly instead of downgrading the gate.
+            assert!(
+                block.contains("rustc --version --verbose"),
+                "{workflow} job `{job}` must assert its resolved toolchain with \
+                 `rustc --version --verbose`"
+            );
+            assert!(
+                block.contains("rustup show active-toolchain"),
+                "{workflow} job `{job}` must read `rustup show active-toolchain` \
+                 to identify the resolved channel"
+            );
+            let expected_arm = alloc::format!("{channel}-*)");
+            assert!(
+                block.contains(&expected_arm),
+                "{workflow} job `{job}` must accept only `{expected_arm}`"
+            );
+
+            // 3. The assertion must actually fail the job. A `case` arm that
+            //    merely prints is indistinguishable from no check at all, and it
+            //    is latent: the mismatch branch is not taken while the override
+            //    is present, so nothing else would ever reveal it.
+            assert!(
+                block.contains("exit 1"),
+                "{workflow} job `{job}`'s toolchain assertion must `exit 1` on \
+                 mismatch, or it cannot fail the job"
+            );
+        }
+    }
+
+    #[test]
+    fn the_toolchain_pin_documents_no_clippy_failure_that_does_not_exist() {
+        // F2 also covered stale commentary: `rust-toolchain.toml` claimed the
+        // `-D warnings` clippy gate FAILS on the pinned floor's clippy. It was
+        // measured passing (exit 0, zero diagnostics) on clippy 0.1.85 and
+        // 0.1.97 alike, and neither construct the claim named still exists.
+        // Guard against the claim being reinstated.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let pin = std::fs::read_to_string(root.join("rust-toolchain.toml"))
+            .expect("rust-toolchain.toml must be readable");
+        assert!(
+            !pin.contains("FAILS on the"),
+            "rust-toolchain.toml must not assert a clippy failure on the pinned \
+             floor: the exact gate was measured passing on clippy 0.1.85"
+        );
+        assert!(
+            pin.contains("clippy 0.1.85 (4d91de4e48 2025-02-17)  — exit 0"),
+            "rust-toolchain.toml must record the measured floor clippy result"
+        );
+        // And the pin itself must still be the MSRV floor, not a moving channel.
+        assert!(
+            pin.contains("channel = \"1.85.0\""),
+            "the toolchain pin must remain the MSRV floor 1.85.0"
+        );
+    }
+
+    #[test]
+    fn os_code_is_declared_in_exactly_one_module() {
+        let mut declaring: alloc::vec::Vec<(std::string::String, usize)> = alloc::vec::Vec::new();
+        let mut saw_util = false;
+        let mut saw_deflate = false;
+
+        for (rel, text) in crate_sources() {
+            let blanked = blank_comments_and_literals(&text);
+            let declarations = blanked.matches("const OS_CODE").count();
+            if declarations > 0 {
+                declaring.push((rel.clone(), declarations));
+            }
+
+            if rel == "src/util/mod.rs" {
+                saw_util = true;
+                // The canonical home holds the full `#ifdef` cascade: one arm per
+                // platform class, mutually exclusive by construction.
+                assert_eq!(
+                    declarations, 3,
+                    "src/util/mod.rs must hold exactly the three-arm OS_CODE cascade"
+                );
+
+                // Each declaration must carry its own `cfg`. Scanned on the raw
+                // text (the blanked copy erases the `"apple"` literal) by walking
+                // back from every declaration over its doc comment to the
+                // attribute immediately above it.
+                // Capturing the literal alongside the `cfg` is what makes the
+                // per-platform claims checkable from a single host: a wrong value in
+                // an arm that this target does not compile is otherwise invisible.
+                let lines: alloc::vec::Vec<&str> = text.lines().collect();
+                let mut arms: alloc::vec::Vec<(&str, &str)> = alloc::vec::Vec::new();
+                for (i, line) in lines.iter().enumerate() {
+                    if !line.contains("const OS_CODE") {
+                        continue;
+                    }
+                    let value = line
+                        .split_once('=')
+                        .and_then(|(_, rhs)| rhs.split_once(';'))
+                        .map(|(value, _)| value.trim())
+                        .expect("an OS_CODE declaration is `... = <literal>;`");
+                    let mut j = i;
+                    while j > 0 {
+                        j -= 1;
+                        let above = lines[j].trim();
+                        if above.is_empty() || above.starts_with("///") {
+                            continue;
+                        }
+                        arms.push((above, value));
+                        break;
+                    }
+                }
+                arms.sort_unstable();
+                assert_eq!(
+                    arms,
+                    alloc::vec![
+                        (
+                            "#[cfg(all(not(windows), not(target_vendor = \"apple\")))]",
+                            "3"
+                        ),
+                        ("#[cfg(all(not(windows), target_vendor = \"apple\"))]", "19"),
+                        ("#[cfg(windows)]", "10"),
+                    ],
+                    "the OS_CODE cascade must be exactly `10` on Windows (zutil.h \
+                     L156-L158), `19` on Apple (L168-L170) and the `3` Unix fallback \
+                     (L187-L189), each guarded by its own mutually exclusive `cfg` so \
+                     that precisely one arm compiles for any target"
+                );
+            }
+
+            if rel == "src/deflate/mod.rs" {
+                saw_deflate = true;
+                assert!(
+                    blanked.contains("use crate::util::OS_CODE;"),
+                    "the gzip header emission path must import the one canonical \
+                     OS_CODE from crate::util instead of declaring its own"
+                );
+            }
+        }
+
+        assert!(saw_util && saw_deflate, "both owning files must be scanned");
+        assert_eq!(
+            declaring,
+            alloc::vec![(std::string::String::from("src/util/mod.rs"), 3usize)],
+            "OS_CODE must be declared only by src/util/mod.rs; a second declaration \
+             is a platform-divergence bug that Linux-only gates cannot observe"
+        );
+    }
+
+    /// The comment/literal blanking and token classification the boundary check
+    /// relies on are themselves tested, so a silent classifier regression cannot
+    /// turn the boundary check into a no-op.
+    #[test]
+    fn boundary_scanner_classifies_tokens_correctly() {
+        // Comments and literals never contribute a hit.
+        for src in [
+            "// unsafe\n",
+            "/* unsafe */",
+            "/* a /* unsafe */ b */",
+            "//! unsafe\n",
+            "let s = \"unsafe\";",
+            "let s = r#\"unsafe\"#;",
+            "let s = br##\"unsafe\"##;",
+        ] {
+            let blanked = blank_comments_and_literals(src);
+            assert!(
+                executable_unsafe_offsets(&blanked).is_empty(),
+                "false positive for {src:?}"
+            );
+        }
+
+        // A lifetime is preserved rather than blanked, and does not create a hit.
+        let blanked = blank_comments_and_literals("fn f<'a>(x: &'a u8) {}");
+        assert!(blanked.contains("'a"));
+        assert!(executable_unsafe_offsets(&blanked).is_empty());
+
+        // Identifiers merely containing the word do not match.
+        for src in [
+            "#![deny(unsafe_code)]",
+            "let unsafely = 1;",
+            "let x_unsafe = 1;",
+        ] {
+            let blanked = blank_comments_and_literals(src);
+            assert!(
+                executable_unsafe_offsets(&blanked).is_empty(),
+                "false positive for {src:?}"
+            );
+        }
+
+        // Function-pointer *types* are declarative, not executable.
+        for src in [
+            "pub type F = unsafe extern \"C\" fn(*mut u8) -> i32;",
+            "pub type G = unsafe fn(u8);",
+        ] {
+            let blanked = blank_comments_and_literals(src);
+            assert!(
+                executable_unsafe_offsets(&blanked).is_empty(),
+                "fn-pointer type wrongly flagged: {src:?}"
+            );
+        }
+
+        // Every executable form IS flagged.
+        for src in [
+            "let x = unsafe { 1 };",
+            "unsafe fn f() {}",
+            "unsafe impl Send for T {}",
+            "unsafe trait T {}",
+            "unsafe extern \"C\" { fn f(); }",
+            "unsafe extern { fn f(); }",
+            "pub unsafe extern \"C\" fn f() {}",
+        ] {
+            let blanked = blank_comments_and_literals(src);
+            assert_eq!(
+                executable_unsafe_offsets(&blanked).len(),
+                1,
+                "executable unsafe missed: {src:?}"
+            );
+        }
     }
 }

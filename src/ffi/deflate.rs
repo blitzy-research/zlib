@@ -864,9 +864,12 @@ pub unsafe extern "C" fn deflateSetHeader(strm: z_streamp, head: gz_headerp) -> 
 /// `int deflateCopy(z_streamp dest, z_streamp source)`
 ///
 /// Duplicates a compression stream, including its sliding window, pending
-/// buffer, and hash tables (the engine's `Clone` performs the deep copy). All
+/// buffer, and hash tables (the engine's allocator-preserving
+/// `DeflateState::try_clone` performs the deep copy, re-allocating every working
+/// buffer through the **same** `zalloc` as the source — AAP §0.6.5). All
 /// observable `z_stream` fields are mirrored from `source` into `dest`, matching
-/// C's full-struct copy. Returns `Z_MEM_ERROR` if the clone allocation fails.
+/// C's full-struct copy. Returns `Z_MEM_ERROR` if a copy allocation fails, in
+/// which case `dest` is left entirely untouched.
 ///
 /// # Safety
 ///
@@ -935,6 +938,7 @@ pub unsafe extern "C" fn deflateCopy(dest: z_streamp, source: z_streamp) -> c_in
 mod tests {
     use super::*;
     use crate::constants::{Z_DEFAULT_COMPRESSION, Z_FINISH, Z_NO_FLUSH};
+    use core::ffi::c_void;
     use core::mem::size_of;
     use std::io::Read;
     use std::vec::Vec;
@@ -1269,6 +1273,144 @@ mod tests {
         assert_eq!(unsafe { deflateEnd(&mut src) }, Z_OK);
     }
 
+    /// A budget carried through the caller's `opaque` cookie, so each test drives
+    /// its own allocator without sharing global state — exactly what zlib's
+    /// `opaque` field exists for.
+    struct Budget {
+        /// Allocations still permitted before `zalloc` starts reporting OOM.
+        remaining: core::sync::atomic::AtomicUsize,
+    }
+
+    /// Bytes reserved ahead of each payload so `zfree` can recover the size.
+    const BUDGET_HDR: usize = 16;
+
+    /// An honest allocator that really allocates and frees, but only until the
+    /// budget in `opaque` is exhausted — after which it reports out-of-memory the
+    /// way a C `zalloc` does under pressure.
+    unsafe extern "C" fn budget_zalloc(
+        opaque: *mut c_void,
+        items: c_uint,
+        size: c_uint,
+    ) -> *mut c_void {
+        // SAFETY: every stream in these tests sets `opaque` to a live `&Budget`
+        // that outlives the stream, and zlib forwards the cookie unchanged.
+        let budget = unsafe { &*(opaque as *const Budget) };
+        if budget
+            .remaining
+            .fetch_update(
+                core::sync::atomic::Ordering::SeqCst,
+                core::sync::atomic::Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            )
+            .is_err()
+        {
+            return ptr::null_mut();
+        }
+
+        let bytes = (items as usize) * (size as usize);
+        let layout = std::alloc::Layout::from_size_align(BUDGET_HDR + bytes, BUDGET_HDR)
+            .expect("test layout is valid");
+        // SAFETY: `layout` has a non-zero size (`BUDGET_HDR` is 16).
+        let base = unsafe { std::alloc::alloc(layout) };
+        if base.is_null() {
+            return ptr::null_mut();
+        }
+        // SAFETY: `base` addresses `BUDGET_HDR + bytes` writable, 16-byte aligned
+        // bytes, so the header write is aligned and in bounds.
+        unsafe {
+            base.cast::<usize>().write(bytes);
+            base.add(BUDGET_HDR).cast::<c_void>()
+        }
+    }
+
+    unsafe extern "C" fn budget_zfree(_opaque: *mut c_void, address: *mut c_void) {
+        if address.is_null() {
+            return;
+        }
+        // SAFETY: `address` is a payload pointer from `budget_zalloc`, so its size
+        // header sits `BUDGET_HDR` bytes below it and the block is live.
+        unsafe {
+            let base = address.cast::<u8>().sub(BUDGET_HDR);
+            let bytes = base.cast::<usize>().read();
+            let layout = std::alloc::Layout::from_size_align(BUDGET_HDR + bytes, BUDGET_HDR)
+                .expect("test layout is valid");
+            std::alloc::dealloc(base, layout);
+        }
+    }
+
+    /// Installs the budgeted allocator on `strm`, pointing `opaque` at `budget`.
+    fn attach_budget(strm: &mut z_stream, budget: &Budget) {
+        strm.zalloc = Some(budget_zalloc);
+        strm.zfree = Some(budget_zfree);
+        strm.opaque = (budget as *const Budget).cast_mut().cast::<c_void>();
+    }
+
+    /// F-03 regression: when the caller's `zalloc` cannot satisfy the copy,
+    /// `deflateCopy` must report `Z_MEM_ERROR` — matching C `deflate.c`
+    /// L1348-L1350 — and must **not** report success with a destination whose
+    /// buffers came from the Rust global allocator instead of the caller's arena
+    /// (AAP §0.6.3, §0.6.5).
+    #[test]
+    fn copy_reports_mem_error_when_caller_allocator_is_exhausted() {
+        // Enough allocations to initialize one stream, none to spare for a copy.
+        let budget = Budget {
+            remaining: core::sync::atomic::AtomicUsize::new(16),
+        };
+
+        let mut src = zeroed_stream();
+        attach_budget(&mut src, &budget);
+        assert_eq!(
+            unsafe { deflateInit_(&mut src, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+
+        // Starve the allocator, then attempt the copy.
+        budget
+            .remaining
+            .store(0, core::sync::atomic::Ordering::SeqCst);
+
+        let mut dst = zeroed_stream();
+        attach_budget(&mut dst, &budget);
+        assert_eq!(
+            unsafe { deflateCopy(&mut dst, &mut src) },
+            ReturnCode::MemError.as_c_int(),
+            "an exhausted caller allocator must fail the copy, not silently \
+             substitute global-allocator storage"
+        );
+        assert!(
+            dst.state.is_null(),
+            "a failed copy must leave the destination without a state"
+        );
+
+        // The source is untouched and still finishes normally.
+        assert!(!src.state.is_null());
+        assert_eq!(unsafe { deflateEnd(&mut src) }, Z_OK);
+    }
+
+    /// The same allocator, with budget to spare, copies successfully — proving
+    /// the test above fails for want of memory and not for any other reason.
+    #[test]
+    fn copy_succeeds_when_caller_allocator_has_budget() {
+        let budget = Budget {
+            remaining: core::sync::atomic::AtomicUsize::new(64),
+        };
+
+        let mut src = zeroed_stream();
+        attach_budget(&mut src, &budget);
+        assert_eq!(
+            unsafe { deflateInit_(&mut src, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+
+        let mut dst = zeroed_stream();
+        attach_budget(&mut dst, &budget);
+        assert_eq!(unsafe { deflateCopy(&mut dst, &mut src) }, Z_OK);
+        assert!(!dst.state.is_null());
+
+        assert_eq!(unsafe { deflateEnd(&mut dst) }, Z_OK);
+        assert_eq!(unsafe { deflateEnd(&mut src) }, Z_OK);
+    }
+
     #[test]
     fn set_header_on_zlib_stream_is_stream_error() {
         let mut strm = zeroed_stream();
@@ -1331,5 +1473,169 @@ mod tests {
         let mut restored = Vec::new();
         dec.read_to_end(&mut restored).expect("gzip inflate failed");
         assert_eq!(restored, input);
+    }
+
+    /// F6 / M7 end-to-end: when the caller's arena is exhausted part-way through
+    /// `deflateCopy`, the C entry point must report `Z_MEM_ERROR`, leave `dest`
+    /// untouched, release every buffer it did manage to allocate, and leave
+    /// `source` fully usable — never silently completing the copy on the Rust
+    /// global allocator.
+    #[test]
+    fn copy_reports_mem_error_when_the_caller_arena_is_exhausted() {
+        use crate::ffi::alloc::test_hook::HookStats;
+
+        let stats = HookStats::new();
+        let hook = stats.hook();
+
+        let mut src = zeroed_stream();
+        src.zalloc = hook.zalloc();
+        src.zfree = hook.zfree();
+        src.opaque = hook.opaque();
+
+        assert_eq!(
+            unsafe { deflateInit_(&mut src, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+        let init_allocs = stats.allocs();
+        assert_eq!(
+            init_allocs, 6,
+            "deflate init makes six requests through the caller's zalloc: the state              reservation mirroring C's `ZALLOC(strm, 1, sizeof(deflate_state))`              (`deflate.c` L440-L442) followed by the five working buffers"
+        );
+        assert_eq!(stats.frees(), 0);
+
+        // Give the source real history so the copy is a meaningful deep copy.
+        let input = b"exhausted arena must surface Z_MEM_ERROR ".repeat(8);
+        let mut out = std::vec![0u8; 4096];
+        src.next_in = input.as_ptr();
+        src.avail_in = input.len() as c_uint;
+        src.next_out = out.as_mut_ptr();
+        src.avail_out = out.len() as c_uint;
+        assert_eq!(unsafe { deflate(&mut src, Z_NO_FLUSH) }, Z_OK);
+        assert_eq!(
+            stats.allocs(),
+            init_allocs,
+            "compression itself must not allocate"
+        );
+
+        // Allow exactly two of the copy's six allocations to succeed.
+        stats.set_budget(2);
+        let mut dst = zeroed_stream();
+        assert_eq!(
+            unsafe { deflateCopy(&mut dst, &mut src) },
+            ReturnCode::MemError.as_c_int(),
+            "an exhausted caller arena must surface Z_MEM_ERROR"
+        );
+
+        // `dest` is untouched: no state installed, no mirrored bookkeeping.
+        assert!(
+            dst.state.is_null(),
+            "a failed copy must not install state into dest"
+        );
+        assert_eq!(dst.total_in, 0);
+        assert_eq!(dst.total_out, 0);
+        assert!(dst.zalloc.is_none() && dst.zfree.is_none());
+
+        // The partial copy was released through the caller's `zfree`, and no
+        // allocation escaped to the global allocator.
+        assert_eq!(
+            stats.allocs() - init_allocs,
+            2,
+            "only the budgeted allocations may succeed"
+        );
+        assert_eq!(stats.ooms(), 1, "the third copy allocation reported OOM");
+        assert_eq!(
+            stats.frees(),
+            2,
+            "every buffer the partial copy obtained must be released"
+        );
+
+        // The source survived untouched and still produces a correct stream.
+        stats.set_budget(usize::MAX);
+        loop {
+            let rc = unsafe { deflate(&mut src, Z_FINISH) };
+            if rc == Z_STREAM_END {
+                break;
+            }
+            assert_eq!(rc, Z_OK);
+        }
+        let n = src.total_out as usize;
+        assert_eq!(zlib_inflate(&out[..n]), input);
+
+        assert_eq!(unsafe { deflateEnd(&mut src) }, Z_OK);
+        assert_eq!(
+            stats.frees(),
+            init_allocs + 2,
+            "deflateEnd releases the source's buffers through the caller's zfree"
+        );
+        assert_eq!(
+            stats.live_bytes(),
+            0,
+            "the caller's arena must be perfectly balanced"
+        );
+    }
+
+    /// The success path of the same setup: with an unbounded caller arena the
+    /// copy is allocated entirely from the caller's `zalloc` (never the global
+    /// allocator), is independent of the source, and both streams balance.
+    #[test]
+    fn copy_allocates_from_the_callers_arena_and_stays_independent() {
+        use crate::ffi::alloc::test_hook::HookStats;
+
+        let stats = HookStats::new();
+        let hook = stats.hook();
+
+        let mut src = zeroed_stream();
+        src.zalloc = hook.zalloc();
+        src.zfree = hook.zfree();
+        src.opaque = hook.opaque();
+        assert_eq!(
+            unsafe { deflateInit_(&mut src, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+        assert_eq!(
+            stats.allocs(),
+            6,
+            "the state reservation plus the five working buffers (six here versus \
+             C's five, because this port does not overlay `sym_buf` on `pending_buf`)"
+        );
+
+        let mut dst = zeroed_stream();
+        assert_eq!(unsafe { deflateCopy(&mut dst, &mut src) }, Z_OK);
+        assert_eq!(
+            stats.allocs(),
+            12,
+            "the copy's own state reservation and five buffers must come from the              caller's zalloc too"
+        );
+        assert_eq!(stats.ooms(), 0);
+        // `deflateCopy` mirrors the allocator triple so `dest` is self-sufficient.
+        assert!(dst.zalloc.is_some() && dst.zfree.is_some());
+        assert_eq!(dst.opaque, src.opaque);
+
+        // Feed the two streams different data; each must produce its own correct
+        // output, proving the buffers are not shared.
+        let a = b"stream A payload ".repeat(6);
+        let b = b"stream B has different bytes entirely ".repeat(6);
+        let mut out_a = std::vec![0u8; 2048];
+        let mut out_b = std::vec![0u8; 2048];
+
+        src.next_in = a.as_ptr();
+        src.avail_in = a.len() as c_uint;
+        src.next_out = out_a.as_mut_ptr();
+        src.avail_out = out_a.len() as c_uint;
+        dst.next_in = b.as_ptr();
+        dst.avail_in = b.len() as c_uint;
+        dst.next_out = out_b.as_mut_ptr();
+        dst.avail_out = out_b.len() as c_uint;
+
+        while unsafe { deflate(&mut src, Z_FINISH) } != Z_STREAM_END {}
+        while unsafe { deflate(&mut dst, Z_FINISH) } != Z_STREAM_END {}
+
+        assert_eq!(zlib_inflate(&out_a[..src.total_out as usize]), a);
+        assert_eq!(zlib_inflate(&out_b[..dst.total_out as usize]), b);
+
+        assert_eq!(unsafe { deflateEnd(&mut dst) }, Z_OK);
+        assert_eq!(unsafe { deflateEnd(&mut src) }, Z_OK);
+        assert_eq!(stats.frees(), 12, "every region reaches the caller's zfree");
+        assert_eq!(stats.live_bytes(), 0);
     }
 }

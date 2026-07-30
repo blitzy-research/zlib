@@ -12,10 +12,13 @@
 //!
 //! There is **zero `unsafe`** in this module (and, by design, in the whole
 //! `deflate/` tree). This satisfies the project constraint "zero unsafe blocks
-//! in core compression logic". All buffers are owned [`Vec`]/arrays and every
-//! access is a checked slice index. The C code relies on `zcalloc`/`zcfree`
-//! and raw pointer arithmetic; here that is replaced by Rust ownership, owned
-//! `Vec` allocations, and `Drop`-based cleanup (the latter is automatic).
+//! in core compression logic". Every working buffer is an owned
+//! [`AllocBuffer`], every fixed-size table is an owned array, and every access
+//! is a checked slice index. The C code relies on `zcalloc`/`zcfree` and raw
+//! pointer arithmetic; here that is replaced by Rust ownership —
+//! [`AllocBuffer`] routes each allocation through the caller's hook when one is
+//! installed and through the global allocator otherwise, and releases it in
+//! `Drop`, so there is no free path to forget.
 //!
 //! # Byte-exact fidelity
 //!
@@ -27,9 +30,15 @@
 //!
 //! # `no_std`
 //!
-//! The module is `no_std` + `alloc`: it uses `alloc::vec::Vec` (never `std`)
-//! and `core` facilities only. The crate root is expected to declare
-//! `#![cfg_attr(not(feature = "std"), no_std)]` and `extern crate alloc;`.
+//! The module is `no_std` + `alloc`: it references only `core`, `alloc` (for
+//! [`Box`]), and the crate's own modules — never `std`. The crate root turns
+//! `no_std` on with
+//! `#![cfg_attr(all(not(feature = "std"), not(test), panic = "abort"), no_std)]`
+//! and declares `extern crate alloc;`. The two extra predicates matter: the
+//! `not(test)` clause keeps the unit-test harness (which needs `std`) buildable
+//! without the `std` feature, and the `panic = "abort"` clause reflects that a
+//! stable-toolchain `no_std` build cannot link an unwinding runtime — both
+//! release and dev profiles therefore set `panic = "abort"`.
 //!
 //! # C cross-reference
 //!
@@ -45,10 +54,11 @@ use crate::checksum::adler32;
 #[cfg(feature = "gzip")]
 use crate::checksum::crc32;
 use crate::constants::{DataType, MAX_MEM_LEVEL, Strategy, Z_DEFAULT_COMPRESSION, Z_DEFLATED};
+use crate::deflate::strategy::CONFIGURATION_TABLE;
 use crate::error::ZlibError;
 #[cfg(feature = "gzip")]
 use crate::gz_header::GzHeader;
-use crate::stream::{AllocBuffer, AllocHook};
+use crate::stream::{AllocBuffer, AllocHook, try_box};
 
 // ===========================================================================
 // Compile-time constants (ported from deflate.h / trees.h / trees.c / zutil.h)
@@ -262,97 +272,6 @@ pub enum TreeKind {
 }
 
 // ===========================================================================
-// Match-finder configuration table (deflate.c configuration_table)
-// ===========================================================================
-
-/// The per-level match-finder tuning parameters, mirroring the numeric portion
-/// of the C `configuration_table` (`deflate.c`).
-///
-/// The C table additionally stores a `compress_func` function pointer per
-/// level; that dispatch concern is handled separately by `strategy.rs`
-/// (as a Rust `enum`), so only the four tuning fields are kept here. These
-/// values must match zlib exactly because they change the lazy-match decisions
-/// and therefore the emitted token stream.
-#[derive(Clone, Copy)]
-struct Config {
-    /// Reduce lazy search above this match length (`good_length`).
-    good_length: u16,
-    /// Do not perform lazy search above this match length (`max_lazy`).
-    max_lazy: u16,
-    /// Quit search above this match length (`nice_length`).
-    nice_length: u16,
-    /// Never search a hash chain beyond this many links (`max_chain`).
-    max_chain: u16,
-}
-
-/// The ten-level match-finder configuration table, ported verbatim from the
-/// non-`FASTEST` `configuration_table` in `deflate.c`. Indexed by the
-/// (already resolved) compression level `0..=9`.
-const CONFIGURATION_TABLE: [Config; 10] = [
-    // good  lazy  nice  chain
-    Config {
-        good_length: 0,
-        max_lazy: 0,
-        nice_length: 0,
-        max_chain: 0,
-    }, // 0 store only
-    Config {
-        good_length: 4,
-        max_lazy: 4,
-        nice_length: 8,
-        max_chain: 4,
-    }, // 1 max speed
-    Config {
-        good_length: 4,
-        max_lazy: 5,
-        nice_length: 16,
-        max_chain: 8,
-    }, // 2
-    Config {
-        good_length: 4,
-        max_lazy: 6,
-        nice_length: 32,
-        max_chain: 32,
-    }, // 3
-    Config {
-        good_length: 4,
-        max_lazy: 4,
-        nice_length: 16,
-        max_chain: 16,
-    }, // 4 lazy matches
-    Config {
-        good_length: 8,
-        max_lazy: 16,
-        nice_length: 32,
-        max_chain: 32,
-    }, // 5
-    Config {
-        good_length: 8,
-        max_lazy: 16,
-        nice_length: 128,
-        max_chain: 128,
-    }, // 6
-    Config {
-        good_length: 8,
-        max_lazy: 32,
-        nice_length: 128,
-        max_chain: 256,
-    }, // 7
-    Config {
-        good_length: 32,
-        max_lazy: 128,
-        nice_length: 258,
-        max_chain: 1024,
-    }, // 8
-    Config {
-        good_length: 32,
-        max_lazy: 258,
-        nice_length: 258,
-        max_chain: 4096,
-    }, // 9 max compression
-];
-
-// ===========================================================================
 // IoContext — the transient z_stream I/O view threaded through the engine
 // ===========================================================================
 
@@ -463,15 +382,24 @@ impl<'a> IoContext<'a> {
 /// This owns every working buffer (the sliding [`window`](Self::window), the
 /// hash-chain tables [`prev`](Self::prev)/[`head`](Self::head), the
 /// [`pending_buf`](Self::pending_buf) output staging area, and the
-/// [`sym_buf`](Self::sym_buf) symbol buffer) as `Vec` allocations, replacing
-/// the C `zcalloc`/`zcfree` pointers. It is created with [`DeflateState::new`]
-/// and typically held as `Option<Box<DeflateState>>` by the owning `ZStream`,
-/// so its memory is released automatically via `Drop`.
+/// [`sym_buf`](Self::sym_buf) symbol buffer) as [`AllocBuffer`]s, replacing the
+/// C `zcalloc`/`zcfree` pointers. Each one is routed through the caller's
+/// `zalloc`/`zfree` hook when the `z_stream` installs an active pair, and
+/// through the global allocator otherwise. It is created with
+/// [`DeflateState::new`] and owned by the [`ZStream`](crate::stream::ZStream)
+/// as the `StreamState::Deflate(Box<DeflateState>)` variant — the place the C
+/// `internal_state *state` pointer went — so its memory is released
+/// automatically via `Drop` and there is no explicit free to forget.
 ///
-/// `#[derive(Clone)]` supports the `deflateCopy` operation: cloning deep-copies
-/// every `Vec`, and — because this port uses indices and owned arrays rather
-/// than raw pointers — there are **no pointer fix-ups** to perform afterwards,
-/// a substantial simplification over the C implementation.
+/// [`try_clone`](Self::try_clone) supports the `deflateCopy` operation: it
+/// deep-copies every buffer through the allocator that backs it, and — because
+/// this port uses indices and owned arrays rather than raw pointers — there are
+/// **no pointer fix-ups** to perform afterwards, a substantial simplification
+/// over the C implementation. The copy is deliberately *fallible* (there is no
+/// [`Clone`] impl): a buffer owned by the caller's `zalloc` must be re-allocated
+/// through that same hook, and if that fails the copy reports
+/// [`ZlibError::MemError`] exactly as C returns `Z_MEM_ERROR` — it never
+/// substitutes global-allocator storage (AAP §0.6.3, §0.6.5).
 ///
 /// # Memory footprint
 ///
@@ -484,7 +412,6 @@ impl<'a> IoContext<'a> {
 /// `sym_buf` (see the field docs) as the price of a fully safe, pointer-free
 /// layout. The `pending_buf` sizing (`4 * lit_bufsize`) is preserved exactly so
 /// the block-emission overflow guarantees still hold.
-#[derive(Clone)]
 pub struct DeflateState {
     /// Current stream status (C `status`). See [`DeflateStatus`].
     pub status: DeflateStatus,
@@ -654,11 +581,12 @@ pub struct DeflateState {
     ///
     /// **Design note:** reference zlib overlays this on `pending_buf` at offset
     /// `lit_bufsize` (`sym_buf = pending_buf + lit_bufsize`). This port instead
-    /// uses a dedicated owned `Vec<u8>` of length `lit_bufsize * 3`, which is
-    /// behaviorally identical to the non-`LIT_MEM` C layout and avoids all
-    /// pointer aliasing. The overflow interaction with `pending_buf` is
-    /// preserved because the symbol buffer is only consumed (by `compress_block`
-    /// in `trees.rs`) at a flush, when `pending` has been drained.
+    /// uses a dedicated owned [`AllocBuffer<u8>`](AllocBuffer) of length
+    /// `lit_bufsize * 3`, which is behaviorally identical to the non-`LIT_MEM` C
+    /// layout and avoids all pointer aliasing. The overflow interaction with
+    /// `pending_buf` is preserved because the symbol buffer is only consumed (by
+    /// `compress_block` in `trees.rs`) at a flush, when `pending` has been
+    /// drained.
     pub sym_buf: AllocBuffer<u8>,
 
     /// Size of the literal/length symbol buffer in symbols-worth of bytes
@@ -709,13 +637,166 @@ pub struct DeflateState {
     /// `data_type`), initialized to [`DataType::Unknown`].
     pub data_type: DataType,
 
-    /// The `mem_level` the state was created with (`1..=8`). Retained for
-    /// `deflateParams` / `deflateBound` bookkeeping even though most derived
-    /// quantities (`hash_bits`, `lit_bufsize`) are precomputed.
+    /// The `mem_level` the state was created with. The accepted range is
+    /// `1..=MAX_MEM_LEVEL`, i.e. `1..=9`, matching the C `deflateInit2_`
+    /// validation (`deflate.c` L433-L437); the *default* used by
+    /// `deflateInit`/`compress` is [`DEF_MEM_LEVEL`](crate::constants::DEF_MEM_LEVEL)
+    /// `== 8`. Retained for `deflateParams` / `deflateBound` bookkeeping even
+    /// though most derived quantities (`hash_bits`, `lit_bufsize`) are
+    /// precomputed.
     pub mem_level: i32,
+
+    /// The caller's allocator hook, retained so the `deflateCopy` path can
+    /// duplicate the working buffers through the *same* `zalloc` the original
+    /// used (AAP §0.6.5) — reproducing C `deflateCopy`, whose `zmemcpy` of the
+    /// `z_stream` makes the destination inherit the source's
+    /// `zalloc`/`zfree`/`opaque` before any allocation happens
+    /// (`deflate.c` L1317-L1377).
+    ///
+    /// [`AllocHook::none`] on the global-allocator path.
+    pub(crate) alloc_hook: AllocHook,
+
+    /// Reservation standing in for C's `ZALLOC(strm, 1, sizeof(deflate_state))`
+    /// (`deflate.c` L440).
+    ///
+    /// The state object itself is a Rust `Box`, because the whole design keeps
+    /// engine state as an owned, `Clone`-able Rust value (AAP §0.6.3) rather
+    /// than a caller-allocated arena. C nevertheless charges the state's bytes
+    /// to the caller's allocator, and a bounded allocator such as
+    /// `infcover.c`'s must therefore see them: without this reservation a
+    /// caller who budgets exactly `sizeof(deflate_state)` fewer bytes than the
+    /// real requirement would observe `Z_OK` where C reports `Z_MEM_ERROR`,
+    /// which is precisely the memory-bounds parity AAP §0.6.5 requires.
+    ///
+    /// Requested as `(1, size_of::<DeflateState>())` so the hook sees C's exact
+    /// argument pair, and taken **first**, matching C's ordering. Empty (a
+    /// zero-length [`AllocBuffer::Owned`]) whenever the hook is inactive, so the
+    /// historical global-allocator path is byte-for-byte unchanged.
+    pub(crate) state_alloc: AllocBuffer<u8>,
 }
 
 impl DeflateState {
+    /// Deep-copies this state into a new one, or returns [`ZlibError::MemError`]
+    /// if any of its six buffers cannot be allocated — the `state_alloc`
+    /// reservation or any of the five working buffers — the safe-Rust
+    /// counterpart of C `deflateCopy`
+    /// (`deflate.c` L1317-L1377).
+    ///
+    /// # Allocator and failure parity
+    ///
+    /// Each buffer is copied through [`AllocBuffer::try_clone`], so a buffer
+    /// backed by the caller's `zalloc` is re-allocated **through that same hook**
+    /// and one backed by the global allocator stays there. This is what AAP
+    /// §0.6.5 requires: "the clone path must route through the same `AllocHook` —
+    /// otherwise a caller that supplied a custom arena would find the copy living
+    /// in the global heap". If any allocation
+    /// fails the whole copy fails, exactly as C abandons the destination and
+    /// returns `Z_MEM_ERROR` (`deflate.c` L1348-L1350) rather than completing the
+    /// copy with substitute storage (AAP §0.6.3, §0.6.5).
+    ///
+    /// Because this port uses indices and owned arrays rather than raw pointers,
+    /// there are **no pointer fix-ups** to perform afterwards — a substantial
+    /// simplification over the C implementation, which must re-point
+    /// `sym_buf`/`pending_out` into the freshly allocated `pending_buf`.
+    ///
+    /// # Why this is written out field by field
+    ///
+    /// The buffers must be cloned fallibly, so `#[derive(Clone)]` cannot express
+    /// this operation. Listing every field explicitly makes the copy
+    /// compiler-checked: adding a field to [`DeflateState`] without deciding how
+    /// it is copied is a compile error rather than a silently dropped value.
+    pub fn try_clone(&self) -> Result<Self, ZlibError> {
+        // Fallible work first: if any buffer cannot be allocated the copy is
+        // abandoned before anything else is built, and the buffers already
+        // cloned are released by their own `Drop` (C `deflateEnd(dest)`).
+        //
+        // The state-object reservation comes first, because that is the order C
+        // `deflateCopy` uses: `ZALLOC(strm, 1, sizeof(deflate_state))` for the
+        // destination state (`deflate.c` L1330-L1333) precedes the working
+        // buffers. Cloning it re-requests the same `(1, size_of)` pair through the
+        // same hook, so the caller's allocation count and failure timing for a
+        // copy match C's as well (AAP §0.6.5).
+        let state_alloc = self.state_alloc.try_clone().ok_or(ZlibError::MemError)?;
+        let pending_buf = self.pending_buf.try_clone().ok_or(ZlibError::MemError)?;
+        let window = self.window.try_clone().ok_or(ZlibError::MemError)?;
+        let prev = self.prev.try_clone().ok_or(ZlibError::MemError)?;
+        let head = self.head.try_clone().ok_or(ZlibError::MemError)?;
+        let sym_buf = self.sym_buf.try_clone().ok_or(ZlibError::MemError)?;
+
+        Ok(Self {
+            status: self.status,
+            state_alloc,
+            pending_buf,
+            pending_buf_size: self.pending_buf_size,
+            pending_out: self.pending_out,
+            pending: self.pending,
+            wrap: self.wrap,
+            #[cfg(feature = "gzip")]
+            gzhead: self.gzhead.clone(),
+            #[cfg(feature = "gzip")]
+            gzindex: self.gzindex,
+            method: self.method,
+            last_flush: self.last_flush,
+            w_size: self.w_size,
+            w_bits: self.w_bits,
+            w_mask: self.w_mask,
+            window,
+            window_size: self.window_size,
+            prev,
+            head,
+            ins_h: self.ins_h,
+            hash_size: self.hash_size,
+            hash_bits: self.hash_bits,
+            hash_mask: self.hash_mask,
+            hash_shift: self.hash_shift,
+            block_start: self.block_start,
+            match_length: self.match_length,
+            prev_match: self.prev_match,
+            match_available: self.match_available,
+            strstart: self.strstart,
+            match_start: self.match_start,
+            lookahead: self.lookahead,
+            prev_length: self.prev_length,
+            max_chain_length: self.max_chain_length,
+            max_lazy_match: self.max_lazy_match,
+            level: self.level,
+            strategy: self.strategy,
+            good_match: self.good_match,
+            nice_match: self.nice_match,
+            dyn_ltree: self.dyn_ltree,
+            dyn_dtree: self.dyn_dtree,
+            bl_tree: self.bl_tree,
+            l_max_code: self.l_max_code,
+            d_max_code: self.d_max_code,
+            bl_max_code: self.bl_max_code,
+            bl_count: self.bl_count,
+            heap: self.heap,
+            heap_len: self.heap_len,
+            heap_max: self.heap_max,
+            depth: self.depth,
+            sym_buf,
+            lit_bufsize: self.lit_bufsize,
+            sym_next: self.sym_next,
+            sym_end: self.sym_end,
+            opt_len: self.opt_len,
+            static_len: self.static_len,
+            matches: self.matches,
+            insert: self.insert,
+            bi_buf: self.bi_buf,
+            bi_valid: self.bi_valid,
+            bi_used: self.bi_used,
+            high_water: self.high_water,
+            slid: self.slid,
+            data_type: self.data_type,
+            mem_level: self.mem_level,
+            // The copy inherits the source's allocator, so its window and every
+            // later re-allocation stay inside the caller's arena — C `deflateCopy`
+            // reaches the same state by `zmemcpy`ing the whole `z_stream`, which
+            // carries `zalloc`/`zfree`/`opaque` across (AAP §0.6.3, §0.6.5).
+            alloc_hook: self.alloc_hook,
+        })
+    }
+
     /// Allocates and initializes a new deflate state, reproducing the
     /// allocation and field-setup portion of the C `deflateInit2_`
     /// (`deflate.c` L387-L533).
@@ -832,19 +913,62 @@ impl DeflateState {
         // block considerations): sym_end = (lit_bufsize - 1) * 3.
         let sym_end = (lit_bufsize - 1) * 3;
 
-        // Allocate every working buffer up front, routed through the caller's
-        // allocator hook. When an active hook's `zalloc` reports out-of-memory,
-        // `try_zeroed` yields `None`, which we surface as `Z_MEM_ERROR` (M7);
-        // any buffers already allocated are released as the early return drops
-        // them. The null-hook (global) path never fails.
-        let pending_buf =
-            AllocBuffer::try_zeroed(pending_buf_size, hook).ok_or(ZlibError::MemError)?;
-        let window = AllocBuffer::try_zeroed(2 * w_size, hook).ok_or(ZlibError::MemError)?;
-        let prev = AllocBuffer::try_zeroed(w_size, hook).ok_or(ZlibError::MemError)?;
-        let head = AllocBuffer::try_zeroed(hash_size, hook).ok_or(ZlibError::MemError)?;
-        let sym_buf = AllocBuffer::try_zeroed(lit_bufsize * 3, hook).ok_or(ZlibError::MemError)?;
+        // C charges the state object itself to the caller's allocator *first*
+        // and checks it immediately (`deflate.c` L440-L442:
+        // `s = ZALLOC(strm, 1, sizeof(deflate_state)); if (s == Z_NULL) return
+        // Z_MEM_ERROR;`). The state lives in a Rust `Box` here, so this
+        // reservation exists purely to keep the caller's memory accounting and
+        // failure timing identical (AAP §0.6.5); it is empty and free when the
+        // hook is inactive. The `(1, size_of)` pair is exactly what C passes.
+        let state_alloc = if hook.is_active() {
+            match AllocBuffer::<u8>::try_zeroed_items(1, core::mem::size_of::<DeflateState>(), hook)
+            {
+                Some(cell) => cell,
+                None => return Err(ZlibError::MemError),
+            }
+        } else {
+            AllocBuffer::default()
+        };
 
-        let mut state = Box::new(DeflateState {
+        // Allocate every working buffer up front, routed through the caller's
+        // allocator hook, forwarding C's exact `(items, item_size)` pairs so a
+        // bounded or inspecting allocator observes the same arguments
+        // (`deflate.c` L458-L460, L505).
+        //
+        // When an active hook's `zalloc` reports out-of-memory, the allocation
+        // yields `None`, which is surfaced as `Z_MEM_ERROR` (AAP §0.6.5). C attempts all
+        // of these and checks them *together* afterwards (`deflate.c`
+        // L508-L514), so the number of `zalloc` calls a failing caller observes
+        // is part of the contract; that ordering is reproduced here rather than
+        // short-circuiting on the first `None` (AAP §0.6.5). Any buffer that did
+        // succeed is released by its `Drop` (through the caller's `zfree`) when
+        // the early return drops the temporaries. The null-hook (global) path
+        // fails only on genuine heap exhaustion.
+        // C: ZALLOC(strm, s->lit_bufsize, LIT_BUFS) with LIT_BUFS == 4
+        // (`deflate.h` L229, `LIT_MEM` being commented out at `deflate.h` L28).
+        // `lit_bufsize * 4 == pending_buf_size`, so the byte count is unchanged.
+        let pending_buf = AllocBuffer::<u8>::try_zeroed_items(lit_bufsize, 4, hook);
+        // C: ZALLOC(strm, s->w_size, 2 * sizeof(Byte)) — the doubled window.
+        let window = AllocBuffer::<u8>::try_zeroed_items(w_size, 2, hook);
+        // C: ZALLOC(strm, s->w_size, sizeof(Pos)) — `Pos` is 2 bytes, which is
+        // already `size_of::<u16>()`, so the element-shaped spelling is exact.
+        let prev = AllocBuffer::<u16>::try_zeroed(w_size, hook);
+        // C: ZALLOC(strm, s->hash_size, sizeof(Pos)).
+        let head = AllocBuffer::<u16>::try_zeroed(hash_size, hook);
+        // C overlays `sym_buf` on `pending_buf` and issues no separate ZALLOC;
+        // this port keeps a dedicated buffer (AAP §0.4.1.3, and the design note
+        // on the `sym_buf` field). It is shaped `(lit_bufsize, 3)` — one
+        // three-byte symbol record per literal slot — mirroring C's
+        // `(lit_bufsize, LIT_BUFS)` item split.
+        let sym_buf = AllocBuffer::<u8>::try_zeroed_items(lit_bufsize, 3, hook);
+
+        let (Some(pending_buf), Some(window), Some(prev), Some(head), Some(sym_buf)) =
+            (pending_buf, window, prev, head, sym_buf)
+        else {
+            return Err(ZlibError::MemError);
+        };
+
+        let mut state = try_box(DeflateState {
             status: DeflateStatus::Init,
             pending_buf,
             pending_buf_size,
@@ -909,7 +1033,10 @@ impl DeflateState {
             slid: false,
             data_type: DataType::Unknown,
             mem_level,
-        });
+            alloc_hook: hook,
+            state_alloc,
+        })
+        .ok_or(ZlibError::MemError)?;
 
         // Reproduce the state-resetting portion of deflateReset. The I/O-side
         // reset (total_in/total_out = 0, adler = initial_adler(wrap)) is the
@@ -918,6 +1045,58 @@ impl DeflateState {
         state.lm_init();
 
         Ok(state)
+    }
+
+    /// Deep-copies this state for `deflateCopy`, **preserving the allocator** and
+    /// reporting an out-of-memory refusal instead of masking it.
+    ///
+    /// C `deflateCopy` (`deflate.c` L1317-L1377) first `zmemcpy`s the `z_stream`
+    /// — so the destination inherits the source's `zalloc`/`zfree`/`opaque` —
+    /// then allocates the state and all four working buffers through that same
+    /// allocator, and returns `Z_MEM_ERROR` if any allocation fails. An infallible
+    /// [`Clone`] could not express that failure — its only options are to panic or
+    /// to fall back to the global allocator, which would return `Z_OK` where C
+    /// returns `Z_MEM_ERROR` and let a caller-supplied arena be silently escaped —
+    /// which is why neither [`DeflateState`] nor
+    /// [`AllocBuffer`](crate::stream::AllocBuffer) implements it. AAP §0.6.5
+    /// requires the copy to route through the same [`AllocHook`], so `deflateCopy`
+    /// uses this method and surfaces [`None`] as `Z_MEM_ERROR`.
+    ///
+    /// # Mechanism
+    ///
+    /// [`try_clone`](Self::try_clone) performs the field-by-field copy, routing
+    /// every buffer through [`alloc_hook`](Self::alloc_hook) — including
+    /// [`state_alloc`](Self::state_alloc), which reproduces C's
+    /// `ZALLOC(strm, 1, sizeof(deflate_state))` for the destination — with exactly
+    /// one request per buffer and none for anything else, so a caller's counter
+    /// sees the same request *per buffer* C issues (`deflate.c` L1335-L1348).
+    /// The one composition difference is the dedicated [`sym_buf`](Self::sym_buf):
+    /// C overlays it on `pending_buf` and issues no `ZALLOC` for it, so this port
+    /// makes six requests where C makes five. That is the deliberate layout choice
+    /// documented on the field, not a parity defect; what AAP §0.6.5 constrains is
+    /// that every request go through the caller's hook and that a refusal be
+    /// reported rather than absorbed, both of which hold. It is fallible
+    /// end to end and has **no** global-allocator fallback: a hook that refuses
+    /// yields [`ZlibError::MemError`] rather than a buffer that quietly escaped the
+    /// caller's arena, so the escape cannot occur and does not have to be detected
+    /// after the fact. A zero-length buffer stays legitimately owned even under an
+    /// active hook, because `try_zeroed` never calls `zalloc` for an empty request.
+    ///
+    /// [`try_box`] then moves the finished state onto the Rust heap fallibly,
+    /// because [`Box::new`] aborts the process on heap exhaustion whereas zlib
+    /// reports `Z_MEM_ERROR` (AAP §0.6.5). If that last step fails, the state is
+    /// dropped normally and every buffer it owns is released through the caller's
+    /// `zfree`.
+    ///
+    /// # Returns
+    ///
+    /// [`None`] if any buffer could not be duplicated through the caller's
+    /// allocator, or if the state box itself could not be allocated. Every buffer
+    /// allocated along the way is released through the caller's `zfree` when the
+    /// abandoned copy drops.
+    #[must_use]
+    pub(crate) fn try_copy(&self) -> Option<Box<DeflateState>> {
+        try_box(self.try_clone().ok()?)
     }
 
     /// Returns the initial checksum seed for the given wrapper, matching the C
@@ -1031,8 +1210,13 @@ impl DeflateState {
         self.window_size = 2 * self.w_size;
         self.clear_hash();
 
-        // Load the per-level configuration (byte-exact port of C
-        // configuration_table[level]). `level` is validated to 0..=9 in `new`.
+        // Load the per-level configuration from the crate's SINGLE
+        // match-finder tuning table — `crate::deflate::strategy`'s
+        // `CONFIGURATION_TABLE`, the verbatim port of C
+        // `configuration_table[10]` (`deflate.c` L112-L124). `deflate_params`
+        // re-dispatch reads the very same rows, so the two paths cannot drift
+        // apart and silently change the emitted token stream (AAP §0.6.4,
+        // TO-5). `level` is validated to 0..=9 in `new`.
         let cfg = &CONFIGURATION_TABLE[self.level as usize];
         self.max_lazy_match = cfg.max_lazy as usize;
         self.good_match = cfg.good_length as usize;
@@ -1124,6 +1308,23 @@ impl DeflateState {
     ///
     /// Returns the number of bytes actually copied (`0` when input is
     /// exhausted).
+    ///
+    /// # Preconditions
+    ///
+    /// `*next_in` and `*avail_in` must describe a valid remaining region of
+    /// `input`, i.e. `*next_in + *avail_in <= input.len()`. That is the
+    /// invariant [`IoContext`] maintains from the moment it is built out of a
+    /// `z_stream`, and the C engine relies on the same one (`strm->next_in` plus
+    /// `strm->avail_in` never runs past the caller's buffer).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the precondition is violated: the copy indexes
+    /// `input[*next_in..*next_in + len]` where `len = min(*avail_in,
+    /// dst.len())`, so a cursor or count that overruns `input` aborts on the
+    /// bounds check instead of reading out of bounds. This is the deliberate
+    /// safe-Rust counterpart of the C pointer arithmetic, which would silently
+    /// read past the buffer.
     #[allow(clippy::too_many_arguments)]
     pub fn read_buf_into(
         input: &[u8],
@@ -1184,7 +1385,11 @@ impl DeflateState {
     /// window down by `w_size` when it fills.
     ///
     /// The 16-bit-machine special-casing (`sizeof(int) <= 2`) in the C source
-    /// is intentionally omitted — `usize` is 64-bit on all supported targets.
+    /// is intentionally omitted: no supported target is 16-bit, so `usize` is
+    /// at least 32 bits wide and the largest window this port can be asked for
+    /// (`2 * 32 KiB`) is always representable without the C workaround. The
+    /// omission is therefore independent of whether `usize` happens to be 32-
+    /// or 64-bit on the target.
     ///
     /// After refilling, any window bytes beyond the current data that have
     /// never been written are zero-filled up to `high_water` (both C branches
@@ -1409,6 +1614,24 @@ impl DeflateState {
     // -----------------------------------------------------------------------
 
     /// Appends one byte to the pending-output buffer (`deflate.h`: `put_byte`).
+    ///
+    /// # Preconditions
+    ///
+    /// [`pending`](Self::pending) must be strictly less than
+    /// [`pending_buf_size`](Self::pending_buf_size), i.e. the pending buffer
+    /// must have at least one byte of room. Every caller in this crate
+    /// establishes that before writing: `pending_buf` is sized `4 *
+    /// lit_bufsize` exactly as C sizes it, which is what makes the
+    /// block-emission overflow guarantee hold, and the block producers flush
+    /// through [`flush_pending`](Self::flush_pending) before the buffer can
+    /// fill.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer is already full, because the write is a checked
+    /// slice index. C's `put_byte` is an unchecked pointer store, so the same
+    /// programming error there is silent memory corruption; here it is a
+    /// deterministic abort.
     #[inline]
     pub fn put_byte(&mut self, b: u8) {
         self.pending_buf[self.pending] = b;
@@ -1417,6 +1640,11 @@ impl DeflateState {
 
     /// Appends a 16-bit value to the pending buffer, **least-significant byte
     /// first** (`trees.c`: `put_short`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if fewer than two bytes of pending-buffer room remain; see
+    /// [`put_byte`](Self::put_byte), which performs both writes.
     #[inline]
     pub fn put_short(&mut self, w: u16) {
         self.put_byte((w & 0xff) as u8);
@@ -1435,6 +1663,24 @@ impl DeflateState {
     /// C truncation semantics without any `unsafe`, the shift is computed in
     /// `u32` and then truncated with `as u16`; the shift amount is always in
     /// `0..=16`, so the `u32` shift is always well-defined.
+    ///
+    /// # Preconditions
+    ///
+    /// `length` must satisfy `1 <= length <= 15` and `value` must fit in
+    /// `length` bits — the same IN assertion the C source states above
+    /// `send_bits` (`trees.c` L250-L255). Those bounds are what keep
+    /// [`bi_valid`](Self::bi_valid) inside `0..16` across calls, which in turn
+    /// keeps both shift amounts inside `0..=16`. Every caller derives `length`
+    /// from a Huffman code length or a fixed literal in `2..=7`, so the bound
+    /// holds by construction.
+    ///
+    /// # Panics
+    ///
+    /// Passing a `length` outside `1..=15` drives `bi_valid` out of range and
+    /// makes a subsequent call shift by more than 31 bits, which panics on
+    /// arithmetic overflow. The overflow branch also calls
+    /// [`put_short`](Self::put_short), so it panics if fewer than two bytes of
+    /// pending-buffer room remain.
     pub fn send_bits(&mut self, value: i32, length: i32) {
         let val = value as u32;
         if self.bi_valid > BUF_SIZE - length {
@@ -1452,6 +1698,20 @@ impl DeflateState {
     /// Sends the Huffman code for symbol `c` from `tree` (`trees.c`:
     /// `send_code`): a [`send_bits`](Self::send_bits) of the code value and its
     /// bit length.
+    ///
+    /// # Preconditions
+    ///
+    /// `c` must be a valid symbol index for `tree` (`c < tree.len()`) and
+    /// `tree[c]` must carry a non-zero bit length — i.e. the symbol must
+    /// actually have been assigned a code by `build_tree`/`gen_codes`. That is
+    /// exactly C's `send_code` contract; C simply indexes the array unchecked.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `c` is out of range for `tree`, since the lookup is a checked
+    /// slice index. It also inherits the [`send_bits`](Self::send_bits) panics:
+    /// a `tree[c]` length of `0` (an unassigned symbol) or greater than `15` (a
+    /// malformed tree) violates that method's precondition.
     #[inline]
     pub fn send_code(&mut self, c: usize, tree: &[CtData]) {
         self.send_bits(tree[c].code() as i32, tree[c].len() as i32);
@@ -1494,6 +1754,11 @@ impl DeflateState {
     /// Reproduces C `_tr_flush_bits` (`trees.c`): flushes the bit buffer to the
     /// pending output (a thin wrapper over [`bi_flush`](Self::bi_flush)). Named
     /// without the leading underscore to keep it a conventional public method.
+    ///
+    /// # Panics
+    ///
+    /// Inherits [`put_byte`](Self::put_byte)/[`put_short`](Self::put_short):
+    /// panics if the pending buffer has no room for the bits being flushed.
     #[inline]
     pub fn tr_flush_bits(&mut self) {
         self.bi_flush();
@@ -1504,6 +1769,24 @@ impl DeflateState {
     /// fit into the output buffer described by `io`, advancing all cursors and
     /// counters. When the pending buffer drains completely, the read offset is
     /// reset to the start.
+    ///
+    /// # Preconditions
+    ///
+    /// Two window invariants must hold, both maintained by [`IoContext`] and by
+    /// this type's own bookkeeping:
+    ///
+    /// * `io.next_out + io.avail_out <= io.output.len()` — the output cursor and
+    ///   remaining count describe a real region of the caller's buffer;
+    /// * `self.pending_out + self.pending <= self.pending_buf.len()` — the
+    ///   unflushed pending bytes lie inside the pending buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either invariant is violated, because both the destination
+    /// (`io.output[next_out..next_out + len]`) and the source
+    /// (`pending_buf[pending_out..pending_out + len]`) are checked slice ranges.
+    /// It also inherits the [`tr_flush_bits`](Self::tr_flush_bits) panics, which
+    /// run first.
     pub fn flush_pending(&mut self, io: &mut IoContext) {
         self.tr_flush_bits();
 
@@ -1549,7 +1832,11 @@ impl DeflateState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::{Strategy, Z_DEFAULT_COMPRESSION, Z_DEFLATED};
+    use crate::constants::{
+        Strategy, Z_DEFAULT_COMPRESSION, Z_DEFLATED, Z_FINISH, Z_NO_FLUSH, Z_SYNC_FLUSH,
+    };
+    use crate::error::ReturnCode;
+    use crate::stream::ZStream;
 
     /// Compile-time constants must equal the C baseline exactly.
     #[test]
@@ -1684,6 +1971,114 @@ mod tests {
         assert_eq!(s.prev_length, MIN_MATCH - 1);
     }
 
+    /// `lm_init` must load the match-finder heuristics for **every** level from
+    /// the crate's single authoritative tuning table, and there must be exactly
+    /// one such table.
+    ///
+    /// `src/deflate/state.rs` previously carried a private duplicate of
+    /// `configuration_table`, so `lm_init` (init) and `deflate_params`
+    /// (re-dispatch) read *different* copies of the same numbers. Two copies can
+    /// diverge silently, and any divergence changes the lazy-match decisions and
+    /// therefore the emitted token stream — breaking byte-identity with reference
+    /// zlib without breaking decodability (AAP §0.6.4, TO-5). The duplicate is
+    /// gone; this test pins the surviving one against live state for all ten
+    /// levels plus the `Z_DEFAULT_COMPRESSION` alias.
+    #[test]
+    fn lm_init_loads_every_level_from_the_authoritative_table() {
+        for level in 0..=9i32 {
+            let s = DeflateState::new(level, Z_DEFLATED, 15, 8, Strategy::Default, 1)
+                .expect("level 0..=9 is valid");
+            let cfg = &CONFIGURATION_TABLE[level as usize];
+
+            assert_eq!(
+                s.good_match, cfg.good_length as usize,
+                "level {level}: good_match"
+            );
+            assert_eq!(
+                s.max_lazy_match, cfg.max_lazy as usize,
+                "level {level}: max_lazy_match"
+            );
+            assert_eq!(
+                s.nice_match, cfg.nice_length as i32,
+                "level {level}: nice_match"
+            );
+            assert_eq!(
+                s.max_chain_length, cfg.max_chain as usize,
+                "level {level}: max_chain_length"
+            );
+            // The resolved level is recorded verbatim, so the row index above is
+            // the row the match finder will keep using.
+            assert_eq!(s.level, level, "level {level}: resolved level");
+        }
+
+        // `Z_DEFAULT_COMPRESSION` (-1) resolves to 6 (`deflate.c` L438-L440), so
+        // it must load row 6 and not, say, row 0.
+        let d = DeflateState::new(
+            Z_DEFAULT_COMPRESSION,
+            Z_DEFLATED,
+            15,
+            8,
+            Strategy::Default,
+            1,
+        )
+        .expect("Z_DEFAULT_COMPRESSION is valid");
+        let six = &CONFIGURATION_TABLE[6];
+        assert_eq!(d.level, 6, "Z_DEFAULT_COMPRESSION must resolve to level 6");
+        assert_eq!(d.good_match, six.good_length as usize);
+        assert_eq!(d.max_lazy_match, six.max_lazy as usize);
+        assert_eq!(d.nice_match, six.nice_length as i32);
+        assert_eq!(d.max_chain_length, six.max_chain as usize);
+    }
+
+    /// The exact row values, spelled out independently of the table itself, so a
+    /// mistaken edit to `CONFIGURATION_TABLE` cannot make the test above pass
+    /// vacuously by moving both sides together. Transcribed from the C
+    /// `configuration_table[10]` (`deflate.c` L112-L124): `{good, lazy, nice,
+    /// chain}`.
+    #[test]
+    fn authoritative_table_rows_match_the_c_baseline() {
+        const C_TABLE: [(u16, u16, u16, u16); 10] = [
+            (0, 0, 0, 0),         // 0 store only
+            (4, 4, 8, 4),         // 1 max speed, no lazy matches
+            (4, 5, 16, 8),        // 2
+            (4, 6, 32, 32),       // 3
+            (4, 4, 16, 16),       // 4 lazy matches
+            (8, 16, 32, 32),      // 5
+            (8, 16, 128, 128),    // 6 (default)
+            (8, 32, 128, 256),    // 7
+            (32, 128, 258, 1024), // 8
+            (32, 258, 258, 4096), // 9 max compression
+        ];
+
+        for (level, &(good, lazy, nice, chain)) in C_TABLE.iter().enumerate() {
+            let cfg = &CONFIGURATION_TABLE[level];
+            assert_eq!(
+                (
+                    cfg.good_length,
+                    cfg.max_lazy,
+                    cfg.nice_length,
+                    cfg.max_chain
+                ),
+                (good, lazy, nice, chain),
+                "CONFIGURATION_TABLE row {level} diverged from deflate.c"
+            );
+
+            // ...and a live state built at that level agrees.
+            let s = DeflateState::new(level as i32, Z_DEFLATED, 15, 8, Strategy::Default, 1)
+                .expect("valid level");
+            assert_eq!(
+                (
+                    s.good_match,
+                    s.max_lazy_match,
+                    s.nice_match,
+                    s.max_chain_length
+                ),
+                (good as usize, lazy as usize, nice as i32, chain as usize),
+                "live state at level {level} diverged from deflate.c"
+            );
+        }
+    }
+
     /// An 8-bit window is legal only with the zlib wrapper and is bumped to 9.
     #[test]
     fn new_window_bits_eight_bumped() {
@@ -1797,21 +2192,607 @@ mod tests {
         assert_eq!(s.lookahead, 0);
     }
 
-    /// `DeflateState` is deep-cloneable (supports `deflateCopy`); owned buffers
-    /// are duplicated and index-based state needs no pointer fix-ups.
+    /// Drives `deflate(.., Z_FINISH)` to completion the way a C caller loops
+    /// until `Z_STREAM_END`, advancing the input cursor by `consumed` on every
+    /// call and appending to `out`. Returns the number of bytes appended.
+    fn finish_into(strm: &mut ZStream, data: &[u8], out: &mut [u8]) -> usize {
+        let mut in_off = 0usize;
+        let mut produced = 0usize;
+        loop {
+            let r = crate::deflate::deflate(strm, &data[in_off..], &mut out[produced..], Z_FINISH);
+            in_off += r.consumed;
+            produced += r.produced;
+            match r.code {
+                ReturnCode::StreamEnd => return produced,
+                ReturnCode::Ok => assert!(
+                    produced < out.len(),
+                    "output buffer exhausted before Z_STREAM_END"
+                ),
+                other => panic!("unexpected deflate return code {other:?}"),
+            }
+        }
+    }
+
+    /// Compresses `prefix` with `Z_NO_FLUSH` and then `tail` with `Z_FINISH` on
+    /// one fresh stream — the exact call sequence the deep-copy test performs —
+    /// so the result is the stream an *uninterrupted* compressor would have
+    /// produced, and is therefore directly comparable to what the snapshot
+    /// produces from the same point onwards.
+    fn deflate_streamed(prefix: &[u8], tail: &[u8], level: i32) -> alloc::vec::Vec<u8> {
+        let mut strm: ZStream = ZStream::new();
+        crate::deflate::deflate_init2(&mut strm, level, Z_DEFLATED, 15, 8, Strategy::Default)
+            .expect("init");
+        let mut out = alloc::vec![0u8; (prefix.len() + tail.len()) * 2 + 128];
+        let r = crate::deflate::deflate(&mut strm, prefix, &mut out, Z_NO_FLUSH);
+        assert_eq!(r.code, ReturnCode::Ok);
+        assert_eq!(r.consumed, prefix.len());
+        let mut n = r.produced;
+        n += finish_into(&mut strm, tail, &mut out[n..]);
+        out.truncate(n);
+        crate::deflate::deflate_end(&mut strm).expect("end");
+        out
+    }
+
+    /// Decompresses a complete zlib stream with the crate's own inflate engine,
+    /// so the deep-copy tests need neither `std` nor a third-party decoder and
+    /// therefore run in every feature configuration.
+    fn inflate_all(stream: &[u8], expect_len: usize) -> alloc::vec::Vec<u8> {
+        let mut strm: ZStream = ZStream::new();
+        crate::inflate::inflate_init2(&mut strm, 15).expect("inflate init");
+        let mut out = alloc::vec![0u8; expect_len + 64];
+        let r = crate::inflate::inflate(&mut strm, stream, &mut out, 0);
+        assert_eq!(r.code, ReturnCode::StreamEnd, "stream must decode fully");
+        out.truncate(r.produced);
+        crate::inflate::inflate_end(&mut strm).expect("inflate end");
+        out
+    }
+
+    /// `deflateCopy` produces a genuinely independent snapshot of a **live**
+    /// compressor, not a shallow alias.
+    ///
+    /// The previous version of this test cloned a *freshly initialised* state,
+    /// poked one window byte, and compared lengths — which a shallow copy that
+    /// shared every buffer would also have passed. This version:
+    ///
+    /// 1. drives real compression so the sliding window, the `head`/`prev` hash
+    ///    chains, the symbol buffer and the pending buffer all hold live data;
+    /// 2. takes the copy;
+    /// 3. proves the buffers are distinct *storage* by mutating one side and
+    ///    observing the other is unchanged (window, `head`, `prev`, `pending_buf`,
+    ///    `sym_buf`);
+    /// 4. feeds the source and the copy **divergent suffixes**, finishes both,
+    ///    and asserts each produced a correct — and different — stream that is
+    ///    moreover byte-identical to what an uninterrupted compressor fed the
+    ///    same total input emits, which is only possible if the window and hash
+    ///    chains were duplicated faithfully rather than shared or reset; and
+    /// 5. drops the two streams in both orders across the two halves of the test,
+    ///    so a double free or a use-after-free would surface.
+    ///
+    /// Note that the copy continues the *same* zlib stream: the bytes the source
+    /// had already emitted before the snapshot are part of the copy's stream too,
+    /// so they are prepended before decoding or comparing.
     #[test]
-    fn deflate_state_is_cloneable() {
+    fn deflate_copy_snapshots_live_state_independently() {
+        let prefix = b"the quick brown fox jumps over the lazy dog; ".repeat(24);
+        let tail_a = b"AAAA suffix alpha alpha alpha ".repeat(8);
+        let tail_b = b"ZZZZ suffix omega omega omega ".repeat(8);
+
+        let mut src: ZStream = ZStream::new();
+        crate::deflate::deflate_init2(&mut src, 6, Z_DEFLATED, 15, 8, Strategy::Default)
+            .expect("init");
+
+        // (1) Consume the prefix so the window and hash chains hold real history.
+        let mut out_src = alloc::vec![0u8; 8192];
+        let r = crate::deflate::deflate(&mut src, &prefix, &mut out_src, Z_NO_FLUSH);
+        assert_eq!(r.code, ReturnCode::Ok);
+        assert_eq!(r.consumed, prefix.len());
+        let mut produced_src = r.produced;
+
+        {
+            let st = src.deflate_state().expect("state installed");
+            assert!(st.strstart > 0, "the window must hold history");
+            assert!(
+                st.head.iter().any(|&h| h != NIL),
+                "the hash heads must hold live chains"
+            );
+            assert!(
+                st.prev.iter().any(|&p| p != NIL),
+                "the prev chain must hold live links"
+            );
+            assert!(st.sym_next > 0, "the symbol buffer must hold live symbols");
+        }
+
+        // Everything the source emitted *before* the snapshot belongs to the
+        // copy's stream as well, so keep it to rebuild a complete stream later.
+        let common: alloc::vec::Vec<u8> = out_src[..produced_src].to_vec();
+
+        // (2) Snapshot.
+        let mut cpy: ZStream = ZStream::new();
+        crate::deflate::deflate_copy(&mut cpy, &src).expect("copy");
+
+        // (2b) The snapshot is faithful: every cursor and every buffer *content*
+        //      matches the source at snapshot time. Asserting this directly —
+        //      rather than inferring it from the output alone — catches a field a
+        //      future edit forgets to carry over even when that field happens to
+        //      be reconstructible (`ins_h`, for instance, is rebuilt by
+        //      `fill_window` from `window` + `insert`, `deflate.c` L314-L317, so
+        //      output equality alone would not notice its loss).
+        {
+            let a = src.deflate_state().expect("source state");
+            let b = cpy.deflate_state().expect("copy state");
+
+            assert_eq!(b.status, a.status, "status");
+            assert_eq!(b.level, a.level, "level");
+            assert_eq!(b.strategy, a.strategy, "strategy");
+            assert_eq!(b.wrap, a.wrap, "wrap");
+            assert_eq!(b.w_size, a.w_size, "w_size");
+            assert_eq!(b.w_mask, a.w_mask, "w_mask");
+            assert_eq!(b.hash_bits, a.hash_bits, "hash_bits");
+            assert_eq!(b.hash_mask, a.hash_mask, "hash_mask");
+            assert_eq!(b.hash_shift, a.hash_shift, "hash_shift");
+            assert_eq!(b.ins_h, a.ins_h, "ins_h");
+            assert_eq!(b.insert, a.insert, "insert");
+            assert_eq!(b.strstart, a.strstart, "strstart");
+            assert_eq!(b.block_start, a.block_start, "block_start");
+            assert_eq!(b.lookahead, a.lookahead, "lookahead");
+            assert_eq!(b.match_start, a.match_start, "match_start");
+            assert_eq!(b.match_length, a.match_length, "match_length");
+            assert_eq!(b.prev_length, a.prev_length, "prev_length");
+            assert_eq!(b.match_available, a.match_available, "match_available");
+            assert_eq!(b.high_water, a.high_water, "high_water");
+            assert_eq!(b.good_match, a.good_match, "good_match");
+            assert_eq!(b.max_lazy_match, a.max_lazy_match, "max_lazy_match");
+            assert_eq!(b.nice_match, a.nice_match, "nice_match");
+            assert_eq!(b.max_chain_length, a.max_chain_length, "max_chain_length");
+            assert_eq!(b.pending, a.pending, "pending");
+            assert_eq!(b.pending_out, a.pending_out, "pending_out");
+            assert_eq!(b.sym_next, a.sym_next, "sym_next");
+            assert_eq!(b.sym_end, a.sym_end, "sym_end");
+            assert_eq!(b.last_flush, a.last_flush, "last_flush");
+            assert_eq!(b.bi_buf, a.bi_buf, "bi_buf");
+            assert_eq!(b.bi_valid, a.bi_valid, "bi_valid");
+            assert_eq!(b.opt_len, a.opt_len, "opt_len");
+            assert_eq!(b.static_len, a.static_len, "static_len");
+            assert_eq!(b.matches, a.matches, "matches");
+            assert_eq!(b.slid, a.slid, "slid");
+            assert_eq!(b.w_bits, a.w_bits, "w_bits");
+            assert_eq!(b.hash_size, a.hash_size, "hash_size");
+            assert_eq!(b.lit_bufsize, a.lit_bufsize, "lit_bufsize");
+            #[cfg(feature = "gzip")]
+            assert_eq!(b.gzindex, a.gzindex, "gzindex");
+
+            // The regions C's `deflateCopy` explicitly duplicates
+            // (`deflate.c` L1352-L1367): `window[..high_water]`, the live `prev`
+            // prefix, the whole `head`, the undelivered `pending` bytes, and
+            // `sym_buf[..sym_next]`. Everything outside them is dead state that
+            // C leaves as freshly-allocated garbage.
+            let live_prev = if a.slid || a.strstart - a.insert > a.w_size {
+                a.w_size
+            } else {
+                a.strstart - a.insert
+            };
+            assert_eq!(
+                &b.window[..a.high_water],
+                &a.window[..a.high_water],
+                "live window"
+            );
+            assert_eq!(
+                &b.prev[..live_prev],
+                &a.prev[..live_prev],
+                "live prev chain"
+            );
+            assert_eq!(&*b.head, &*a.head, "hash heads");
+            assert_eq!(
+                &b.pending_buf[a.pending_out..a.pending_out + a.pending],
+                &a.pending_buf[a.pending_out..a.pending_out + a.pending],
+                "undelivered pending output"
+            );
+            assert_eq!(
+                &b.sym_buf[..a.sym_next],
+                &a.sym_buf[..a.sym_next],
+                "live symbol buffer"
+            );
+
+            // This implementation copies each buffer in full, a superset of C's
+            // live-region copy, so the snapshot carries no uninitialised bytes.
+            assert_eq!(&*b.window, &*a.window, "window contents");
+            assert_eq!(&*b.prev, &*a.prev, "prev contents");
+            assert_eq!(&*b.pending_buf, &*a.pending_buf, "pending_buf contents");
+            assert_eq!(&*b.sym_buf, &*a.sym_buf, "sym_buf contents");
+        }
+
+        // (3) The buffers are distinct storage: mutating the copy leaves the
+        //     source byte-for-byte unchanged.
+        {
+            let before = {
+                let st = src.deflate_state().expect("source state");
+                (
+                    st.window[0],
+                    st.head[0],
+                    st.prev[0],
+                    st.pending_buf[0],
+                    st.sym_buf[0],
+                    st.strstart,
+                    st.sym_next,
+                )
+            };
+
+            let c = cpy.deflate_state_mut().expect("copy state");
+            assert_eq!(c.window[0], before.0, "the copy starts identical");
+            assert_eq!(c.strstart, before.5, "the copy inherits the window cursor");
+            assert_eq!(c.sym_next, before.6, "the copy inherits the symbol cursor");
+            c.window[0] = before.0 ^ 0xFF;
+            c.head[0] = before.1 ^ 0xBEEF;
+            c.prev[0] = before.2 ^ 0xBEEF;
+            c.pending_buf[0] = before.3 ^ 0xFF;
+            c.sym_buf[0] = before.4 ^ 0xFF;
+
+            let st = src.deflate_state().expect("source state");
+            assert_eq!(st.window[0], before.0, "window is shared!");
+            assert_eq!(st.head[0], before.1, "head is shared!");
+            assert_eq!(st.prev[0], before.2, "prev is shared!");
+            assert_eq!(st.pending_buf[0], before.3, "pending_buf is shared!");
+            assert_eq!(st.sym_buf[0], before.4, "sym_buf is shared!");
+            assert_eq!(st.strstart, before.5);
+            assert_eq!(st.sym_next, before.6);
+
+            // Restore the copy so step (4) compresses honestly.
+            let c = cpy.deflate_state_mut().expect("copy state");
+            c.window[0] = before.0;
+            c.head[0] = before.1;
+            c.prev[0] = before.2;
+            c.pending_buf[0] = before.3;
+            c.sym_buf[0] = before.4;
+        }
+
+        // (4) Divergent suffixes, finished independently.
+        let mut out_cpy = alloc::vec![0u8; 8192];
+        let produced_cpy = finish_into(&mut cpy, &tail_b, &mut out_cpy);
+        produced_src += finish_into(&mut src, &tail_a, &mut out_src[produced_src..]);
+
+        let mut want_a = prefix.clone();
+        want_a.extend_from_slice(&tail_a);
+        let mut want_b = prefix.clone();
+        want_b.extend_from_slice(&tail_b);
+
+        let got_a: alloc::vec::Vec<u8> = out_src[..produced_src].to_vec();
+        let mut got_b = common.clone();
+        got_b.extend_from_slice(&out_cpy[..produced_cpy]);
+
+        assert_ne!(
+            got_a, got_b,
+            "divergent suffixes must produce different streams"
+        );
+        assert_eq!(inflate_all(&got_a, want_a.len()), want_a);
+        assert_eq!(inflate_all(&got_b, want_b.len()), want_b);
+
+        // Each side is byte-identical to an uninterrupted compressor fed the same
+        // total input, which holds only if the snapshot duplicated the window and
+        // the hash chains faithfully instead of sharing or resetting them.
+        assert_eq!(
+            got_a,
+            deflate_streamed(&prefix, &tail_a, 6),
+            "the source must continue exactly as an uninterrupted stream would"
+        );
+        assert_eq!(
+            got_b,
+            deflate_streamed(&prefix, &tail_b, 6),
+            "the snapshot must continue exactly as an uninterrupted stream would"
+        );
+
+        // (5) Drop order A: copy first, then source.
+        crate::deflate::deflate_end(&mut cpy).expect("end copy");
+        crate::deflate::deflate_end(&mut src).expect("end source");
+        drop(cpy);
+        drop(src);
+
+        // (5) Drop order B: source first, then copy — the copy must still own its
+        //     buffers and keep compressing correctly after the source is gone.
+        let mut src2: ZStream = ZStream::new();
+        crate::deflate::deflate_init2(&mut src2, 9, Z_DEFLATED, 15, 8, Strategy::Default)
+            .expect("init");
+        let mut scratch = alloc::vec![0u8; 8192];
+        let r = crate::deflate::deflate(&mut src2, &prefix, &mut scratch, Z_NO_FLUSH);
+        assert_eq!(r.code, ReturnCode::Ok);
+        assert_eq!(r.consumed, prefix.len());
+        let common2: alloc::vec::Vec<u8> = scratch[..r.produced].to_vec();
+
+        let mut cpy2: ZStream = ZStream::new();
+        crate::deflate::deflate_copy(&mut cpy2, &src2).expect("copy");
+        // C's `deflateEnd` reports `Z_DATA_ERROR` for a stream discarded while
+        // still `BUSY_STATE` — `status == BUSY_STATE ? Z_DATA_ERROR : Z_OK`
+        // (`deflate.c` L1309) — while still releasing everything. `src2` is
+        // deliberately mid-stream here, so that is the C-exact outcome, and the
+        // release must nonetheless leave the copy fully intact.
+        assert_eq!(
+            crate::deflate::deflate_end(&mut src2),
+            Err(ZlibError::DataError)
+        );
+        drop(src2);
+
+        let st = cpy2
+            .deflate_state()
+            .expect("copy state outlives the source");
+        assert!(st.strstart > 0);
+        let mut out2 = alloc::vec![0u8; 8192];
+        let n2 = finish_into(&mut cpy2, &tail_a, &mut out2);
+        let mut got2 = common2;
+        got2.extend_from_slice(&out2[..n2]);
+        assert_eq!(inflate_all(&got2, want_a.len()), want_a);
+        assert_eq!(
+            got2,
+            deflate_streamed(&prefix, &tail_a, 9),
+            "a copy whose source has been freed still tracks an uninterrupted stream"
+        );
+        crate::deflate::deflate_end(&mut cpy2).expect("end copy");
+    }
+
+    /// Drives a stream to the point where a block sits **undelivered** in
+    /// `pending_buf`: consume `prefix` with `Z_NO_FLUSH`, then ask for a
+    /// `Z_SYNC_FLUSH` through a `sync_window`-byte output window, so the block is
+    /// emitted into `pending_buf` but cannot be handed back in full. Appends to
+    /// `out` and returns the number of bytes emitted so far.
+    fn drive_to_pending(
+        strm: &mut ZStream,
+        prefix: &[u8],
+        out: &mut [u8],
+        sync_window: usize,
+    ) -> usize {
+        let r = crate::deflate::deflate(strm, prefix, out, Z_NO_FLUSH);
+        assert_eq!(r.code, ReturnCode::Ok);
+        assert_eq!(r.consumed, prefix.len());
+        let n = r.produced;
+        let r = crate::deflate::deflate(strm, &[], &mut out[n..n + sync_window], Z_SYNC_FLUSH);
+        assert_eq!(r.code, ReturnCode::Ok);
+        n + r.produced
+    }
+
+    /// The uninterrupted-stream reference for [`drive_to_pending`], i.e. the same
+    /// scripted call sequence followed by `tail` under `Z_FINISH`.
+    fn deflate_scripted_pending(
+        prefix: &[u8],
+        tail: &[u8],
+        level: i32,
+        window_bits: i32,
+        sync_window: usize,
+    ) -> alloc::vec::Vec<u8> {
+        let mut strm: ZStream = ZStream::new();
+        crate::deflate::deflate_init2(
+            &mut strm,
+            level,
+            Z_DEFLATED,
+            window_bits,
+            8,
+            Strategy::Default,
+        )
+        .expect("init");
+        let mut out = alloc::vec![0u8; (prefix.len() + tail.len()) * 2 + 256];
+        let mut n = drive_to_pending(&mut strm, prefix, &mut out, sync_window);
+        n += finish_into(&mut strm, tail, &mut out[n..]);
+        out.truncate(n);
+        crate::deflate::deflate_end(&mut strm).expect("end");
+        out
+    }
+
+    /// `deflateCopy` carries **undelivered output**. C duplicates the pending
+    /// region explicitly — `ds->pending_out = ds->pending_buf + (ss->pending_out -
+    /// ss->pending_buf); zmemcpy(ds->pending_out, ss->pending_out, ss->pending)`
+    /// (`deflate.c` L1358-L1359) — so a snapshot taken while a block is still
+    /// sitting in `pending_buf` has to deliver those exact bytes itself.
+    ///
+    /// The main snapshot test cannot cover this: `deflate` writes to
+    /// `pending_buf` only when it flushes a block, and flushing a block empties
+    /// `sym_buf`, so `pending > 0` and `sym_next > 0` cannot both hold at a call
+    /// boundary. This test therefore snapshots at the complementary point,
+    /// reached by requesting a `Z_SYNC_FLUSH` through a three-byte output window.
+    #[test]
+    fn deflate_copy_carries_undelivered_pending_output() {
+        let prefix = b"pending output travels with the snapshot; ".repeat(40);
+        let tail_a = b"AAAA alpha alpha alpha ".repeat(8);
+        let tail_b = b"ZZZZ omega omega omega ".repeat(8);
+        const SYNC_WINDOW: usize = 3;
+        // A 512-byte window (`windowBits = 9`) with 1,680 bytes of input also
+        // forces `fill_window` to slide, so this snapshot carries `slid == true`
+        // — the flag C's `deflateCopy` consults when sizing its `prev` copy
+        // (`deflate.c` L1353-L1355).
+        const WINDOW_BITS: i32 = 9;
+
+        let mut src: ZStream = ZStream::new();
+        crate::deflate::deflate_init2(&mut src, 6, Z_DEFLATED, WINDOW_BITS, 8, Strategy::Default)
+            .expect("init");
+        let mut out_src = alloc::vec![0u8; 8192];
+        let mut produced_src = drive_to_pending(&mut src, &prefix, &mut out_src, SYNC_WINDOW);
+        let common: alloc::vec::Vec<u8> = out_src[..produced_src].to_vec();
+
+        let (want_pending, want_pending_out) = {
+            let st = src.deflate_state().expect("state installed");
+            assert!(
+                st.pending > 0,
+                "the snapshot point must hold undelivered output"
+            );
+            assert_eq!(st.sym_next, 0, "a sync flush empties the symbol buffer");
+            assert!(st.slid, "the window must have slid at this snapshot point");
+            (st.pending, st.pending_out)
+        };
+
+        let mut cpy: ZStream = ZStream::new();
+        crate::deflate::deflate_copy(&mut cpy, &src).expect("copy");
+
+        {
+            let a = src.deflate_state().expect("source state");
+            let b = cpy.deflate_state().expect("copy state");
+            assert!(b.slid, "slid");
+            assert_eq!(b.pending, want_pending, "pending");
+            assert_eq!(b.pending_out, want_pending_out, "pending_out");
+            assert_eq!(
+                &b.pending_buf[want_pending_out..want_pending_out + want_pending],
+                &a.pending_buf[want_pending_out..want_pending_out + want_pending],
+                "the undelivered bytes must travel with the copy"
+            );
+        }
+
+        let mut out_cpy = alloc::vec![0u8; 8192];
+        let produced_cpy = finish_into(&mut cpy, &tail_b, &mut out_cpy);
+        produced_src += finish_into(&mut src, &tail_a, &mut out_src[produced_src..]);
+
+        let mut want_a = prefix.clone();
+        want_a.extend_from_slice(&tail_a);
+        let mut want_b = prefix.clone();
+        want_b.extend_from_slice(&tail_b);
+
+        let got_a: alloc::vec::Vec<u8> = out_src[..produced_src].to_vec();
+        let mut got_b = common;
+        got_b.extend_from_slice(&out_cpy[..produced_cpy]);
+
+        assert_ne!(got_a, got_b, "divergent suffixes must differ");
+        assert_eq!(inflate_all(&got_a, want_a.len()), want_a);
+        assert_eq!(inflate_all(&got_b, want_b.len()), want_b);
+        assert_eq!(
+            got_a,
+            deflate_scripted_pending(&prefix, &tail_a, 6, WINDOW_BITS, SYNC_WINDOW)
+        );
+        assert_eq!(
+            got_b,
+            deflate_scripted_pending(&prefix, &tail_b, 6, WINDOW_BITS, SYNC_WINDOW),
+            "the snapshot must deliver the pending block exactly once"
+        );
+
+        crate::deflate::deflate_end(&mut src).expect("end source");
+        crate::deflate::deflate_end(&mut cpy).expect("end copy");
+    }
+
+    /// The uninterrupted-stream reference for the level-0 snapshot: store
+    /// `prefix` at level 0 through a 512-byte window, switch to level 6, then
+    /// finish `tail`.
+    fn deflate_scripted_level0(prefix: &[u8], tail: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut strm: ZStream = ZStream::new();
+        crate::deflate::deflate_init2(&mut strm, 0, Z_DEFLATED, 9, 8, Strategy::Default)
+            .expect("init");
+        let mut out = alloc::vec![0u8; (prefix.len() + tail.len()) * 2 + 512];
+        let r = crate::deflate::deflate(&mut strm, prefix, &mut out, Z_NO_FLUSH);
+        assert_eq!(r.code, ReturnCode::Ok);
+        assert_eq!(r.consumed, prefix.len());
+        let mut n = r.produced;
+        let r = crate::deflate::deflate_params(&mut strm, &[], &mut out[n..], 6, Strategy::Default);
+        assert_eq!(r.code, ReturnCode::Ok);
+        n += r.produced;
+        n += finish_into(&mut strm, tail, &mut out[n..]);
+        out.truncate(n);
+        crate::deflate::deflate_end(&mut strm).expect("end");
+        out
+    }
+
+    /// `deflateCopy` carries the level-0 bookkeeping a later `deflateParams`
+    /// depends on. When storing, `s->matches` counts the hash-table slides still
+    /// owed — 1 means slide once, 2 means clear the table (`deflate.c`
+    /// L1658-L1663) — and the large-copy path sets `s->insert = s->strstart`
+    /// (`deflate.c` L1765-L1770). Both are dead while the level stays 0 and
+    /// become load-bearing the moment the level changes, so the switch is
+    /// performed here on both sides.
+    ///
+    /// This is also the scenario that makes those two fields non-trivial: in the
+    /// main snapshot test both are legitimately zero, so a copy that dropped them
+    /// would go unnoticed there.
+    #[test]
+    fn deflate_copy_carries_level0_slide_bookkeeping() {
+        // 1080 bytes through a 512-byte window: more input than the window holds,
+        // so `deflate_stored` takes the supplant-history path.
+        let prefix = b"stored blocks slide the window down; ".repeat(30);
+        let tail_a = b"AAAA alpha alpha alpha ".repeat(8);
+        let tail_b = b"ZZZZ omega omega omega ".repeat(8);
+
+        let mut src: ZStream = ZStream::new();
+        crate::deflate::deflate_init2(&mut src, 0, Z_DEFLATED, 9, 8, Strategy::Default)
+            .expect("init");
+        let mut out_src = alloc::vec![0u8; 16384];
+        let r = crate::deflate::deflate(&mut src, &prefix, &mut out_src, Z_NO_FLUSH);
+        assert_eq!(r.code, ReturnCode::Ok);
+        assert_eq!(r.consumed, prefix.len());
+        let mut produced_src = r.produced;
+
+        let (want_matches, want_insert) = {
+            let st = src.deflate_state().expect("state installed");
+            assert!(
+                st.matches > 0,
+                "storing more than a window must leave a hash-table slide owed"
+            );
+            assert!(st.insert > 0, "storing leaves unhashed bytes in the window");
+            (st.matches, st.insert)
+        };
+        let common: alloc::vec::Vec<u8> = out_src[..produced_src].to_vec();
+
+        let mut cpy: ZStream = ZStream::new();
+        crate::deflate::deflate_copy(&mut cpy, &src).expect("copy");
+        {
+            let b = cpy.deflate_state().expect("copy state");
+            assert_eq!(b.matches, want_matches, "matches");
+            assert_eq!(b.insert, want_insert, "insert");
+        }
+
+        // Switch both sides to level 6, which is when `matches` and `insert` are
+        // consumed, then finish with divergent tails.
+        let mut out_cpy = alloc::vec![0u8; 16384];
+        let r = crate::deflate::deflate_params(&mut cpy, &[], &mut out_cpy, 6, Strategy::Default);
+        assert_eq!(r.code, ReturnCode::Ok);
+        let mut produced_cpy = r.produced;
+        produced_cpy += finish_into(&mut cpy, &tail_b, &mut out_cpy[produced_cpy..]);
+
+        let r = crate::deflate::deflate_params(
+            &mut src,
+            &[],
+            &mut out_src[produced_src..],
+            6,
+            Strategy::Default,
+        );
+        assert_eq!(r.code, ReturnCode::Ok);
+        produced_src += r.produced;
+        produced_src += finish_into(&mut src, &tail_a, &mut out_src[produced_src..]);
+
+        let mut want_a = prefix.clone();
+        want_a.extend_from_slice(&tail_a);
+        let mut want_b = prefix.clone();
+        want_b.extend_from_slice(&tail_b);
+
+        let got_a: alloc::vec::Vec<u8> = out_src[..produced_src].to_vec();
+        let mut got_b = common;
+        got_b.extend_from_slice(&out_cpy[..produced_cpy]);
+
+        assert_ne!(got_a, got_b, "divergent suffixes must differ");
+        assert_eq!(inflate_all(&got_a, want_a.len()), want_a);
+        assert_eq!(inflate_all(&got_b, want_b.len()), want_b);
+        assert_eq!(got_a, deflate_scripted_level0(&prefix, &tail_a));
+        assert_eq!(
+            got_b,
+            deflate_scripted_level0(&prefix, &tail_b),
+            "the snapshot must slide the hash table exactly as its source would"
+        );
+
+        crate::deflate::deflate_end(&mut src).expect("end source");
+        crate::deflate::deflate_end(&mut cpy).expect("end copy");
+    }
+
+    /// `DeflateState` is deep-copyable (supports `deflateCopy`); owned buffers
+    /// are duplicated and index-based state needs no pointer fix-ups. The copy
+    /// is fallible by design, so it is obtained through
+    /// [`DeflateState::try_clone`] rather than [`Clone`].
+    #[test]
+    fn deflate_state_is_copyable() {
         let mut s = DeflateState::new(6, Z_DEFLATED, 15, 8, Strategy::Default, 1).unwrap();
         s.window[7] = 0x5A;
         s.strstart = 12;
 
-        let c = s.clone();
+        let c = s.try_clone().expect("global-allocator copy cannot fail");
         assert_eq!(c.w_size, s.w_size);
         assert_eq!(c.window.len(), s.window.len());
         assert_eq!(c.window[7], 0x5A);
         assert_eq!(c.strstart, 12);
         assert_eq!(c.status, s.status);
         assert_eq!(c.pending_buf.len(), s.pending_buf.len());
+
+        // The copy is independent: mutating it must not disturb the source.
+        let mut c = c;
+        c.window[7] = 0xA5;
+        assert_eq!(s.window[7], 0x5A);
     }
 
     /// `read_buf_into` copies input, updates the Adler-32 checksum for zlib
@@ -1841,5 +2822,95 @@ mod tests {
         assert_eq!(avail_in, 4);
         assert_eq!(total_in, 4);
         assert_eq!(adler, adler32(1, &[1, 2, 3, 4]));
+    }
+
+    /// Strict transcription guard for the per-level match-finder tuning table.
+    ///
+    /// Two independent transcriptions of C's `configuration_table`
+    /// (`deflate.c` L112-L124) exist in this crate: the operational copy in
+    /// this module, which [`DeflateState::lm_init`] reads, and the public
+    /// `crate::deflate::strategy::CONFIGURATION_TABLE`, which additionally
+    /// carries the block-producer tag. They are deliberately kept separate so
+    /// that `strategy.rs` stays data-only with a single dependency on
+    /// `crate::constants::Strategy` and this module keeps its import set
+    /// unchanged. Nothing in the type system ties the two together, so a
+    /// *one-sided* edit to either would change the lazy-match decisions, and
+    /// therefore the emitted token stream, while every round-trip test still
+    /// passed — the class of defect that is invisible to a round-trip test.
+    ///
+    /// This guard closes that gap on three axes:
+    ///
+    /// 1. the operational table equals an independent transcription of the C
+    ///    rows, which catches a two-sided edit that keeps both tables equal to
+    ///    each other but drifts from the reference;
+    /// 2. the operational table equals the public table field-for-field, which
+    ///    catches a one-sided edit to either file;
+    /// 3. the four values `lm_init` actually installs into the match finder
+    ///    (`good_match`, `max_lazy_match`, `nice_match`, `max_chain_length`)
+    ///    equal the C rows for every level `0..=9`, which proves the guard
+    ///    covers the *operational* path and not merely a table literal.
+    #[test]
+    fn configuration_table_matches_strategy_table_and_c_oracle() {
+        // Transcribed independently from C `deflate.c` L112-L124 as
+        // (good_length, max_lazy, nice_length, max_chain).
+        const C_ORACLE: [(u16, u16, u16, u16); 10] = [
+            (0, 0, 0, 0),         // 0 store only
+            (4, 4, 8, 4),         // 1 max speed, no lazy matches
+            (4, 5, 16, 8),        // 2
+            (4, 6, 32, 32),       // 3
+            (4, 4, 16, 16),       // 4 lazy matches
+            (8, 16, 32, 32),      // 5
+            (8, 16, 128, 128),    // 6 (default)
+            (8, 32, 128, 256),    // 7
+            (32, 128, 258, 1024), // 8
+            (32, 258, 258, 4096), // 9 max compression
+        ];
+
+        assert_eq!(CONFIGURATION_TABLE.len(), 10);
+        assert_eq!(crate::deflate::strategy::CONFIGURATION_TABLE.len(), 10);
+
+        for (level, &(good, lazy, nice, chain)) in C_ORACLE.iter().enumerate() {
+            // (1) The operational table matches the C reference row.
+            let op = &CONFIGURATION_TABLE[level];
+            assert_eq!(op.good_length, good, "good_length, level {level}");
+            assert_eq!(op.max_lazy, lazy, "max_lazy, level {level}");
+            assert_eq!(op.nice_length, nice, "nice_length, level {level}");
+            assert_eq!(op.max_chain, chain, "max_chain, level {level}");
+
+            // (2) The operational table matches the public `strategy` table,
+            // so a one-sided edit to either file fails this test.
+            let canonical = &crate::deflate::strategy::CONFIGURATION_TABLE[level];
+            assert_eq!(
+                op.good_length, canonical.good_length,
+                "good_length diverges from strategy::CONFIGURATION_TABLE, level {level}"
+            );
+            assert_eq!(
+                op.max_lazy, canonical.max_lazy,
+                "max_lazy diverges from strategy::CONFIGURATION_TABLE, level {level}"
+            );
+            assert_eq!(
+                op.nice_length, canonical.nice_length,
+                "nice_length diverges from strategy::CONFIGURATION_TABLE, level {level}"
+            );
+            assert_eq!(
+                op.max_chain, canonical.max_chain,
+                "max_chain diverges from strategy::CONFIGURATION_TABLE, level {level}"
+            );
+
+            // (3) The values `lm_init` installs into the match finder. `new_in`
+            // ends with `lm_init`, so a freshly constructed state carries them.
+            let s =
+                DeflateState::new(level as i32, Z_DEFLATED, 15, 8, Strategy::Default, 1).unwrap();
+            assert_eq!(s.good_match, good as usize, "good_match, level {level}");
+            assert_eq!(
+                s.max_lazy_match, lazy as usize,
+                "max_lazy_match, level {level}"
+            );
+            assert_eq!(s.nice_match, nice as i32, "nice_match, level {level}");
+            assert_eq!(
+                s.max_chain_length, chain as usize,
+                "max_chain_length, level {level}"
+            );
+        }
     }
 }

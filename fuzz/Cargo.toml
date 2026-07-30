@@ -8,15 +8,24 @@
 # nightly toolchain (it injects `-Z` sanitizer / coverage instrumentation that
 # is unavailable on stable); see `.github/workflows/fuzz.yml`.
 #
-# LOCAL RUNS NEED AN EXPLICIT `+nightly`. The repository root carries a
-# `rust-toolchain.toml` pinning the crate's MSRV — a STABLE toolchain — and
-# rustup resolves that file by searching UPWARD from the working directory, so a
-# shell sitting in `fuzz/` inherits it; an unprefixed `cargo fuzz build` or
-# `cargo fuzz run` then fails with "the option `Z` is only accepted on the
-# nightly compiler". Use `cargo +nightly fuzz build|list|run <target>` and
-# `cargo +nightly fmt --all -- --check` here. CI needs no prefix: the workflow's
-# `dtolnay/rust-toolchain@nightly` step exports `RUSTUP_TOOLCHAIN`, which takes
-# precedence over the toolchain file.
+# EVERY RUN NEEDS AN EXPLICIT `+nightly` — LOCAL AND CI ALIKE. The repository
+# root carries a `rust-toolchain.toml` pinning the crate's MSRV — a STABLE
+# toolchain — and rustup resolves that file (precedence rank 4) by searching
+# UPWARD from the working directory, ahead of the default toolchain (rank 5). So
+# a shell sitting in `fuzz/` inherits the pin, and so does a CI job: installing
+# nightly with `dtolnay/rust-toolchain@nightly` sets the DEFAULT toolchain and
+# does NOT export `RUSTUP_TOOLCHAIN`, and the toolchain file outranks it. Either
+# way an unprefixed `cargo fuzz build` or `cargo fuzz run` fails with "the option
+# `Z` is only accepted on the nightly compiler". Use
+# `cargo +nightly fuzz build|list|run <target>` and
+# `cargo +nightly fmt --all -- --check` here.
+#
+# The `cargo-fuzz` job in `.github/workflows/fuzz.yml` says it twice, for the same
+# reason every job in `ci.yml` does: a `+nightly` shorthand on every cargo
+# invocation (rank 1, the highest precedence rustup has, needing no cooperation
+# from the environment) plus a job-level `RUSTUP_TOOLCHAIN: nightly` (rank 2,
+# which additionally reaches the nested `cargo` calls `cargo-fuzz` itself makes).
+# The two name the same channel, so they cannot disagree; neither is redundant.
 
 [package]
 name = "zlib-rs-fuzz"
