@@ -90,10 +90,11 @@ pub const ENOUGH_DISTS: usize = 592;
 /// `InflateState.codes: [Code; ENOUGH]`) must be sized to this value to match
 /// the C memory footprint and the table-overflow checks in [`inflate_table`].
 ///
-/// NOTE (blueprint correction): `doc/technical-specifications.md` §0.5.1
-/// erroneously states `ENOUGH = 2048`. The verified `inftrees.h` source value
-/// is **1444**; that is what is used here so the overflow guards and memory
-/// layout match reference zlib exactly.
+/// NOTE (constant-value correction): the `2048` figure for `ENOUGH` that
+/// appears in stale planning material is wrong. **1444** is authoritative: the
+/// C oracle `inftrees.h` states and derives it at L38-L48 and fixes it in the
+/// L49-L51 macros, AAP §0.6.6 records the same three values, and preservation
+/// directive D-2 forbids altering any of them.
 pub const ENOUGH: usize = ENOUGH_LENS + ENOUGH_DISTS;
 
 /// The type of code to build for [`inflate_table`].
