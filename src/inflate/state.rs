@@ -66,6 +66,8 @@ use alloc::boxed::Box;
 
 use crate::gz_header::GzHeader;
 use crate::inflate::tables::{Code, ENOUGH};
+use core::ffi::{c_int, c_uchar, c_uint, c_ulong, c_ushort, c_void};
+
 use crate::stream::{AllocBuffer, AllocHook, try_box};
 
 /// The possible inflate modes maintained between `inflate()` calls.
@@ -414,7 +416,7 @@ pub struct InflateState {
     /// Hook-backed reservation mirroring reference zlib's allocation of the
     /// inflate state struct itself — C `inflateInit2_` does
     /// `ZALLOC(strm, 1, sizeof(struct inflate_state))` before any window is
-    /// needed.
+    /// needed (`inflate.c` L198, `infback.c` L51).
     ///
     /// The idiomatic [`InflateState`] lives in a Rust [`Box`] on the global
     /// allocator (safe, and matching how the deflate engine keeps its
@@ -427,15 +429,16 @@ pub struct InflateState {
     /// equivalent footprint through the caller's hook and parks it here. It is:
     ///
     /// * an active-hook [`Foreign`](AllocBuffer::Foreign) buffer of
-    ///   `size_of::<InflateState>()` bytes on the regular init path when a
-    ///   caller hook is installed (one `zalloc`, matching C's state `ZALLOC`);
+    ///   [`C_LAYOUT_SIZE`](InflateState::C_LAYOUT_SIZE) bytes — C's own
+    ///   `sizeof(struct inflate_state)`, not this Rust type's size — whenever the
+    ///   init path's allocator reserves the state footprint (one `zalloc`,
+    ///   matching C's state `ZALLOC`); this covers both
+    ///   [`inflate_init2`](crate::inflate::inflate_init2) and the `inflateBack`
+    ///   init path, whose *only* allocation in C is exactly this one
+    ///   (`infback.c` L51); and
     /// * an empty [`AllocBuffer::default`] under the global allocator, so no
     ///   extra allocation is made and the crate's ~7 KB inflate memory-bounds
-    ///   parity is preserved (AAP §0.6.5); and
-    /// * left empty for `inflateBack` — whose single hook allocation is its own
-    ///   window — because that path builds the state through
-    ///   [`new_in`](InflateState::new_in) directly (not the regular init path),
-    ///   keeping its one-allocation parity with C.
+    ///   parity is preserved (AAP §0.6.5).
     ///
     /// Being an owned [`AllocBuffer`], it is released automatically on drop —
     /// through the caller's `zfree` for a hook-backed reservation — subsuming
@@ -445,12 +448,107 @@ pub struct InflateState {
     pub state_alloc: AllocBuffer<u8>,
 }
 
+// ===========================================================================
+// C layout mirror — the authoritative `sizeof(struct inflate_state)` for
+// allocator accounting (AAP §0.6.3, §0.6.5)
+// ===========================================================================
+
+/// A field-exact `#[repr(C)]` mirror of C's `struct inflate_state`
+/// (`inflate.h` L82-L125), used for **one** purpose: to compute the byte count
+/// reference zlib passes to a caller's `zalloc` in
+/// `ZALLOC(strm, 1, sizeof(struct inflate_state))` (`inflate.c` L198).
+///
+/// `size_of::<InflateState>()` is *not* that number — it is 7296 against C's
+/// 7160 on LP64 — because the idiomatic state holds an owning
+/// [`AllocBuffer`] where C holds a bare `unsigned char *`, a
+/// [`TableSource`] discriminant plus offsets where C holds three interior
+/// `code *` pointers, and Rust enums where C holds `int`s. Sizing the *request*
+/// from the C layout while keeping the *storage* in a Rust [`Box`] is what makes
+/// a bounded caller allocator observe C's footprint (AAP §0.6.5).
+///
+/// Every field is a `core::ffi` scalar alias or a raw pointer and the struct is
+/// `#[repr(C)]`, so rustc applies the platform C ABI's layout rules — the same
+/// ones the C compiler applies — making the size correct on LP64, on Windows
+/// LLP64 (where `c_ulong` is 32-bit), and on 32-bit targets without a per-target
+/// table. The tests pin the exact LP64 offsets `gcc` reports for the in-tree
+/// `inflate.h`, field by field.
+///
+/// Nothing constructs this type and nothing reads its fields outside that test.
+#[allow(dead_code)]
+#[repr(C)]
+struct InflateStateC {
+    strm: *mut c_void,
+    /// C's `inflate_mode` enumeration, which the compiler represents as an `int`.
+    mode: c_int,
+    last: c_int,
+    wrap: c_int,
+    havedict: c_int,
+    flags: c_int,
+    dmax: c_uint,
+    check: c_ulong,
+    total: c_ulong,
+    head: *mut c_void,
+    wbits: c_uint,
+    wsize: c_uint,
+    whave: c_uint,
+    wnext: c_uint,
+    window: *mut c_uchar,
+    hold: c_ulong,
+    bits: c_uint,
+    length: c_uint,
+    offset: c_uint,
+    extra: c_uint,
+    lencode: *const CodeC,
+    distcode: *const CodeC,
+    lenbits: c_uint,
+    distbits: c_uint,
+    ncode: c_uint,
+    nlen: c_uint,
+    ndist: c_uint,
+    have: c_uint,
+    next: *mut CodeC,
+    lens: [c_ushort; 320],
+    work: [c_ushort; 288],
+    codes: [CodeC; ENOUGH],
+    sane: c_int,
+    back: c_int,
+    was: c_uint,
+}
+
+/// Layout mirror of C's `code` struct (`inftrees.h` L24-L28): two `unsigned
+/// char`s followed by an `unsigned short`, four bytes in total.
+#[allow(dead_code)]
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct CodeC {
+    op: c_uchar,
+    bits: c_uchar,
+    val: c_ushort,
+}
+
 /// Default `dmax` value: the maximum back-reference distance for a 32 KiB
 /// window (`1 << 15`). Reference zlib initializes `state->dmax = 32768U` in
 /// `inflateResetKeep`.
 const DMAX_DEFAULT: u32 = 32768;
 
 impl InflateState {
+    /// The byte count reference zlib passes to a caller's `zalloc` when it
+    /// allocates the inflate state — C's `sizeof(struct inflate_state)` —
+    /// computed from the field-exact `#[repr(C)]` layout mirror rather than from
+    /// this Rust type's own size.
+    ///
+    /// This is the value C uses in
+    /// `ZALLOC(strm, 1, sizeof(struct inflate_state))` (`inflate.c` L198), and it
+    /// is what [`inflate_init2`](crate::inflate::inflate_init2) and
+    /// [`inflate_copy`](crate::inflate::inflate_copy) reserve so a
+    /// caller-supplied allocator observes the same request C would make
+    /// (AAP §0.6.3, §0.6.5). It is **7160 on LP64**, whereas
+    /// `size_of::<InflateState>()` is legitimately larger.
+    ///
+    /// Exposed publicly because it is the only way an allocator implementation or
+    /// a memory-accounting test can predict the request it will be handed.
+    pub const C_LAYOUT_SIZE: usize = core::mem::size_of::<InflateStateC>();
+
     /// Creates a new, boxed inflate state for the given wrapper mode and window
     /// size.
     ///
@@ -490,10 +588,12 @@ impl InflateState {
     ///
     /// This convenience constructor records [`AllocHook::none`], so the window
     /// (when the driver later allocates it) uses the Rust global allocator —
-    /// equivalent to a C caller with null `zalloc`/`zfree`. The FFI init path
-    /// calls [`new_in`](Self::new_in) instead, passing the caller's
-    /// [`AllocHook`] so the window is routed through the caller's
-    /// `zalloc`/`zfree` (AAP §0.6.3).
+    /// equivalent to a C caller with null `zalloc`/`zfree`.
+    ///
+    /// It is **not** the constructor the FFI uses. Every path that has to report
+    /// an allocation failure rather than abort goes through
+    /// [`try_new_in`](Self::try_new_in); see there for the complete list of
+    /// callers and the exact allocation schedule each one performs.
     #[inline]
     #[must_use]
     pub fn new(wrap: i32, wbits: u32) -> Box<InflateState> {
@@ -509,12 +609,17 @@ impl InflateState {
     ///
     /// The window is *not* allocated here — it is sized on demand by the
     /// driver's `updatewindow`, which consults the stored
-    /// [`alloc_hook`](InflateState::alloc_hook) at that time.
+    /// [`alloc_hook`](InflateState::alloc_hook) at that time. Neither is the
+    /// caller-visible state reservation: see
+    /// [`try_new_in`](Self::try_new_in) for who installs it and when.
     ///
-    /// This spelling boxes the state with [`Box::new`], which aborts if the Rust
-    /// global heap is exhausted. The FFI init paths use
-    /// [`try_new_in`](Self::try_new_in) instead so that condition becomes
-    /// `Z_MEM_ERROR`.
+    /// # Panics
+    ///
+    /// This spelling boxes the state with [`Box::new`], so it **aborts the
+    /// process** if the Rust global heap cannot hold the roughly 7 KB state. It
+    /// exists only for Rust-native callers that treat allocation failure as fatal;
+    /// nothing that has to return a zlib error code may use it. Use
+    /// [`try_new_in`](Self::try_new_in) instead.
     #[must_use]
     pub fn new_in(hook: AllocHook, wrap: i32, wbits: u32) -> Box<InflateState> {
         Box::new(Self::build(hook, wrap, wbits))
@@ -525,8 +630,27 @@ impl InflateState {
     /// the heap cannot satisfy it.
     ///
     /// C `inflateInit2_` reports a failed state allocation as `Z_MEM_ERROR`
-    /// (`inflate.c` L198-L200), so the init paths must be able to surface it.
+    /// (`inflate.c` L198-L200), so every init path must be able to surface it.
     /// The field-initialization contract is identical to [`new`](Self::new).
+    ///
+    /// # Callers, and the allocation each one performs
+    ///
+    /// This constructor itself makes exactly **one** allocation — the global
+    /// `Box` holding the state — and no caller-hook request. The reservation that
+    /// stands in for C's state `ZALLOC`, and the window, are the responsibility of
+    /// the two init paths above it:
+    ///
+    /// | Caller | Caller-hook requests, in order |
+    /// |--------|--------------------------------|
+    /// | [`crate::inflate::inflate_init2`] (reached from FFI `inflateInit2_`) | `(1, `[`C_LAYOUT_SIZE`](Self::C_LAYOUT_SIZE)`)` for the state reservation; the window comes later, lazily, from `updatewindow` — C's schedule exactly (`inflate.c` L198, L261) |
+    /// | `crate::inflate::back::inflate_back_init_borrowed_window` (reached from FFI `inflateBackInit_`) | `(1, `[`C_LAYOUT_SIZE`](Self::C_LAYOUT_SIZE)`)` and nothing else — the window is the ABI caller's own buffer, lent rather than allocated (`infback.c` L51, L60) |
+    /// | [`crate::inflate::back::inflate_back_init_with`] (Rust-native convenience) | the same state reservation, then `(1 << window_bits, 1)` for a window it owns — the one documented divergence from C, since a Rust caller supplies no buffer |
+    ///
+    /// Each of those paths makes the reservation only when its
+    /// [`Allocator::reserves_state_footprint`](crate::stream::Allocator::reserves_state_footprint)
+    /// says to, so the global-allocator path keeps its historical footprint: the
+    /// `Box` below already *is* that allocation, and charging a second equally
+    /// sized region would double every stream's fixed overhead (AAP §0.6.5).
     #[must_use]
     pub fn try_new_in(hook: AllocHook, wrap: i32, wbits: u32) -> Option<Box<InflateState>> {
         try_box(Self::build(hook, wrap, wbits))
@@ -577,11 +701,12 @@ impl InflateState {
             codes: [Code::default(); ENOUGH],
             was: 0,
             alloc_hook: hook,
-            // Left empty here: the state reservation is installed by the regular
-            // FFI init path (`inflate_init2`) only when a caller hook is active.
-            // Keeping `new_in` itself allocation-free is what lets the shared
-            // `inflateBack` constructor (`inflate_back_init_in`) retain its
-            // single-allocation (window-only) parity with C.
+            // Left empty here. The reservation standing in for C's state `ZALLOC`
+            // is installed by whichever init path built this state — see the table
+            // on `try_new_in` — and only when that path's allocator reserves the
+            // state footprint. Leaving it to the caller keeps this constructor's
+            // own allocation count at one (the `Box`) regardless of which path
+            // reaches it.
             state_alloc: AllocBuffer::default(),
         }
     }
@@ -733,6 +858,37 @@ impl InflateState {
             TableSource::Fixed => fixed,
             TableSource::Dynamic => &self.codes[self.distcode..],
         }
+    }
+}
+
+/// Releases the window and the state reservation in **C `inflateEnd`'s order**.
+///
+/// Ownership alone already frees both — that is what makes the explicit
+/// `ZFREE`s of C unnecessary — but it frees them in *field declaration* order,
+/// which is an incidental property of how this struct happens to be written.
+/// Reference zlib's order is fixed by its source:
+///
+/// ```text
+/// if (state->window != Z_NULL) ZFREE(strm, state->window);  /* inflate.c L1160 */
+/// ZFREE(strm, strm->state);                                 /* inflate.c L1161 */
+/// ```
+///
+/// A caller-supplied `zfree` observes that sequence, and AAP §0.6.5 makes the
+/// allocator-visible schedule a first-class parity requirement, so it is pinned
+/// here rather than left to depend on field ordering — matching how
+/// [`crate::deflate::DeflateState`] pins C `deflateEnd`'s five-step order.
+///
+/// Each buffer is swapped out with [`core::mem::take`] and dropped immediately;
+/// the replacement is an empty [`AllocBuffer`] whose own drop is a no-op, so the
+/// implicit field drops that follow release nothing further.
+///
+/// For an `inflateBack` state the window is the ABI caller's own lent region,
+/// whose `Drop` is deliberately empty, so only the reservation reaches `zfree` —
+/// exactly the single free `inflateBackEnd` performs (`infback.c` L572-L577).
+impl Drop for InflateState {
+    fn drop(&mut self) {
+        drop(core::mem::take(&mut self.window));
+        drop(core::mem::take(&mut self.state_alloc));
     }
 }
 
@@ -1122,5 +1278,87 @@ mod tests {
         assert!(owned.is_inflate());
         assert!(!owned.is_deflate());
         assert!(!owned.is_none());
+    }
+
+    // =======================================================================
+    // C layout-mirror pinning (F2, AAP §0.6.3, §0.6.5)
+    // =======================================================================
+
+    /// `InflateState::C_LAYOUT_SIZE` must equal C's
+    /// `sizeof(struct inflate_state)`.
+    ///
+    /// Measured with a `gcc` probe against the in-tree `inflate.h` and
+    /// `inftrees.h` on this target (`x86_64-unknown-linux-gnu`, LP64,
+    /// `gcc 15.2.0`). Gated to LP64 for the same reason as the deflate twin: on
+    /// LLP64 `c_ulong` is four bytes and on 32-bit targets pointers are, so the
+    /// total legitimately differs while the mirror stays correct by virtue of
+    /// `#[repr(C)]` plus `core::ffi` aliases.
+    #[test]
+    #[cfg(all(target_pointer_width = "64", not(windows)))]
+    fn c_layout_size_matches_the_measured_c_inflate_state() {
+        assert_eq!(
+            InflateState::C_LAYOUT_SIZE,
+            7160,
+            "sizeof(struct inflate_state) on LP64"
+        );
+        assert_eq!(
+            align_of::<InflateStateC>(),
+            8,
+            "_Alignof(struct inflate_state) on LP64"
+        );
+        assert_ne!(
+            InflateState::C_LAYOUT_SIZE,
+            size_of::<InflateState>(),
+            "the mirror must be C's layout, not this Rust type's"
+        );
+        assert_eq!(size_of::<CodeC>(), 4, "sizeof(code)");
+        // `ENOUGH` bounds the `codes` arena; a wrong value here would move every
+        // trailing offset and silently mis-size the reservation.
+        assert_eq!(ENOUGH, 1444, "ENOUGH_LENS + ENOUGH_DISTS");
+    }
+
+    /// Field-by-field offset pinning for [`InflateStateC`], emitted verbatim by
+    /// an `offsetof` probe compiled against the in-tree headers. See the deflate
+    /// twin for why total size alone is insufficient evidence.
+    #[test]
+    #[cfg(all(target_pointer_width = "64", not(windows)))]
+    fn c_layout_mirror_reproduces_every_c_inflate_state_offset() {
+        use core::mem::offset_of;
+
+        assert_eq!(offset_of!(InflateStateC, strm), 0);
+        assert_eq!(offset_of!(InflateStateC, mode), 8);
+        assert_eq!(offset_of!(InflateStateC, last), 12);
+        assert_eq!(offset_of!(InflateStateC, wrap), 16);
+        assert_eq!(offset_of!(InflateStateC, havedict), 20);
+        assert_eq!(offset_of!(InflateStateC, flags), 24);
+        assert_eq!(offset_of!(InflateStateC, dmax), 28);
+        assert_eq!(offset_of!(InflateStateC, check), 32);
+        assert_eq!(offset_of!(InflateStateC, total), 40);
+        assert_eq!(offset_of!(InflateStateC, head), 48);
+        assert_eq!(offset_of!(InflateStateC, wbits), 56);
+        assert_eq!(offset_of!(InflateStateC, wsize), 60);
+        assert_eq!(offset_of!(InflateStateC, whave), 64);
+        assert_eq!(offset_of!(InflateStateC, wnext), 68);
+        assert_eq!(offset_of!(InflateStateC, window), 72);
+        assert_eq!(offset_of!(InflateStateC, hold), 80);
+        assert_eq!(offset_of!(InflateStateC, bits), 88);
+        assert_eq!(offset_of!(InflateStateC, length), 92);
+        assert_eq!(offset_of!(InflateStateC, offset), 96);
+        assert_eq!(offset_of!(InflateStateC, extra), 100);
+        assert_eq!(offset_of!(InflateStateC, lencode), 104);
+        assert_eq!(offset_of!(InflateStateC, distcode), 112);
+        assert_eq!(offset_of!(InflateStateC, lenbits), 120);
+        assert_eq!(offset_of!(InflateStateC, distbits), 124);
+        assert_eq!(offset_of!(InflateStateC, ncode), 128);
+        assert_eq!(offset_of!(InflateStateC, nlen), 132);
+        assert_eq!(offset_of!(InflateStateC, ndist), 136);
+        assert_eq!(offset_of!(InflateStateC, have), 140);
+        assert_eq!(offset_of!(InflateStateC, next), 144);
+        assert_eq!(offset_of!(InflateStateC, lens), 152);
+        assert_eq!(offset_of!(InflateStateC, work), 792);
+        assert_eq!(offset_of!(InflateStateC, codes), 1368);
+        assert_eq!(offset_of!(InflateStateC, sane), 7144);
+        assert_eq!(offset_of!(InflateStateC, back), 7148);
+        assert_eq!(offset_of!(InflateStateC, was), 7152);
     }
 }

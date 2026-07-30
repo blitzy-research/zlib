@@ -53,7 +53,7 @@ use crate::error::ReturnCode;
 use crate::inflate::fixed::{DISTFIX, LENFIX};
 use crate::inflate::state::{InflateMode, InflateState, TableSource};
 use crate::inflate::tables::{Code, CodeType, inflate_table};
-use crate::stream::{AllocBuffer, AllocHook};
+use crate::stream::{AllocBuffer, AllocHook, Allocator, HookAllocator};
 
 /// Permutation of the 19 code-length code lengths, as read from a dynamic
 /// block header. Transcribed verbatim from `infback.c` L205-L206 (identical to
@@ -359,36 +359,127 @@ pub fn inflate_back_init(window_bits: i32) -> Result<Box<InflateState>, ReturnCo
 ///
 /// * [`ReturnCode::StreamError`] — `window_bits` is outside `8..=15`.
 /// * [`ReturnCode::MemError`] — the state or the window could not be allocated.
+#[inline]
 pub fn inflate_back_init_in(
     hook: AllocHook,
     window_bits: i32,
+) -> Result<Box<InflateState>, ReturnCode> {
+    inflate_back_init_with(&HookAllocator::new(hook), window_bits)
+}
+
+/// Same as [`inflate_back_init_in`] but takes an [`Allocator`] rather than a bare
+/// [`AllocHook`], so the state footprint and the window are requested from it.
+///
+/// This is the spelling any caller with a custom Rust allocator should use: a
+/// bare hook only ever selects between the caller's `zalloc` and the global
+/// allocator, whereas an [`Allocator`] can serve the memory itself (AAP §0.6.3).
+///
+/// # Allocator schedule
+///
+/// Two requests, in C's order: the state footprint
+/// (`(1, `[`InflateState::C_LAYOUT_SIZE`]`)`, mirroring
+/// `ZALLOC(strm, 1, sizeof(struct inflate_state))` at `infback.c` L51) followed
+/// by the window (`(1 << window_bits, 1)`). C makes only the first, because its
+/// window comes from the caller; the second is this convenience constructor's
+/// documented divergence, and the FFI shim avoids it entirely by lending the
+/// ABI caller's buffer through the crate-private
+/// `inflate_back_init_borrowed_window`.
+///
+/// # Errors
+///
+/// As [`inflate_back_init_in`].
+pub fn inflate_back_init_with<A: Allocator>(
+    alloc: &A,
+    window_bits: i32,
+) -> Result<Box<InflateState>, ReturnCode> {
+    // C L33-L35: reject windowBits outside the raw range 8..=15. Checked before
+    // any allocation, exactly as C does.
+    if !(MIN_WBITS..=MAX_WBITS).contains(&window_bits) {
+        return Err(ReturnCode::StreamError);
+    }
+    // In back-inflate the window *is* the output buffer, so unlike the streaming
+    // `inflate` path this allocation is eager. Routing it through `alloc` means it
+    // honors a caller-supplied allocator rather than silently using the global
+    // heap (AAP §0.6.3 has-hook clause).
+    let window = alloc
+        .allocate_zeroed::<u8>(1usize << window_bits)
+        .ok_or(ReturnCode::MemError)?;
+    inflate_back_init_borrowed_window(alloc, window_bits, window)
+}
+
+/// Builds a back-inflate state around an **already-provided** window buffer,
+/// making the single state-footprint request C makes and no other.
+///
+/// This is the entry point the FFI `inflateBackInit_` shim uses. Reference zlib's
+/// `inflateBackInit_` allocates exactly one region — the state — and then adopts
+/// the caller's buffer verbatim:
+///
+/// ```text
+/// state = ZALLOC(strm, 1, sizeof(struct inflate_state));  /* infback.c L51 */
+/// if (state == Z_NULL) return Z_MEM_ERROR;
+/// ...
+/// state->window = window;                                 /* infback.c L60 */
+/// ```
+///
+/// Passing the caller's region in as `window` (wrapped by the boundary's borrowed
+/// -buffer bridge, whose `Drop` is a no-op) reproduces that exactly: one
+/// allocator request, no copy, and `inflateBackEnd` leaves the caller's memory
+/// alone just as `infback.c` L572-L577 does.
+///
+/// `window` must hold at least `1 << window_bits` bytes; a shorter buffer is
+/// rejected with [`ReturnCode::StreamError`] rather than silently truncating the
+/// history the decoder may reach back into.
+///
+/// # Errors
+///
+/// * [`ReturnCode::StreamError`] — `window_bits` is outside `8..=15`, or `window`
+///   is smaller than `1 << window_bits`.
+/// * [`ReturnCode::MemError`] — the state footprint was refused, or the global
+///   heap could not hold the boxed state.
+pub(crate) fn inflate_back_init_borrowed_window<A: Allocator>(
+    alloc: &A,
+    window_bits: i32,
+    window: AllocBuffer<u8>,
 ) -> Result<Box<InflateState>, ReturnCode> {
     // C L33-L35: reject windowBits outside the raw range 8..=15.
     if !(MIN_WBITS..=MAX_WBITS).contains(&window_bits) {
         return Err(ReturnCode::StreamError);
     }
+    let wsize = 1usize << window_bits;
+    if window.len() < wsize {
+        return Err(ReturnCode::StreamError);
+    }
 
+    // C L51-L53: the state is charged to the caller's allocator and checked
+    // immediately. The state itself lives in a Rust `Box`, so this reservation
+    // exists purely to keep the request count, the `(items, size)` pair and the
+    // failure timing identical to C's (AAP §0.6.5); whether to make it is the
+    // allocator's decision (`Allocator::reserves_state_footprint`).
+    let state_alloc = if alloc.reserves_state_footprint() {
+        alloc
+            .allocate_zeroed_items::<u8>(1, InflateState::C_LAYOUT_SIZE)
+            .ok_or(ReturnCode::MemError)?
+    } else {
+        AllocBuffer::default()
+    };
+
+    let hook = alloc.hook();
     // Raw stream: wrap = 0. `try_new_in` already sets dmax = 32768, sane = true,
-    // and records `hook` so any window (re)allocation routes through it. Boxing
-    // is fallible so global-heap exhaustion becomes `Z_MEM_ERROR` — the code C
-    // returns when its state `ZALLOC` fails (`infback.c` L52-L53) — rather than
-    // an abort (M7).
+    // and records `hook` so any later window handling routes through it. Boxing is
+    // fallible so global-heap exhaustion becomes `Z_MEM_ERROR` — the code C returns
+    // when its state `ZALLOC` fails (`infback.c` L52-L53) — rather than an abort.
     let mut state =
         InflateState::try_new_in(hook, 0, window_bits as u32).ok_or(ReturnCode::MemError)?;
 
-    // C L56-L62: set the window geometry and allocate the owned window through
-    // the caller's allocator hook (or the global allocator when no hook is
-    // installed). An active-hook OOM surfaces as `Z_MEM_ERROR` (M7); C's
-    // `inflateBackInit_` likewise returns `Z_MEM_ERROR` when the window `ZALLOC`
-    // fails.
+    // C L56-L62: window geometry, then adopt the window.
     state.dmax = 32768;
     state.wbits = window_bits as u32;
-    state.wsize = 1u32 << window_bits;
+    state.wsize = wsize as u32;
     state.whave = 0;
     state.wnext = 0;
     state.sane = true;
-    state.window =
-        AllocBuffer::try_zeroed(state.wsize as usize, hook).ok_or(ReturnCode::MemError)?;
+    state.window = window;
+    state.state_alloc = state_alloc;
 
     Ok(state)
 }
@@ -1215,5 +1306,90 @@ mod tests {
         // is freed on return.
         let state = inflate_back_init(15).unwrap();
         assert_eq!(inflate_back_end(state), ReturnCode::Ok);
+    }
+
+    /// F2 (inflate): `inflate_back_init_borrowed_window` charges C's *single*
+    /// state allocation and adopts the supplied window without requesting one.
+    ///
+    /// This is the property that makes the FFI `inflateBackInit_` shim match
+    /// `infback.c` exactly: one `ZALLOC` for the state (L51), then
+    /// `state->window = window;` (L60). A recording allocator therefore sees one
+    /// request whose `(items, size)` pair is `(1, sizeof(struct inflate_state))`.
+    #[test]
+    fn borrowed_window_init_makes_only_the_state_request() {
+        use core::cell::RefCell;
+
+        use crate::stream::{AllocBuffer, Allocator, ZeroValid};
+
+        /// Records every `(items, item_size)` pair, serving each from the global
+        /// allocator. `reserves_state_footprint` is left at its `true` default,
+        /// which is what a bounded C-style allocator behaves like.
+        struct Recorder {
+            seen: RefCell<Vec<(usize, usize)>>,
+        }
+
+        impl Allocator for Recorder {
+            fn allocate_zeroed_items<T>(
+                &self,
+                items: usize,
+                item_size: usize,
+            ) -> Option<AllocBuffer<T>>
+            where
+                T: Copy + Default + ZeroValid + 'static,
+            {
+                self.seen.borrow_mut().push((items, item_size));
+                AllocBuffer::try_zeroed_items(items, item_size, self.hook())
+            }
+        }
+
+        let alloc = Recorder {
+            seen: RefCell::new(Vec::new()),
+        };
+        // A window the caller "owns" — here an ordinary owned buffer, which stands
+        // in for the region the FFI shim lends through `borrow_caller_window`.
+        let window = AllocBuffer::<u8>::try_zeroed(1 << 15, AllocHook::none())
+            .expect("global allocator serves a 32 KiB window");
+
+        let state = inflate_back_init_borrowed_window(&alloc, 15, window)
+            .expect("a healthy allocator initializes the state");
+        assert_eq!(state.wsize, 1 << 15);
+        assert_eq!(state.wbits, 15);
+        assert_eq!(state.dmax, 32768);
+        assert!(state.sane);
+        assert_eq!(state.whave, 0);
+        assert_eq!(state.wnext, 0);
+        assert_eq!(state.window.len(), 1 << 15);
+
+        assert_eq!(
+            alloc.seen.into_inner(),
+            vec![(1, InflateState::C_LAYOUT_SIZE)],
+            "exactly C's single state request, with C's own sizeof pair"
+        );
+    }
+
+    /// A window shorter than `1 << window_bits` is rejected rather than silently
+    /// truncating the history the decoder may reach back into.
+    ///
+    /// C cannot detect this — `inflateBackInit_` receives a bare pointer — but
+    /// this port knows the lent region's length, so the check costs nothing and
+    /// turns what would be out-of-bounds access in C into `Z_STREAM_ERROR`.
+    #[test]
+    fn borrowed_window_init_rejects_a_short_window() {
+        use crate::stream::AllocBuffer;
+
+        let short = AllocBuffer::<u8>::try_zeroed((1 << 15) - 1, AllocHook::none())
+            .expect("global allocator serves the buffer");
+        assert!(matches!(
+            inflate_back_init_borrowed_window(&HookAllocator::new(AllocHook::none()), 15, short),
+            Err(ReturnCode::StreamError)
+        ));
+
+        // Out-of-range windowBits is still rejected first, before the length test.
+        let ok = AllocBuffer::<u8>::try_zeroed(1 << 15, AllocHook::none())
+            .expect("global allocator serves the buffer");
+        assert!(matches!(
+            inflate_back_init_borrowed_window(&HookAllocator::new(AllocHook::none()), 16, ok),
+            Err(ReturnCode::StreamError)
+        ));
     }
 }

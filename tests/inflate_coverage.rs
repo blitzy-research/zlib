@@ -41,15 +41,33 @@
 //!   only yields input bytes and cannot touch private state; equivalent coverage
 //!   of that guard lives as a unit test in `src/inflate/back.rs`.
 //!
+//! ## Rust-native allocator accounting (the [`Allocator`] trait)
+//!
+//! `infcover.c` can only reach the allocator through the C `zalloc`/`zfree`
+//! pointers, because that is the only allocation customization point C has. The
+//! Rust port additionally exposes the safe [`zlib_rs::stream::Allocator`] trait,
+//! and it must be a *real* customization point rather than a decorative one: a
+//! downstream implementation has to observe every engine request and be able to
+//! refuse it. That claim is pinned by
+//! [`external_allocator_observes_every_deflate_request`],
+//! [`external_allocator_refusal_fails_deflate_init`],
+//! [`external_allocator_refusal_fails_inflate_init_then_window`], and
+//! [`external_allocator_round_trip_is_byte_identical`], which drive the engines
+//! through an allocator built **only** from this crate's public, safe surface —
+//! no `unsafe`, no hook. Because this is an integration test it is compiled as a
+//! separate crate, so those tests can only use what a real downstream user can.
+//!
 //! Gzip-framed cases are gated behind `#[cfg(feature = "gzip")]`; the file is
 //! authored for the default (std + gzip) feature set.
 
+use core::cell::{Cell, RefCell};
 use core::ffi::{c_int, c_uint, c_void};
 use core::ptr;
 
 #[cfg(feature = "gzip")]
 use zlib_rs::GzHeader;
-use zlib_rs::constants::{Z_NO_FLUSH, Z_TREES};
+use zlib_rs::constants::{DEF_MEM_LEVEL, Strategy, Z_DEFLATED, Z_FINISH, Z_NO_FLUSH, Z_TREES};
+use zlib_rs::deflate::{DeflateState, deflate, deflate_end, deflate_init2};
 use zlib_rs::ffi::{
     inflate as ffi_inflate, inflateBack, inflateBackEnd, inflateBackInit_, inflateCopy, inflateEnd,
     inflateInit_, inflateInit2_, z_stream,
@@ -63,6 +81,7 @@ use zlib_rs::inflate::{
     inflate_mark, inflate_prime, inflate_reset2, inflate_set_dictionary, inflate_sync,
     inflate_sync_point, inflate_table, inflate_undermine,
 };
+use zlib_rs::stream::{AllocBuffer, Allocator, ZeroValid};
 use zlib_rs::{ReturnCode, ZStream, ZlibError};
 
 // ===========================================================================
@@ -958,7 +977,7 @@ unsafe extern "C" fn cap_free(opaque: *mut c_void, address: *mut c_void) {
 fn mem_limit_forces_mem_error() {
     // Size of the inflate state, which reference zlib (and now zlib-rs) reserves
     // through the caller's `zalloc` at `inflateInit2_`.
-    const STATE_SIZE: usize = core::mem::size_of::<zlib_rs::inflate::InflateState>();
+    const STATE_SIZE: usize = zlib_rs::inflate::InflateState::C_LAYOUT_SIZE;
     // The raw 8-bit inflate window (`1 << 8`) allocated lazily by `inflate`.
     const WINDOW_8: usize = 1 << 8;
 
@@ -1069,7 +1088,7 @@ fn mem_limit_forces_mem_error() {
 ///    nothing on the destination.
 #[test]
 fn inflate_copy_honors_the_caller_allocator_budget() {
-    const STATE_SIZE: usize = core::mem::size_of::<zlib_rs::inflate::InflateState>();
+    const STATE_SIZE: usize = zlib_rs::inflate::InflateState::C_LAYOUT_SIZE;
 
     /// Initializes `strm` as a raw 8-bit-window inflate stream on `cap`.
     ///
@@ -1164,4 +1183,354 @@ fn inflate_copy_honors_the_caller_allocator_budget() {
         // SAFETY: `src` still holds the state installed by `init_on`.
         assert_eq!(unsafe { inflateEnd(&mut src) }, ReturnCode::Ok.as_c_int());
     }
+}
+
+// ===========================================================================
+// Rust-native allocator accounting
+//
+// The C harness above reaches the allocator through `z_stream.zalloc`/`zfree`,
+// which is the only customization point C offers. The Rust port adds the safe
+// `Allocator` trait, and these tests pin that it is a genuine customization
+// point: an implementation written with nothing but this crate's public, safe
+// surface observes every engine request — including the engine-state footprint
+// C charges with `ZALLOC(strm, 1, sizeof(deflate_state))` (`deflate.c` L440) —
+// and a refusal becomes `Z_MEM_ERROR` instead of a silent fall back to the Rust
+// global heap.
+//
+// Being an integration test, this file is a separate crate, so nothing here can
+// use an item a downstream user cannot. In particular no `AllocHook` is built:
+// supplying raw storage requires the `unsafe` FFI constructor, whereas deciding
+// and accounting — which is what a bounded allocator exists to do — is fully
+// expressible in safe code.
+// ===========================================================================
+
+/// A downstream-style [`Allocator`] that records and budgets every request.
+///
+/// It overrides only the two allocation methods and leaves
+/// [`Allocator::hook`] at its inactive default, which is exactly how a
+/// Rust-native allocator is meant to be written. Storage still comes from the
+/// public [`AllocBuffer::try_zeroed_items`] constructor — a global-allocator
+/// region, because handing the engines foreign memory is an `unsafe` operation
+/// on stable Rust — but *whether* each request is served, and with what shape,
+/// is entirely this type's decision.
+struct ExternalAllocator {
+    /// Remaining byte budget. [`usize::MAX`] means effectively unlimited.
+    budget: Cell<usize>,
+    /// Every `(items, item_size)` pair the engines asked for, in call order,
+    /// including the pair that was refused.
+    requests: RefCell<Vec<(usize, usize)>>,
+}
+
+impl ExternalAllocator {
+    /// An allocator that serves every request.
+    fn unlimited() -> Self {
+        Self::with_budget(usize::MAX)
+    }
+
+    /// An allocator that refuses any request which would exceed `bytes` in
+    /// total, mirroring `infcover.c`'s capped `mem_limit` harness.
+    fn with_budget(bytes: usize) -> Self {
+        Self {
+            budget: Cell::new(bytes),
+            requests: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Records the request and reports whether the budget can absorb it. A
+    /// refusal deducts nothing, so a later smaller request can still succeed —
+    /// the same semantics as a real bounded arena.
+    fn charge(&self, items: usize, item_size: usize) -> bool {
+        self.requests.borrow_mut().push((items, item_size));
+        let Some(bytes) = items.checked_mul(item_size) else {
+            return false;
+        };
+        let left = self.budget.get();
+        if bytes > left {
+            return false;
+        }
+        self.budget.set(left - bytes);
+        true
+    }
+
+    /// The recorded request list.
+    fn requests(&self) -> Vec<(usize, usize)> {
+        self.requests.borrow().clone()
+    }
+
+    /// How many times `(items, item_size)` was requested.
+    fn count_of(&self, items: usize, item_size: usize) -> usize {
+        self.requests
+            .borrow()
+            .iter()
+            .filter(|pair| **pair == (items, item_size))
+            .count()
+    }
+}
+
+impl Allocator for ExternalAllocator {
+    fn allocate_zeroed<T>(&self, count: usize) -> Option<AllocBuffer<T>>
+    where
+        T: Copy + Default + ZeroValid + 'static,
+    {
+        // C's element-shaped `ZALLOC(strm, n, sizeof(Pos))` split.
+        self.allocate_zeroed_items(count, core::mem::size_of::<T>())
+    }
+
+    fn allocate_zeroed_items<T>(&self, items: usize, item_size: usize) -> Option<AllocBuffer<T>>
+    where
+        T: Copy + Default + ZeroValid + 'static,
+    {
+        if !self.charge(items, item_size) {
+            return None;
+        }
+        AllocBuffer::try_zeroed_items(items, item_size, self.hook())
+    }
+}
+
+/// Every deflate buffer — and the engine-state footprint — must be requested
+/// through the [`Allocator`] trait, with the same `(items, item_size)` shapes C
+/// passes to `zalloc`.
+///
+/// This is the property the trait exists for: before it held, an external
+/// implementation was consulted for nothing and the engine quietly used the Rust
+/// global heap.
+#[test]
+fn external_allocator_observes_every_deflate_request() {
+    // `deflateInit2_(level=6, Z_DEFLATED, windowBits=15, memLevel=8, default)`.
+    const W_BITS: i32 = 15;
+    let w_size = 1usize << W_BITS;
+    let lit_bufsize = 1usize << (DEF_MEM_LEVEL as u32 + 6);
+    // `hash_bits = memLevel + 7` (`deflate.c` L452).
+    let hash_size = 1usize << (DEF_MEM_LEVEL as u32 + 7);
+
+    let alloc = ExternalAllocator::unlimited();
+    let mut strm = ZStream::with_allocator(alloc);
+    assert_eq!(
+        rc(deflate_init2(
+            &mut strm,
+            6,
+            Z_DEFLATED,
+            W_BITS,
+            DEF_MEM_LEVEL,
+            Strategy::Default,
+        )),
+        ReturnCode::Ok,
+        "an unlimited external allocator must satisfy deflateInit2"
+    );
+
+    let requests = strm.allocator().requests();
+
+    // C charges the state object first and checks it immediately
+    // (`deflate.c` L440-L442), so the very first request an external allocator
+    // sees is the `(1, sizeof(deflate_state))` pair.
+    assert_eq!(
+        requests.first().copied(),
+        Some((1, DeflateState::C_LAYOUT_SIZE)),
+        "the engine-state footprint must be the first request, as in C, and it must \
+         carry C's own `sizeof(deflate_state)` rather than this Rust type's size"
+    );
+
+    // The doubled sliding window, the `prev` chain, and the `head` hash table
+    // are all two-byte-element requests; C passes `(w_size, 2 * sizeof(Byte))`,
+    // `(w_size, sizeof(Pos))`, and `(hash_size, sizeof(Pos))` (`deflate.c`
+    // L458-L460). With windowBits 15 and memLevel 8 all three are (32768, 2).
+    assert_eq!(w_size, hash_size, "windowBits 15 / memLevel 8 sizing");
+    assert!(
+        strm.allocator().count_of(w_size, 2) >= 3,
+        "window, prev, and head must each be requested through the allocator; saw {requests:?}"
+    );
+
+    // The pending buffer: C's `ZALLOC(strm, lit_bufsize, LIT_BUFS)` with
+    // `LIT_BUFS == 4` (`deflate.c` L505, `deflate.h` L28 leaves `LIT_MEM`
+    // undefined).
+    assert!(
+        strm.allocator().count_of(lit_bufsize, 4) >= 1,
+        "the pending buffer must be requested through the allocator; saw {requests:?}"
+    );
+
+    // Exactly five requests, matching C `deflateInit2_` — the state plus
+    // `window`, `prev`, `head` and the *single* `pending_buf` that carries the
+    // overlaid symbol region (`deflate.c` L440-L520). A sixth request would mean
+    // the symbol buffer had been split out again.
+    assert_eq!(
+        requests,
+        vec![
+            (1, DeflateState::C_LAYOUT_SIZE),
+            (w_size, 2),
+            (w_size, 2),
+            (hash_size, 2),
+            (lit_bufsize, 4),
+        ],
+        "deflateInit2 must present C's exact five-request schedule"
+    );
+
+    // Nothing may have been taken from the global heap behind the allocator's
+    // back: the byte total it was charged must cover the whole documented
+    // footprint (AAP §0.6.3 enumerates state + doubled window + prev + head +
+    // the pending/symbol buffer).
+    let charged: usize = requests
+        .iter()
+        .map(|(items, size)| items * size)
+        .sum::<usize>();
+    let minimum =
+        DeflateState::C_LAYOUT_SIZE + 2 * w_size + 2 * w_size + 2 * hash_size + 4 * lit_bufsize;
+    assert!(
+        charged >= minimum,
+        "the allocator was charged {charged} bytes but the deflate footprint is at least {minimum}"
+    );
+
+    assert_eq!(rc(deflate_end(&mut strm)), ReturnCode::Ok);
+}
+
+/// A refused state reservation must fail `deflateInit2` with `Z_MEM_ERROR`, and
+/// must fail it *immediately* — C checks its state `ZALLOC` before requesting any
+/// working buffer (`deflate.c` L440-L442).
+#[test]
+fn external_allocator_refusal_fails_deflate_init() {
+    let state_size = DeflateState::C_LAYOUT_SIZE;
+    let alloc = ExternalAllocator::with_budget(state_size - 1);
+    let mut strm = ZStream::with_allocator(alloc);
+
+    assert_eq!(
+        deflate_init2(
+            &mut strm,
+            6,
+            Z_DEFLATED,
+            15,
+            DEF_MEM_LEVEL,
+            Strategy::Default
+        ),
+        Err(ZlibError::MemError),
+        "an external allocator that refuses the state reservation must fail init \
+         with Z_MEM_ERROR rather than silently using the global heap"
+    );
+    assert_eq!(
+        strm.allocator().requests(),
+        vec![(1, state_size)],
+        "init must stop at the first refused request, exactly as C does"
+    );
+}
+
+/// The inflate side of the same contract, and the Rust-native twin of
+/// [`mem_limit_forces_mem_error`]: the state reservation is charged at
+/// `inflateInit2` and the window lazily during `inflate`, so a budget between
+/// the two makes init succeed and the first `inflate` fail.
+#[test]
+fn external_allocator_refusal_fails_inflate_init_then_window() {
+    let state_size = zlib_rs::inflate::InflateState::C_LAYOUT_SIZE;
+    // The raw 8-bit window (`1 << 8`) `inflate` grows on first use.
+    let window_8 = 1usize << 8;
+    // A minimal raw-DEFLATE fragment that drives the engine to grow its window
+    // (the same feed `mem_limit_forces_mem_error` uses).
+    let input = [0x63u8, 0x00];
+
+    // --- Budget below the state size => init fails ---------------------------
+    {
+        let mut strm = ZStream::with_allocator(ExternalAllocator::with_budget(state_size - 1));
+        assert_eq!(
+            inflate_init2(&mut strm, -8),
+            Err(ZlibError::MemError),
+            "a refused state reservation must fail inflate_init2"
+        );
+        assert_eq!(
+            strm.allocator().requests(),
+            vec![(1, state_size)],
+            "the state reservation is the only request an init failure makes"
+        );
+    }
+
+    // --- Budget for the state but not the window => `inflate` fails ----------
+    {
+        let mut strm =
+            ZStream::with_allocator(ExternalAllocator::with_budget(state_size + window_8 - 1));
+        assert_eq!(
+            rc(inflate_init2(&mut strm, -8)),
+            ReturnCode::Ok,
+            "a budget covering the state must let inflate_init2 succeed"
+        );
+        let mut out = [0u8; 1];
+        let outcome = inflate(&mut strm, &input, &mut out, Z_NO_FLUSH);
+        assert_eq!(
+            outcome.code,
+            ReturnCode::MemError,
+            "a refused window must surface Z_MEM_ERROR, not a global-heap fallback"
+        );
+        assert!(
+            strm.allocator().count_of(window_8, 1) >= 1,
+            "the window must be requested through the allocator as C's \
+             ZALLOC(strm, 1U << wbits, sizeof(unsigned char))"
+        );
+        assert_eq!(rc(inflate_end(&mut strm)), ReturnCode::Ok);
+    }
+
+    // --- Unlimited => the stream decodes normally ---------------------------
+    {
+        let mut strm = ZStream::with_allocator(ExternalAllocator::unlimited());
+        assert_eq!(rc(inflate_init2(&mut strm, -8)), ReturnCode::Ok);
+        let mut out = [0u8; 1];
+        let outcome = inflate(&mut strm, &input, &mut out, Z_NO_FLUSH);
+        assert_eq!(
+            outcome.code,
+            ReturnCode::Ok,
+            "an unlimited external allocator must not disturb decoding"
+        );
+        assert_eq!(rc(inflate_end(&mut strm)), ReturnCode::Ok);
+    }
+}
+
+/// Serving engine memory through an external allocator must not change a single
+/// emitted byte: compressed output stays byte-identical to the default
+/// allocator's, and the stream round-trips (User Constraint 1 / AAP §0.6.4).
+#[test]
+fn external_allocator_round_trip_is_byte_identical() {
+    // Mixed-entropy payload: a repeated run plus a deterministic ramp, so both
+    // the match finder and the literal path are exercised.
+    let mut payload = Vec::with_capacity(40_000);
+    for i in 0..40_000usize {
+        payload.push(if i % 97 < 40 {
+            b'A' + (i % 7) as u8
+        } else {
+            (i * 31 % 251) as u8
+        });
+    }
+
+    fn compress_with<A: Allocator>(alloc: A, payload: &[u8]) -> Vec<u8> {
+        let mut strm = ZStream::with_allocator(alloc);
+        assert_eq!(
+            rc(deflate_init2(
+                &mut strm,
+                6,
+                Z_DEFLATED,
+                15,
+                DEF_MEM_LEVEL,
+                Strategy::Default,
+            )),
+            ReturnCode::Ok
+        );
+        let mut out = vec![0u8; payload.len() + 1024];
+        let outcome = deflate(&mut strm, payload, &mut out, Z_FINISH);
+        assert_eq!(outcome.code, ReturnCode::StreamEnd, "deflate must finish");
+        assert_eq!(outcome.consumed, payload.len());
+        out.truncate(outcome.produced);
+        assert_eq!(rc(deflate_end(&mut strm)), ReturnCode::Ok);
+        out
+    }
+
+    let external = compress_with(ExternalAllocator::unlimited(), &payload);
+    let default = compress_with(zlib_rs::DefaultAllocator, &payload);
+    assert_eq!(
+        external, default,
+        "the allocator must not influence a single compressed byte"
+    );
+
+    // And the external-allocator output decodes back to the original through an
+    // external allocator too.
+    let mut strm = ZStream::with_allocator(ExternalAllocator::unlimited());
+    assert_eq!(rc(inflate_init2(&mut strm, 15)), ReturnCode::Ok);
+    let mut decoded = vec![0u8; payload.len()];
+    let outcome = inflate(&mut strm, &external, &mut decoded, Z_FINISH);
+    assert_eq!(outcome.code, ReturnCode::StreamEnd);
+    assert_eq!(outcome.produced, payload.len());
+    assert_eq!(decoded, payload, "round trip must be lossless");
+    assert_eq!(rc(inflate_end(&mut strm)), ReturnCode::Ok);
 }

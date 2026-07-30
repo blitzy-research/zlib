@@ -246,12 +246,37 @@ fn crc32_bulk(crc: u32, buf: &[u8]) -> u32 {
 ///
 /// The braid computes `CRC_BRAID_N` independent CRCs over interleaved
 /// `CRC_BRAID_W`-byte words and combines them at the end of the final block,
-/// which breaks the serial dependency of the byte-wise loop. Both the
-/// little- and big-endian variants are compiled on every target and selected by
-/// [`cfg!`]`(target_endian = ...)`, exactly as C performs its endian check at
-/// execution time — because, as `crc32.c` notes, ARM cores can switch
-/// endianness at run time. Compiling both also means every table `build.rs`
-/// generates is genuinely consumed rather than allowed to be dead.
+/// which breaks the serial dependency of the byte-wise loop.
+///
+/// # Endian selection is resolved at compile time
+///
+/// Both the little- and big-endian variants are *compiled* on every target —
+/// [`cfg!`] is an expression macro, so both arms of the `if` are type-checked and
+/// both generated table sets stay alive rather than becoming dead code — but the
+/// arm that actually runs is fixed when the crate is built, because
+/// `cfg!(target_endian = ...)` is a compile-time constant read from the target
+/// triple.
+///
+/// This is a deliberate, output-preserving divergence from C. Reference zlib
+/// probes endianness at *execution* time (`endian = 1; if (*(unsigned char
+/// *)&endian)`, `crc32.c` L657-L662) and explains why: a bi-endian ARM core can
+/// change endianness at run time, so a compile-time answer could be wrong for the
+/// mode the process is actually running in. C's own comment notes that a compiler
+/// which knows the endianness will optimize the check and the unused branch away,
+/// which is precisely the code this port emits directly.
+///
+/// The divergence cannot change a checksum. Each variant is a self-consistent
+/// algorithm over the same byte sequence — one loading words little-endian
+/// against the reflected tables, the other big-endian against the byte-swapped
+/// companions — so both return the same CRC for the same input. That is asserted,
+/// not assumed: `both_endian_braids_match_byte_wise` drives `braid_le` *and*
+/// `braid_be` against the byte-wise reference on whatever target runs the suite,
+/// which is also what exercises `CRC_BIG_TABLE` and `CRC_BRAID_BIG_TABLE` on a
+/// little-endian host where the selected path never reaches them.
+///
+/// Should a target ever require a genuine run-time probe, the replacement is
+/// local to the `cfg!` in [`crc32_bulk`]: both branches already exist and are
+/// already tested.
 ///
 /// This module is compiled when the `simd` feature is **off** (where it is the
 /// bulk implementation) and additionally under `cfg(test)`, so its equivalence

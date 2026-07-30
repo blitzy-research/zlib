@@ -331,15 +331,23 @@ impl core::ops::DerefMut for GzBorrow<'_> {
 fn box_state(result: Result<Box<GzState>, ReturnCode>) -> gzFile {
     match result {
         Ok(state) => {
-            let handle = Box::new(GzHandle {
+            // Fallible boxing: C `gzopen` reports every allocation failure by
+            // returning `NULL`, never by aborting (`gzlib.c` L206-L210), so an
+            // exhausted Rust heap must produce the same `NULL` sentinel
+            // (AAP §0.6.5). The dropped `state` closes its file descriptor and
+            // releases its buffers.
+            let handle = GzHandle {
                 prefix: gzFile_s {
                     have: 0,
                     next: ptr::null_mut(),
                     pos: 0,
                 },
                 state,
-            });
-            Box::into_raw(handle) as gzFile
+            };
+            match crate::ffi::alloc::try_box(handle) {
+                Some(boxed) => Box::into_raw(boxed) as gzFile,
+                None => ptr::null_mut(),
+            }
         }
         Err(_) => ptr::null_mut(),
     }

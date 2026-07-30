@@ -33,11 +33,10 @@
 use core::ffi::{c_char, c_int, c_uint};
 use core::{ptr, slice};
 
-use alloc::boxed::Box;
-
 use crate::constants::{DEF_MEM_LEVEL, MAX_WBITS, Strategy, Z_DEFAULT_STRATEGY, Z_DEFLATED};
 use crate::deflate as engine;
 use crate::error::{ReturnCode, ZlibError};
+use crate::ffi::alloc::try_box;
 use crate::ffi::types::*;
 use crate::stream::ZStream;
 
@@ -57,6 +56,8 @@ const Z_STREAM_ERROR: c_int = ReturnCode::StreamError.as_c_int();
 const Z_BUF_ERROR: c_int = ReturnCode::BufError.as_c_int();
 /// `Z_VERSION_ERROR` — header/library version or `z_stream` size mismatch.
 const Z_VERSION_ERROR: c_int = ReturnCode::VersionError.as_c_int();
+/// `Z_MEM_ERROR` — an allocation (engine buffer or opaque handle) was refused.
+const Z_MEM_ERROR: c_int = ReturnCode::MemError.as_c_int();
 
 // ===========================================================================
 // Boundary helpers
@@ -183,11 +184,22 @@ pub unsafe extern "C" fn deflateInit2_(
         let data_type = zs.data_type;
         let msg = msg_ptr(&zs);
 
+        // Box the handle **fallibly** before touching `s`. `Box::new` aborts the
+        // process when the Rust global heap cannot hold the handle, which would
+        // turn a recoverable condition into process death after the engine's own
+        // allocations already succeeded; C reports every failed allocation as
+        // `Z_MEM_ERROR` (AAP §0.6.5). On failure `zs` drops here, releasing every
+        // working buffer through the caller's `zfree`, and the caller's `z_stream`
+        // is left exactly as it was found.
+        let Some(handle) = try_box(DeflateHandle::new(zs)) else {
+            return Z_MEM_ERROR;
+        };
+
         // Install the boxed state. C overwrites `strm->state` unconditionally;
         // callers must not re-init without `deflateEnd` (documented contract).
         // SAFETY: transfers ownership of the box into the opaque `state` handle;
         // it is reclaimed exactly once by `deflateEnd` via `state_take`.
-        s.state = unsafe { state_ptr_from_box(Box::new(DeflateHandle::new(zs))) };
+        s.state = unsafe { state_ptr_from_box(handle) };
         s.total_in = 0;
         s.total_out = 0;
         set_msg(s, msg);
@@ -904,10 +916,20 @@ pub unsafe extern "C" fn deflateCopy(dest: z_streamp, source: z_streamp) -> c_in
             new_zs
         };
 
+        // Box the cloned handle **fallibly** before any field of `dest` is
+        // written, so global-heap exhaustion is reported as `Z_MEM_ERROR` with
+        // `dest` untouched — the state C leaves behind when it calls
+        // `deflateEnd(dest)` and returns `Z_MEM_ERROR` (AAP §0.6.5). The dropped
+        // `new_zs` releases the freshly cloned buffers through the caller's
+        // `zfree`.
+        let Some(handle) = try_box(DeflateHandle::new(new_zs)) else {
+            return Z_MEM_ERROR;
+        };
+
         // Install the cloned state into `dest`.
         // SAFETY: transfers ownership into `dest.state`; reclaimed once by
         // `deflateEnd`.
-        d.state = unsafe { state_ptr_from_box(Box::new(DeflateHandle::new(new_zs))) };
+        d.state = unsafe { state_ptr_from_box(handle) };
 
         // Mirror the full observable `z_stream` (C copies the whole struct).
         d.next_in = src.next_in;
@@ -1345,6 +1367,36 @@ mod tests {
         strm.opaque = (budget as *const Budget).cast_mut().cast::<c_void>();
     }
 
+    /// Every handle installation must be fallible **before** the caller's
+    /// `z_stream` is mutated. When the caller's allocator refuses the very first
+    /// request — the state reservation C makes and checks immediately at
+    /// `deflate.c` L440-L442 — `deflateInit2_` must report `Z_MEM_ERROR` and
+    /// leave `strm->state` null, so the caller's struct is exactly as it was
+    /// found and a retry or a `deflateEnd` behaves as on an uninitialized stream.
+    #[test]
+    fn init_reports_mem_error_and_installs_no_state_when_allocator_refuses() {
+        // Zero allocations permitted: the state reservation itself is refused.
+        let budget = Budget {
+            remaining: core::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let mut strm = zeroed_stream();
+        attach_budget(&mut strm, &budget);
+        assert_eq!(
+            unsafe { deflateInit_(&mut strm, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_MEM_ERROR,
+            "a refused allocation must surface Z_MEM_ERROR, never an abort or a \
+             silent global-heap substitution"
+        );
+        assert!(
+            strm.state.is_null(),
+            "a failed init must not install a state on the caller's z_stream"
+        );
+        // Nothing was installed, so the stream is still uninitialized and
+        // `deflateEnd` reports that exactly as C's `deflateStateCheck` does.
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_STREAM_ERROR);
+    }
+
     /// F-03 regression: when the caller's `zalloc` cannot satisfy the copy,
     /// `deflateCopy` must report `Z_MEM_ERROR` — matching C `deflate.c`
     /// L1348-L1350 — and must **not** report success with a destination whose
@@ -1498,8 +1550,11 @@ mod tests {
         );
         let init_allocs = stats.allocs();
         assert_eq!(
-            init_allocs, 6,
-            "deflate init makes six requests through the caller's zalloc: the state              reservation mirroring C's `ZALLOC(strm, 1, sizeof(deflate_state))`              (`deflate.c` L440-L442) followed by the five working buffers"
+            init_allocs, 5,
+            "deflate init makes exactly C's five requests through the caller's zalloc: \
+             the state reservation mirroring `ZALLOC(strm, 1, sizeof(deflate_state))` \
+             (`deflate.c` L440-L442), then `window`, `prev`, `head` and the single \
+             `pending_buf` that carries the overlaid symbol region (L458-L505)"
         );
         assert_eq!(stats.frees(), 0);
 
@@ -1517,7 +1572,10 @@ mod tests {
             "compression itself must not allocate"
         );
 
-        // Allow exactly two of the copy's six allocations to succeed.
+        // Allow exactly two of the copy's five allocations to succeed: the
+        // destination state reservation and `window`. C then still *asks* for
+        // `prev`, `head` and `pending_buf` before checking, which is what the
+        // `ooms()` assertion below pins.
         stats.set_budget(2);
         let mut dst = zeroed_stream();
         assert_eq!(
@@ -1542,7 +1600,13 @@ mod tests {
             2,
             "only the budgeted allocations may succeed"
         );
-        assert_eq!(stats.ooms(), 1, "the third copy allocation reported OOM");
+        assert_eq!(
+            stats.ooms(),
+            3,
+            "C `deflateCopy` issues all four working-buffer `ZALLOC`s and checks \
+             them together (`deflate.c` L1341-L1350), so the three that cannot be \
+             served each report out-of-memory to the caller's hook"
+        );
         assert_eq!(
             stats.frees(),
             2,
@@ -1594,17 +1658,19 @@ mod tests {
         );
         assert_eq!(
             stats.allocs(),
-            6,
-            "the state reservation plus the five working buffers (six here versus \
-             C's five, because this port does not overlay `sym_buf` on `pending_buf`)"
+            5,
+            "C's five `deflateInit2_` requests exactly: the state reservation plus \
+             `window`, `prev`, `head` and the single `pending_buf` holding the \
+             overlaid symbol region (`deflate.c` L440-L520)"
         );
 
         let mut dst = zeroed_stream();
         assert_eq!(unsafe { deflateCopy(&mut dst, &mut src) }, Z_OK);
         assert_eq!(
             stats.allocs(),
-            12,
-            "the copy's own state reservation and five buffers must come from the              caller's zalloc too"
+            10,
+            "the copy repeats the same five requests through the caller's zalloc, \
+             matching C `deflateCopy` (`deflate.c` L1335-L1372)"
         );
         assert_eq!(stats.ooms(), 0);
         // `deflateCopy` mirrors the allocator triple so `dest` is self-sufficient.
@@ -1635,7 +1701,7 @@ mod tests {
 
         assert_eq!(unsafe { deflateEnd(&mut dst) }, Z_OK);
         assert_eq!(unsafe { deflateEnd(&mut src) }, Z_OK);
-        assert_eq!(stats.frees(), 12, "every region reaches the caller's zfree");
+        assert_eq!(stats.frees(), 10, "every region reaches the caller's zfree");
         assert_eq!(stats.live_bytes(), 0);
     }
 }

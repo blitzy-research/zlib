@@ -98,7 +98,7 @@ use core::ffi::{c_uint, c_void};
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 
-use crate::stream::{AllocHook, ForeignBuffer, ZeroValid};
+use crate::stream::{AllocHook, FallibleBoxAlloc, ForeignAlloc, ForeignBuffer, ZeroValid};
 
 /// A working buffer backed by a caller-supplied C `zalloc`/`zfree` pair.
 ///
@@ -201,6 +201,141 @@ impl<T: Copy + Default + ZeroValid> Drop for CForeignBuffer<T> {
             unsafe { zfree(self.hook.opaque(), self.ptr.as_ptr() as *mut c_void) };
         }
     }
+}
+
+/// A byte buffer the **caller** owns, lent to the engine for the lifetime of one
+/// `inflateBack` session.
+///
+/// # Why this exists
+///
+/// `inflateBackInit_` is the one zlib entry point whose window is supplied *by
+/// the caller* rather than allocated by the library:
+///
+/// ```text
+/// state = ZALLOC(strm, 1, sizeof(struct inflate_state));  /* infback.c L51 */
+/// if (state == Z_NULL) return Z_MEM_ERROR;
+/// ...
+/// state->window = window;                                 /* infback.c L60 */
+/// ```
+///
+/// and `inflateBackEnd` frees only the state (`infback.c` L572-L577) — never the
+/// window. A C caller therefore observes exactly **one** `zalloc`, keeps using
+/// its own buffer afterwards, and is entitled to place that buffer wherever it
+/// likes (a static array, a stack frame, a memory-mapped region). Allocating a
+/// replacement window would break all three of those properties at once, which
+/// is what F2 reports.
+///
+/// This type closes the gap: it presents the caller's region through the same
+/// safe [`ForeignBuffer`] interface [`crate::stream::AllocBuffer::Foreign`]
+/// already uses, so the decoder reads and writes it as an ordinary slice with no
+/// `unsafe` outside this file, while [`Drop`] is **absent** — the region is not
+/// ours to release.
+///
+/// # Type invariants
+///
+/// Established once by [`borrow_caller_window`], the only producer:
+///
+/// * `ptr` is non-null and `len` is non-zero;
+/// * the region addresses exactly `len` **initialized** bytes (they are zeroed
+///   there before this buffer is constructed);
+/// * `len <= isize::MAX`, so the region is a valid Rust slice length;
+/// * the caller keeps the region valid and grants exclusive access for as long as
+///   the `inflateBack` state lives, which is the documented `# Safety` contract of
+///   the `inflateBackInit_` shim.
+///
+/// # Not clonable
+///
+/// [`clone_foreign`](ForeignBuffer::clone_foreign) returns [`None`]: a borrowed
+/// region cannot be duplicated without inventing storage the caller never
+/// provided. Nothing needs it to — zlib has no `inflateBackCopy`, so no code path
+/// ever clones an `inflateBack` window.
+struct CBorrowedBuffer {
+    /// Non-null pointer to `len` initialized bytes owned by the caller.
+    ptr: NonNull<u8>,
+    /// Length of the lent region in bytes.
+    len: usize,
+}
+
+impl ForeignBuffer<u8> for CBorrowedBuffer {
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: `borrow_caller_window` established every `from_raw_parts`
+        // precondition — non-null pointer, `len` initialized bytes (it zeroes them),
+        // `len <= isize::MAX`, and `u8`'s alignment of 1 which every address
+        // satisfies. The caller's `# Safety` contract on `inflateBackInit_`
+        // guarantees the region stays valid and is not aliased for the life of the
+        // state, so a shared slice for this `&self` borrow is sound.
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    #[inline]
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: same validity, length and initialization reasoning as
+        // `as_slice`; the `&mut self` borrow additionally guarantees no other
+        // reference into the region exists on our side, and the caller's
+        // `inflateBackInit_` contract guarantees none exists on theirs, so a
+        // unique slice is sound.
+        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+
+    fn clone_foreign(&self) -> Option<Box<dyn ForeignBuffer<u8>>> {
+        // A lent region has no allocator to re-request it from. See the type-level
+        // "Not clonable" note: no zlib entry point copies an `inflateBack` state.
+        None
+    }
+}
+
+// Deliberately **no** `impl Drop for CBorrowedBuffer`. C `inflateBackEnd` frees
+// only the state and leaves the caller's window alone (`infback.c` L572-L577);
+// releasing it here would be a double free of memory this crate never allocated.
+
+/// Wraps a caller-supplied `inflateBack` window as an [`AllocBuffer`] the engine
+/// can use without copying or reallocating it.
+///
+/// Returns [`None`] — which the `inflateBackInit_` shim reports as
+/// `Z_STREAM_ERROR` for a malformed request or `Z_MEM_ERROR` for an exhausted
+/// heap — when `window` is null, when `len` is `0` or exceeds `isize::MAX`, or
+/// when the small `Box` holding the borrow cannot be allocated.
+///
+/// # The region is zeroed
+///
+/// C leaves the caller's window untouched at init; this function writes `len`
+/// zero bytes over it first. That is required rather than optional: Rust may not
+/// form a `&mut [u8]` over uninitialized memory, and the decoder needs exactly
+/// that. It is also unobservable to a correct caller — `whave` and `wnext` both
+/// start at `0`, so `inflateBack` never reads a window byte it has not itself
+/// written, and every byte it emits comes from the output callback rather than
+/// from a pre-existing window value. The narrow, deliberate difference is that a
+/// caller who inspects its window buffer after a short stream sees zeros where a
+/// C build would leave its own prior contents; `zlib.h` documents the window
+/// purely as working space for the library, so nothing may rely on that.
+///
+/// # Safety
+///
+/// * `window` must be valid for reads and writes of `len` bytes.
+/// * The region must remain allocated, and must not be accessed by the caller or
+///   aliased by any other pointer, until the `inflateBack` state built from it is
+///   destroyed by `inflateBackEnd`.
+///
+/// These are precisely the obligations `zlib.h` already places on the `window`
+/// argument of `inflateBackInit` (`zlib.h` L1682-L1699), restated in Rust terms.
+pub(crate) unsafe fn borrow_caller_window(
+    window: *mut core::ffi::c_uchar,
+    len: usize,
+) -> Option<crate::stream::AllocBuffer<u8>> {
+    let ptr = NonNull::new(window)?;
+    if len == 0 || len > isize::MAX as usize {
+        return None;
+    }
+
+    // SAFETY: the caller guarantees `window` is valid for writes of `len` bytes
+    // (and `len <= isize::MAX` was just checked, so the region cannot wrap the
+    // address space). Zeroing initializes every byte, which is what lets the
+    // `ForeignBuffer` methods above form slices over it soundly.
+    unsafe { core::ptr::write_bytes(ptr.as_ptr(), 0, len) };
+
+    let borrowed = try_box(CBorrowedBuffer { ptr, len })?;
+    Some(crate::stream::AllocBuffer::Foreign(borrowed))
 }
 
 /// The validated shape of one caller-hook allocation request.
@@ -460,13 +595,23 @@ pub(crate) fn try_alloc_foreign_items<T: Copy + Default + ZeroValid + 'static>(
         unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr().cast::<MaybeUninit<T>>(), count) };
     fill_default(uninit);
 
-    Some(Box::new(CForeignBuffer {
+    // Build the owner first, then box it **fallibly**. `Box::new` aborts the
+    // process when the Rust global heap cannot hold the owner's metadata, which
+    // would turn a recoverable condition into process death *after* the caller's
+    // `zalloc` had already succeeded — the opposite of C, which reports every
+    // failed allocation as `Z_MEM_ERROR` (AAP §0.6.5). Moving the value into
+    // `try_box` means a failure drops the owner, and `CForeignBuffer`'s `Drop`
+    // hands the region straight back to the caller's `zfree`, so nothing leaks
+    // and the caller's allocation accounting stays balanced.
+    let owner = CForeignBuffer {
         ptr,
         len: count,
         items,
         item_size,
         hook,
-    }))
+    };
+    let boxed: Box<dyn ForeignBuffer<T>> = try_box(owner)?;
+    Some(boxed)
 }
 
 /// Allocates a single `T` on the Rust global heap **fallibly**, returning [`None`]
@@ -501,6 +646,45 @@ pub(crate) fn try_box<T>(value: T) -> Option<Box<T>> {
     // exactly the layout `Box<T>` deallocates with — and now holds an initialized
     // `T` that nothing else owns, so `Box` may take ownership of it.
     Some(unsafe { Box::from_raw(ptr.as_ptr()) })
+}
+
+// ===========================================================================
+// Core-declared allocation capabilities, implemented at the boundary
+// ===========================================================================
+//
+// `crate::stream` (layer 5) declares the two capabilities below and this module
+// (layer 8) implements them. That is the whole mechanism by which the safe core
+// obtains fallible boxing and caller-hook-backed buffers without naming a single
+// `crate::ffi` item: the dependency edge runs `ffi -> stream` only, preserving
+// the AAP's strictly acyclic, one-way layer ordering (AAP §0.3.1, §0.6.2) while
+// keeping every raw-pointer operation inside the designated unsafe boundary
+// (AAP §0.7.2 standard S2).
+//
+// Both traits are `pub(crate)`, so these blanket implementations are the only
+// ones that can ever exist and no downstream crate can substitute a different
+// allocation runtime.
+
+impl<T> FallibleBoxAlloc for T {
+    #[inline]
+    fn try_box_fallible(self) -> Option<Box<Self>> {
+        try_box(self)
+    }
+}
+
+impl<T: Copy + Default + ZeroValid + 'static> ForeignAlloc for T {
+    #[inline]
+    fn try_alloc_foreign(hook: AllocHook, count: usize) -> Option<Box<dyn ForeignBuffer<Self>>> {
+        try_alloc_foreign::<Self>(hook, count)
+    }
+
+    #[inline]
+    fn try_alloc_foreign_items(
+        hook: AllocHook,
+        items: usize,
+        item_size: usize,
+    ) -> Option<Box<dyn ForeignBuffer<Self>>> {
+        try_alloc_foreign_items::<Self>(hook, items, item_size)
+    }
 }
 
 // Shared counted-hook test support (F5 / F1 / F6 remediation)
@@ -808,6 +992,61 @@ mod tests {
 
         assert_eq!(stats.frees(), 1, "zfree must balance zalloc exactly");
         assert_eq!(stats.live_bytes(), 0, "no bytes may stay outstanding");
+    }
+
+    /// [`try_box`] — the fallible replacement for [`Box::new`] that keeps a
+    /// global-heap failure reportable as `Z_MEM_ERROR` instead of aborting —
+    /// must move its value onto the heap intact.
+    ///
+    /// This is the helper every FFI handle installation now routes through
+    /// (`deflateInit2_`, `deflateCopy`, `inflateInit2_`, `inflateBackInit_`,
+    /// `inflateCopy`, `gzopen`) as well as the `CForeignBuffer` owner above, so
+    /// its value-preservation and its zero-sized fast path are both pinned here.
+    #[test]
+    fn try_box_moves_the_value_onto_the_heap_intact() {
+        /// A payload with mixed alignment requirements, so a wrong `Layout`
+        /// would show up as a corrupted field rather than passing by luck.
+        #[derive(Debug, PartialEq, Eq)]
+        struct Payload {
+            tag: u64,
+            byte: u8,
+            words: [u16; 3],
+        }
+
+        let boxed = try_box(Payload {
+            tag: 0x0123_4567_89ab_cdef,
+            byte: 0x5a,
+            words: [1, 2, 3],
+        })
+        .expect("a small allocation must succeed");
+
+        assert_eq!(
+            *boxed,
+            Payload {
+                tag: 0x0123_4567_89ab_cdef,
+                byte: 0x5a,
+                words: [1, 2, 3],
+            },
+            "try_box must not disturb the value it moves"
+        );
+        assert_eq!(
+            (&raw const *boxed).addr() % core::mem::align_of::<Payload>(),
+            0,
+            "the box must satisfy the type's alignment"
+        );
+        // Dropping the box releases the region through the global allocator with
+        // exactly `Layout::new::<Payload>()`, the layout it was allocated with.
+        drop(boxed);
+    }
+
+    /// A zero-sized `T` never reaches the allocator, so [`try_box`] takes its
+    /// infallible fast path and can never report failure.
+    #[test]
+    fn try_box_succeeds_for_a_zero_sized_type() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct Zst;
+
+        assert_eq!(*try_box(Zst).expect("a ZST box cannot fail"), Zst);
     }
 
     /// A **partial** hook is inactive per the has-hook clause: allocation uses

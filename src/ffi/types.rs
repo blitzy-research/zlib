@@ -404,9 +404,101 @@ impl Allocator for CAllocator {
         AllocHook::new(self.zalloc, self.zfree, self.opaque)
     }
 
+    /// The engine-state footprint is charged to the caller only when they
+    /// actually installed a hook, exactly as C charges
+    /// `ZALLOC(strm, 1, sizeof(deflate_state))` to `strm->zalloc`
+    /// (`deflate.c` L440). With null hooks this returns `false`, keeping the
+    /// footprint of a hookless C caller byte-for-byte what it has always been
+    /// (AAP §0.6.5).
+    #[inline]
+    fn reserves_state_footprint(&self) -> bool {
+        self.hook().is_active()
+    }
+
     // `deallocate` uses the trait default: dropping the `AllocBuffer` routes to
     // the correct deallocator — the caller's `zfree` for a `Foreign` region, or
     // the global allocator for an `Owned` fallback.
+    //
+    // `allocate_zeroed_items` also uses the trait default, which forwards C's
+    // `(items, size)` pair to `hook()` verbatim.
+}
+
+/// Builds an [`AllocHook`] from a raw C `zalloc`/`zfree`/`opaque` triple.
+///
+/// This is the sanctioned public path for constructing an **active** allocator
+/// hook — one that routes engine buffers through foreign C function pointers.
+/// `AllocHook::new` is deliberately crate-private: the
+/// obligations below cannot be checked by the compiler, and `src/stream.rs`
+/// carries `#![deny(unsafe_code)]`, so the constructor that imposes them belongs
+/// at the FFI boundary where `unsafe` is permitted (AAP §0.6.2).
+///
+/// A Rust-native [`Allocator`] implementation does **not** need this: it should
+/// override [`Allocator::allocate_zeroed`] /
+/// [`Allocator::allocate_zeroed_items`], which the engines call for every
+/// working buffer and for each engine-state footprint. Reach for this function
+/// only when the storage genuinely lives behind a C `alloc_func`/`free_func`
+/// pair — for example when embedding this crate underneath an existing C
+/// allocator, or when re-implementing the drop-in boundary.
+///
+/// Passing `None` for either half yields an *inactive* hook
+/// ([`AllocHook::is_active`] is `false`), which selects the global-allocator
+/// path. That mirrors the AAP's has-hook policy: caller storage is used only when
+/// **both** halves are present (AAP §0.6.3).
+///
+/// # Safety
+///
+/// The caller must guarantee, for the entire lifetime of every buffer allocated
+/// through the returned hook, that:
+///
+/// 1. `zalloc(opaque, items, size)` either returns null or returns a pointer to
+///    at least `items * size` writable bytes that no other code accesses;
+/// 2. `zfree(opaque, address)` releases exactly a region previously returned by
+///    that `zalloc` with the same `opaque`, and is safe to call once per region;
+/// 3. neither hook unwinds into Rust — both are `extern "C"`, so unwinding across
+///    the boundary is undefined behavior; and
+/// 4. `opaque` remains valid for both hooks for as long as any buffer allocated
+///    through this hook is alive.
+///
+/// These are precisely the obligations `zlib.h` L85-L86 already places on
+/// `alloc_func`/`free_func`. Everything that *can* be verified mechanically —
+/// null returns, unrepresentable sizes, and misalignment — is checked by the
+/// crate: a misaligned region is handed straight back to `zfree` and the request
+/// is reported as an allocation failure, so a merely *unhelpful* hook produces
+/// `Z_MEM_ERROR` rather than undefined behavior.
+///
+/// # Examples
+///
+/// ```
+/// use core::ffi::{c_uint, c_void};
+/// use zlib_rs::stream::{Allocator, AllocHook};
+/// use zlib_rs::ffi::types::alloc_hook_from_parts;
+///
+/// unsafe extern "C" fn my_alloc(_opaque: *mut c_void, _items: c_uint, _size: c_uint)
+///     -> *mut c_void { core::ptr::null_mut() }
+/// unsafe extern "C" fn my_free(_opaque: *mut c_void, _address: *mut c_void) {}
+///
+/// // SAFETY: `my_alloc` only ever reports out-of-memory (it returns null), and
+/// // `my_free` is a no-op that is never handed a region, so clauses 1-4 hold.
+/// let hook = unsafe {
+///     alloc_hook_from_parts(Some(my_alloc), Some(my_free), core::ptr::null_mut())
+/// };
+/// assert!(hook.is_active());
+///
+/// // An allocator that forwards to it reports the hook's out-of-memory verbatim.
+/// struct Forwarding(AllocHook);
+/// impl Allocator for Forwarding {
+///     fn hook(&self) -> AllocHook { self.0 }
+/// }
+/// assert!(Forwarding(hook).allocate_zeroed::<u8>(64).is_none());
+/// ```
+#[inline]
+#[must_use]
+pub const unsafe fn alloc_hook_from_parts(
+    zalloc: alloc_func,
+    zfree: free_func,
+    opaque: *mut c_void,
+) -> AllocHook {
+    AllocHook::new(zalloc, zfree, opaque)
 }
 
 /// Builds an idiomatic [`ZStream<CAllocator>`](crate::stream::ZStream) whose
@@ -1149,6 +1241,8 @@ mod tests {
     use super::*;
     use core::mem::{MaybeUninit, align_of, offset_of, size_of};
 
+    use crate::stream::HookAllocator;
+
     /// The four C function-pointer typedefs must be pointer-sized, confirming
     /// the null-pointer optimization the `#[repr(C)]` structs rely on.
     #[test]
@@ -1276,6 +1370,34 @@ mod tests {
         assert_eq!(offset_of!(gzFile_s, next), 8);
         assert_eq!(offset_of!(gzFile_s, pos), 16);
         assert_eq!(size_of::<gzFile_s>(), 24);
+    }
+
+    /// `CAllocator` charges the engine-state footprint only when the caller
+    /// actually installed a hook, so a C caller who left `zalloc`/`zfree` null
+    /// keeps exactly the footprint they have always had (AAP §0.6.5).
+    #[test]
+    fn callocator_reserves_the_state_footprint_only_with_an_active_hook() {
+        let null_hooks = CAllocator {
+            zalloc: None,
+            zfree: None,
+            opaque: ptr::null_mut(),
+        };
+        assert!(
+            !null_hooks.reserves_state_footprint(),
+            "a hookless C caller must not be charged an extra state-sized region"
+        );
+
+        let stats = crate::ffi::alloc::test_hook::HookStats::new();
+        let hook = stats.hook();
+        let active = CAllocator {
+            zalloc: hook.zalloc(),
+            zfree: hook.zfree(),
+            opaque: hook.opaque(),
+        };
+        assert!(
+            active.reserves_state_footprint(),
+            "an installed hook must be charged for the state, as C's ZALLOC is"
+        );
     }
 
     /// With null hooks, `CAllocator` falls back to the global allocator and
@@ -1582,19 +1704,31 @@ mod tests {
         assert!(longs.iter().all(|&l| l == 0));
     }
 
-    /// F4 geometry regression: `DeflateState::new_in` must present the caller's
-    /// `zalloc` with the same `(items, size)` argument pairs — and in the same
-    /// order — that C `deflateInit2_` passes.
+    /// F2 geometry regression: `DeflateState::new_in` must present the caller's
+    /// `zalloc` with the same `(items, size)` argument pairs — in the same order,
+    /// and the same number of times — that C `deflateInit2_` passes.
     ///
     /// A bounded or inspecting allocator (`infcover.c`'s is the canonical
-    /// example) legitimately reads both arguments, so flattening every request to
-    /// `(byte_count, 1)` is an observable ABI difference even though the total
-    /// byte count is unchanged. C's sequence is the state
-    /// (`ZALLOC(strm, 1, sizeof(deflate_state))`, `deflate.c` L440) followed by
-    /// `pending_buf` `(lit_bufsize, LIT_BUFS)` (L505), `window` `(w_size, 2)`
-    /// (L458), `prev` `(w_size, sizeof(Pos))` (L459) and `head`
-    /// `(hash_size, sizeof(Pos))` (L460); this port additionally owns a separate
-    /// `sym_buf` shaped `(lit_bufsize, 3)` (AAP §0.4.1.3).
+    /// example) legitimately reads both arguments and counts the calls, so
+    /// flattening every request to `(byte_count, 1)`, reordering them, or issuing
+    /// one more than C does is an observable ABI difference even when the total
+    /// byte count is unchanged (AAP §0.6.5).
+    ///
+    /// C's sequence is exactly five requests:
+    ///
+    /// 1. the state, `ZALLOC(strm, 1, sizeof(deflate_state))` (`deflate.c` L440),
+    /// 2. `window`, `ZALLOC(strm, s->w_size, 2 * sizeof(Byte))` (L458),
+    /// 3. `prev`, `ZALLOC(strm, s->w_size, sizeof(Pos))` (L459),
+    /// 4. `head`, `ZALLOC(strm, s->hash_size, sizeof(Pos))` (L460),
+    /// 5. `pending_buf`, `ZALLOC(strm, s->lit_bufsize, LIT_BUFS)` (L505).
+    ///
+    /// There is no sixth request: C carves the symbol buffer out of the pending
+    /// allocation with `s->sym_buf = s->pending_buf + s->lit_bufsize` (L520), and
+    /// this port reproduces that as index arithmetic inside one owned buffer
+    /// (AAP §0.3.2 rule T3). The state's byte count comes from
+    /// [`DeflateState::C_LAYOUT_SIZE`] — the field-exact `#[repr(C)]` layout
+    /// mirror of C's `deflate_state` — not from this Rust type's own `size_of`,
+    /// which differs (AAP §0.6.3).
     #[test]
     fn deflate_new_in_presents_c_zalloc_geometry() {
         use core::sync::atomic::{AtomicUsize, Ordering};
@@ -1640,13 +1774,17 @@ mod tests {
         let w_size = 1usize << 15;
         let hash_size = 1usize << (8 + 7);
         let lit_bufsize = 1usize << (8 + 6);
-        let expected: [(usize, usize); 6] = [
-            (1, size_of::<DeflateState>()), // C: ZALLOC(strm, 1, sizeof(deflate_state))
-            (lit_bufsize, 4),               // C: ZALLOC(strm, s->lit_bufsize, LIT_BUFS)
-            (w_size, 2),                    // C: ZALLOC(strm, s->w_size, 2 * sizeof(Byte))
-            (w_size, 2),                    // C: ZALLOC(strm, s->w_size, sizeof(Pos))
-            (hash_size, 2),                 // C: ZALLOC(strm, s->hash_size, sizeof(Pos))
-            (lit_bufsize, 3),               // this port's owned symbol buffer
+        let expected: [(usize, usize); 5] = [
+            // C: ZALLOC(strm, 1, sizeof(deflate_state))   -- deflate.c L440
+            (1, DeflateState::C_LAYOUT_SIZE),
+            // C: ZALLOC(strm, s->w_size, 2 * sizeof(Byte)) -- deflate.c L458
+            (w_size, 2),
+            // C: ZALLOC(strm, s->w_size, sizeof(Pos))      -- deflate.c L459
+            (w_size, 2),
+            // C: ZALLOC(strm, s->hash_size, sizeof(Pos))   -- deflate.c L460
+            (hash_size, 2),
+            // C: ZALLOC(strm, s->lit_bufsize, LIT_BUFS)    -- deflate.c L505
+            (lit_bufsize, 4),
         ];
 
         let observed = COUNT.load(Ordering::SeqCst);
@@ -1667,12 +1805,225 @@ mod tests {
             );
         }
 
-        // Sanity: the byte totals still match the buffer geometry.
+        // Sanity: the byte totals still match the buffer geometry. The single
+        // `pending_buf` request covers both the pending output (its lower
+        // `lit_bufsize` bytes) and the overlaid symbol region (the upper
+        // `3 * lit_bufsize`), which is why four rather than seven appears here.
         assert_eq!(state.pending_buf.len(), lit_bufsize * 4);
         assert_eq!(state.window.len(), 2 * w_size);
         assert_eq!(state.prev.len(), w_size);
         assert_eq!(state.head.len(), hash_size);
-        assert_eq!(state.sym_buf.len(), lit_bufsize * 3);
+    }
+
+    /// F2 regression: `deflateCopy` must present the caller's `zalloc` with C's
+    /// **copy** schedule — the destination state, then `window`, `prev`, `head`
+    /// and `pending_buf` (`deflate.c` L1335-L1345) — with the same `(items, size)`
+    /// pairs `deflateInit2_` used, and with no request for the overlaid symbol
+    /// region.
+    #[test]
+    fn deflate_copy_presents_c_zalloc_geometry() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::constants::{Strategy, Z_DEFLATED};
+        use crate::deflate::state::DeflateState;
+
+        /// Recorded `(items, size)` pairs, in call order, for the copy only.
+        const CAP: usize = 12;
+        static COUNT: AtomicUsize = AtomicUsize::new(0);
+        static ITEMS: [AtomicUsize; CAP] = [const { AtomicUsize::new(0) }; CAP];
+        static SIZES: [AtomicUsize; CAP] = [const { AtomicUsize::new(0) }; CAP];
+        /// Set once init is done, so only the copy's requests are recorded.
+        static RECORDING: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+
+        unsafe extern "C" fn copy_zalloc(
+            _opaque: *mut c_void,
+            items: c_uint,
+            size: c_uint,
+        ) -> *mut c_void {
+            if RECORDING.load(Ordering::SeqCst) {
+                let i = COUNT.fetch_add(1, Ordering::SeqCst);
+                if i < CAP {
+                    ITEMS[i].store(items as usize, Ordering::SeqCst);
+                    SIZES[i].store(size as usize, Ordering::SeqCst);
+                }
+            }
+            hook_backing_alloc((items as usize) * (size as usize))
+        }
+        unsafe extern "C" fn copy_zfree(_opaque: *mut c_void, address: *mut c_void) {
+            hook_backing_free(address);
+        }
+
+        let hook = AllocHook::new(Some(copy_zalloc), Some(copy_zfree), ptr::null_mut());
+
+        // A small geometry keeps the test cheap while keeping every request pair
+        // distinct enough to be meaningful: windowBits 9 => w_size 512,
+        // memLevel 4 => hash_size 2048, lit_bufsize 1024.
+        let state = DeflateState::new_in(hook, 6, Z_DEFLATED, 9, 4, Strategy::Default, 1)
+            .expect("healthy hook initializes the state");
+
+        RECORDING.store(true, Ordering::SeqCst);
+        let copy = state
+            .try_copy_in(&HookAllocator::new(hook))
+            .expect("healthy hook duplicates the state");
+        RECORDING.store(false, Ordering::SeqCst);
+
+        let w_size = 1usize << 9;
+        let hash_size = 1usize << (4 + 7);
+        let lit_bufsize = 1usize << (4 + 6);
+        let expected: [(usize, usize); 5] = [
+            // C: ZALLOC(dest, 1, sizeof(deflate_state))     -- deflate.c L1335
+            (1, DeflateState::C_LAYOUT_SIZE),
+            // C: ZALLOC(dest, ds->w_size, 2 * sizeof(Byte)) -- deflate.c L1341
+            (w_size, 2),
+            // C: ZALLOC(dest, ds->w_size, sizeof(Pos))      -- deflate.c L1342
+            (w_size, 2),
+            // C: ZALLOC(dest, ds->hash_size, sizeof(Pos))   -- deflate.c L1343
+            (hash_size, 2),
+            // C: ZALLOC(dest, ds->lit_bufsize, LIT_BUFS)    -- deflate.c L1344
+            (lit_bufsize, 4),
+        ];
+
+        assert_eq!(
+            COUNT.load(Ordering::SeqCst),
+            expected.len(),
+            "deflateCopy must make exactly C's five requests"
+        );
+        for (i, &(items, size)) in expected.iter().enumerate() {
+            assert_eq!(
+                (
+                    ITEMS[i].load(Ordering::SeqCst),
+                    SIZES[i].load(Ordering::SeqCst)
+                ),
+                (items, size),
+                "copy allocation #{i} must be ({items}, {size}) as C passes it"
+            );
+        }
+
+        // The copy really is a copy: same geometry, same live bytes, distinct
+        // storage, and every region inside the caller's arena.
+        assert_eq!(copy.lit_bufsize, state.lit_bufsize);
+        assert_eq!(copy.pending_buf.len(), state.pending_buf.len());
+        assert_eq!(&copy.window[..], &state.window[..]);
+        assert!(copy.pending_buf.is_foreign() && copy.state_alloc.is_foreign());
+    }
+
+    /// F2 regression: the engines must release their buffers in the **reverse of
+    /// C's allocation order**, which is the order C's own teardown uses.
+    ///
+    /// `deflateEnd` is explicit about it — the source carries the comment
+    /// "Deallocate in reverse order of allocations" — and the sequence is
+    /// `pending_buf`, `head`, `prev`, `window`, then the state
+    /// (`deflate.c` L1300-L1306). `inflateEnd` frees the window then the state
+    /// (`inflate.c` L1160-L1161).
+    ///
+    /// The four deflate working buffers can share a byte size, so size alone
+    /// cannot identify them. This test therefore records the *address* each
+    /// allocation returned and, on each `zfree`, reports which allocation index
+    /// that address belonged to — an exact identification independent of geometry.
+    #[test]
+    fn engine_teardown_frees_in_c_reverse_allocation_order() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::constants::{Strategy, Z_DEFLATED};
+        use crate::deflate::state::DeflateState;
+        use crate::inflate::state::InflateState;
+
+        /// Capacity for the recorded allocation/free sequences. Generous so an
+        /// unexpected extra event shows up as a length mismatch, not an overflow.
+        const CAP: usize = 12;
+        /// Addresses returned by `zalloc`, in allocation order.
+        static ADDRS: [AtomicUsize; CAP] = [const { AtomicUsize::new(0) }; CAP];
+        /// Number of allocations recorded.
+        static NALLOC: AtomicUsize = AtomicUsize::new(0);
+        /// Allocation indices, in the order their regions were freed.
+        static FREED: [AtomicUsize; CAP] = [const { AtomicUsize::new(usize::MAX) }; CAP];
+        /// Number of frees recorded.
+        static NFREE: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn tracking_zalloc(
+            _opaque: *mut c_void,
+            items: c_uint,
+            size: c_uint,
+        ) -> *mut c_void {
+            let block = hook_backing_alloc((items as usize) * (size as usize));
+            let i = NALLOC.fetch_add(1, Ordering::SeqCst);
+            if i < CAP {
+                ADDRS[i].store(block as usize, Ordering::SeqCst);
+            }
+            block
+        }
+        unsafe extern "C" fn tracking_zfree(_opaque: *mut c_void, address: *mut c_void) {
+            let want = address as usize;
+            let n = NALLOC.load(Ordering::SeqCst).min(CAP);
+            // Resolve the freed address back to the allocation index that
+            // produced it. Address identity is the only usable key here: the
+            // four deflate working buffers can share a byte size, so the
+            // `(items, size)` pair cannot tell them apart.
+            let which = ADDRS
+                .iter()
+                .take(n)
+                .position(|slot| slot.load(Ordering::SeqCst) == want)
+                .unwrap_or(usize::MAX);
+            let f = NFREE.fetch_add(1, Ordering::SeqCst);
+            if f < CAP {
+                FREED[f].store(which, Ordering::SeqCst);
+            }
+            hook_backing_free(address);
+        }
+
+        let hook = AllocHook::new(Some(tracking_zalloc), Some(tracking_zfree), ptr::null_mut());
+
+        // --- deflate: five allocations, freed 4, 3, 2, 1, 0 ------------------
+        {
+            let state = DeflateState::new_in(hook, 6, Z_DEFLATED, 15, 8, Strategy::Default, 1)
+                .expect("healthy hook initializes the state");
+            assert_eq!(
+                NALLOC.load(Ordering::SeqCst),
+                5,
+                "C's deflateInit2_ schedule: state, window, prev, head, pending_buf"
+            );
+            assert_eq!(NFREE.load(Ordering::SeqCst), 0, "init frees nothing");
+            drop(state);
+        }
+        let n = NFREE.load(Ordering::SeqCst);
+        assert_eq!(n, 5, "every region must reach the caller's zfree");
+        let order: [usize; 5] = core::array::from_fn(|i| FREED[i].load(Ordering::SeqCst));
+        assert_eq!(
+            order,
+            // Allocation indices were 0 = state, 1 = window, 2 = prev,
+            // 3 = head, 4 = pending_buf.
+            [4, 3, 2, 1, 0],
+            "deflateEnd frees pending_buf, head, prev, window, state \
+             (`deflate.c` L1300-L1306)"
+        );
+
+        // --- inflate: state reservation then the lazily grown window ---------
+        NALLOC.store(0, Ordering::SeqCst);
+        NFREE.store(0, Ordering::SeqCst);
+        for cell in &FREED {
+            cell.store(usize::MAX, Ordering::SeqCst);
+        }
+        {
+            let mut state = InflateState::try_new_in(hook, 0, 15).expect("state boxes");
+            // Install the two hook-backed regions in C's order: the state
+            // reservation (`inflate.c` L198) and then the window (L261).
+            state.state_alloc = AllocBuffer::try_zeroed_items(1, InflateState::C_LAYOUT_SIZE, hook)
+                .expect("healthy hook reserves the state footprint");
+            state.window =
+                AllocBuffer::try_zeroed(1 << 15, hook).expect("healthy hook serves the window");
+            assert_eq!(NALLOC.load(Ordering::SeqCst), 2);
+            drop(state);
+        }
+        assert_eq!(NFREE.load(Ordering::SeqCst), 2);
+        let order: [usize; 2] = core::array::from_fn(|i| FREED[i].load(Ordering::SeqCst));
+        assert_eq!(
+            order,
+            // 0 = state reservation, 1 = window.
+            [1, 0],
+            "inflateEnd frees the window then the state \
+             (`inflate.c` L1160-L1161)"
+        );
     }
 
     /// F2 regression: `deflateCopy` must duplicate the state through the *same*
@@ -1718,14 +2069,13 @@ mod tests {
 
         {
             let copy = state
-                .try_copy()
+                .try_copy_in(&HookAllocator::new(hook))
                 .expect("healthy hook duplicates the state and its buffers");
             assert!(
                 copy.window.is_foreign()
                     && copy.prev.is_foreign()
                     && copy.head.is_foreign()
                     && copy.pending_buf.is_foreign()
-                    && copy.sym_buf.is_foreign()
                     && copy.state_alloc.is_foreign(),
                 "every buffer of the copy must stay in the caller's arena"
             );
@@ -1737,7 +2087,7 @@ mod tests {
         // returning a state whose buffers escaped into the global heap.
         REFUSE.store(true, Ordering::SeqCst);
         assert!(
-            state.try_copy().is_none(),
+            state.try_copy_in(&HookAllocator::new(hook)).is_none(),
             "an allocator refusal during deflateCopy must surface as Z_MEM_ERROR"
         );
         REFUSE.store(false, Ordering::SeqCst);

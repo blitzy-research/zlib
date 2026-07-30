@@ -761,9 +761,65 @@ mod tests {
     // Generated-table schema
     // -----------------------------------------------------------------------
 
+    /// Reduce an arbitrary ambient string to a single safe path component.
+    ///
+    /// `CLONE_INDEX` is ambient input: it is read from the environment, so its
+    /// value is outside this build script's control. Interpolating it into a path
+    /// unfiltered is a directory-traversal defect (CWE-22) — a value such as
+    /// `slot/../../security_target` escapes the temporary directory lexically and
+    /// resolves somewhere else entirely.
+    ///
+    /// Only ASCII alphanumerics, `_`, and `-` survive. That drops every character
+    /// which could end the component or refer to a parent: `/`, `\`, `.`
+    /// (so `..` collapses away entirely), `:`, NUL, and every non-ASCII byte. The
+    /// result is truncated so an absurdly long value cannot push the path past a
+    /// filesystem limit, and an input that filters down to nothing becomes `x`, so
+    /// the caller always receives a usable component.
+    fn safe_component(raw: &str) -> String {
+        let filtered: String = raw
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .take(32)
+            .collect();
+        if filtered.is_empty() {
+            "x".to_owned()
+        } else {
+            filtered
+        }
+    }
+
+    /// Create `path` as a new, private directory, failing if anything is already
+    /// there.
+    ///
+    /// Non-recursive on purpose: unlike `create_dir_all`, this reports
+    /// `AlreadyExists` when the name is taken — including when it is taken by a
+    /// symlink an attacker planted — which is what lets [`Scratch::new`] skip to
+    /// the next candidate instead of following the link. On Unix the `0o700` mode
+    /// is handed to `mkdir(2)` itself, so the directory is never even briefly
+    /// group- or world-accessible; there is no `set_permissions` window to race.
+    fn create_private_dir(path: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            fs::DirBuilder::new().mode(0o700).create(path)
+        }
+        #[cfg(not(unix))]
+        {
+            fs::DirBuilder::new().create(path)
+        }
+    }
+
     /// A scratch directory unique to this process and call, so the schema tests
     /// are safe to run in parallel and alongside sibling clones of this
     /// repository (each of which sets its own `CLONE_INDEX`).
+    ///
+    /// The directory is created with create-new semantics inside the system
+    /// temporary directory, and its name is assembled only from a
+    /// [`safe_component`]-sanitized `CLONE_INDEX`, the process id, a monotonic
+    /// counter, and a caller tag. Nothing pre-existing is ever removed: an
+    /// occupied candidate name is skipped rather than deleted, so a symlink or
+    /// directory planted at a predictable path can neither be destroyed nor
+    /// followed (CWE-22 / CWE-367).
     struct Scratch {
         path: std::path::PathBuf,
     }
@@ -772,24 +828,143 @@ mod tests {
         fn new(tag: &str) -> Self {
             static CTR: AtomicU32 = AtomicU32::new(0);
             let n = CTR.fetch_add(1, Ordering::Relaxed);
-            let clone = env::var("CLONE_INDEX").unwrap_or_else(|_| "x".to_owned());
-            let path = env::temp_dir().join(format!(
-                "blitzy_adhoc_test_buildrs_{tag}_{clone}_{}_{n}",
-                std::process::id()
-            ));
-            // A stale directory from a killed earlier run must not leak state in.
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).expect("failed to create the scratch directory");
-            Self { path }
+            let clone = safe_component(&env::var("CLONE_INDEX").unwrap_or_default());
+            let tag = safe_component(tag);
+            let pid = std::process::id();
+            let base = env::temp_dir();
+
+            // Retry only advances the candidate name; it never deletes.
+            for attempt in 0..64u32 {
+                let candidate = base.join(format!(
+                    "blitzy_adhoc_test_buildrs_{tag}_{clone}_{pid}_{n}_{attempt}"
+                ));
+                match create_private_dir(&candidate) {
+                    Ok(()) => return Self { path: candidate },
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("failed to create the scratch directory: {e}"),
+                }
+            }
+            panic!("could not find an unused scratch directory name after 64 attempts");
         }
     }
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            // Best effort on every path, including a panicking one: leaving a
-            // directory behind is not worth masking the original failure.
+            // Safe to recurse: this directory did not exist before `Scratch::new`
+            // created it with create-new semantics, so it cannot be a pre-existing
+            // path or a symlink into one. Best effort on every path, including a
+            // panicking one: leaving a directory behind is not worth masking the
+            // original failure.
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    /// `safe_component` must collapse every traversal and separator form to a
+    /// single harmless component.
+    ///
+    /// The first case is the exact payload the review cited: with the raw value
+    /// interpolated, `slot/../../security_target` escaped the temporary directory
+    /// lexically and resolved to `/security_target_<pid>_0`. Sanitized, it can only
+    /// ever name a child of the temporary directory.
+    #[test]
+    fn safe_component_neutralizes_traversal_and_separators() {
+        for raw in [
+            "slot/../../security_target",
+            "../../../etc/passwd",
+            "..",
+            ".",
+            "/absolute",
+            "back\\slash",
+            "c:\\windows\\system32",
+            "with space",
+            "semi;colon",
+            "new\nline",
+            "nul\0byte",
+            "tilde~",
+            "dollar$sign",
+            "\u{00e9}\u{4f60}\u{597d}",
+        ] {
+            let got = safe_component(raw);
+            assert!(!got.is_empty(), "{raw:?} must yield a usable component");
+            assert!(
+                got.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "{raw:?} yielded {got:?}, which still contains a disallowed character"
+            );
+            assert!(
+                !got.contains(".."),
+                "{raw:?} yielded {got:?}, still traversing"
+            );
+            // The decisive property: joining it descends exactly one level.
+            let joined = Path::new("/tmp").join(&got);
+            assert_eq!(
+                joined.parent(),
+                Some(Path::new("/tmp")),
+                "{raw:?} yielded {got:?}, which does not stay one level below the base"
+            );
+        }
+    }
+
+    /// Inputs that filter down to nothing, and inputs that are far too long, must
+    /// still produce a usable bounded component.
+    #[test]
+    fn safe_component_is_total_and_bounded() {
+        assert_eq!(safe_component(""), "x", "an unset variable must still work");
+        assert_eq!(safe_component("///"), "x", "separators only");
+        assert_eq!(safe_component("...."), "x", "dots only");
+        assert_eq!(safe_component("\u{4f60}\u{597d}"), "x", "non-ASCII only");
+
+        let long = "a".repeat(4096);
+        let got = safe_component(&long);
+        assert_eq!(got.len(), 32, "an over-long value must be truncated");
+
+        // Characters that are safe are preserved in order.
+        assert_eq!(safe_component("clone-07_b"), "clone-07_b");
+    }
+
+    /// A `Scratch` must be a freshly created, private, single-level child of the
+    /// system temporary directory — never a pre-existing path.
+    #[test]
+    fn scratch_creates_a_private_new_directory_under_temp() {
+        let a = Scratch::new("hygiene");
+        assert!(a.path.is_dir(), "the scratch directory must exist");
+        assert_eq!(
+            a.path.parent(),
+            Some(env::temp_dir().as_path()),
+            "the scratch directory must sit directly under the temp directory"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(&a.path)
+                .expect("stat scratch")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o700,
+                "the scratch directory must be owner-only from the moment it exists"
+            );
+        }
+
+        // Two scratches taken back to back must never collide, and creating one
+        // must never adopt an existing directory.
+        let b = Scratch::new("hygiene");
+        assert_ne!(a.path, b.path, "concurrent scratches must be distinct");
+
+        // Create-new semantics: the name `Scratch` chose is now taken, so a second
+        // attempt at exactly that path must be refused rather than reused.
+        let err = create_private_dir(&a.path).expect_err("the path is already taken");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "an occupied name must report AlreadyExists so the caller can skip it"
+        );
+
+        let path_a = a.path.clone();
+        drop(a);
+        assert!(!path_a.exists(), "Drop must remove the scratch directory");
     }
 
     /// Parse every `pub(crate) const|static NAME: TYPE = ...;` declaration out of

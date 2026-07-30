@@ -509,9 +509,38 @@ fn test_dict_inflate() {
 // gzip file I/O — gated behind `gz-io` (mirrors the C `NO_GZCOMPRESS` guard).
 // ===========================================================================
 
+/// Reduce an arbitrary ambient string to a single safe path component.
+///
+/// `CLONE_INDEX` is ambient input read from the environment, so its value is
+/// outside this suite's control. Interpolating it into a path unfiltered is a
+/// directory-traversal defect (CWE-22): a value such as `slot/../../target`
+/// escapes the temporary directory lexically and resolves somewhere else
+/// entirely. Only ASCII alphanumerics, `_`, and `-` survive, which drops every
+/// character that could end the component or refer to a parent — `/`, `\`, `.`
+/// (so `..` collapses away), `:`, NUL, and every non-ASCII byte. The result is
+/// truncated so an over-long value cannot push the path past a filesystem limit,
+/// and an input that filters down to nothing becomes `x`.
+#[cfg(feature = "gz-io")]
+fn safe_component(raw: &str) -> String {
+    let filtered: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(32)
+        .collect();
+    if filtered.is_empty() {
+        "x".to_owned()
+    } else {
+        filtered
+    }
+}
+
 /// Builds a unique temporary `.gz` path. Uniqueness combines the process id, an
 /// optional `CLONE_INDEX` (set for parallel clones), and a high-resolution
 /// timestamp so that concurrent test runs on the shared host never collide.
+///
+/// Both the caller's `tag` and the ambient `CLONE_INDEX` pass through
+/// [`safe_component`], so the returned path is always exactly one level below the
+/// system temporary directory and can never traverse out of it.
 #[cfg(feature = "gz-io")]
 fn unique_temp_path(tag: &str) -> std::path::PathBuf {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -519,9 +548,55 @@ fn unique_temp_path(tag: &str) -> std::path::PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    let clone = std::env::var("CLONE_INDEX").unwrap_or_else(|_| "x".to_string());
+    let clone = safe_component(&std::env::var("CLONE_INDEX").unwrap_or_default());
+    let tag = safe_component(tag);
     let name = format!("zlibrs_{tag}_{}_{clone}_{nanos}.gz", std::process::id());
     std::env::temp_dir().join(name)
+}
+
+/// The sanitizer must collapse every traversal and separator form so that
+/// [`unique_temp_path`] stays exactly one level below the temporary directory.
+#[cfg(feature = "gz-io")]
+#[test]
+fn temp_paths_cannot_traverse_out_of_the_temp_directory() {
+    for raw in [
+        "slot/../../security_target",
+        "../../../etc/passwd",
+        "..",
+        ".",
+        "/absolute",
+        "back\\slash",
+        "with space",
+        "nul\0byte",
+        "\u{00e9}\u{4f60}\u{597d}",
+        "",
+    ] {
+        let got = safe_component(raw);
+        assert!(!got.is_empty(), "{raw:?} must yield a usable component");
+        assert!(
+            got.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "{raw:?} yielded {got:?}, which still contains a disallowed character"
+        );
+        assert!(
+            !got.contains(".."),
+            "{raw:?} yielded {got:?}, still traversing"
+        );
+    }
+
+    // The composed path is what actually matters.
+    let path = unique_temp_path("../../escape");
+    assert_eq!(
+        path.parent(),
+        Some(std::env::temp_dir().as_path()),
+        "{} must sit directly under the temp directory",
+        path.display()
+    );
+    assert!(
+        !path.to_string_lossy().contains(".."),
+        "{} must contain no parent-directory reference",
+        path.display()
+    );
 }
 
 /// Port of C `test_gzio`: write a `.gz` file with `gzputc`/`gzputs`/`gzprintf`

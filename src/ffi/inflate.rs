@@ -51,6 +51,7 @@ use alloc::boxed::Box;
 
 use crate::constants::DEF_WBITS;
 use crate::error::ReturnCode;
+use crate::ffi::alloc::try_box;
 use crate::ffi::types::{
     Bytef, CAllocator, HandleKind, advance_input, advance_output, guard_int, guard_ulong,
     gz_headerp, in_func, input_ptr_valid, input_slice, out_func, output_slice, peek_handle_kind,
@@ -59,7 +60,7 @@ use crate::ffi::types::{
 };
 use crate::inflate::back::{InFunc, OutFunc};
 use crate::inflate::state::InflateState;
-use crate::stream::{Allocator, ZStream};
+use crate::stream::ZStream;
 
 // `gz_header` (the `#[repr(C)]` mirror) and the header write-back helper are
 // only referenced by the gzip-only `inflateGetHeader` path and the header
@@ -86,6 +87,8 @@ const Z_OK: c_int = ReturnCode::Ok.as_c_int();
 const Z_STREAM_ERROR: c_int = ReturnCode::StreamError.as_c_int();
 /// C `Z_VERSION_ERROR` (-6).
 const Z_VERSION_ERROR: c_int = ReturnCode::VersionError.as_c_int();
+/// `Z_MEM_ERROR` — an allocation (engine buffer or opaque handle) was refused.
+const Z_MEM_ERROR: c_int = ReturnCode::MemError.as_c_int();
 
 /// The value C's `inflateMark` returns when the stream state is unusable:
 /// `-(1L << 16)` == `-65536`.
@@ -500,7 +503,14 @@ pub unsafe extern "C" fn inflateInit2_(
         match crate::inflate::inflate_init2(&mut zs, window_bits) {
             Ok(_) => {
                 let adler = zs.adler;
-                let handle = Box::new(InflateHandle::new(zs));
+                // Box the handle **fallibly**: `Box::new` would abort on
+                // global-heap exhaustion where C reports `Z_MEM_ERROR`
+                // (AAP §0.6.5). On failure `zs` drops here, releasing the state
+                // reservation (and any window) through the caller's `zfree`, and
+                // the caller's `z_stream` is left untouched.
+                let Some(handle) = try_box(InflateHandle::new(zs)) else {
+                    return Z_MEM_ERROR;
+                };
                 // SAFETY: transfers ownership of the box into the opaque
                 // `state` slot; reclaimed and dropped by `inflateEnd`.
                 sref.state = unsafe { state_ptr_from_box(handle) };
@@ -531,14 +541,33 @@ pub unsafe extern "C" fn inflateInit_(
 
 /// C `inflateBackInit_` — initialize for a raw-callback `inflateBack` decode.
 ///
-/// `windowBits` must be in `8..=15` (raw DEFLATE only). In zlib the caller
-/// supplies the `1 << windowBits` byte sliding-window buffer; the realized
-/// [`crate::inflate::back`] engine instead allocates and owns its own window, so
-/// this shim validates `window` for ABI parity but does not use it as backing
-/// storage. (Documented deviation; behavior is unaffected.) The owned window is
-/// nonetheless allocated through any caller-supplied `zalloc`/`zfree` captured
-/// from the `z_stream`, so a caller's custom allocator is still honored
-/// (AAP §0.6.3; QA FINDING-3).
+/// `windowBits` must be in `8..=15` (raw DEFLATE only) and `window` must address
+/// at least `1 << windowBits` bytes.
+///
+/// # The caller's window is used, not replaced
+///
+/// This is the one zlib entry point whose sliding window is supplied by the
+/// caller. Reference zlib adopts the pointer verbatim — `state->window = window;`
+/// (`infback.c` L60) — makes exactly **one** `zalloc` (the state, `infback.c`
+/// L51), and frees only that state in `inflateBackEnd` (`infback.c` L572-L577).
+/// This shim reproduces all three properties: the region is lent to the engine
+/// through the boundary's borrowed-buffer bridge, so no second allocation is made,
+/// no bytes are copied, the caller may legitimately place the buffer in static or
+/// mapped memory, and teardown leaves it untouched (AAP §0.6.3, §0.6.5).
+///
+/// The state footprint is still charged to any caller-supplied `zalloc` captured
+/// from the `z_stream`, which is exactly the single request C makes.
+///
+/// # Safety
+///
+/// In addition to the usual `z_stream` obligations, `window` must be valid for
+/// reads and writes of `1 << windowBits` bytes, and must stay allocated and
+/// un-aliased until [`inflateBackEnd`] destroys the state. These are the
+/// obligations `zlib.h` already places on the argument (`zlib.h` L1682-L1699).
+///
+/// The region is zero-filled before use — see `crate::ffi::alloc`'s
+/// `borrow_caller_window` for why that is required and why it is unobservable to
+/// a correct caller.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn inflateBackInit_(
     strm: z_streamp,
@@ -560,21 +589,46 @@ pub unsafe extern "C" fn inflateBackInit_(
         }
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
-        // Capture any caller-supplied zalloc/zfree/opaque so the owned window
-        // (which in back-inflate doubles as the output buffer) is routed through
-        // the caller's allocator, matching reference zlib's `ZALLOC(strm, ...)`
-        // (AAP §0.6.3; QA FINDING-3). Null hooks fall back to the global
-        // allocator inside `inflate_back_init_in`.
+        // Capture any caller-supplied zalloc/zfree/opaque so the *state* footprint
+        // is charged to the caller's allocator, matching the single
+        // `ZALLOC(strm, 1, sizeof(struct inflate_state))` C makes (`infback.c`
+        // L51). Null hooks leave the reservation unmade, exactly as a C caller with
+        // `zalloc == Z_NULL` gets the built-in allocator.
         // SAFETY: `sref` is a valid `&z_stream`; `from_stream` only copies the
         // plain `Copy` allocator fields and never dereferences the hooks.
-        let hook = unsafe { CAllocator::from_stream(sref) }.hook();
-        match crate::inflate::back::inflate_back_init_in(hook, window_bits) {
+        let allocator = unsafe { CAllocator::from_stream(sref) };
+
+        // Lend the caller's buffer to the engine rather than allocating a
+        // replacement: C adopts the pointer with `state->window = window;`
+        // (`infback.c` L60) and `inflateBackEnd` never frees it.
+        // SAFETY: `window` is non-null (checked above) and the caller's documented
+        // contract on this entry point guarantees it is valid for reads and writes
+        // of `1 << window_bits` bytes and stays valid, un-aliased, until
+        // `inflateBackEnd` destroys the state built from it.
+        let lent =
+            unsafe { crate::ffi::alloc::borrow_caller_window(window, 1usize << window_bits) };
+        let Some(lent) = lent else {
+            // The only reachable causes are an exhausted global heap (the tiny box
+            // holding the borrow) — `Z_MEM_ERROR`, as C reports for a failed
+            // allocation — since the null and range checks above already ran.
+            return Z_MEM_ERROR;
+        };
+
+        match crate::inflate::back::inflate_back_init_borrowed_window(&allocator, window_bits, lent)
+        {
             Ok(state) => {
                 // Tag the state as an `inflateBack` handle before installing it,
                 // so `inflateBack`/`inflateBackEnd` can validate the kind and the
                 // regular `inflateEnd` rejects it (C4: no more blind casts of an
                 // untagged `Box<InflateState>`).
-                let handle = Box::new(InflateBackHandle::new(state));
+                // Fallible boxing: an exhausted Rust heap must surface as
+                // `Z_MEM_ERROR`, which is what C's failed state `ZALLOC` returns
+                // (`infback.c` L52-L53), not as an abort (AAP §0.6.5). The
+                // dropped `state` releases the state reservation through the
+                // caller's `zfree` and leaves the lent window untouched.
+                let Some(handle) = try_box(InflateBackHandle::new(state)) else {
+                    return Z_MEM_ERROR;
+                };
                 // SAFETY: transfers ownership of the `Box<InflateBackHandle>`
                 // into the opaque `state` slot; reclaimed and dropped by
                 // `inflateBackEnd` after tag validation.
@@ -1031,11 +1085,20 @@ pub unsafe extern "C" fn inflateCopy(dest: z_streamp, source: z_streamp) -> c_in
                 {
                     handle.head = src_head;
                 }
+                // Box the cloned handle **fallibly** before writing any field of
+                // `dest`, so heap exhaustion yields `Z_MEM_ERROR` with `dest`
+                // untouched — matching C's `ZFREE(copy); return Z_MEM_ERROR`
+                // (`inflate.c` L1343-L1349). The dropped handle releases the
+                // cloned window and state reservation through the caller's
+                // `zfree`.
+                let Some(boxed) = try_box(handle) else {
+                    return Z_MEM_ERROR;
+                };
                 // SAFETY: `dest` is non-null and a valid `z_stream`.
                 let dref = unsafe { &mut *dest };
                 // SAFETY: transfers ownership of the cloned handle into
                 // `dest.state`; reclaimed by `inflateEnd`.
-                dref.state = unsafe { state_ptr_from_box(Box::new(handle)) };
+                dref.state = unsafe { state_ptr_from_box(boxed) };
 
                 // Mirror zlib's `zmemcpy(dest, source, sizeof(z_stream))` for the
                 // observable fields (the `state` pointer was just set above).
@@ -1943,6 +2006,129 @@ mod tests {
         assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
     }
 
+    /// F2 (inflate): `inflateBackInit_` must **use the caller's window**, not
+    /// allocate a replacement.
+    ///
+    /// Reference zlib adopts the pointer verbatim (`state->window = window;`,
+    /// `infback.c` L60). Three consequences are observable through the C ABI and
+    /// all three are asserted here:
+    ///
+    /// 1. the decoder writes the decompressed data into the caller's buffer, so
+    ///    after a successful decode the caller's own array holds the plaintext;
+    /// 2. `inflateBackInit_` makes exactly **one** allocation through the caller's
+    ///    `zalloc` — the state (`infback.c` L51) — and no window request; and
+    /// 3. `inflateBackEnd` releases only that one region (`infback.c` L572-L577),
+    ///    leaving the caller's buffer intact and still readable afterwards.
+    #[test]
+    fn back_init_lends_the_callers_window_and_never_frees_it() {
+        use crate::ffi::alloc::test_hook::HookStats;
+
+        let stats = HookStats::new();
+        let hook = stats.hook();
+
+        // A heap window, so a stray `zfree` or a double free would be caught by
+        // the allocator rather than silently corrupting a stack frame.
+        let mut window = vec![0xAAu8; 1 << 15];
+        let window_ptr = window.as_mut_ptr();
+
+        let mut strm = zeroed_stream();
+        strm.zalloc = hook.zalloc();
+        strm.zfree = hook.zfree();
+        strm.opaque = hook.opaque();
+
+        assert_eq!(
+            unsafe {
+                inflateBackInit_(
+                    &mut strm,
+                    15,
+                    window_ptr,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        assert_eq!(
+            stats.allocs(),
+            1,
+            "inflateBackInit_ makes C's single state allocation and no window \
+             request (`infback.c` L51, L60)"
+        );
+        assert_eq!(stats.frees(), 0);
+
+        // Decode a real stream through the callbacks.
+        let mut in_state = BackIn {
+            data: RAW_STREAM,
+            given: false,
+        };
+        let mut out_state = BackOut {
+            collected: Vec::new(),
+        };
+        let rc = unsafe {
+            inflateBack(
+                &mut strm,
+                Some(back_in),
+                &mut in_state as *mut BackIn as *mut c_void,
+                Some(back_out),
+                &mut out_state as *mut BackOut as *mut c_void,
+            )
+        };
+        assert_eq!(rc, Z_STREAM_END);
+        assert_eq!(out_state.collected, MSG);
+        assert_eq!(
+            stats.allocs(),
+            1,
+            "decoding must not allocate: the window was already provided"
+        );
+
+        assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
+        assert_eq!(
+            stats.frees(),
+            1,
+            "inflateBackEnd frees only the state, never the caller's window \
+             (`infback.c` L572-L577)"
+        );
+        assert_eq!(
+            stats.live_bytes(),
+            0,
+            "the caller's arena must be perfectly balanced"
+        );
+
+        // The caller still owns and can read its buffer, and it holds the decoded
+        // bytes — proof the engine used this region rather than a private copy.
+        assert_eq!(
+            &window[..MSG.len()],
+            MSG,
+            "the decoder must write through the caller's window"
+        );
+    }
+
+    /// A null window must be rejected before anything is allocated or installed,
+    /// exactly as C rejects it (`infback.c` L33-L35) — and since the borrowed
+    /// -window bridge dereferences that pointer, the check has to happen first.
+    ///
+    /// Nothing is installed, so `inflateBackEnd` then reports an uninitialized
+    /// stream.
+    #[test]
+    fn back_init_rejects_a_null_window() {
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                inflateBackInit_(
+                    &mut strm,
+                    15,
+                    ptr::null_mut(),
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_STREAM_ERROR,
+            "a null window is C's Z_STREAM_ERROR (`infback.c` L33-L35)"
+        );
+        assert!(strm.state.is_null());
+        assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_STREAM_ERROR);
+    }
+
     /// A budget carried through the caller's `opaque` cookie so each test drives
     /// its own allocator with no shared global state — which is precisely what
     /// zlib's `opaque` field is for.
@@ -2013,6 +2199,68 @@ mod tests {
         strm.zalloc = Some(budget_zalloc);
         strm.zfree = Some(budget_zfree);
         strm.opaque = (budget as *const Budget).cast_mut().cast::<c_void>();
+    }
+
+    /// `inflateInit2_` must be fallible **before** it mutates the caller's
+    /// `z_stream`: when the allocator refuses the state reservation C makes at
+    /// `inflate.c` L198, the entry point reports `Z_MEM_ERROR` and `strm->state`
+    /// stays null.
+    #[test]
+    fn init_reports_mem_error_and_installs_no_state_when_allocator_refuses() {
+        // Zero allocations permitted, so the state reservation is refused.
+        let budget = Budget {
+            remaining: core::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let mut strm = zeroed_stream();
+        attach_budget(&mut strm, &budget);
+        assert_eq!(
+            unsafe { inflateInit_(&mut strm, VERSION.as_ptr(), size_of::<z_stream>() as c_int) },
+            Z_MEM_ERROR,
+            "a refused allocation must surface Z_MEM_ERROR, never an abort or a \
+             silent global-heap substitution"
+        );
+        assert!(
+            strm.state.is_null(),
+            "a failed init must not install a state on the caller's z_stream"
+        );
+        // Nothing was installed, so the stream is still uninitialized.
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_STREAM_ERROR);
+    }
+
+    /// The `inflateBack` twin of the test above. C's `inflateBackInit_` makes a
+    /// single `ZALLOC` for the state (`infback.c` L51-L53); refusing it must
+    /// yield `Z_MEM_ERROR` with nothing installed, and `inflateBackEnd` must then
+    /// report an uninitialized stream.
+    #[test]
+    fn back_init_reports_mem_error_and_installs_no_state_when_allocator_refuses() {
+        let budget = Budget {
+            remaining: core::sync::atomic::AtomicUsize::new(0),
+        };
+
+        // A caller-supplied window, as the C ABI requires, kept alive for the
+        // duration of the call.
+        let mut window = vec![0u8; 1 << 15];
+        let mut strm = zeroed_stream();
+        attach_budget(&mut strm, &budget);
+        assert_eq!(
+            unsafe {
+                inflateBackInit_(
+                    &mut strm,
+                    15,
+                    window.as_mut_ptr(),
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_MEM_ERROR,
+            "a refused inflateBack allocation must surface Z_MEM_ERROR"
+        );
+        assert!(
+            strm.state.is_null(),
+            "a failed inflateBackInit_ must not install a state"
+        );
+        assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_STREAM_ERROR);
     }
 
     /// F-03 regression: when the caller's `zalloc` cannot satisfy the copy,

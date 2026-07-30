@@ -340,15 +340,16 @@ pub fn deflate_init2<A: Allocator>(
         WrapMode::Auto => return Err(ZlibError::StreamError),
     };
 
-    // `DeflateState::new_in` performs the full deflateInit2_ validation,
+    // `DeflateState::new_in_with` performs the full deflateInit2_ validation,
     // resolves the default level, and runs the state-side reset + lm_init.
-    // The allocator hook (the caller's `zalloc`/`zfree` under the FFI
-    // `CAllocator`, or a no-op under the global allocator) is threaded through
-    // so every working buffer is routed through the caller's allocator when one
-    // is installed (AAP §0.6.3 has-hook clause; QA FINDING-3).
-    let hook = strm.allocator().hook();
-    let state = DeflateState::new_in(
-        hook,
+    // The stream's `Allocator` itself is threaded through — not merely its
+    // `hook()` — so the state footprint and every working buffer are requested
+    // from it, with the same `(items, size)` pairs C passes `zalloc`. A custom
+    // Rust allocator therefore serves engine memory, and a caller-installed
+    // `zalloc`/`zfree` still backs every buffer (AAP §0.6.3 has-hook clause,
+    // §0.6.5).
+    let state = DeflateState::new_in_with(
+        strm.allocator(),
         level,
         method,
         w_bits as i32,
@@ -622,11 +623,13 @@ pub fn deflate_used<A: Allocator>(strm: &ZStream<A>) -> Result<i32, ZlibError> {
 /// the compressed data.
 ///
 /// Port of C `deflatePrime` (`deflate.c` L745-L771). `bits` must be in
-/// `0..=16`. The C room check guards against the compressed data catching up
-/// to the (overlaid) symbol buffer; in this crate `sym_buf` is a separate
-/// allocation, so the equivalent guard is expressed against `lit_bufsize`:
-/// there must be at least `(Buf_size + 7) / 8` bytes of head-room before the
-/// symbol region, i.e. `lit_bufsize >= pending_out + 2`.
+/// `0..=16`. The room check guards against the compressed data catching up to
+/// the overlaid symbol region, and is C's check verbatim: C writes
+/// `s->sym_buf < s->pending_out + ((Buf_size + 7) >> 3)` (`deflate.c` L757),
+/// where `sym_buf == pending_buf + lit_bufsize` and `pending_out` is also a
+/// pointer into `pending_buf`. Subtracting the common `pending_buf` base — which
+/// this port has already done, since both are stored as indices (AAP §0.3.2 rule
+/// T3) — leaves exactly `lit_bufsize < pending_out + ((Buf_size + 7) >> 3)`.
 ///
 /// # Errors
 ///
@@ -1425,7 +1428,12 @@ pub fn deflate_copy<A: Allocator>(dest: &mut ZStream<A>, source: &ZStream<A>) ->
     // allocator's OOM leaves the destination stream unmodified.
     let cloned = {
         let src = source.deflate_state().ok_or(ZlibError::StreamError)?;
-        src.try_copy().ok_or(ZlibError::MemError)?
+        // C `deflateCopy` `zmemcpy`s the whole `z_stream`, so the destination
+        // inherits the source's allocator; allocate the copy's buffers through
+        // `dest`'s allocator, which the FFI shim has already made a duplicate of
+        // the source's (AAP §0.6.3, §0.6.5).
+        src.try_copy_in(dest.allocator())
+            .ok_or(ZlibError::MemError)?
     };
     dest.total_in = source.total_in;
     dest.total_out = source.total_out;

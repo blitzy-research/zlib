@@ -584,9 +584,9 @@ mod tests {
     // round-trips once `gzclose_w` is called. If a future `Drop` ever finished the
     // stream, the negative test fails.
     //
-    // Both tests write to a uniquely named temporary file guarded by
-    // [`TempGz`], which removes it on every exit path — normal return, early
-    // return, or unwind.
+    // Both tests write to a uniquely named temporary file inside a private,
+    // freshly created directory guarded by [`TempGz`], which removes the file and
+    // the directory on every exit path — normal return, early return, or unwind.
     // -----------------------------------------------------------------------
 
     use crate::gz::close::gzclose_w;
@@ -595,14 +595,73 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// An owned temporary `.gz` path that is deleted when the guard is dropped.
+    /// Reduce an arbitrary ambient string to a single safe path component.
     ///
-    /// The name embeds the `blitzy_adhoc_test_` prefix (so the file can never be
-    /// mistaken for a tracked artifact), the `CLONE_INDEX` of the checkout, the
-    /// process id, and a monotonic counter. That makes it unique across parallel
-    /// test threads, across concurrent `cargo test` invocations, and across
-    /// sibling clones of this repository sharing one `/tmp`.
+    /// `CLONE_INDEX` is ambient input read from the environment, so its value is
+    /// outside this crate's control. Interpolating it into a path unfiltered is a
+    /// directory-traversal defect (CWE-22): a value such as
+    /// `slot/../../security_target` escapes the temporary directory lexically and
+    /// resolves somewhere else entirely.
+    ///
+    /// Only ASCII alphanumerics, `_`, and `-` survive. That drops every character
+    /// which could end the component or refer to a parent — `/`, `\`, `.` (so
+    /// `..` collapses away entirely), `:`, NUL, and every non-ASCII byte. The
+    /// result is truncated so an absurdly long value cannot push the path past a
+    /// filesystem limit, and an input that filters down to nothing becomes `x`, so
+    /// the caller always receives a usable component.
+    fn safe_component(raw: &str) -> String {
+        let filtered: String = raw
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .take(32)
+            .collect();
+        if filtered.is_empty() {
+            "x".to_owned()
+        } else {
+            filtered
+        }
+    }
+
+    /// Create `path` as a new, private directory, failing if anything is already
+    /// there.
+    ///
+    /// Non-recursive on purpose: unlike `create_dir_all`, this reports
+    /// [`std::io::ErrorKind::AlreadyExists`] when the name is taken — including
+    /// when it is taken by a symlink someone else planted — which is what lets
+    /// [`TempGz::new`] move to the next candidate instead of following the link or
+    /// deleting it. On Unix the `0o700` mode is handed to `mkdir(2)` itself, so the
+    /// directory is never even briefly group- or world-accessible and there is no
+    /// `set_permissions` window to race (CWE-367).
+    fn create_private_dir(path: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new().mode(0o700).create(path)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::DirBuilder::new().create(path)
+        }
+    }
+
+    /// An owned temporary `.gz` file inside a private directory, both removed when
+    /// the guard is dropped.
+    ///
+    /// The **directory** carries the uniqueness: the `blitzy_adhoc_test_` prefix
+    /// (so nothing here can be mistaken for a tracked artifact), a
+    /// [`safe_component`]-sanitized `CLONE_INDEX`, the process id, a monotonic
+    /// counter, and a retry ordinal. That keeps it distinct across parallel test
+    /// threads, across concurrent `cargo test` invocations, and across sibling
+    /// clones of this repository sharing one `/tmp`.
+    ///
+    /// Creating the directory with create-new semantics is what makes the file
+    /// inside it safe. Nothing pre-existing is ever removed — an occupied
+    /// candidate name is skipped rather than deleted — so a symlink or file planted
+    /// at a predictable path can neither be destroyed nor followed, and because the
+    /// enclosing directory is freshly created and owner-only, the payload name
+    /// within it cannot be pre-empted at all.
     struct TempGz {
+        dir: PathBuf,
         path: PathBuf,
     }
 
@@ -610,16 +669,29 @@ mod tests {
         fn new(tag: &str) -> Self {
             static CTR: AtomicU32 = AtomicU32::new(0);
             let n = CTR.fetch_add(1, Ordering::Relaxed);
-            let clone = std::env::var("CLONE_INDEX").unwrap_or_else(|_| String::from("x"));
-            let mut path = std::env::temp_dir();
-            path.push(format!(
-                "blitzy_adhoc_test_gzdrop_{tag}_{clone}_{}_{n}.gz",
-                std::process::id()
-            ));
-            // A stale file from an earlier aborted run must not be mistaken for
-            // output produced by this test.
-            let _ = std::fs::remove_file(&path);
-            Self { path }
+            let clone = safe_component(&std::env::var("CLONE_INDEX").unwrap_or_default());
+            let tag = safe_component(tag);
+            let pid = std::process::id();
+            let base = std::env::temp_dir();
+
+            // Retry only advances the candidate name; it never deletes.
+            for attempt in 0..64u32 {
+                let candidate = base.join(format!(
+                    "blitzy_adhoc_test_gzdrop_{tag}_{clone}_{pid}_{n}_{attempt}"
+                ));
+                match create_private_dir(&candidate) {
+                    Ok(()) => {
+                        let path = candidate.join("payload.gz");
+                        return Self {
+                            dir: candidate,
+                            path,
+                        };
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("failed to create the private temp directory: {e}"),
+                }
+            }
+            panic!("could not find an unused temp directory name after 64 attempts");
         }
 
         fn path(&self) -> &Path {
@@ -638,10 +710,147 @@ mod tests {
 
     impl Drop for TempGz {
         fn drop(&mut self) {
-            // Best effort on every path, including an unwinding one: failing to
-            // clean up must never mask the original failure.
+            // Safe to recurse: `dir` did not exist before `TempGz::new` created it
+            // with create-new semantics, so it cannot be a pre-existing path or a
+            // symlink into one. Best effort on every path, including an unwinding
+            // one: failing to clean up must never mask the original failure.
             let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// `safe_component` must collapse every traversal and separator form to a
+    /// single harmless component.
+    ///
+    /// The first case is the exact payload the review cited: with the raw value
+    /// interpolated, `slot/../../security_target` escaped the temporary directory
+    /// lexically. Sanitized, it can only ever name a child of that directory.
+    #[test]
+    fn safe_component_neutralizes_traversal_and_separators() {
+        for raw in [
+            "slot/../../security_target",
+            "../../../etc/passwd",
+            "..",
+            ".",
+            "/absolute",
+            "back\\slash",
+            "c:\\windows\\system32",
+            "with space",
+            "semi;colon",
+            "new\nline",
+            "nul\0byte",
+            "tilde~",
+            "dollar$sign",
+            "\u{00e9}\u{4f60}\u{597d}",
+        ] {
+            let got = safe_component(raw);
+            assert!(!got.is_empty(), "{raw:?} must yield a usable component");
+            assert!(
+                got.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "{raw:?} yielded {got:?}, which still contains a disallowed character"
+            );
+            assert!(
+                !got.contains(".."),
+                "{raw:?} yielded {got:?}, still traversing"
+            );
+            // The decisive property: joining it descends exactly one level.
+            let joined = Path::new("/tmp").join(&got);
+            assert_eq!(
+                joined.parent(),
+                Some(Path::new("/tmp")),
+                "{raw:?} yielded {got:?}, which does not stay one level below the base"
+            );
+        }
+    }
+
+    /// Inputs that filter down to nothing, and inputs that are far too long, must
+    /// still produce a usable bounded component.
+    #[test]
+    fn safe_component_is_total_and_bounded() {
+        assert_eq!(safe_component(""), "x", "an unset variable must still work");
+        assert_eq!(safe_component("///"), "x", "separators only");
+        assert_eq!(safe_component("...."), "x", "dots only");
+        assert_eq!(safe_component("\u{4f60}\u{597d}"), "x", "non-ASCII only");
+
+        let long = "a".repeat(4096);
+        assert_eq!(
+            safe_component(&long).len(),
+            32,
+            "an over-long value must be truncated"
+        );
+
+        // Characters that are safe are preserved in order.
+        assert_eq!(safe_component("clone-07_b"), "clone-07_b");
+    }
+
+    /// A [`TempGz`] must own a freshly created, private, single-level child of the
+    /// system temporary directory, and must place its payload inside it.
+    #[test]
+    fn temp_gz_uses_a_private_new_directory_and_create_new_file() {
+        let a = TempGz::new("hygiene");
+        assert!(a.dir.is_dir(), "the private directory must exist");
+        assert_eq!(
+            a.dir.parent(),
+            Some(std::env::temp_dir().as_path()),
+            "the private directory must sit directly under the temp directory"
+        );
+        assert_eq!(
+            a.path().parent(),
+            Some(a.dir.as_path()),
+            "the payload must live inside the private directory"
+        );
+        assert!(
+            !a.exists(),
+            "`TempGz::new` must not create the payload file; `create_new` does"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&a.dir)
+                .expect("stat the private directory")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o700,
+                "the directory must be owner-only from the moment it exists"
+            );
+        }
+
+        // Two guards taken back to back must never collide.
+        let b = TempGz::new("hygiene");
+        assert_ne!(a.dir, b.dir, "concurrent guards must be distinct");
+
+        // Create-new semantics: the directory name is now taken, so a second
+        // attempt at exactly that path must be refused rather than reused.
+        let err = create_private_dir(&a.dir).expect_err("the path is already taken");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "an occupied name must report AlreadyExists so the caller can skip it"
+        );
+
+        // The state builder must open the payload with create-new semantics, and a
+        // second attempt on the same path must therefore be refused rather than
+        // truncating what the first one wrote.
+        let state = drop_contract_write_state(a.path());
+        assert!(a.exists(), "the payload file must now exist");
+        drop(state);
+        let second = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(a.path());
+        assert_eq!(
+            second.expect_err("the payload already exists").kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "the payload must never be reopened with truncation"
+        );
+
+        let dir_a = a.dir.clone();
+        drop(a);
+        assert!(!dir_a.exists(), "Drop must remove the private directory");
     }
 
     /// Builds a fresh write-mode [`GzState`] backed by a real, truncated file.
@@ -650,7 +859,16 @@ mod tests {
     /// initializes the deflate engine on first use, exactly as a real `gzopen`
     /// would — matching C's `state->size = 0` sentinel (`gzguts.h` L172).
     fn drop_contract_write_state(path: &Path) -> Box<GzState> {
-        let file = File::create(path).expect("create writable temp file");
+        // `create_new(true)` rather than a truncating `File::create`: the file
+        // must not already exist, and if something is squatting on the name this
+        // must fail loudly instead of truncating it. `TempGz` guarantees the
+        // enclosing directory was just created owner-only, so the name cannot have
+        // been pre-empted (CWE-22 / CWE-367).
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create a new writable temp file");
         Box::new(GzState {
             have: 0,
             next: 0,
@@ -682,20 +900,22 @@ mod tests {
         })
     }
 
-    /// Number of payload bytes the two `Drop`-contract tests write.
+    /// The write buffer size used by [`drop_contract_write_state`].
     ///
-    /// Deliberately far larger than the 8 KiB `want` buffer so that several
-    /// `gz_comp(Z_NO_FLUSH)` rounds reach the file before the state is dropped.
-    /// A payload small enough to sit entirely in `in_buf` would leave only the
-    /// 10-byte gzip header on disk, and the negative test would then prove
-    /// merely "nothing was written" rather than the much stronger and more
-    /// relevant "a real member was started and left unfinished".
-    /// The write buffer size used by [`drop_contract_write_state`]. `gz_init`
-    /// copies `want` into `size`, and `size` is what `gz_write` compares each
-    /// incoming write against, so this single constant fixes both the state
-    /// under test and the branch-coverage invariant asserted over it.
+    /// `gz_init` copies `want` into `size`, and `size` is what `gz_write`
+    /// compares each incoming write against, so this single constant fixes both
+    /// the state under test and the branch-coverage invariant asserted over it.
     const DROP_CONTRACT_WANT: usize = 8192;
 
+    /// Number of payload bytes the two `Drop`-contract tests write.
+    ///
+    /// Deliberately far larger than the [`DROP_CONTRACT_WANT`]-byte `want`
+    /// buffer so that several `gz_comp(Z_NO_FLUSH)` rounds reach the file before
+    /// the state is dropped. A payload small enough to sit entirely in `in_buf`
+    /// would leave only the 10-byte gzip header on disk, and the negative test
+    /// would then prove merely "nothing was written" rather than the much
+    /// stronger and more relevant "a real member was started and left
+    /// unfinished".
     const DROP_CONTRACT_LEN: usize = 500_000;
 
     /// Incompressible pseudo-random payload from a fixed-seed LCG.

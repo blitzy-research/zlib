@@ -77,7 +77,7 @@ use crate::constants::{DEF_WBITS, MAX_WBITS, Z_BLOCK, Z_DEFLATED, Z_FINISH, Z_TR
 use crate::error::{ReturnCode, ZlibError};
 #[cfg(feature = "gzip")]
 use crate::gz_header::GzHeader;
-use crate::stream::{AllocBuffer, Allocator, StreamState, ZStream, try_box};
+use crate::stream::{AllocBuffer, Allocator, StreamState, ZStream, ZeroValid, try_box};
 
 use crate::inflate::fast::inflate_fast;
 use crate::inflate::fixed::{DISTFIX, LENFIX};
@@ -347,17 +347,23 @@ fn fixedtables(state: &mut InflateState) {
 /// which the callers translate into the `MEM` mode / `Z_MEM_ERROR` (M7). The
 /// global-allocator path is infallible (it aborts on OOM per Rust convention),
 /// so this only fails for a caller-installed bounded allocator.
-fn updatewindow(
+fn updatewindow<A: Allocator>(
     state: &mut InflateState,
+    alloc: &A,
     output: &[u8],
     end: usize,
     mut copy: usize,
 ) -> Result<(), ZlibError> {
-    // If it hasn't been done already, allocate space for the window — routed
-    // through the caller's allocator hook when one was installed. An active-hook
-    // OOM propagates as `Z_MEM_ERROR` (M7) rather than falling back to global.
+    // If it hasn't been done already, allocate space for the window — through the
+    // owning stream's `Allocator`, so a custom Rust allocator serves it and a
+    // caller-installed `zalloc` still backs it. C requests
+    // `ZALLOC(strm, 1U << state->wbits, sizeof(unsigned char))` (`inflate.c`
+    // L261), which is the element-shaped split, so `allocate_zeroed` forwards the
+    // same argument pair. A refusal propagates as `Z_MEM_ERROR` (M7) rather than
+    // falling back to the global allocator (AAP §0.6.3 has-hook clause).
     if state.window.is_empty() {
-        state.window = AllocBuffer::try_zeroed(1usize << state.wbits, state.alloc_hook)
+        state.window = alloc
+            .allocate_zeroed::<u8>(1usize << state.wbits)
             .ok_or(ZlibError::MemError)?;
     }
 
@@ -588,12 +594,17 @@ pub fn inflate_init2<A: Allocator>(strm: &mut ZStream<A>, window_bits: i32) -> I
     // surfaces `Z_MEM_ERROR` at init — before the window is needed — matching
     // C's allocation count and failure timing (AAP §0.6.3/§0.6.5). The
     // `(1, size_of)` split is the exact argument pair C passes, so a caller that
-    // inspects `items`/`size` sees the same values. Under the global allocator
-    // (`!hook.is_active()`) no extra allocation is made, so the ~7 KB inflate
-    // memory-bounds parity is preserved (AAP §0.6.5). This closes the QA finding
-    // that the inflate state allocation bypassed the hook.
-    if hook.is_active() {
-        match AllocBuffer::try_zeroed_items(1, core::mem::size_of::<InflateState>(), hook) {
+    // inspects `items`/`size` sees the same values. Whether to make the request
+    // is the allocator's decision (`Allocator::reserves_state_footprint`): the
+    // global default declines it, because there the state `Box` already *is* the
+    // allocation and a second region would change the ~7 KB inflate
+    // memory-bounds parity (AAP §0.6.5); a custom Rust allocator and an active
+    // C hook both take it.
+    if strm.allocator().reserves_state_footprint() {
+        match strm
+            .allocator()
+            .allocate_zeroed_items::<u8>(1, InflateState::C_LAYOUT_SIZE)
+        {
             Some(cell) => state.state_alloc = cell,
             // The state was not installed on the stream yet, so nothing to tear
             // down; report OOM exactly as C's failed state `ZALLOC` does.
@@ -1737,7 +1748,14 @@ pub fn inflate<A: Allocator>(
     // `&&` short-circuits, so `updatewindow` runs (with its window side effect)
     // exactly when the condition holds; the body runs only on an OOM failure.
     if needs_window_update
-        && updatewindow(&mut state, &io.output[..], io.put, produced_since_ck).is_err()
+        && updatewindow(
+            &mut state,
+            strm.allocator(),
+            &io.output[..],
+            io.put,
+            produced_since_ck,
+        )
+        .is_err()
     {
         // C `inf_leave`: `state->mode = MEM; return Z_MEM_ERROR;` — the lazy
         // window allocation (routed through the caller's `zalloc`) reported OOM.
@@ -1851,7 +1869,12 @@ pub fn inflate_set_dictionary<A: Allocator>(
     strm: &mut ZStream<A>,
     dictionary: &[u8],
 ) -> InflateResult {
-    let state = strm.inflate_state_mut().ok_or(ZlibError::StreamError)?;
+    // Borrow the decoder and the allocator together: `updatewindow` mutates the
+    // state *and* may allocate the window, and both live in distinct `ZStream`
+    // fields (AAP §0.6.3).
+    let (state, alloc) = strm
+        .inflate_state_and_allocator()
+        .ok_or(ZlibError::StreamError)?;
     // A dictionary is only accepted for a raw stream, or when explicitly needed.
     if state.wrap != 0 && state.mode != InflateMode::Dict {
         return Err(ZlibError::StreamError);
@@ -1868,7 +1891,7 @@ pub fn inflate_set_dictionary<A: Allocator>(
     // that when the window allocation is routed through a caller hook that
     // reports OOM (M7).
     let dict_len = dictionary.len();
-    if updatewindow(state, dictionary, dict_len, dict_len).is_err() {
+    if updatewindow(state, alloc, dictionary, dict_len, dict_len).is_err() {
         state.mode = InflateMode::Mem;
         return Err(ZlibError::MemError);
     }
@@ -2032,6 +2055,58 @@ pub fn inflate_sync_point<A: Allocator>(strm: &ZStream<A>) -> Result<bool, ZlibE
 ///
 /// # Allocator fidelity
 ///
+/// Allocates a destination buffer of `items * item_size` bytes through `alloc`
+/// and copies `src` into it — the `ZALLOC` + `zmemcpy` pair C `inflateCopy`
+/// performs for one buffer.
+///
+/// # Errors
+///
+/// [`ZlibError::MemError`] if the allocation is refused, or if it produced a
+/// length other than `src.len()` (which would mean the geometry fields and the
+/// buffer disagreed).
+fn clone_buffer_items<A: Allocator, T>(
+    alloc: &A,
+    src: &AllocBuffer<T>,
+    items: usize,
+    item_size: usize,
+) -> Result<AllocBuffer<T>, ZlibError>
+where
+    T: Copy + Default + ZeroValid + 'static,
+{
+    let mut dst = alloc
+        .allocate_zeroed_items::<T>(items, item_size)
+        .ok_or(ZlibError::MemError)?;
+    if dst.len() != src.len() {
+        return Err(ZlibError::MemError);
+    }
+    dst.copy_from_slice(src);
+    Ok(dst)
+}
+
+/// Element-shaped counterpart of [`clone_buffer_items`], for C's
+/// `ZALLOC(strm, 1U << wbits, sizeof(unsigned char))` window request.
+///
+/// # Errors
+///
+/// As [`clone_buffer_items`].
+fn clone_buffer<A: Allocator, T>(
+    alloc: &A,
+    src: &AllocBuffer<T>,
+    count: usize,
+) -> Result<AllocBuffer<T>, ZlibError>
+where
+    T: Copy + Default + ZeroValid + 'static,
+{
+    let mut dst = alloc
+        .allocate_zeroed::<T>(count)
+        .ok_or(ZlibError::MemError)?;
+    if dst.len() != src.len() {
+        return Err(ZlibError::MemError);
+    }
+    dst.copy_from_slice(src);
+    Ok(dst)
+}
+
 /// C `inflateCopy` allocates the destination state and its window through the
 /// source stream's own `zalloc` and returns `Z_MEM_ERROR` if either fails
 /// (`inflate.c` L1340-L1350, including the `ZFREE(copy)` that releases the state
@@ -2048,13 +2123,31 @@ pub fn inflate_sync_point<A: Allocator>(strm: &ZStream<A>) -> Result<bool, ZlibE
 /// [`Clone`] would return `Z_OK` while quietly escaping that arena, which is the
 /// behavior AAP §0.6.5 forbids — and is why neither `AllocBuffer` nor the engine
 /// states implement it.
-fn try_clone_inflate_state(s: &InflateState) -> Result<Box<InflateState>, ZlibError> {
+fn try_clone_inflate_state<A: Allocator>(
+    s: &InflateState,
+    alloc: &A,
+) -> Result<Box<InflateState>, ZlibError> {
     // Fallible work first, so a failure abandons the copy before any state is
     // built; the partial clone is released by its own `Drop` (C's `ZFREE(copy)`).
     // C's order: the state reservation first (`inflate.c` L1340), then the window
     // (L1346).
-    let state_alloc = s.state_alloc.try_clone().ok_or(ZlibError::MemError)?;
-    let window = s.window.try_clone().ok_or(ZlibError::MemError)?;
+    //
+    // Both are requested from `alloc` with the same `(items, size)` split C uses
+    // — `(1, sizeof(struct inflate_state))` and `(1 << wbits, 1)` — rather than
+    // duplicated in place, so a custom Rust allocator serves the copy as well as
+    // the original (AAP §0.6.3, §0.6.5). An empty source buffer stays empty: C
+    // has nothing to copy either when the window was never allocated, and the
+    // state reservation is only taken when a C-style hook is installed.
+    let state_alloc = if s.state_alloc.is_empty() {
+        AllocBuffer::default()
+    } else {
+        clone_buffer_items(alloc, &s.state_alloc, 1, InflateState::C_LAYOUT_SIZE)?
+    };
+    let window = if s.window.is_empty() {
+        AllocBuffer::default()
+    } else {
+        clone_buffer(alloc, &s.window, 1usize << s.wbits)?
+    };
 
     try_box(InflateState {
         mode: s.mode,
@@ -2130,7 +2223,10 @@ pub fn inflate_copy<A: Allocator>(dest: &mut ZStream<A>, source: &ZStream<A>) ->
     let state = source.inflate_state().ok_or(ZlibError::StreamError)?;
     // Allocate the copy FIRST and bail out before touching `dest`, exactly as C
     // does — so an OOM leaves the destination stream unmodified.
-    let copy = try_clone_inflate_state(state)?;
+    // C `inflateCopy` allocates through the *source* stream's `zalloc`
+    // (`inflate.c` L1340-L1346); the FFI shim gives `dest` a duplicate of that
+    // allocator, so requesting from `dest` is the same allocator either way.
+    let copy = try_clone_inflate_state(state, dest.allocator())?;
     // Mirror C `zmemcpy(dest, source, sizeof(z_stream))` for the observable
     // stream bookkeeping (the allocator and I/O cursors are the caller's).
     dest.total_in = source.total_in;

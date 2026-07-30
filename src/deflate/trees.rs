@@ -1307,21 +1307,29 @@ fn send_tree_code(s: &mut DeflateState, trees: TreeSet, is_dist: bool, idx: usiz
     s.send_bits(e.code() as i32, e.len() as i32);
 }
 
-/// Emits the literal / length / distance token stream held in `s.sym_buf`.
+/// Emits the literal / length / distance token stream held in the symbol region.
 ///
-/// Each symbol occupies three bytes in `sym_buf`: the low and high bytes of the
-/// match distance (both zero for a literal) followed by the literal byte or the
-/// length code. This is the non-`LIT_MEM` buffer layout. The block is terminated
-/// with the end-of-block code. Ported exactly from the C `compress_block`.
+/// Each symbol occupies three bytes: the low and high bytes of the match distance
+/// (both zero for a literal) followed by the literal byte or the length code.
+/// This is the non-`LIT_MEM` buffer layout, and the region is overlaid inside
+/// `pending_buf` at offset `lit_bufsize` exactly as in C — reached here through
+/// [`DeflateState::sym`]. The block is terminated with the end-of-block code.
+/// Ported exactly from the C `compress_block`.
+///
+/// Reading a symbol before emitting it (rather than holding a borrow across the
+/// emission) is what lets the block bits accumulate into the *same* allocation
+/// the symbols live in, which is precisely what C does; C's overflow proof
+/// (`deflate.c` L466-L500) guarantees the write index never reaches the symbol
+/// currently being read.
 fn compress_block(s: &mut DeflateState, trees: TreeSet) {
-    let mut sx = 0usize; // running index in sym_buf
+    let mut sx = 0usize; // running index in the symbol region
     if s.sym_next != 0 {
         loop {
-            let mut dist = (s.sym_buf[sx] as usize) & 0xff;
+            let mut dist = (s.sym(sx) as usize) & 0xff;
             sx += 1;
-            dist += (s.sym_buf[sx] as usize & 0xff) << 8;
+            dist += (s.sym(sx) as usize & 0xff) << 8;
             sx += 1;
-            let lc = s.sym_buf[sx] as usize;
+            let lc = s.sym(sx) as usize;
             sx += 1;
             if dist == 0 {
                 send_tree_code(s, trees, false, lc); // send a literal byte
@@ -1470,7 +1478,8 @@ pub(crate) fn _tr_flush_block(
 // ---------------------------------------------------------------------------
 // Section 22: `_tr_tally` and inline tally helpers (trees.c + deflate.h).
 //
-// Each symbol occupies three bytes in `sym_buf`: (dist_low, dist_high, lc).
+// Each symbol occupies three bytes in the symbol region overlaid inside
+// `pending_buf` at offset `lit_bufsize`: (dist_low, dist_high, lc).
 // A literal is encoded with dist == 0; a match with dist != 0 where `lc` holds
 // the match length minus MIN_MATCH. All three helpers return `true` when the
 // symbol buffer is full and the block must be flushed.
@@ -1482,9 +1491,9 @@ pub(crate) fn _tr_flush_block(
 /// layout). Returns `true` when the symbol buffer is full.
 pub(crate) fn _tr_tally_lit(s: &mut DeflateState, c: u8) -> bool {
     let n = s.sym_next;
-    s.sym_buf[n] = 0;
-    s.sym_buf[n + 1] = 0;
-    s.sym_buf[n + 2] = c;
+    s.set_sym(n, 0);
+    s.set_sym(n + 1, 0);
+    s.set_sym(n + 2, c);
     s.sym_next = n + 3;
     let cc = c as usize;
     let f = s.dyn_ltree[cc].freq();
@@ -1502,9 +1511,9 @@ pub(crate) fn _tr_tally_lit(s: &mut DeflateState, c: u8) -> bool {
 /// path is never taken. Returns `true` when the symbol buffer is full.
 pub(crate) fn _tr_tally_dist(s: &mut DeflateState, dist: usize, len: u8) -> bool {
     let n = s.sym_next;
-    s.sym_buf[n] = (dist & 0xff) as u8;
-    s.sym_buf[n + 1] = (dist >> 8) as u8;
-    s.sym_buf[n + 2] = len;
+    s.set_sym(n, (dist & 0xff) as u8);
+    s.set_sym(n + 1, (dist >> 8) as u8);
+    s.set_sym(n + 2, len);
     s.sym_next = n + 3;
     let dist = dist - 1;
     let li = LENGTH_CODE[len as usize] as usize + LITERALS + 1;
@@ -1529,9 +1538,9 @@ pub(crate) fn _tr_tally_dist(s: &mut DeflateState, dist: usize, len: u8) -> bool
 #[allow(dead_code)]
 pub(crate) fn _tr_tally(s: &mut DeflateState, dist: usize, lc: usize) -> bool {
     let n = s.sym_next;
-    s.sym_buf[n] = (dist & 0xff) as u8;
-    s.sym_buf[n + 1] = (dist >> 8) as u8;
-    s.sym_buf[n + 2] = lc as u8;
+    s.set_sym(n, (dist & 0xff) as u8);
+    s.set_sym(n + 1, (dist >> 8) as u8);
+    s.set_sym(n + 2, lc as u8);
     s.sym_next = n + 3;
     if dist == 0 {
         // lc is the unmatched char.
