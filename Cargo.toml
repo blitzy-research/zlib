@@ -46,15 +46,43 @@ categories = ["compression", "no-std", "encoding", "api-bindings"]
 build = "build.rs"
 # The C baseline co-exists in this repository during the migration but must not
 # ship inside the published crate. Keep the C sources/headers, the contributed
-# subtrees, the legacy platform directories, and the C build/packaging files out
-# of the packaged `.crate`. (`exclude` only affects `cargo package`/`publish`;
-# it never affects `cargo build`/`test`/`bench` in the workspace.)
+# subtrees, the legacy platform directories, the C build/packaging files, the
+# upstream C documentation, and the migration engagement material out of the
+# packaged `.crate`. (`exclude` only affects `cargo package`/`publish`; it never
+# affects `cargo build`/`test`/`bench` in the workspace, so the retained C tree
+# stays fully available in-repository as the cross-validation oracle.)
+#
+# GLOB SUBTLETY — do NOT "simplify" the suffix patterns below. Cargo matches
+# `exclude` entries with gitignore semantics, so a `*.<suffix>` pattern matches
+# only that exact trailing suffix: `*.in` catches `zlib.pc.in`, `zconf.h.in`,
+# `zlibConfig.cmake.in`, and `Makefile.in`, but it does NOT catch
+# `zlib.pc.cmakein`, because `.cmakein` is a different suffix. That is why
+# `*.cmakein` is listed separately. A bare name such as `README` matches a path
+# component at any depth, which is why `README.md` (the `readme = ` target) is
+# unaffected by it.
+#
+# ACCEPTANCE GATE for this list: `cargo package --list`. Run it after ANY edit
+# here and confirm (a) no `*.c`/`*.h`/`*.map`/`*.in`/`*.cmakein`, no upstream C
+# docs, and no engagement material appear, and (b) `src/`, `tests/`, `benches/`,
+# `build.rs`, `README.md`, `LICENSE`, `Cargo.toml`, and `Cargo.lock` all still
+# do. That check is what keeps this list from silently regressing.
+#
+# NEVER add to this list — these ARE the crate: `src/**`, `tests/**`,
+# `benches/**`, `build.rs`, `Cargo.toml`, `Cargo.lock`, `README.md`, `LICENSE`,
+# `CHANGELOG.md`, `SECURITY.md`, `CONTRIBUTING.md`, `deny.toml`, `clippy.toml`,
+# `rustfmt.toml`, `rust-toolchain.toml`. Note especially that the `test/**`
+# entry below is the *C driver* directory (`test/example.c`, `test/infcover.c`,
+# `test/minigzip.c`) and is a DIFFERENT path from the Rust integration suite
+# `tests/**`, which must remain packaged. Do not conflate the two.
 exclude = [
     "*.c",
     "*.h",
     "*.in",
     "*.map",
     "*.pc.in",
+    # `*.in` does not match a `.cmakein` suffix — see the GLOB SUBTLETY note
+    # above. Without this entry `zlib.pc.cmakein` ships in the `.crate`.
+    "*.cmakein",
     "contrib/**",
     "examples/**",
     "test/**",
@@ -72,6 +100,37 @@ exclude = [
     "treebuild.xml",
     "BUILD.bazel",
     "MODULE.bazel",
+    # CMake's own formatter config — tooling for the retained C build only.
+    ".cmake-format.yaml",
+    # Upstream C documentation. `README.md` (this crate's `readme = ` target)
+    # and the Rust `CHANGELOG.md` are deliberately NOT in this group: the bare
+    # `README` and `ChangeLog` names below are the *upstream C* files, which the
+    # Rust-facing documents supersede for crate consumers.
+    "ChangeLog",
+    "FAQ",
+    "INDEX",
+    "README",
+    "README-cmake.md",
+    "zlib.3",
+    "zlib.3.pdf",
+    # Normative wire-format references and the heavy binary CRC monograph. These
+    # are indispensable in-repository (they are the RFC 1950/1951/1952 sources
+    # this port is verified against) but are dead weight in a published crate:
+    # no Rust source, test, bench, doctest, or `include_str!`/`include_bytes!`
+    # site reads any of them, and `mkdocs.yml` builds only `doc/index.md`,
+    # `doc/project-guide.md`, and `doc/technical-specifications.md` — all three
+    # of which stay packaged. Excluding this group alone removes ~873 KB,
+    # dominated by `doc/crc-doc.1.0.pdf`.
+    "doc/algorithm.txt",
+    "doc/crc-doc.1.0.pdf",
+    "doc/rfc1950.txt",
+    "doc/rfc1951.txt",
+    "doc/rfc1952.txt",
+    "doc/txtvsbin.txt",
+    # Migration engagement documentation and presentation assets — process
+    # artifacts, not product, and never of use to a crate consumer.
+    "blitzy/**",
+    "blitzy-deck/**",
 ]
 
 [lib]
@@ -155,6 +214,33 @@ simd = ["dep:crc32fast"]
 # with reference zlib; enable only to reject out-of-window distances early.
 # Referenced by `src/inflate/fast.rs`.
 inflate_strict = []
+#
+# Opt-in live C-oracle conformance harness (`tests/c_oracle.rs`), which makes the
+# full byte-identity sweep against a locally built reference C zlib reproducible
+# inside this repository instead of only in an ad-hoc environment.
+#
+# It expands to `[]` DELIBERATELY: it adds NO dependency of any kind, so
+# `Cargo.lock` and `cargo metadata` are completely unaffected by it and the
+# crate keeps its defining "the test suite requires no C toolchain" property.
+# The feature's only effect is to unlock the `[[test]]` target declared further
+# down, which shells out to whatever system C compiler is present via
+# `std::process::Command` — never through the `cc` crate. There is deliberately
+# no `cc`/`bindgen`/`pkg-config` dependency, no `[build-dependencies]` table,
+# and no `links =` key anywhere in this manifest: `build.rs` is pure `std` with
+# no external crates, and that property is load-bearing.
+#
+# This harness is strictly ADDITIVE. Tier 1 of `tests/interop.rs` — byte-identity
+# against deterministic vectors baked from the genuine C encoder — remains the
+# always-on, toolchain-free release gate and is never replaced or weakened by
+# this feature.
+#
+# CONTRACT the harness itself must honour (do NOT "simplify" this away): the
+# `build-test` matrix in `.github/workflows/ci.yml` includes an `--all-features`
+# row, and `--all-features` enables `c-oracle`. The harness must therefore probe
+# for a usable C compiler at RUN TIME and, when none is available, print a
+# capability notice and PASS. It must not fail, and it must not be `#[ignore]`d —
+# the suite's ignored-test count is zero and stays zero.
+c-oracle = []
 
 # Three criterion benchmarks. Each disables the built-in libtest harness so that
 # criterion supplies its own `main` via `criterion_main!` (AAP §0.3.1 / §0.4.1).
@@ -169,6 +255,25 @@ harness = false
 [[bench]]
 name = "checksum_bench"
 harness = false
+
+# The live C-oracle conformance harness is declared explicitly ONLY so that
+# `required-features` can gate it: without this block Cargo would auto-discover
+# `tests/c_oracle.rs` and compile it on every plain `cargo test`, which would
+# drag a C-toolchain requirement into the default suite. With the block, the
+# target is not even compiled unless `--features c-oracle` (or `--all-features`)
+# is passed, so the default `cargo test` run is byte-for-byte the same suite as
+# before this target existed and the `c_oracle` binary never appears in it.
+#
+# `autotests` is intentionally left at its default (`true`, for edition 2024), so
+# the other six integration tests — `checksum`, `gzip_compat`, `inflate_coverage`,
+# `interop`, `regression`, `round_trip` — continue to be auto-discovered from
+# `tests/`. An explicit `[[test]]` whose `name` matches an auto-discovered target
+# simply overrides that target's settings rather than suppressing discovery of
+# its siblings, which is exactly the behaviour relied on here.
+[[test]]
+name = "c_oracle"
+path = "tests/c_oracle.rs"
+required-features = ["c-oracle"]
 
 [profile.release]
 # The release build is optimized with LTO (project-guide §6.4).

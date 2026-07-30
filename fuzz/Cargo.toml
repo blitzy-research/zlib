@@ -7,6 +7,16 @@
 # compile these nightly-only libFuzzer harnesses. cargo-fuzz builds them with a
 # nightly toolchain (it injects `-Z` sanitizer / coverage instrumentation that
 # is unavailable on stable); see `.github/workflows/fuzz.yml`.
+#
+# LOCAL RUNS NEED AN EXPLICIT `+nightly`. The repository root carries a
+# `rust-toolchain.toml` pinning the crate's MSRV — a STABLE toolchain — and
+# rustup resolves that file by searching UPWARD from the working directory, so a
+# shell sitting in `fuzz/` inherits it; an unprefixed `cargo fuzz build` or
+# `cargo fuzz run` then fails with "the option `Z` is only accepted on the
+# nightly compiler". Use `cargo +nightly fuzz build|list|run <target>` and
+# `cargo +nightly fmt --all -- --check` here. CI needs no prefix: the workflow's
+# `dtolnay/rust-toolchain@nightly` step exports `RUSTUP_TOOLCHAIN`, which takes
+# precedence over the toolchain file.
 
 [package]
 name = "zlib-rs-fuzz"
@@ -33,6 +43,13 @@ path = ".."
 # libFuzzer wants line-level debug info in the optimized build for actionable
 # crash reports; overflow checks stay on so arithmetic mistakes surface as
 # reproducible findings rather than silently wrapping.
+#
+# Cargo reads profiles from the workspace-root manifest of the workspace being
+# built, and inside `fuzz/` that root is THIS file. It deliberately sets no
+# `panic` key, so the fuzz build — including the `zlib-rs` path dependency
+# compiled for it — uses Cargo's default `unwind`; the root manifest's
+# `panic = "abort"` does not reach here (observable with `cargo build -v`, which
+# passes no `-C panic=` flag from this workspace).
 [profile.release]
 debug = 1
 overflow-checks = true
