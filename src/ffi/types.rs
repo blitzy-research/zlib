@@ -29,7 +29,7 @@
 //! # Unsafe boundary
 //!
 //! `src/ffi/**` is the crate's designated `unsafe` boundary (AAP §0.6.2 /
-//! §0.7.2): the idiomatic core (`src/deflate/**`, `src/stream.rs`, …) is fully
+//! §0.7.2 standard S2): the idiomatic core (`src/deflate/**`, `src/stream.rs`, …) is fully
 //! safe, and every `unsafe` operation here carries a `// SAFETY:` justification,
 //! while every public `unsafe fn` documents its contract in a `# Safety`
 //! section.
@@ -1397,6 +1397,102 @@ mod tests {
         assert!(
             active.reserves_state_footprint(),
             "an installed hook must be charged for the state, as C's ZALLOC is"
+        );
+    }
+
+    /// The three published [`HandleKind`] magics must be pairwise distinct, and
+    /// the tag must stay a `u64` sitting at offset 0 of every tagged handle.
+    ///
+    /// [`peek_handle_kind`] reads the discriminant through the C-layout
+    /// [`HandleHeader`] prefix *before* any handle is reinterpreted, so a magic
+    /// collision — or a width/offset drift — would silently defeat the
+    /// cross-engine `End` guard and re-open the layout-mismatched deallocation
+    /// that tagging exists to prevent.
+    #[test]
+    fn handle_kind_magics_are_distinct_and_u64_shaped() {
+        // Pairwise distinctness across all three engines.
+        assert_ne!(HandleKind::DEFLATE, HandleKind::INFLATE);
+        assert_ne!(HandleKind::INFLATE, HandleKind::INFLATE_BACK);
+        assert_ne!(HandleKind::DEFLATE, HandleKind::INFLATE_BACK);
+
+        // `#[repr(transparent)]` over a `u64`: identical size and alignment, so
+        // reading the tag through the `HandleHeader` prefix is exact.
+        assert_eq!(size_of::<HandleKind>(), size_of::<u64>());
+        assert_eq!(align_of::<HandleKind>(), align_of::<u64>());
+        assert_eq!(size_of::<HandleHeader>(), size_of::<u64>());
+
+        // The tag must lead the shared header AND every tagged handle — that is
+        // precisely what lets `peek_handle_kind` read it without knowing the
+        // concrete handle type behind the opaque `state` pointer.
+        assert_eq!(offset_of!(HandleHeader, kind), 0);
+        assert_eq!(offset_of!(DeflateHandle, kind), 0);
+    }
+
+    /// The tag gates `deflate_state`/`deflate_take`: a foreign engine's handle is
+    /// rejected WITHOUT reconstituting a wrong-type box, and `state` is left
+    /// intact so nothing is ever dropped through a mismatched `Layout`.
+    #[test]
+    fn handle_tag_gates_deflate_state_and_take() {
+        // No handle installed: every accessor reports absence without touching
+        // the null pointer.
+        let mut strm = zeroed_stream();
+        // SAFETY: `state` is null, so no dereference occurs.
+        assert!(unsafe { peek_handle_kind(&strm) }.is_none());
+        // SAFETY: as above.
+        assert!(unsafe { deflate_state(&mut strm) }.is_none());
+        // SAFETY: as above.
+        assert!(unsafe { deflate_take(&mut strm) }.is_none());
+
+        // Install a genuine, correctly tagged deflate handle.
+        let handle = Box::new(DeflateHandle::new(ZStream::with_allocator(CAllocator {
+            zalloc: None,
+            zfree: None,
+            opaque: ptr::null_mut(),
+        })));
+        // SAFETY: transfers ownership of a freshly boxed handle into `state`;
+        // it is reclaimed exactly once by the `deflate_take` at the end.
+        strm.state = unsafe { state_ptr_from_box(handle) };
+        // SAFETY: `state` holds the live `Box<DeflateHandle>` installed above,
+        // whose first field is the `HandleKind` tag.
+        assert_eq!(
+            unsafe { peek_handle_kind(&strm) },
+            Some(HandleKind::DEFLATE)
+        );
+        // SAFETY: as above; the tag confirms a `DeflateHandle`.
+        assert!(unsafe { deflate_state(&mut strm) }.is_some());
+
+        // Overwrite the tag with a foreign engine's magic, emulating a caller
+        // that passes an inflate-initialized stream to `deflateEnd`.
+        // SAFETY: `state` points at a live, C-layout `DeflateHandle` whose first
+        // field is a `HandleKind`, and `HandleHeader` is a C-layout struct with
+        // the same leading field, so this writes exactly that field and no other.
+        unsafe {
+            (*(strm.state as *mut HandleHeader)).kind = HandleKind::INFLATE;
+        }
+        // SAFETY: `state` still points at the live handle allocation, so the tag
+        // remains readable.
+        assert!(unsafe { deflate_state(&mut strm) }.is_none());
+        // SAFETY: as above.
+        assert!(unsafe { deflate_take(&mut strm) }.is_none());
+        assert!(
+            !strm.state.is_null(),
+            "a rejected take must leave `state` installed, never dropping a \
+             wrong-type box"
+        );
+
+        // Restore the correct tag and reclaim the box, so the handle is freed
+        // through its real type and the test leaks nothing.
+        // SAFETY: as for the corrupting write above — same allocation, same
+        // leading field.
+        unsafe {
+            (*(strm.state as *mut HandleHeader)).kind = HandleKind::DEFLATE;
+        }
+        // SAFETY: the tag again confirms the live `Box<DeflateHandle>`, which is
+        // reconstituted exactly once here.
+        assert!(unsafe { deflate_take(&mut strm) }.is_some());
+        assert!(
+            strm.state.is_null(),
+            "a successful take must null `state` to prevent a double free"
         );
     }
 

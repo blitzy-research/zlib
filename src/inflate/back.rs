@@ -11,7 +11,7 @@
 //! `gzip -d`'s core loop.
 //!
 //! The decoded output is **byte-identical** to reference zlib for the same
-//! input (AAP §0.6.4, §0.7.1): the DEFLATE bit reader, the block dispatch, the
+//! input (AAP §0.6.4, §0.8.1 directive D-1): the DEFLATE bit reader, the block dispatch, the
 //! dynamic Huffman table construction (shared with the main driver via
 //! [`crate::inflate::tables::inflate_table`]), the fixed tables
 //! ([`crate::inflate::fixed`]), and — crucially — the overlapping LZ77 window

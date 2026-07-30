@@ -9,22 +9,26 @@
 //!
 //! # Unsafe policy
 //!
-//! `src/inflate/fast.rs` is the *only* file in `src/inflate/` that is permitted
-//! to contain `unsafe`, and only for hot-path bounds-check elision. Per the
-//! project's "prefer a fully-safe implementation first" directive, this port is
-//! written entirely in **safe Rust**: it uses bounds-checked slice indexing
+//! This module contains **zero `unsafe`**, as does every other file in
+//! `src/inflate/`. In this crate `unsafe` is confined to `src/ffi/**` and the
+//! private no-`std` runtime-support block of `src/lib.rs` (AAP §0.6.2,
+//! preservation directive D-6); the crate root's `#![deny(unsafe_code)]` makes
+//! that boundary a compile-time guarantee. This port is written entirely in
+//! **safe Rust**: it uses bounds-checked slice indexing
 //! throughout. The entry contract documented on [`inflate_fast`] guarantees
 //! that at most six input bytes and at most 258 output bytes are touched per
 //! loop iteration, so — for a well-formed stream honoring that contract — the
-//! bounds checks never fail. Should profiling ever justify unchecked indexing,
-//! this module is the designated (and sole) location for it, and every such
-//! block must carry a `// SAFETY:` justification. None is required today.
+//! bounds checks never fail. Unchecked indexing is *not* available here, and at
+//! 107%-127% of the C baseline's decompression throughput it is not warranted
+//! either: introducing it would violate User Constraint 3 ("zero unsafe blocks
+//! in core compression logic") and fail the crate-root `#![deny(unsafe_code)]`.
+//! This module carries no `// SAFETY:` justification and needs none.
 //!
 //! # Byte-exact output
 //!
 //! The decode sequence, the bit-refill schedule, and — crucially — the
 //! *overlapping* LZ77 back-reference copy are reproduced exactly so that output
-//! is byte-identical to reference zlib (AAP §0.6.4, §0.7.1). The overlapping
+//! is byte-identical to reference zlib (AAP §0.6.4, §0.8.1 directive D-1). The overlapping
 //! copy (when `dist < len`) is performed forward, one byte at a time, so that
 //! freshly written bytes are re-read; a `memcpy`/`copy_from_slice` would be
 //! incorrect there.
