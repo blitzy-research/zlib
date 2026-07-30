@@ -87,12 +87,18 @@
 //!
 //! The entire module is compiled only when the `gz-io` feature is enabled
 //! (`gz-io` implies `std`, required for [`std::fs::File`] I/O, [`CStr`], and
-//! `from_raw_fd`). This is the crate's `unsafe` boundary: every `unsafe` block
+//! `from_raw_fd`). That gate lives on the `#[cfg(feature = "gz-io")] pub mod gz;`
+//! declaration in `src/ffi/mod.rs`, which is the only path by which this file is
+//! reached; it is deliberately **not** repeated as a module-level `#![cfg(…)]`
+//! here, because an inner `cfg` duplicating the one on the `mod` declaration is
+//! reported as a `clippy::duplicated_attributes` error by the Clippy shipped
+//! with the pinned MSRV toolchain (see `rust-toolchain.toml`).
+//!
+//! This is the crate's `unsafe` boundary: every `unsafe` block
 //! carries a `// SAFETY:` justification, and no shim may unwind across the C
 //! boundary — fallible bodies run inside the `guard_*` helpers so a panic is
 //! caught and converted to the function's C error sentinel.
 
-#![cfg(feature = "gz-io")]
 #![allow(clippy::missing_safety_doc)]
 
 use core::ffi::{CStr, c_char, c_int, c_uint};
@@ -254,8 +260,8 @@ impl GzHandle {
             // returned and the `GzBorrow` has been dropped), so exposing it as a
             // raw `*mut` is sound. It is recomputed on every `sync`, so a buffer
             // reallocation between calls can never leave it dangling.
-            self.prefix.next =
-                unsafe { self.state.out_buf.as_ptr().add(self.state.next) } as *mut u8;
+            let next = unsafe { self.state.out_buf.as_ptr().add(self.state.next) };
+            self.prefix.next = next as *mut u8;
         } else {
             self.prefix.have = 0;
             self.prefix.next = ptr::null_mut();

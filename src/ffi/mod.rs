@@ -62,11 +62,13 @@
 //! requires the standard library for filesystem access. It is therefore compiled
 //! only when the `gz-io` Cargo feature is enabled (which implies `std` and
 //! `gzip`), matching the gating in [`crate::gz`] and the `#[cfg(feature =
-//! "gz-io")] pub mod gz;` declaration in `src/lib.rs`. Because the sibling
-//! `src/ffi/gz.rs` additionally self-gates with a module-level
-//! `#![cfg(feature = "gz-io")]`, the `#[cfg(feature = "gz-io")]` attribute on the
-//! `pub mod gz;` declaration below is kept consistent to avoid a module/`cfg`
-//! mismatch. A build **without** `gz-io` still links the complete set of core
+//! "gz-io")] pub mod gz;` declaration in `src/lib.rs`. The `#[cfg(feature =
+//! "gz-io")]` attribute on the `pub mod gz;` declaration below is the single
+//! gate for `src/ffi/gz.rs`: that file deliberately does **not** repeat it as a
+//! module-level `#![cfg(…)]`, because an inner `cfg` duplicating the one on the
+//! `mod` declaration is reported as a `clippy::duplicated_attributes` error by
+//! the Clippy shipped with the pinned MSRV toolchain (`rust-toolchain.toml`).
+//! A build **without** `gz-io` still links the complete set of core
 //! (`deflate`/`inflate`/`checksum`/one-call/version) symbols: [`types`],
 //! [`util`], [`deflate`](mod@deflate), and [`inflate`](mod@inflate) are always compiled so the core zlib
 //! symbol table is always present for linkage.

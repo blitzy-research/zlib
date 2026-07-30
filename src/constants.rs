@@ -26,7 +26,7 @@
 //!
 //! * Every numeric value is part of the preserved public API and wire-format
 //!   contract and is **bit-identical** to the corresponding C macro. The values
-//!   must never be altered (see AAP §0.7.1).
+//!   must never be altered (see AAP §0.8.1, preservation directive D-2).
 //! * The module is `no_std`-compatible — it references only `core` and performs
 //!   **zero** `unsafe` operations.
 //!
