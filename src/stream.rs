@@ -78,10 +78,10 @@
 //! `crate::ffi::alloc` zone behind the safe [`ForeignBuffer`] trait (M6). The
 //! [`Foreign`](AllocBuffer::Foreign) arm holds a `Box<dyn ForeignBuffer<T>>` and
 //! delegates every access to that safe interface. Consequently the **core
-//! compression engine** (`src/deflate/**`) also contains **zero `unsafe`** (user
-//! rule R3) — its buffer fields are [`AllocBuffer`]s accessed purely through
-//! safe slice operations, and the compression-logic files
-//! (`slow.rs`/`stored.rs`/`trees.rs`) remain under `#![deny(unsafe_code)]`.
+//! compression engine** (`src/deflate/**`) also contains **zero `unsafe`** (User
+//! Constraint 3 / AAP §0.7.2 standard S2) — its buffer fields are [`AllocBuffer`]s
+//! accessed purely through safe slice operations, and the compression-logic
+//! files (`slow.rs`/`stored.rs`/`trees.rs`) remain under `#![deny(unsafe_code)]`.
 //!
 //! Allocation is **fallible** at the boundary: when a caller installs a bounded
 //! allocator whose `zalloc` reports out-of-memory, buffer construction returns
