@@ -1443,3 +1443,530 @@ pub fn deflate_copy<A: Allocator>(dest: &mut ZStream<A>, source: &ZStream<A>) ->
     dest.set_deflate_state(cloned);
     Ok(ReturnCode::Ok)
 }
+
+// ===========================================================================
+// Unit tests.
+//
+// These pin the decision surfaces this module owns *exclusively* — the ones no
+// sibling file covers: the zlib (RFC 1950) and gzip (RFC 1952) framing bytes,
+// the wrapper-length and bound arithmetic, the bit-priming helpers, and the
+// `level == 0` / strategy dispatch precedence of `deflate.c` L1217-L1220.
+//
+// Every expectation is transcribed independently from the C oracle
+// (`deflate.c`) or derived from the RFCs — never from this module's own output.
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    /// C `deflateBound_z`'s fixed-block bound (`deflate.c` L864-L868),
+    /// transcribed independently of the implementation under test.
+    fn c_fixedlen(source_len: usize) -> usize {
+        source_len + (source_len >> 3) + (source_len >> 8) + (source_len >> 9) + 4
+    }
+
+    /// C `deflateBound_z`'s stored-block bound (`deflate.c` L871-L875).
+    fn c_storelen(source_len: usize) -> usize {
+        source_len + (source_len >> 5) + (source_len >> 7) + (source_len >> 11) + 7
+    }
+
+    /// C `deflateBound_z`'s tight default bound (`deflate.c` L925-L926). The C
+    /// expression is written `+ 13 - 6 + wraplen`, kept verbatim here so the
+    /// port's folded `+ 7` is checked against the original form.
+    fn c_tight(source_len: usize, wraplen: usize) -> usize {
+        source_len + (source_len >> 12) + (source_len >> 14) + (source_len >> 25) + 13 - 6 + wraplen
+    }
+
+    /// Initializes a deflate stream, panicking if the parameters are rejected.
+    fn init(level: i32, window_bits: i32, mem_level: i32, strategy: Strategy) -> ZStream {
+        let mut strm: ZStream = ZStream::new();
+        deflate_init2(
+            &mut strm,
+            level,
+            Z_DEFLATED,
+            window_bits,
+            mem_level,
+            strategy,
+        )
+        .expect("deflate_init2 must accept these parameters");
+        strm
+    }
+
+    /// Compresses `data` in a single [`deflate`] call with a bound-sized output
+    /// buffer and returns the complete stream (header, payload, and trailer).
+    fn compress_all(level: i32, window_bits: i32, strategy: Strategy, data: &[u8]) -> Vec<u8> {
+        let mut strm = init(level, window_bits, DEF_MEM_LEVEL, strategy);
+        let mut out = vec![0u8; deflate_bound(&strm, data.len()) + 64];
+        let outcome = deflate(&mut strm, data, &mut out, Z_FINISH);
+        assert_eq!(
+            outcome.code,
+            ReturnCode::StreamEnd,
+            "one deflate(Z_FINISH) into a bound-sized buffer must finish the stream"
+        );
+        assert_eq!(outcome.consumed, data.len(), "all input must be consumed");
+        out.truncate(outcome.produced);
+        deflate_end(&mut strm).expect("deflate_end must succeed after Z_STREAM_END");
+        out
+    }
+
+    /// Without an installed state, C returns the larger of the two conservative
+    /// bounds plus a full 18-byte wrapper (`deflate.c` L877-L878), and
+    /// `deflateBound` forwards to `deflateBound_z` unchanged.
+    #[test]
+    fn deflate_bound_without_a_state_returns_the_larger_bound_plus_18() {
+        let strm: ZStream = ZStream::new();
+        for len in [0usize, 1, 3, 100, 1024, 200_000] {
+            let expected = c_fixedlen(len).max(c_storelen(len)) + 18;
+            assert_eq!(
+                deflate_bound_z(&strm, len),
+                expected,
+                "no-state bound for len {len}"
+            );
+            assert_eq!(
+                deflate_bound(&strm, len),
+                expected,
+                "deflate_bound must forward"
+            );
+        }
+    }
+
+    /// With the default `windowBits == 15` and `memLevel == 8`, C takes the
+    /// tight bound and adds the wrapper length: 6 for zlib, 0 for raw
+    /// (`deflate.c` L893-L896, L925-L926).
+    #[test]
+    fn deflate_bound_uses_the_tight_default_bound_plus_the_wrapper() {
+        let zlib = init(6, MAX_WBITS, DEF_MEM_LEVEL, Strategy::Default);
+        let raw = init(6, -MAX_WBITS, DEF_MEM_LEVEL, Strategy::Default);
+        for len in [0usize, 1, 1024, 200_000, 5_000_000] {
+            assert_eq!(
+                deflate_bound_z(&zlib, len),
+                c_tight(len, 6),
+                "zlib bound for len {len}"
+            );
+            assert_eq!(
+                deflate_bound_z(&raw, len),
+                c_tight(len, 0),
+                "raw bound for len {len}"
+            );
+        }
+
+        // The bound must actually bound: real output has to fit inside it.
+        const DATA: &[u8] = b"the quick brown fox jumps over the lazy dog";
+        let compressed = compress_all(6, MAX_WBITS, Strategy::Default, DATA);
+        assert!(
+            compressed.len() <= deflate_bound_z(&zlib, DATA.len()),
+            "compressed length {} exceeded the bound",
+            compressed.len()
+        );
+    }
+
+    /// Non-default window or hash sizes take a conservative bound: fixed when
+    /// `w_bits <= hash_bits && level != 0`, stored otherwise (`deflate.c`
+    /// L917-L923). `hash_bits == memLevel + 7`, so `memLevel 8` gives 15.
+    #[test]
+    fn deflate_bound_uses_a_conservative_bound_for_non_default_parameters() {
+        // windowBits 9: w_bits 9 <= hash_bits 15 and level != 0 -> fixed.
+        let small_window = init(6, 9, DEF_MEM_LEVEL, Strategy::Default);
+        // memLevel 1: hash_bits 8 < w_bits 15 -> stored.
+        let small_hash = init(6, MAX_WBITS, 1, Strategy::Default);
+        // level 0 disqualifies the fixed bound even though w_bits <= hash_bits.
+        let level_zero = init(0, 9, DEF_MEM_LEVEL, Strategy::Default);
+        for len in [0usize, 1024, 200_000] {
+            let fixed = c_fixedlen(len) + 6;
+            let stored = c_storelen(len) + 6;
+            assert_eq!(
+                deflate_bound_z(&small_window, len),
+                fixed,
+                "windowBits 9, len {len}"
+            );
+            assert_eq!(
+                deflate_bound_z(&small_hash, len),
+                stored,
+                "memLevel 1, len {len}"
+            );
+            assert_eq!(
+                deflate_bound_z(&level_zero, len),
+                stored,
+                "level 0, len {len}"
+            );
+        }
+    }
+
+    /// C returns `(z_size_t)-1` on overflow; this port saturates instead, which
+    /// caps at [`usize::MAX`] rather than wrapping or panicking.
+    #[test]
+    fn deflate_bound_saturates_instead_of_overflowing() {
+        let stateless: ZStream = ZStream::new();
+        assert_eq!(deflate_bound_z(&stateless, usize::MAX), usize::MAX);
+        let zlib = init(6, MAX_WBITS, DEF_MEM_LEVEL, Strategy::Default);
+        assert_eq!(deflate_bound_z(&zlib, usize::MAX), usize::MAX);
+        let small_window = init(6, 9, DEF_MEM_LEVEL, Strategy::Default);
+        assert_eq!(deflate_bound_z(&small_window, usize::MAX), usize::MAX);
+    }
+
+    /// The gzip wrapper length is 18 plus every supplied header field. C counts
+    /// the name and comment with `do { wraplen++; } while (*str++);`
+    /// (`deflate.c` L899-L906), which includes the NUL terminator — this port
+    /// stores no NUL, so it must add `len() + 1`.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn deflate_bound_gzip_wraplen_counts_every_header_field_and_its_nul() {
+        let mut strm = init(6, MAX_WBITS + 16, DEF_MEM_LEVEL, Strategy::Default);
+        for len in [0usize, 1024] {
+            assert_eq!(
+                deflate_bound_z(&strm, len),
+                c_tight(len, 18),
+                "bare gzip, len {len}"
+            );
+        }
+
+        let mut head = GzHeader::new()
+            .with_extra(vec![1u8, 2, 3])
+            .with_name("name.txt")
+            .with_comment("a comment");
+        head.hcrc = true;
+        deflate_set_header(&mut strm, Some(head)).expect("a gzip stream accepts a header");
+
+        // 18 + (2 + 3 extra) + (8 name + 1 NUL) + (9 comment + 1 NUL) + 2 hcrc.
+        let wraplen = 18 + (2 + 3) + (8 + 1) + (9 + 1) + 2;
+        for len in [0usize, 1024] {
+            assert_eq!(
+                deflate_bound_z(&strm, len),
+                c_tight(len, wraplen),
+                "full gzip, len {len}"
+            );
+        }
+    }
+
+    /// C `CLEAR_HASH` (`deflate.c` L170-L175) writes `NIL` to the last head
+    /// slot, `zmemzero`s the rest, and clears `slid`. Because `NIL == 0`,
+    /// zeroing every entry is equivalent — this checks the post-condition.
+    #[test]
+    fn clear_hash_resets_every_head_entry_and_the_slid_flag() {
+        let mut strm = init(6, MAX_WBITS, DEF_MEM_LEVEL, Strategy::Default);
+        let s = strm.deflate_state_mut().expect("init installs a state");
+        for (i, h) in s.head.iter_mut().enumerate() {
+            *h = (i as u16) | 1; // deliberately non-NIL everywhere
+        }
+        s.slid = true;
+        clear_hash(s);
+        assert!(
+            s.head.iter().all(|&h| h == NIL),
+            "every head entry must be NIL"
+        );
+        assert!(!s.slid, "the slide flag must be cleared");
+    }
+
+    /// C `putShortMSB` (`deflate.c` L939-L942) appends a 16-bit value
+    /// most-significant byte first; the zlib header word, the preset-dictionary
+    /// Adler-32, and the zlib trailer all depend on that order.
+    #[test]
+    fn put_short_msb_writes_the_most_significant_byte_first() {
+        let mut strm = init(6, MAX_WBITS, DEF_MEM_LEVEL, Strategy::Default);
+        let s = strm.deflate_state_mut().expect("init installs a state");
+        assert_eq!(
+            s.pending, 0,
+            "a freshly initialized state has no pending output"
+        );
+        put_short_msb(s, 0x1234);
+        put_short_msb(s, 0xabcd);
+        assert_eq!(s.pending, 4);
+        assert_eq!(&s.pending_buf[..4], &[0x12, 0x34, 0xab, 0xcd]);
+    }
+
+    /// C `deflatePending` (`deflate.c` L722-L734) and `deflateUsed`
+    /// (`deflate.c` L737-L742) both require an installed state and both report
+    /// state that is otherwise invisible to callers.
+    #[test]
+    fn deflate_pending_and_deflate_used_require_a_state_and_start_at_zero() {
+        let mut strm: ZStream = ZStream::new();
+        assert_eq!(deflate_pending(&strm), Err(ZlibError::StreamError));
+        assert_eq!(deflate_used(&strm), Err(ZlibError::StreamError));
+
+        deflate_init2(
+            &mut strm,
+            6,
+            Z_DEFLATED,
+            MAX_WBITS,
+            DEF_MEM_LEVEL,
+            Strategy::Default,
+        )
+        .expect("deflate_init2 must accept the default parameters");
+        assert_eq!(
+            deflate_pending(&strm),
+            Ok((0, 0)),
+            "nothing is pending after init"
+        );
+        assert_eq!(
+            deflate_used(&strm),
+            Ok(0),
+            "no output byte has been written yet"
+        );
+
+        deflate_end(&mut strm).expect("deflate_end before any compression returns Z_OK");
+        assert_eq!(
+            deflate_pending(&strm),
+            Err(ZlibError::StreamError),
+            "state is gone"
+        );
+    }
+
+    /// C `deflatePrime` (`deflate.c` L745-L771) inserts bits low-order first,
+    /// flushing whole bytes least-significant first through `bi_flush`, and
+    /// rejects any width outside `0..=16` with `Z_BUF_ERROR`.
+    #[test]
+    fn deflate_prime_packs_bits_low_order_first_and_rejects_bad_widths() {
+        let mut strm = init(6, MAX_WBITS, DEF_MEM_LEVEL, Strategy::Default);
+
+        deflate_prime(&mut strm, 5, 0b1_0101).expect("5 bits fit the empty accumulator");
+        assert_eq!(
+            deflate_pending(&strm),
+            Ok((0, 5)),
+            "5 bits buffer without emitting a byte"
+        );
+
+        deflate_prime(&mut strm, 16, 0xffff).expect("16 more bits");
+        // 21 bits total: 0b1_0101 then sixteen 1s. The low 16 bits of the
+        // accumulator (0xfff5) are flushed least-significant byte first, and the
+        // remaining 5 bits stay buffered.
+        assert_eq!(deflate_pending(&strm), Ok((2, 5)));
+        let s = strm.deflate_state().expect("init installs a state");
+        assert_eq!(&s.pending_buf[..2], &[0xf5, 0xff]);
+
+        assert_eq!(
+            deflate_prime(&mut strm, 17, 0),
+            Err(ZlibError::BufError),
+            "17 bits is too wide"
+        );
+        assert_eq!(
+            deflate_prime(&mut strm, -1, 0),
+            Err(ZlibError::BufError),
+            "negative width"
+        );
+
+        let mut bare: ZStream = ZStream::new();
+        assert_eq!(deflate_prime(&mut bare, 8, 0), Err(ZlibError::StreamError));
+    }
+
+    /// C `deflateTune` (`deflate.c` L819-L830) overrides the four match-finder
+    /// fields **on the state**. The configuration table is `const` and keeps the
+    /// verbatim C values — level 6 is `{8, 16, 128, 128, deflate_slow}`
+    /// (`deflate.c` L118).
+    #[test]
+    fn deflate_tune_overrides_state_fields_and_leaves_the_configuration_table_intact() {
+        let mut strm = init(6, MAX_WBITS, DEF_MEM_LEVEL, Strategy::Default);
+        {
+            let s = strm.deflate_state().expect("init installs a state");
+            assert_eq!(s.good_match, 8, "level 6 good_length");
+            assert_eq!(s.max_lazy_match, 16, "level 6 max_lazy");
+            assert_eq!(s.nice_match, 128, "level 6 nice_length");
+            assert_eq!(s.max_chain_length, 128, "level 6 max_chain");
+        }
+
+        deflate_tune(&mut strm, 33, 133, 259, 4097).expect("tune accepts advanced overrides");
+        let s = strm.deflate_state().expect("init installs a state");
+        assert_eq!(s.good_match, 33);
+        assert_eq!(s.max_lazy_match, 133);
+        assert_eq!(s.nice_match, 259);
+        assert_eq!(s.max_chain_length, 4097);
+
+        let row = CONFIGURATION_TABLE[6];
+        assert_eq!(row.good_length, 8, "the table must not be mutable state");
+        assert_eq!(row.max_lazy, 16);
+        assert_eq!(row.nice_length, 128);
+        assert_eq!(row.max_chain, 128);
+        assert_eq!(row.func, CompressFunc::Slow);
+    }
+
+    /// Each [`DeflateConfig`] setter is a pure single-field write, and
+    /// `new()` matches `default()` — the C `deflateInit2_` defaults.
+    #[test]
+    fn deflate_config_builder_changes_exactly_one_field_per_setter() {
+        let base = DeflateConfig::new();
+        assert_eq!(base, DeflateConfig::default(), "new() must equal default()");
+        assert_eq!(base.level, Z_DEFAULT_COMPRESSION);
+        assert_eq!(base.method, Z_DEFLATED);
+        assert_eq!(base.window_bits, MAX_WBITS);
+        assert_eq!(base.mem_level, DEF_MEM_LEVEL);
+        assert_eq!(base.strategy, Strategy::Default);
+
+        // Validation belongs to `init`, not the setters: each one only records.
+        assert_eq!(base.level(9), DeflateConfig { level: 9, ..base });
+        assert_eq!(base.method(0), DeflateConfig { method: 0, ..base });
+        assert_eq!(
+            base.window_bits(-15),
+            DeflateConfig {
+                window_bits: -15,
+                ..base
+            }
+        );
+        assert_eq!(
+            base.mem_level(1),
+            DeflateConfig {
+                mem_level: 1,
+                ..base
+            }
+        );
+        assert_eq!(
+            base.strategy(Strategy::Rle),
+            DeflateConfig {
+                strategy: Strategy::Rle,
+                ..base
+            }
+        );
+    }
+
+    /// The zlib (RFC 1950) header words are canonical and independently known:
+    /// `78 01` for levels 0-1, `78 5e` for 2-5, `78 9c` for 6, `78 da` for 7-9
+    /// at `windowBits == 15`. They follow from C's four-way `level_flags` ladder
+    /// (`deflate.c` L1036-L1043) plus the FCHECK adjustment
+    /// `header += 31 - (header % 31)` (`deflate.c` L1046).
+    #[test]
+    fn zlib_header_matches_the_canonical_cmf_flg_words() {
+        const DATA: &[u8] = b"zlib header CMF/FLG word";
+        for (level, cmf, flg) in [
+            (0, 0x78u8, 0x01u8),
+            (1, 0x78, 0x01),
+            (2, 0x78, 0x5e),
+            (5, 0x78, 0x5e),
+            (6, 0x78, 0x9c),
+            (7, 0x78, 0xda),
+            (9, 0x78, 0xda),
+        ] {
+            let out = compress_all(level, MAX_WBITS, Strategy::Default, DATA);
+            assert_eq!(out[0], cmf, "CMF at level {level}");
+            assert_eq!(out[1], flg, "FLG at level {level}");
+            let header = (u32::from(out[0]) << 8) | u32::from(out[1]);
+            assert_eq!(
+                header % 31,
+                0,
+                "the FCHECK residue must be 0 at level {level}"
+            );
+            assert_eq!(
+                u32::from(out[1]) & PRESET_DICT,
+                0,
+                "PRESET_DICT must be clear without a dictionary at level {level}"
+            );
+        }
+    }
+
+    /// RFC 1950 §2.2 stores the Adler-32 trailer most-significant byte first; C
+    /// writes it as two `putShortMSB` calls (`deflate.c` L1281-L1282). Raw
+    /// framing carries neither header nor trailer, so the wrapper costs exactly
+    /// six bytes over the identical payload.
+    #[test]
+    fn zlib_trailer_carries_the_adler32_most_significant_byte_first() {
+        const DATA: &[u8] = b"Adler-32 trailer byte order: most significant first";
+        let out = compress_all(6, MAX_WBITS, Strategy::Default, DATA);
+        let expected = adler32(1, DATA);
+        assert_eq!(
+            &out[out.len() - 4..],
+            &expected.to_be_bytes(),
+            "big-endian Adler-32"
+        );
+
+        let raw = compress_all(6, -MAX_WBITS, Strategy::Default, DATA);
+        assert_eq!(out.len() - raw.len(), 6, "2 header + 4 trailer bytes");
+        assert_eq!(
+            &out[2..out.len() - 4],
+            raw.as_slice(),
+            "the payload is framing-independent"
+        );
+    }
+
+    /// RFC 1952 §2.3.1 stores CRC-32 then ISIZE least-significant byte first; C
+    /// writes eight explicit bytes (`deflate.c` L1269-L1276). The bare gzip
+    /// wrapper is a 10-byte header plus that 8-byte trailer.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn gzip_trailer_carries_crc32_then_isize_least_significant_byte_first() {
+        const DATA: &[u8] = b"gzip trailer: CRC-32 then ISIZE, little-endian";
+        let out = compress_all(6, MAX_WBITS + 16, Strategy::Default, DATA);
+        assert_eq!(&out[..3], &[0x1f, 0x8b, 0x08], "gzip magic bytes and CM");
+
+        let crc = crc32(0, DATA);
+        let end = out.len();
+        assert_eq!(
+            &out[end - 8..end - 4],
+            &crc.to_le_bytes(),
+            "little-endian CRC-32"
+        );
+        assert_eq!(
+            &out[end - 4..],
+            &(DATA.len() as u32).to_le_bytes(),
+            "little-endian ISIZE"
+        );
+
+        let raw = compress_all(6, -MAX_WBITS, Strategy::Default, DATA);
+        assert_eq!(out.len() - raw.len(), 18, "10 header + 8 trailer bytes");
+        assert_eq!(
+            &out[10..end - 8],
+            raw.as_slice(),
+            "the payload is framing-independent"
+        );
+    }
+
+    /// C tests `s->level == 0` **first** in its dispatch cascade (`deflate.c`
+    /// L1217-L1220), so level 0 stores regardless of strategy. The expected
+    /// bytes come from RFC 1951 §3.2.4: a final stored block is `01`, then LEN
+    /// and its ones-complement, each little-endian, then the literal bytes.
+    #[test]
+    fn level_zero_emits_stored_blocks_for_every_strategy() {
+        const DATA: &[u8] = b"stored block payload";
+        let len = DATA.len() as u16;
+        let mut expected = vec![0x01u8];
+        expected.extend_from_slice(&len.to_le_bytes());
+        expected.extend_from_slice(&(!len).to_le_bytes());
+        expected.extend_from_slice(DATA);
+
+        for strategy in [
+            Strategy::Default,
+            Strategy::Filtered,
+            Strategy::HuffmanOnly,
+            Strategy::Rle,
+            Strategy::Fixed,
+        ] {
+            let out = compress_all(0, -MAX_WBITS, strategy, DATA);
+            assert_eq!(
+                out, expected,
+                "level 0 must store regardless of {strategy:?}"
+            );
+        }
+    }
+
+    /// `Z_HUFFMAN_ONLY` and `Z_RLE` are tested before the per-level table
+    /// (`deflate.c` L1218-L1220), so at any non-zero level they select their own
+    /// producer and ignore the level's tuning row entirely — which makes their
+    /// output level-independent. The table producer does use the window, so it
+    /// compresses a repetitive input far better than a literals-only pass.
+    #[test]
+    fn strategy_overrides_the_per_level_producer_for_huffman_only_and_rle() {
+        const RUNS: &[u8] = b"aaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbaaaaaaaaaaaaaaaa";
+        for strategy in [Strategy::HuffmanOnly, Strategy::Rle] {
+            let first = compress_all(1, -MAX_WBITS, strategy, RUNS);
+            for level in 2..=9 {
+                assert_eq!(
+                    compress_all(level, -MAX_WBITS, strategy, RUNS),
+                    first,
+                    "{strategy:?} must ignore the level {level} tuning row"
+                );
+            }
+        }
+
+        let mut repeated: Vec<u8> = Vec::with_capacity(512);
+        while repeated.len() < 512 {
+            repeated.extend_from_slice(b"abcdefghijklmnop");
+        }
+        let huff = compress_all(9, -MAX_WBITS, Strategy::HuffmanOnly, &repeated);
+        let table = compress_all(9, -MAX_WBITS, Strategy::Default, &repeated);
+        assert!(
+            table.len() < huff.len(),
+            "the table producer ({} bytes) must beat literals-only ({} bytes)",
+            table.len(),
+            huff.len()
+        );
+    }
+}
