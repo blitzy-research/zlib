@@ -31,7 +31,7 @@
 //! multi-call `deflate` sequence is what keeps the emitted stream byte-identical
 //! to reference zlib. [`compress_bound`] reproduces the sizing formula bit-for-
 //! bit — including the saturate-to-maximum overflow behavior — because callers
-//! pre-allocate their output buffers against it (AAP §0.6.4, §0.7.1).
+//! pre-allocate their output buffers against it (AAP §0.6.4, §0.8.1 directive D-1).
 //!
 //! # Safety and portability
 //!
@@ -60,7 +60,7 @@ use crate::stream::ZStream;
 /// and trailer. The result is **bit-exact** with reference zlib for every input,
 /// so a caller that sizes its destination buffer to `compress_bound(n)` and then
 /// calls [`compress`] / [`compress2`] on `n` bytes is guaranteed enough space
-/// (AAP §0.6.4, §0.7.1).
+/// (AAP §0.6.4, §0.8.1 directive D-1).
 ///
 /// # Overflow
 ///
