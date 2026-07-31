@@ -4,14 +4,14 @@
 //! `gz*` functions declared in `zlib.h` (`gzopen`, `gzread`, `gzwrite`,
 //! `gzgets`, `gzclose`, …). Each shim validates raw C inputs, converts C
 //! strings / file descriptors into safe Rust types, bridges to the idiomatic
-//! [`crate::gz`] implementation, and translates the result back into the exact
+//! `crate::gz` implementation, and translates the result back into the exact
 //! integer / pointer sentinel a C caller expects.
 //!
 //! # Opaque handle model
 //!
 //! The public `gzFile` handle (`*mut gzFile_s`) is an *opaque* pointer to a
 //! `#[repr(C)]` `GzHandle` whose FIRST field is a live C-layout `gzFile_s`
-//! `{ have, next, pos }` prefix; the idiomatic [`GzState`] lives in its own
+//! `{ have, next, pos }` prefix; the idiomatic `GzState` lives in its own
 //! allocation behind the prefix. The handle is:
 //!
 //! * **open** — `Box::into_raw(Box::new(GzHandle { prefix, state })) as gzFile`
@@ -19,14 +19,33 @@
 //! * **operations** — the handle is *borrowed*, never owned, through a
 //!   `GzBorrow` guard that reconciles the prefix on entry and re-syncs it on
 //!   exit (see below). The box is not reconstructed.
-//! * **close** — the `Box<GzHandle>` is reconstructed *exactly once*
-//!   (`Box::from_raw(file as *mut GzHandle)`) and its inner `Box<GzState>` is
-//!   handed to the idiomatic close routine, which flushes/finishes writers,
-//!   emits the gzip trailer, frees buffers, and drops the owned
-//!   [`std::fs::File`]; the prefix is dropped with the handle.
+//! * **close** — the requested direction is checked first, through a *borrow*;
+//!   only if it matches is the `Box<GzHandle>` reconstructed, *exactly once*
+//!   (`take_for_close`). Its inner `Box<GzState>` then goes to the idiomatic
+//!   `gz::gzclose*_release` finalizer, which flushes/finishes writers, emits the
+//!   gzip trailer, frees buffers, and hands back the still-open
+//!   [`std::fs::File`]; the shim closes that descriptor itself so a failing
+//!   `close(2)` can be reported as `Z_ERRNO`, exactly as C does. The prefix drops
+//!   with the handle.
 //!
 //! This guarantees a sound lifecycle: one allocation on open, guarded borrows on
-//! every operation, one deallocation on close — no double-free, no leak.
+//! every operation, one deallocation on close — no double-free, no leak. The
+//! direction-before-ownership ordering is essential rather than stylistic: C
+//! tests `state->mode` *before* any `free`/`close` (`gzread.c` L650-L651,
+//! `gzwrite.c` L677-L678), so `gzclose_w` on a reader is a pure no-op and the
+//! caller may retry with `gzclose_r`. Reclaiming the box before that test would
+//! drop the allocation while the caller still held the pointer — a
+//! use-after-free on the next operation and a double-free on the retry.
+//!
+//! # Descriptor ownership across `gzdopen`
+//!
+//! `gzdopen` adopts a raw descriptor, so *when* it adopts is part of the ABI. C
+//! performs every mode-grammar rejection and every `malloc` before storing the
+//! descriptor in `state->fd` (`gzlib.c` L150-L197 and L206-L210 precede L263), so
+//! **no** `gzdopen` failure closes the caller's descriptor. This shim matches
+//! that: the mode is pre-validated before `File::from_raw_fd`, and an allocation
+//! failure after adoption releases the descriptor with `into_raw_fd` instead of
+//! closing it.
 //!
 //! # `gzgetc` / `gzgetc_` — live `gzFile_s` prefix
 //!
@@ -66,7 +85,7 @@
 //! error-returning variant is therefore the faithful, in-contract choice.
 //!
 //! Rust consumers have **no** functional gap: the idiomatic
-//! [`crate::gz::gzprintf`] / [`crate::gz::gzvprintf`] accept
+//! `crate::gz::gzprintf` / `crate::gz::gzvprintf` accept
 //! [`core::fmt::Arguments`] (via [`format_args!`]) and perform full formatted
 //! output. **Every other** `gz*` symbol is fully functional through the C ABI.
 //!
@@ -85,14 +104,39 @@
 //!
 //! # Feature gating & safety
 //!
-//! The entire module is compiled only when the `gz-io` feature is enabled
-//! (`gz-io` implies `std`, required for [`std::fs::File`] I/O, [`CStr`], and
-//! `from_raw_fd`). That gate lives on the `#[cfg(feature = "gz-io")] pub mod gz;`
-//! declaration in `src/ffi/mod.rs`, which is the only path by which this file is
-//! reached; it is deliberately **not** repeated as a module-level `#![cfg(…)]`
-//! here, because an inner `cfg` duplicating the one on the `mod` declaration is
-//! reported as a `clippy::duplicated_attributes` error by the Clippy shipped
-//! with the pinned MSRV toolchain (see `rust-toolchain.toml`).
+//! **This module is compiled unconditionally, and every one of its 34
+//! `#[unsafe(no_mangle)]` entry points is emitted in every Cargo feature
+//! configuration** — the emitted `cdylib`/`staticlib` must present the complete
+//! zlib C symbol table regardless of how the crate was configured (AAP §0.3.1,
+//! §0.8.1 D-4). A C consumer links against one ABI; a build that dropped
+//! `gzbuffer` or `gzclose_r` would be *unlinkable*, not merely reduced.
+//!
+//! The `gz-io` feature (which implies `std`, required for `std::fs::File` I/O,
+//! `CStr`, and `from_raw_fd`) therefore gates each function **body**, never the
+//! `mod` declaration and never an exported item:
+//!
+//! * **With `gz-io`** — every shim bridges to `crate::gz` and reproduces the C
+//!   behaviour exactly.
+//! * **Without `gz-io`** — every shim still exists with its exact C signature and
+//!   returns that entry point's documented failure sentinel: `NULL` for the
+//!   pointer-returning `gzopen`/`gzopen64`/`gzdopen`/`gzgets`/`gzerror` family,
+//!   `-1` for `gzbuffer`/`gzread`/`gzgetc`/`gzgetc_`/`gzungetc`/`gzputc`/
+//!   `gzputs`/`gzrewind`/`gzseek`/`gzseek64`/`gztell`/`gztell64`/`gzoffset`/
+//!   `gzoffset64`, `0` for `gzwrite`/`gzeof`/`gzdirect` and the
+//!   `z_size_t`-returning `gzfread`/`gzfwrite`, `Z_STREAM_ERROR` for
+//!   `gzsetparams`/`gzflush`/`gzclose`/`gzclose_r`/`gzclose_w`, and a no-op for
+//!   the `void`-returning `gzclearerr`. This is the same discipline as the
+//!   `gzprintf`/`gzvprintf` concession above: the symbol resolves and the failure
+//!   is observable through the return value instead of at link time.
+//!
+//! Only the `std`-dependent *internals* — the `GzHandle`/`GzBorrow` ownership
+//! types, the boxing and close plumbing, the platform `close(2)` binding, and the
+//! path conversion — carry `#[cfg(feature = "gz-io")]`, so a
+//! `--no-default-features` build compiles no unreachable machinery while still
+//! emitting every symbol. `src/ffi/mod.rs` pins both halves of this contract with
+//! `no_exported_gz_symbol_is_feature_gated` (no `cfg` may reach an exported item)
+//! and `every_exported_c_symbol_resolves_to_a_live_address` (each of the 95
+//! exports is a live, distinct address in the row under test).
 //!
 //! This module is part of `src/ffi/**`, the crate's designated `unsafe`
 //! boundary: every `unsafe` block carries a `// SAFETY:` justification, and no
@@ -109,16 +153,30 @@
 // here.
 #![allow(clippy::missing_safety_doc)]
 
-use core::ffi::{CStr, c_char, c_int, c_uint};
-use core::{ptr, slice};
-
-use alloc::boxed::Box;
-
-#[cfg(unix)]
-use std::os::fd::FromRawFd;
+use core::ffi::{c_char, c_int, c_uint};
+use core::ptr;
 
 use crate::error::ReturnCode;
 use crate::ffi::types::*;
+
+// Everything below is needed only by the gzip file-I/O *implementation*, which is
+// compiled when `gz-io` is enabled. The `extern "C"` entry points themselves are
+// always compiled (see the module docs), so their signatures depend on nothing
+// gated here.
+#[cfg(feature = "gz-io")]
+use core::ffi::CStr;
+#[cfg(feature = "gz-io")]
+use core::slice;
+
+#[cfg(feature = "gz-io")]
+use alloc::boxed::Box;
+
+#[cfg(all(unix, feature = "gz-io"))]
+use std::os::fd::FromRawFd;
+
+#[cfg(all(unix, feature = "gz-io"))]
+use crate::gz::GzFile;
+#[cfg(feature = "gz-io")]
 use crate::gz::{self, GzMode, GzState};
 
 // ===========================================================================
@@ -135,6 +193,10 @@ use crate::gz::{self, GzMode, GzState};
 const Z_OK: c_int = ReturnCode::Ok.as_c_int();
 /// `Z_STREAM_ERROR` (`-2`) — inconsistent stream / invalid handle.
 const Z_STREAM_ERROR: c_int = ReturnCode::StreamError.as_c_int();
+/// `Z_ERRNO` (`-1`) — an OS-level error; the code the C finalizers return when
+/// `close(state->fd)` fails (`gzread.c` L665-L667, `gzwrite.c` L695-L696).
+#[allow(dead_code)]
+const Z_ERRNO: c_int = ReturnCode::ErrNo.as_c_int();
 
 // ===========================================================================
 // Local helpers
@@ -146,6 +208,7 @@ const Z_STREAM_ERROR: c_int = ReturnCode::StreamError.as_c_int();
 /// `usize` variant, so this mirrors the same catch-and-default behavior for
 /// [`z_size_t`]. `gz-io` implies `std`, so [`std::panic::catch_unwind`] is
 /// always available here.
+#[cfg(feature = "gz-io")]
 #[inline]
 fn guard_size(
     default: z_size_t,
@@ -155,6 +218,7 @@ fn guard_size(
 }
 
 /// Panic guard for the sole `*const c_char`-returning shim (`gzerror`).
+#[cfg(feature = "gz-io")]
 #[inline]
 fn guard_const_ptr<T>(
     default: *const T,
@@ -175,6 +239,7 @@ fn guard_const_ptr<T>(
 ///
 /// `path` must be non-null and point to a NUL-terminated C string that remains
 /// valid for the duration of the call.
+#[cfg(feature = "gz-io")]
 #[cfg(unix)]
 unsafe fn cpath_to_pathbuf(path: *const c_char) -> Option<std::path::PathBuf> {
     use std::os::unix::ffi::OsStrExt;
@@ -190,6 +255,7 @@ unsafe fn cpath_to_pathbuf(path: *const c_char) -> Option<std::path::PathBuf> {
 /// # Safety
 ///
 /// See the Unix variant: `path` must be non-null and NUL-terminated.
+#[cfg(feature = "gz-io")]
 #[cfg(not(unix))]
 unsafe fn cpath_to_pathbuf(path: *const c_char) -> Option<std::path::PathBuf> {
     // SAFETY: the caller guarantees `path` is non-null and NUL-terminated.
@@ -219,6 +285,7 @@ unsafe fn cpath_to_pathbuf(path: *const c_char) -> Option<std::path::PathBuf> {
 /// [`gzFile_s`] prefix (offset 0) is what the C `gzgetc(g)` macro reads and
 /// mutates. The idiomatic [`GzState`] lives in its own allocation behind a
 /// `Box`; only the prefix is ABI-visible.
+#[cfg(feature = "gz-io")]
 #[repr(C)]
 struct GzHandle {
     /// C `gzFile_s` prefix consumed by the `gzgetc(g)` macro fast-path. MUST be
@@ -228,6 +295,7 @@ struct GzHandle {
     state: Box<GzState>,
 }
 
+#[cfg(feature = "gz-io")]
 impl GzHandle {
     /// Absorbs any bytes the C `gzgetc(g)` macro consumed directly from the
     /// prefix since the last [`sync`](Self::sync), advancing the idiomatic cursor
@@ -285,6 +353,7 @@ impl GzHandle {
 /// `gzopen*`/`gzdopen`) and not yet closed. Because [`gzFile_s`] is the first
 /// field of the `#[repr(C)]` [`GzHandle`], the `gzFile` pointer has the same
 /// address as the `GzHandle`.
+#[cfg(feature = "gz-io")]
 #[inline]
 unsafe fn gz_handle<'a>(file: gzFile) -> &'a mut GzHandle {
     // SAFETY: per the contract `file` points at a live `GzHandle` (prefix at
@@ -297,10 +366,12 @@ unsafe fn gz_handle<'a>(file: gzFile) -> &'a mut GzHandle {
 /// creation (absorbing any `gzgetc` macro consumption) and
 /// [`sync`](GzHandle::sync)s on drop (re-exposing the read buffer). Dereferences
 /// to [`GzState`] so existing shim bodies are unchanged.
+#[cfg(feature = "gz-io")]
 struct GzBorrow<'a> {
     handle: &'a mut GzHandle,
 }
 
+#[cfg(feature = "gz-io")]
 impl<'a> GzBorrow<'a> {
     #[inline]
     fn new(handle: &'a mut GzHandle) -> Self {
@@ -309,6 +380,7 @@ impl<'a> GzBorrow<'a> {
     }
 }
 
+#[cfg(feature = "gz-io")]
 impl Drop for GzBorrow<'_> {
     #[inline]
     fn drop(&mut self) {
@@ -316,6 +388,7 @@ impl Drop for GzBorrow<'_> {
     }
 }
 
+#[cfg(feature = "gz-io")]
 impl core::ops::Deref for GzBorrow<'_> {
     type Target = GzState;
     #[inline]
@@ -324,6 +397,7 @@ impl core::ops::Deref for GzBorrow<'_> {
     }
 }
 
+#[cfg(feature = "gz-io")]
 impl core::ops::DerefMut for GzBorrow<'_> {
     #[inline]
     fn deref_mut(&mut self) -> &mut GzState {
@@ -331,10 +405,259 @@ impl core::ops::DerefMut for GzBorrow<'_> {
     }
 }
 
+/// Which open direction a close entry point requires of its handle.
+///
+/// Mirrors the `state->mode` test each C finalizer performs **before** it frees
+/// or closes anything (`gzread.c` L650-L651, `gzwrite.c` L677-L678); see
+/// [`take_for_close`].
+#[cfg(feature = "gz-io")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CloseDirection {
+    /// `gzclose` — dispatches on the mode rather than demanding one, so any live
+    /// direction is acceptable (`gzclose.c` L11-L23).
+    Either,
+    /// `gzclose_r` — requires [`GzMode::Read`].
+    Read,
+    /// `gzclose_w` — requires [`GzMode::Write`].
+    Write,
+}
+
+/// Reads the open direction of the handle behind `file` through a **borrow** and,
+/// only if it matches `want`, reclaims the owning `Box<GzHandle>`.
+///
+/// # Why the ordering matters
+///
+/// Every C finalizer tests `state->mode` before it frees or closes anything:
+///
+/// ```c
+/// if (state->mode != GZ_READ) return Z_STREAM_ERROR;   /* gzread.c  L650-L651 */
+/// if (state->mode != GZ_WRITE) return Z_STREAM_ERROR;  /* gzwrite.c L677-L678 */
+/// ```
+///
+/// A wrong-direction close is therefore a **pure no-op** in C: nothing is freed,
+/// the descriptor stays open, and the caller still holds a fully live `gzFile` it
+/// can retry with the correct closer — verified against reference zlib, which
+/// answers `gzclose_w` on a reader with `Z_STREAM_ERROR` any number of times and
+/// then still completes a `gzclose_r` with `Z_OK`.
+///
+/// Reconstructing the `Box` *before* the direction test would hand ownership to a
+/// function that may reject the call, dropping the allocation while the caller
+/// still holds the pointer — a use-after-free on the next operation and a
+/// double-free on the retry with the correct closer (CWE-416, CWE-415). Taking
+/// the box only after the direction matches removes that window entirely: on
+/// refusal nothing is consumed and exactly one live handle remains.
+///
+/// The direction is read through a short-lived shared borrow rather than a
+/// [`GzBorrow`] guard, because `GzBorrow` reconciles and then clears the
+/// [`gzFile_s`] prefix. C mutates nothing on a refused close, so the prefix — and
+/// with it the `gzgetc` macro fast path — must survive a rejection untouched.
+///
+/// # Safety
+///
+/// `file` must be a non-null handle produced by [`box_state`] and not yet closed.
+/// On `Some`, ownership transfers to the caller and `file` is dangling; on `None`
+/// the handle is untouched and remains valid.
+#[cfg(feature = "gz-io")]
+#[inline]
+unsafe fn take_for_close(file: gzFile, want: CloseDirection) -> Option<Box<GzHandle>> {
+    // SAFETY: per the contract `file` points at a live `GzHandle` whose
+    // `gzFile_s` prefix sits at offset 0, so the cast is the identity on the
+    // address. The place expression borrows the handle (and, through its `Box`,
+    // the `GzState`) only for this statement and copies the `GzMode` out, so no
+    // reference outlives the read and none is live when the box is reclaimed
+    // below. Nothing is mutated, so a rejected close leaves the handle — prefix
+    // included — bit-for-bit as C leaves it.
+    let mode = unsafe { (*(file as *const GzHandle)).state.mode };
+
+    let matches = match want {
+        // `gzclose` has no mode test of its own; it dispatches with
+        // `state->mode == GZ_READ ? gzclose_r(file) : gzclose_w(file)`. Both
+        // arms then apply their own test, so a handle in neither direction is
+        // rejected by the callee without being freed. Screening for a live
+        // direction here reproduces that outcome without consuming the handle.
+        CloseDirection::Either => matches!(mode, GzMode::Read | GzMode::Write),
+        CloseDirection::Read => mode == GzMode::Read,
+        CloseDirection::Write => mode == GzMode::Write,
+    };
+
+    if !matches {
+        return None;
+    }
+
+    // SAFETY: `file` came from `Box::into_raw(Box<GzHandle>)` in `box_state` and
+    // has not been closed, so reconstructing the box reclaims that exact
+    // allocation. The direction matched, so the finalizer this feeds cannot
+    // refuse the handle, and the box is therefore consumed exactly once.
+    Some(unsafe { Box::from_raw(file as *mut GzHandle) })
+}
+
+// -- platform-close-failure seam --------------------------------------------
+
+#[cfg(feature = "gz-io")]
+#[cfg(test)]
+std::thread_local! {
+    /// When set, [`platform_close`] reports failure without consulting the OS,
+    /// driving the `Z_ERRNO` arm of [`finish_close`].
+    ///
+    /// Reference zlib turns a failing `close(2)` into `Z_ERRNO`
+    /// (`gzread.c` L665-L667, `gzwrite.c` L695-L696) — a path no ordinary
+    /// in-process test can reach, because a descriptor a live `File` owns is by
+    /// construction closable. The C conformance harness provokes it by stealing
+    /// the descriptor behind the library's back; this seam reproduces the outcome
+    /// deterministically instead.
+    ///
+    /// Thread-local because the harness runs each `#[test]` on its own thread, so
+    /// concurrently running tests cannot observe one another's flag. Compiled out
+    /// of every shipped artifact.
+    static FORCE_CLOSE_FAILURE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Runs `body` with the platform-close-failure seam armed, clearing it again
+/// afterwards even if `body` panics.
+#[cfg(feature = "gz-io")]
+#[cfg(test)]
+fn with_forced_close_failure<R>(body: impl FnOnce() -> R) -> R {
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            FORCE_CLOSE_FAILURE.set(false);
+        }
+    }
+    FORCE_CLOSE_FAILURE.set(true);
+    let _disarm = Disarm;
+    body()
+}
+
+// POSIX `close(2)`. Declared directly rather than pulled from a `libc` crate to
+// preserve the zero-C-dependency rule (AAP §0.5.2): this is a link-time
+// reference to the platform C runtime that `std` already links, not a new crate
+// dependency. It is the counterpart of the `malloc`/`free` declarations in
+// `src/ffi/alloc.rs`.
+#[cfg(feature = "gz-io")]
+#[cfg(unix)]
+unsafe extern "C" {
+    /// Closes a file descriptor, returning `0` on success and `-1` on failure.
+    fn close(fd: c_int) -> c_int;
+}
+
+// Win32 `CloseHandle`. A Rust `File` owns a `HANDLE` (not a CRT `int fd`) on
+// Windows, so the observable close result comes from `CloseHandle`, which returns
+// a non-zero `BOOL` on success.
+#[cfg(feature = "gz-io")]
+#[cfg(windows)]
+unsafe extern "system" {
+    /// Closes an open object handle; non-zero on success.
+    fn CloseHandle(handle: *mut core::ffi::c_void) -> c_int;
+}
+
+/// Closes `file`'s descriptor and reports whether the platform close succeeded.
+///
+/// This is the `unsafe` half of the C `close(state->fd)` step that
+/// [`crate::gz::gzclose_r_release`] and [`crate::gz::gzclose_w_release`]
+/// deliberately leave undone: [`std::fs::File`]'s [`Drop`] discards the result,
+/// but zlib reports a failure as [`Z_ERRNO`], so the descriptor must be closed
+/// explicitly to observe it.
+///
+/// Returns `true` on success, `false` if the platform reported an error.
+#[cfg(feature = "gz-io")]
+#[cfg(unix)]
+fn platform_close(file: std::fs::File) -> bool {
+    #[cfg(test)]
+    if FORCE_CLOSE_FAILURE.get() {
+        // Still release the descriptor — a leaked fd would destabilise the rest
+        // of the suite — then report the failure C would have reported.
+        drop(file);
+        return false;
+    }
+
+    use std::os::fd::IntoRawFd;
+
+    // Take the raw descriptor so `File`'s `Drop` does not also close it: a double
+    // close could shut a descriptor another thread has since been handed.
+    let fd = file.into_raw_fd();
+
+    // SAFETY: `fd` was just released from a live `File`, so it is a valid open
+    // descriptor that nothing else owns, and `close(2)` is safe to call on it
+    // exactly once. Ownership ended with `into_raw_fd`, so no Rust destructor
+    // will close it again.
+    unsafe { close(fd) == 0 }
+}
+
+/// Windows counterpart of [`platform_close`], using `CloseHandle` on the `HANDLE`
+/// a [`std::fs::File`] owns.
+#[cfg(feature = "gz-io")]
+#[cfg(windows)]
+fn platform_close(file: std::fs::File) -> bool {
+    #[cfg(test)]
+    if FORCE_CLOSE_FAILURE.get() {
+        drop(file);
+        return false;
+    }
+
+    use std::os::windows::io::IntoRawHandle;
+
+    // Take the raw handle so `File`'s `Drop` does not also close it.
+    let handle = file.into_raw_handle();
+
+    // SAFETY: `handle` was just released from a live `File`, so it is a valid
+    // open object handle that nothing else owns, and `CloseHandle` is safe to
+    // call on it exactly once. Ownership ended with `into_raw_handle`, so no Rust
+    // destructor will close it again.
+    unsafe { CloseHandle(handle) != 0 }
+}
+
+/// Fallback [`platform_close`] for targets that are neither Unix nor Windows,
+/// where `std` exposes no way to observe the platform close result. The handle is
+/// closed by [`Drop`] and success is reported, matching the pre-existing
+/// behaviour on such targets.
+#[cfg(feature = "gz-io")]
+#[cfg(not(any(unix, windows)))]
+fn platform_close(file: std::fs::File) -> bool {
+    #[cfg(test)]
+    if FORCE_CLOSE_FAILURE.get() {
+        drop(file);
+        return false;
+    }
+
+    drop(file);
+    true
+}
+
+/// Applies zlib's close-result precedence to the `(status, descriptor)` pair a
+/// `gz::gzclose*_release` finalizer produced.
+///
+/// C spells the rule two ways that mean the same thing — `gzclose_w` writes
+/// `if (close(state->fd) == -1) ret = Z_ERRNO;` before `return ret`
+/// (`gzwrite.c` L695-L696), letting a close failure override the accumulated
+/// flush status, and `gzclose_r` writes `return ret ? Z_ERRNO : err;`
+/// (`gzread.c` L665-L667). Either way: a failing close yields
+/// [`Z_ERRNO`](crate::error::ReturnCode::ErrNo) and a succeeding one yields the
+/// accumulated status.
+///
+/// `None` means the finalizer refused the handle (wrong direction) and released
+/// no descriptor, so `status` — `Z_STREAM_ERROR` — passes through unchanged.
+#[cfg(feature = "gz-io")]
+#[inline]
+fn finish_close(status: c_int, released: Option<std::fs::File>) -> c_int {
+    match released {
+        // C `close(state->fd)`: a failure becomes `Z_ERRNO`, a success leaves the
+        // accumulated status in place.
+        Some(file) => {
+            if platform_close(file) {
+                status
+            } else {
+                ReturnCode::ErrNo.as_c_int()
+            }
+        }
+        None => status,
+    }
+}
+
 /// Boxes an idiomatic open result into the opaque `gzFile` handle, translating
 /// failure into the C `NULL` sentinel. The handle is a [`GzHandle`] whose
 /// leading [`gzFile_s`] prefix starts cleared (`have = 0`), so the `gzgetc`
 /// macro falls through to the real function until the first read populates it.
+#[cfg(feature = "gz-io")]
 #[inline]
 fn box_state(result: Result<Box<GzState>, ReturnCode>) -> gzFile {
     match result {
@@ -373,21 +696,30 @@ fn box_state(result: Result<Box<GzState>, ReturnCode>) -> gzFile {
 /// failure (including a null `path`/`mode` or a non-decodable path).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzopen(path: *const c_char, mode: *const c_char) -> gzFile {
-    guard_ptr(ptr::null_mut(), || -> gzFile {
-        if path.is_null() || mode.is_null() {
-            return ptr::null_mut();
-        }
-        // SAFETY: `path` is non-null (checked) and, per the C contract, a
-        // caller-owned NUL-terminated string valid for this call.
-        let Some(pathbuf) = (unsafe { cpath_to_pathbuf(path) }) else {
-            return ptr::null_mut();
-        };
-        // SAFETY: `mode` is non-null (checked) and NUL-terminated.
-        let Ok(mode_str) = (unsafe { CStr::from_ptr(mode) }).to_str() else {
-            return ptr::null_mut();
-        };
-        box_state(gz::gzopen(pathbuf, mode_str))
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (path, mode);
+        ptr::null_mut()
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_ptr(ptr::null_mut(), || -> gzFile {
+            if path.is_null() || mode.is_null() {
+                return ptr::null_mut();
+            }
+            // SAFETY: `path` is non-null (checked) and, per the C contract, a
+            // caller-owned NUL-terminated string valid for this call.
+            let Some(pathbuf) = (unsafe { cpath_to_pathbuf(path) }) else {
+                return ptr::null_mut();
+            };
+            // SAFETY: `mode` is non-null (checked) and NUL-terminated.
+            let Ok(mode_str) = (unsafe { CStr::from_ptr(mode) }).to_str() else {
+                return ptr::null_mut();
+            };
+            box_state(gz::gzopen(pathbuf, mode_str))
+        })
+    }
 }
 
 /// `gzFile gzopen64(const char *path, const char *mode)`
@@ -397,60 +729,154 @@ pub unsafe extern "C" fn gzopen(path: *const c_char, mode: *const c_char) -> gzF
 /// [`gzopen`] on this platform).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzopen64(path: *const c_char, mode: *const c_char) -> gzFile {
-    guard_ptr(ptr::null_mut(), || -> gzFile {
-        if path.is_null() || mode.is_null() {
-            return ptr::null_mut();
-        }
-        // SAFETY: `path` is non-null (checked) and NUL-terminated.
-        let Some(pathbuf) = (unsafe { cpath_to_pathbuf(path) }) else {
-            return ptr::null_mut();
-        };
-        // SAFETY: `mode` is non-null (checked) and NUL-terminated.
-        let Ok(mode_str) = (unsafe { CStr::from_ptr(mode) }).to_str() else {
-            return ptr::null_mut();
-        };
-        box_state(gz::gzopen64(pathbuf, mode_str))
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (path, mode);
+        ptr::null_mut()
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_ptr(ptr::null_mut(), || -> gzFile {
+            if path.is_null() || mode.is_null() {
+                return ptr::null_mut();
+            }
+            // SAFETY: `path` is non-null (checked) and NUL-terminated.
+            let Some(pathbuf) = (unsafe { cpath_to_pathbuf(path) }) else {
+                return ptr::null_mut();
+            };
+            // SAFETY: `mode` is non-null (checked) and NUL-terminated.
+            let Ok(mode_str) = (unsafe { CStr::from_ptr(mode) }).to_str() else {
+                return ptr::null_mut();
+            };
+            box_state(gz::gzopen64(pathbuf, mode_str))
+        })
+    }
 }
 
 /// `gzFile gzdopen(int fd, const char *mode)`  *(Unix)*
 ///
-/// Associates a `gz*` stream with an already-open file descriptor. Ownership of
-/// `fd` is **transferred**: it is adopted by a [`File`], so it is closed by
-/// [`gzclose`] on success and by that transient [`File`]'s [`Drop`] if the open
-/// fails.
+/// Associates a `gz*` stream with an already-open file descriptor. On **success**
+/// ownership of `fd` transfers to the returned handle, which closes it in
+/// [`gzclose`]/[`gzclose_r`]/[`gzclose_w`].
 ///
-/// This differs from C on the failure path. C `gzdopen` builds its own path
-/// string and calls `gz_open`, which never closes the caller's descriptor, so a
-/// C caller may retry or `close(fd)` itself after a failure. Here the descriptor
-/// is already owned by a [`File`] before the open is attempted, so a failure
-/// closes it. It is an implementation consequence of RAII descriptor ownership,
-/// recorded here so callers do not double-close; it is not one of the deliberate
-/// divergences enumerated in AAP §0.8.2.
+/// On **failure the caller keeps `fd`**, open and usable, exactly as in C. C
+/// `gzdopen` builds a `<fd:N>` path string and calls `gz_open`, which performs
+/// every mode-grammar rejection and its own `malloc` before it ever stores the
+/// descriptor in `state->fd` (`gzlib.c` L150-L197 and L206-L210 precede L263), so
+/// no C failure path closes the caller's descriptor and a C caller may retry or
+/// `close(fd)` itself. This shim reproduces that contract on every failure path:
 ///
-/// Returns `NULL` for a null `mode` or a negative `fd`. Every such early
-/// rejection — negative `fd`, null `mode`, and a non-UTF-8 `mode` — happens
-/// *before* `File::from_raw_fd`, so in those cases the descriptor is never
-/// adopted and never closed.
+/// * a negative `fd`, a null `mode`, and a non-UTF-8 `mode` are rejected before
+///   `File::from_raw_fd`, so the descriptor is never adopted;
+/// * an **invalid mode string** (`"r+"`, `"rT"`, `"wG"`, a string with no
+///   `r`/`w`/`a`, …) is rejected by `crate::gz::validate_mode`, also before
+///   adoption — this is the check C performs at `gzlib.c` L150-L197; and
+/// * if the handle allocation fails after adoption, the descriptor is released
+///   back to the OS-owned world with `into_raw_fd` rather than closed — the
+///   analogue of C's `malloc` failure at `gzlib.c` L206-L210, which likewise
+///   leaves `fd` open.
+///
+/// Returns `NULL` on any of those failures.
 ///
 /// [`File`]: std::fs::File
 #[cfg(unix)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzdopen(fd: c_int, mode: *const c_char) -> gzFile {
-    guard_ptr(ptr::null_mut(), || -> gzFile {
-        if mode.is_null() || fd < 0 {
-            return ptr::null_mut();
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (fd, mode);
+        ptr::null_mut()
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_ptr(ptr::null_mut(), || -> gzFile {
+            if mode.is_null() || fd < 0 {
+                return ptr::null_mut();
+            }
+            // SAFETY: `mode` is non-null (checked) and NUL-terminated.
+            let Ok(mode_str) = (unsafe { CStr::from_ptr(mode) }).to_str() else {
+                return ptr::null_mut();
+            };
+            // C `gz_open` validates the whole mode grammar before it takes the
+            // caller's descriptor, so every rejection must happen while `fd` is still
+            // the caller's. Adopting first and letting the open fail would close a
+            // descriptor C leaves open — an ownership divergence a C caller cannot
+            // detect and that turns its own later `close(fd)` into a double close.
+            if gz::validate_mode(mode_str).is_err() {
+                return ptr::null_mut();
+            }
+            // SAFETY: the caller transfers ownership of `fd`, a valid open OS file
+            // descriptor (negatives rejected above). Adoption happens only now, with
+            // the mode already proven acceptable, so the remaining failure mode is an
+            // exhausted heap — handled by releasing the descriptor below rather than
+            // closing it.
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            dopen_state(gz::gzdopen(file, mode_str))
+        })
+    }
+}
+
+/// [`box_state`] for the `gzdopen` path: identical on success, but an allocation
+/// failure **releases** the adopted descriptor instead of closing it.
+///
+/// C reaches its `malloc` failures (`gzlib.c` L206-L210 and the `state->path`
+/// allocation) before `state->fd = fd`, so no allocation failure in `gzdopen`
+/// closes the caller's descriptor. Here the descriptor is already inside a
+/// [`std::fs::File`] whose [`Drop`] *would* close it, so it is lifted out of the
+/// state before the fallible boxing and only put back once that boxing has
+/// succeeded. If the boxing fails the descriptor is handed back to the OS-owned
+/// world with `into_raw_fd`, deliberately leaving it open for the caller —
+/// precisely what "the caller still owns `fd`" means — while the rest of the
+/// state drops, matching C's `free(state)`.
+#[cfg(feature = "gz-io")]
+#[cfg(unix)]
+fn dopen_state(result: Result<Box<GzState>, ReturnCode>) -> gzFile {
+    // The mode was pre-validated and the descriptor already adopted, so `Err`
+    // here is unreachable in practice. Should it ever occur, the `GzState` was
+    // never constructed and the transient `File` has already been dropped by
+    // `gz_open`, so there is nothing left to release.
+    let Ok(mut state) = result else {
+        return ptr::null_mut();
+    };
+
+    // Lift the descriptor out so the fallible boxing below cannot close it. This
+    // is what makes the ownership transfer atomic with respect to success: until
+    // the handle exists, nothing that can be dropped owns the caller's `fd`.
+    let released = state.file.release();
+
+    let handle = GzHandle {
+        prefix: gzFile_s {
+            have: 0,
+            next: ptr::null_mut(),
+            pos: 0,
+        },
+        state,
+    };
+
+    match crate::ffi::alloc::try_box(handle) {
+        Some(mut boxed) => {
+            // The handle exists; ownership of the descriptor now transfers to it,
+            // to be closed by `gzclose`/`gzclose_r`/`gzclose_w`.
+            if let Some(file) = released {
+                boxed.state.file = GzFile::new(file);
+            }
+            Box::into_raw(boxed) as gzFile
         }
-        // SAFETY: `mode` is non-null (checked) and NUL-terminated.
-        let Ok(mode_str) = (unsafe { CStr::from_ptr(mode) }).to_str() else {
-            return ptr::null_mut();
-        };
-        // SAFETY: the caller transfers ownership of `fd`, a valid open OS file
-        // descriptor (negatives rejected above). The resulting `File` owns the
-        // descriptor and closes it on drop or via `gzclose`.
-        let file = unsafe { std::fs::File::from_raw_fd(fd) };
-        box_state(gz::gzdopen(file, mode_str))
-    })
+        None => {
+            // Allocation failed. C never got this far with the descriptor, so
+            // give it back to the caller unclosed: `into_raw_fd` dissolves the
+            // `File` without closing, leaving `fd` exactly as the caller passed
+            // it. `handle` (and with it the buffers) drops here — C's
+            // `free(state)`.
+            if let Some(file) = released {
+                use std::os::fd::IntoRawFd;
+                let _ = file.into_raw_fd();
+            }
+            ptr::null_mut()
+        }
+    }
 }
 
 /// `gzFile gzdopen(int fd, const char *mode)`  *(non-Unix fallback)*
@@ -472,15 +898,24 @@ pub unsafe extern "C" fn gzdopen(_fd: c_int, _mode: *const c_char) -> gzFile {
 /// enforces the ordering) or for a null handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzbuffer(file: gzFile, size: c_uint) -> c_int {
-    guard_int(-1, || {
-        if file.is_null() {
-            return -1;
-        }
-        // SAFETY: non-null handle from `gzopen*`/`gzdopen`; borrowed, not owned.
-        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &mut *guard;
-        gz::gzbuffer(state, size)
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file, size);
+        -1
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_int(-1, || {
+            if file.is_null() {
+                return -1;
+            }
+            // SAFETY: non-null handle from `gzopen*`/`gzdopen`; borrowed, not owned.
+            let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &mut *guard;
+            gz::gzbuffer(state, size)
+        })
+    }
 }
 
 /// `int gzsetparams(gzFile file, int level, int strategy)`
@@ -490,15 +925,24 @@ pub unsafe extern "C" fn gzbuffer(file: gzFile, size: c_uint) -> c_int {
 /// null handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzsetparams(file: gzFile, level: c_int, strategy: c_int) -> c_int {
-    guard_int(Z_STREAM_ERROR, || {
-        if file.is_null() {
-            return Z_STREAM_ERROR;
-        }
-        // SAFETY: non-null handle; borrowed, not owned.
-        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &mut *guard;
-        gz::gzsetparams(state, level, strategy)
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file, level, strategy);
+        Z_STREAM_ERROR
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_int(Z_STREAM_ERROR, || {
+            if file.is_null() {
+                return Z_STREAM_ERROR;
+            }
+            // SAFETY: non-null handle; borrowed, not owned.
+            let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &mut *guard;
+            gz::gzsetparams(state, level, strategy)
+        })
+    }
 }
 
 // ===========================================================================
@@ -511,18 +955,27 @@ pub unsafe extern "C" fn gzsetparams(file: gzFile, level: c_int, strategy: c_int
 /// actually read (`0` at end of file), or `-1` on error or a null handle/buffer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzread(file: gzFile, buf: voidp, len: c_uint) -> c_int {
-    guard_int(-1, || {
-        if file.is_null() || buf.is_null() {
-            return -1;
-        }
-        // SAFETY: non-null handle; borrowed, not owned.
-        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &mut *guard;
-        // SAFETY: `buf` is non-null (checked) and, per the C contract, valid for
-        // writes of `len` bytes.
-        let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
-        gz::gzread(state, out)
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file, buf, len);
+        -1
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_int(-1, || {
+            if file.is_null() || buf.is_null() {
+                return -1;
+            }
+            // SAFETY: non-null handle; borrowed, not owned.
+            let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &mut *guard;
+            // SAFETY: `buf` is non-null (checked) and, per the C contract, valid for
+            // writes of `len` bytes.
+            let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
+            gz::gzread(state, out)
+        })
+    }
 }
 
 /// `z_size_t gzfread(voidp buf, z_size_t size, z_size_t nitems, gzFile file)`
@@ -538,34 +991,43 @@ pub unsafe extern "C" fn gzfread(
     nitems: z_size_t,
     file: gzFile,
 ) -> z_size_t {
-    guard_size(0, || {
-        if file.is_null() {
-            return 0;
-        }
-        // SAFETY: non-null handle; borrowed, not owned.
-        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &mut *guard;
-        let Some(len) = size.checked_mul(nitems) else {
-            // Overflow: let the idiomatic layer record Z_STREAM_ERROR and
-            // return 0 (an empty slice cannot itself trigger a read).
-            return gz::gzfread(state, &mut [], size, nitems);
-        };
-        if len == 0 {
-            // Zero-length request (size == 0 or nitems == 0): drive the
-            // idiomatic checks with an empty slice; `buf` may legitimately be
-            // null in this case.
-            return gz::gzfread(state, &mut [], size, nitems);
-        }
-        if buf.is_null() {
-            // Non-zero length with no destination: decline safely rather than
-            // constructing a slice over a null pointer.
-            return 0;
-        }
-        // SAFETY: `buf` is non-null (checked) and valid for `len` bytes;
-        // `len == size * nitems` did not overflow.
-        let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
-        gz::gzfread(state, out, size, nitems)
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (buf, size, nitems, file);
+        0
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_size(0, || {
+            if file.is_null() {
+                return 0;
+            }
+            // SAFETY: non-null handle; borrowed, not owned.
+            let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &mut *guard;
+            let Some(len) = size.checked_mul(nitems) else {
+                // Overflow: let the idiomatic layer record Z_STREAM_ERROR and
+                // return 0 (an empty slice cannot itself trigger a read).
+                return gz::gzfread(state, &mut [], size, nitems);
+            };
+            if len == 0 {
+                // Zero-length request (size == 0 or nitems == 0): drive the
+                // idiomatic checks with an empty slice; `buf` may legitimately be
+                // null in this case.
+                return gz::gzfread(state, &mut [], size, nitems);
+            }
+            if buf.is_null() {
+                // Non-zero length with no destination: decline safely rather than
+                // constructing a slice over a null pointer.
+                return 0;
+            }
+            // SAFETY: `buf` is non-null (checked) and valid for `len` bytes;
+            // `len == size * nitems` did not overflow.
+            let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
+            gz::gzfread(state, out, size, nitems)
+        })
+    }
 }
 
 /// `int gzgetc(gzFile file)`
@@ -575,15 +1037,24 @@ pub unsafe extern "C" fn gzfread(
 /// the macro-parity note.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzgetc(file: gzFile) -> c_int {
-    guard_int(-1, || {
-        if file.is_null() {
-            return -1;
-        }
-        // SAFETY: non-null handle; borrowed, not owned.
-        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &mut *guard;
-        gz::gzgetc(state)
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file,);
+        -1
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_int(-1, || {
+            if file.is_null() {
+                return -1;
+            }
+            // SAFETY: non-null handle; borrowed, not owned.
+            let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &mut *guard;
+            gz::gzgetc(state)
+        })
+    }
 }
 
 /// `int gzgetc_(gzFile file)`
@@ -592,15 +1063,24 @@ pub unsafe extern "C" fn gzgetc(file: gzFile) -> c_int {
 /// identical; both symbols are exported so either linkage resolves.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzgetc_(file: gzFile) -> c_int {
-    guard_int(-1, || {
-        if file.is_null() {
-            return -1;
-        }
-        // SAFETY: non-null handle; borrowed, not owned.
-        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &mut *guard;
-        gz::gzgetc_(state)
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file,);
+        -1
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_int(-1, || {
+            if file.is_null() {
+                return -1;
+            }
+            // SAFETY: non-null handle; borrowed, not owned.
+            let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &mut *guard;
+            gz::gzgetc_(state)
+        })
+    }
 }
 
 /// `char *gzgets(gzFile file, char *buf, int len)`
@@ -611,21 +1091,30 @@ pub unsafe extern "C" fn gzgetc_(file: gzFile) -> c_int {
 /// idiomatic layer guarantees NUL-termination within `len`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzgets(file: gzFile, buf: *mut c_char, len: c_int) -> *mut c_char {
-    guard_ptr(ptr::null_mut(), || -> *mut c_char {
-        if file.is_null() || buf.is_null() || len <= 0 {
-            return ptr::null_mut();
-        }
-        // SAFETY: non-null handle; borrowed, not owned.
-        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &mut *guard;
-        // SAFETY: `buf` is non-null (checked) and valid for `len` bytes
-        // (`len > 0` checked). The idiomatic writer NUL-terminates within it.
-        let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
-        match gz::gzgets(state, out) {
-            Some(_) => buf,
-            None => ptr::null_mut(),
-        }
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file, buf, len);
+        ptr::null_mut()
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_ptr(ptr::null_mut(), || -> *mut c_char {
+            if file.is_null() || buf.is_null() || len <= 0 {
+                return ptr::null_mut();
+            }
+            // SAFETY: non-null handle; borrowed, not owned.
+            let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &mut *guard;
+            // SAFETY: `buf` is non-null (checked) and valid for `len` bytes
+            // (`len > 0` checked). The idiomatic writer NUL-terminates within it.
+            let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
+            match gz::gzgets(state, out) {
+                Some(_) => buf,
+                None => ptr::null_mut(),
+            }
+        })
+    }
 }
 
 /// `int gzungetc(int c, gzFile file)`
@@ -635,15 +1124,24 @@ pub unsafe extern "C" fn gzgets(file: gzFile, buf: *mut c_char, len: c_int) -> *
 /// handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
-    guard_int(-1, || {
-        if file.is_null() {
-            return -1;
-        }
-        // SAFETY: non-null handle; borrowed, not owned.
-        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &mut *guard;
-        gz::gzungetc(c, state)
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (c, file);
+        -1
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_int(-1, || {
+            if file.is_null() {
+                return -1;
+            }
+            // SAFETY: non-null handle; borrowed, not owned.
+            let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &mut *guard;
+            gz::gzungetc(c, state)
+        })
+    }
 }
 
 // ===========================================================================
@@ -658,26 +1156,35 @@ pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
 /// sentinel.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzwrite(file: gzFile, buf: voidpc, len: c_uint) -> c_int {
-    guard_int(0, || {
-        if file.is_null() {
-            return 0;
-        }
-        if buf.is_null() && len != 0 {
-            return 0;
-        }
-        // SAFETY: non-null handle; borrowed, not owned.
-        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &mut *guard;
-        let input = if len == 0 {
-            // Empty write: avoid forming a slice over a possibly-null pointer.
-            &[][..]
-        } else {
-            // SAFETY: `buf` is non-null (checked above for `len > 0`) and valid
-            // for reads of `len` bytes per the C contract.
-            unsafe { slice::from_raw_parts(buf as *const u8, len as usize) }
-        };
-        gz::gzwrite(state, input)
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file, buf, len);
+        0
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_int(0, || {
+            if file.is_null() {
+                return 0;
+            }
+            if buf.is_null() && len != 0 {
+                return 0;
+            }
+            // SAFETY: non-null handle; borrowed, not owned.
+            let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &mut *guard;
+            let input = if len == 0 {
+                // Empty write: avoid forming a slice over a possibly-null pointer.
+                &[][..]
+            } else {
+                // SAFETY: `buf` is non-null (checked above for `len > 0`) and valid
+                // for reads of `len` bytes per the C contract.
+                unsafe { slice::from_raw_parts(buf as *const u8, len as usize) }
+            };
+            gz::gzwrite(state, input)
+        })
+    }
 }
 
 /// `z_size_t gzfwrite(voidpc buf, z_size_t size, z_size_t nitems, gzFile file)`
@@ -693,30 +1200,39 @@ pub unsafe extern "C" fn gzfwrite(
     nitems: z_size_t,
     file: gzFile,
 ) -> z_size_t {
-    guard_size(0, || {
-        if file.is_null() {
-            return 0;
-        }
-        // SAFETY: non-null handle; borrowed, not owned.
-        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &mut *guard;
-        let Some(len) = size.checked_mul(nitems) else {
-            // Overflow: idiomatic layer records Z_STREAM_ERROR and returns 0.
-            return gz::gzfwrite(state, &[], size, nitems);
-        };
-        if len == 0 {
-            // Zero-length request: drive the idiomatic checks with an empty
-            // slice; `buf` may legitimately be null.
-            return gz::gzfwrite(state, &[], size, nitems);
-        }
-        if buf.is_null() {
-            return 0;
-        }
-        // SAFETY: `buf` is non-null (checked) and valid for `len` bytes;
-        // `len == size * nitems` did not overflow.
-        let input = unsafe { slice::from_raw_parts(buf as *const u8, len) };
-        gz::gzfwrite(state, input, size, nitems)
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (buf, size, nitems, file);
+        0
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_size(0, || {
+            if file.is_null() {
+                return 0;
+            }
+            // SAFETY: non-null handle; borrowed, not owned.
+            let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &mut *guard;
+            let Some(len) = size.checked_mul(nitems) else {
+                // Overflow: idiomatic layer records Z_STREAM_ERROR and returns 0.
+                return gz::gzfwrite(state, &[], size, nitems);
+            };
+            if len == 0 {
+                // Zero-length request: drive the idiomatic checks with an empty
+                // slice; `buf` may legitimately be null.
+                return gz::gzfwrite(state, &[], size, nitems);
+            }
+            if buf.is_null() {
+                return 0;
+            }
+            // SAFETY: `buf` is non-null (checked) and valid for `len` bytes;
+            // `len == size * nitems` did not overflow.
+            let input = unsafe { slice::from_raw_parts(buf as *const u8, len) };
+            gz::gzfwrite(state, input, size, nitems)
+        })
+    }
 }
 
 /// `int gzputc(gzFile file, int c)`
@@ -725,15 +1241,24 @@ pub unsafe extern "C" fn gzfwrite(
 /// error / for a null handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzputc(file: gzFile, c: c_int) -> c_int {
-    guard_int(-1, || {
-        if file.is_null() {
-            return -1;
-        }
-        // SAFETY: non-null handle; borrowed, not owned.
-        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &mut *guard;
-        gz::gzputc(state, c)
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file, c);
+        -1
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_int(-1, || {
+            if file.is_null() {
+                return -1;
+            }
+            // SAFETY: non-null handle; borrowed, not owned.
+            let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &mut *guard;
+            gz::gzputc(state, c)
+        })
+    }
 }
 
 /// `int gzputs(gzFile file, const char *s)`
@@ -746,25 +1271,34 @@ pub unsafe extern "C" fn gzputc(file: gzFile, c: c_int) -> c_int {
 /// error sentinel.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzputs(file: gzFile, s: *const c_char) -> c_int {
-    guard_int(-1, || {
-        if file.is_null() || s.is_null() {
-            return -1;
-        }
-        // SAFETY: non-null handle; borrowed, not owned.
-        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &mut *guard;
-        // SAFETY: `s` is non-null (checked) and a NUL-terminated C string.
-        let bytes = unsafe { CStr::from_ptr(s) }.to_bytes();
-        match core::str::from_utf8(bytes) {
-            Ok(text) => gz::gzputs(state, text),
-            Err(_) => {
-                // Non-UTF-8: write raw bytes, preserving gzputs' -1-on-error
-                // contract (`gzwrite` returns 0 on error).
-                let n = gz::gzwrite(state, bytes);
-                if n == 0 && !bytes.is_empty() { -1 } else { n }
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file, s);
+        -1
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_int(-1, || {
+            if file.is_null() || s.is_null() {
+                return -1;
             }
-        }
-    })
+            // SAFETY: non-null handle; borrowed, not owned.
+            let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &mut *guard;
+            // SAFETY: `s` is non-null (checked) and a NUL-terminated C string.
+            let bytes = unsafe { CStr::from_ptr(s) }.to_bytes();
+            match core::str::from_utf8(bytes) {
+                Ok(text) => gz::gzputs(state, text),
+                Err(_) => {
+                    // Non-UTF-8: write raw bytes, preserving gzputs' -1-on-error
+                    // contract (`gzwrite` returns 0 on error).
+                    let n = gz::gzwrite(state, bytes);
+                    if n == 0 && !bytes.is_empty() { -1 } else { n }
+                }
+            }
+        })
+    }
 }
 
 /// `int gzflush(gzFile file, int flush)`
@@ -773,15 +1307,24 @@ pub unsafe extern "C" fn gzputs(file: gzFile, s: *const c_char) -> c_int {
 /// (`Z_OK` on success), or `Z_STREAM_ERROR` for a null handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzflush(file: gzFile, flush: c_int) -> c_int {
-    guard_int(Z_STREAM_ERROR, || {
-        if file.is_null() {
-            return Z_STREAM_ERROR;
-        }
-        // SAFETY: non-null handle; borrowed, not owned.
-        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &mut *guard;
-        gz::gzflush(state, flush)
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file, flush);
+        Z_STREAM_ERROR
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_int(Z_STREAM_ERROR, || {
+            if file.is_null() {
+                return Z_STREAM_ERROR;
+            }
+            // SAFETY: non-null handle; borrowed, not owned.
+            let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &mut *guard;
+            gz::gzflush(state, flush)
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -820,7 +1363,7 @@ pub unsafe extern "C" fn gzflush(file: gzFile, flush: c_int) -> c_int {
 /// `zlibCompileFlags` bit 27). Rendering a C `va_list` requires the nightly-only
 /// `c_variadic` feature, incompatible with the crate's stable MSRV (AAP §0.7.2 standard S7);
 /// see the module note above for the ABI rationale and the fully functional
-/// idiomatic [`crate::gz::gzvprintf`].
+/// idiomatic `crate::gz::gzvprintf`.
 #[unsafe(no_mangle)]
 pub extern "C" fn gzvprintf(
     _file: gzFile,
@@ -837,7 +1380,7 @@ pub extern "C" fn gzvprintf(
 /// `NO_vsnprintf && !ZLIB_INSECURE` zlib variant (advertised via
 /// `zlibCompileFlags` bit 27) because a true C-variadic definition would need
 /// the nightly-only `c_variadic` feature (AAP §0.7.2 standard S7). Rust callers use the
-/// fully functional idiomatic [`crate::gz::gzprintf`].
+/// fully functional idiomatic `crate::gz::gzprintf`.
 #[unsafe(no_mangle)]
 pub extern "C" fn gzprintf(_file: gzFile, _format: *const c_char) -> c_int {
     Z_STREAM_ERROR
@@ -858,17 +1401,26 @@ pub extern "C" fn gzprintf(_file: gzFile, _format: *const c_char) -> c_int {
 /// on error / for a null handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzseek(file: gzFile, offset: z_off_t, whence: c_int) -> z_off_t {
-    guard_off(-1, || {
-        if file.is_null() {
-            return -1;
-        }
-        // SAFETY: non-null handle; borrowed, not owned.
-        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &mut *guard;
-        // Widen the C `off_t` to the engine's 64-bit offset. On 32-bit targets
-        // (`z_off_t == i32`) this is a real widening; on 64-bit it is a no-op.
-        gz::gzseek(state, offset as z_off64_t, whence)
-    }) as z_off_t
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file, offset, whence);
+        -1
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_off(-1, || {
+            if file.is_null() {
+                return -1;
+            }
+            // SAFETY: non-null handle; borrowed, not owned.
+            let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &mut *guard;
+            // Widen the C `off_t` to the engine's 64-bit offset. On 32-bit targets
+            // (`z_off_t == i32`) this is a real widening; on 64-bit it is a no-op.
+            gz::gzseek(state, offset as z_off64_t, whence)
+        }) as z_off_t
+    }
 }
 
 /// `z_off64_t gzseek64(gzFile file, z_off64_t offset, int whence)` (`ZLIB_1.2.3.3`)
@@ -876,15 +1428,24 @@ pub unsafe extern "C" fn gzseek(file: gzFile, offset: z_off_t, whence: c_int) ->
 /// 64-bit-offset variant of [`gzseek`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzseek64(file: gzFile, offset: z_off64_t, whence: c_int) -> z_off64_t {
-    guard_off(-1, || {
-        if file.is_null() {
-            return -1;
-        }
-        // SAFETY: non-null handle; borrowed, not owned.
-        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &mut *guard;
-        gz::gzseek64(state, offset, whence)
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file, offset, whence);
+        -1
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_off(-1, || {
+            if file.is_null() {
+                return -1;
+            }
+            // SAFETY: non-null handle; borrowed, not owned.
+            let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &mut *guard;
+            gz::gzseek64(state, offset, whence)
+        })
+    }
 }
 
 /// `int gzrewind(gzFile file)`
@@ -893,15 +1454,24 @@ pub unsafe extern "C" fn gzseek64(file: gzFile, offset: z_off64_t, whence: c_int
 /// error / for a null handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzrewind(file: gzFile) -> c_int {
-    guard_int(-1, || {
-        if file.is_null() {
-            return -1;
-        }
-        // SAFETY: non-null handle; borrowed, not owned.
-        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &mut *guard;
-        gz::gzrewind(state)
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file,);
+        -1
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_int(-1, || {
+            if file.is_null() {
+                return -1;
+            }
+            // SAFETY: non-null handle; borrowed, not owned.
+            let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &mut *guard;
+            gz::gzrewind(state)
+        })
+    }
 }
 
 /// `z_off_t gztell(gzFile file)`
@@ -909,15 +1479,24 @@ pub unsafe extern "C" fn gzrewind(file: gzFile) -> c_int {
 /// Returns the current uncompressed offset, or `-1` for a null handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gztell(file: gzFile) -> z_off_t {
-    guard_off(-1, || {
-        if file.is_null() {
-            return -1;
-        }
-        // SAFETY: non-null handle; borrowed immutably.
-        let guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &*guard;
-        gz::gztell(state)
-    }) as z_off_t
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file,);
+        -1
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_off(-1, || {
+            if file.is_null() {
+                return -1;
+            }
+            // SAFETY: non-null handle; borrowed immutably.
+            let guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &*guard;
+            gz::gztell(state)
+        }) as z_off_t
+    }
 }
 
 /// `z_off64_t gztell64(gzFile file)` (`ZLIB_1.2.3.3`)
@@ -925,15 +1504,24 @@ pub unsafe extern "C" fn gztell(file: gzFile) -> z_off_t {
 /// 64-bit-offset variant of [`gztell`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gztell64(file: gzFile) -> z_off64_t {
-    guard_off(-1, || {
-        if file.is_null() {
-            return -1;
-        }
-        // SAFETY: non-null handle; borrowed immutably.
-        let guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &*guard;
-        gz::gztell64(state)
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file,);
+        -1
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_off(-1, || {
+            if file.is_null() {
+                return -1;
+            }
+            // SAFETY: non-null handle; borrowed immutably.
+            let guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &*guard;
+            gz::gztell64(state)
+        })
+    }
 }
 
 /// `z_off_t gzoffset(gzFile file)` (`ZLIB_1.2.3.5`)
@@ -942,15 +1530,24 @@ pub unsafe extern "C" fn gztell64(file: gzFile) -> z_off64_t {
 /// handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzoffset(file: gzFile) -> z_off_t {
-    guard_off(-1, || {
-        if file.is_null() {
-            return -1;
-        }
-        // SAFETY: non-null handle; borrowed, not owned.
-        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &mut *guard;
-        gz::gzoffset(state)
-    }) as z_off_t
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file,);
+        -1
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_off(-1, || {
+            if file.is_null() {
+                return -1;
+            }
+            // SAFETY: non-null handle; borrowed, not owned.
+            let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &mut *guard;
+            gz::gzoffset(state)
+        }) as z_off_t
+    }
 }
 
 /// `z_off64_t gzoffset64(gzFile file)` (`ZLIB_1.2.3.5`)
@@ -958,15 +1555,24 @@ pub unsafe extern "C" fn gzoffset(file: gzFile) -> z_off_t {
 /// 64-bit-offset variant of [`gzoffset`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzoffset64(file: gzFile) -> z_off64_t {
-    guard_off(-1, || {
-        if file.is_null() {
-            return -1;
-        }
-        // SAFETY: non-null handle; borrowed, not owned.
-        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &mut *guard;
-        gz::gzoffset64(state)
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file,);
+        -1
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_off(-1, || {
+            if file.is_null() {
+                return -1;
+            }
+            // SAFETY: non-null handle; borrowed, not owned.
+            let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &mut *guard;
+            gz::gzoffset64(state)
+        })
+    }
 }
 
 /// `int gzeof(gzFile file)`
@@ -975,15 +1581,24 @@ pub unsafe extern "C" fn gzoffset64(file: gzFile) -> z_off64_t {
 /// `past` flag semantics), otherwise `0`; `0` for a null handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzeof(file: gzFile) -> c_int {
-    guard_int(0, || {
-        if file.is_null() {
-            return 0;
-        }
-        // SAFETY: non-null handle; borrowed immutably.
-        let guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &*guard;
-        gz::gzeof(state)
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file,);
+        0
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_int(0, || {
+            if file.is_null() {
+                return 0;
+            }
+            // SAFETY: non-null handle; borrowed immutably.
+            let guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &*guard;
+            gz::gzeof(state)
+        })
+    }
 }
 
 /// `int gzdirect(gzFile file)` (`ZLIB_1.2.2.3`)
@@ -993,15 +1608,24 @@ pub unsafe extern "C" fn gzeof(file: gzFile) -> c_int {
 /// null handle. May trigger a header look on first read, matching C.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzdirect(file: gzFile) -> c_int {
-    guard_int(0, || {
-        if file.is_null() {
-            return 0;
-        }
-        // SAFETY: non-null handle; borrowed, not owned.
-        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &mut *guard;
-        gz::gzdirect(state)
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file,);
+        0
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_int(0, || {
+            if file.is_null() {
+                return 0;
+            }
+            // SAFETY: non-null handle; borrowed, not owned.
+            let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &mut *guard;
+            gz::gzdirect(state)
+        })
+    }
 }
 
 // ===========================================================================
@@ -1024,39 +1648,48 @@ pub unsafe extern "C" fn gzdirect(file: gzFile) -> c_int {
 /// yields `NULL`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzerror(file: gzFile, errnum: *mut c_int) -> *const c_char {
-    guard_const_ptr(ptr::null(), || -> *const c_char {
-        if file.is_null() {
-            return ptr::null();
-        }
-        // SAFETY: non-null handle; borrowed immutably.
-        let guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &*guard;
-        // Only a live reader/writer reports an error (matches C's mode check).
-        if state.mode != GzMode::Read && state.mode != GzMode::Write {
-            return ptr::null();
-        }
-        let code = state.err;
-        if !errnum.is_null() {
-            // SAFETY: `errnum` is a non-null, caller-owned `int` slot.
-            unsafe { *errnum = code.as_c_int() };
-        }
-        // Return the same text the idiomatic `gz::gzerror` reports, but as a
-        // stable, NUL-terminated pointer (see the module docs). `Z_MEM_ERROR`
-        // deliberately stores no heap message, so synthesise the literal
-        // `"out of memory"` without allocating; otherwise hand back a pointer
-        // into the handle's owned `msg_c` mirror of `msg` — the specific
-        // `"{path}: {detail}"` string, or the empty string when no detail is
-        // present. The pointer stays valid until the next `gz*` call records a
-        // new error and replaces `msg_c`, exactly matching the C lifetime.
-        if code == ReturnCode::MemError {
-            c"out of memory".as_ptr()
-        } else {
-            match &state.msg_c {
-                Some(cs) => cs.as_ptr(),
-                None => c"".as_ptr(),
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file, errnum);
+        ptr::null()
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_const_ptr(ptr::null(), || -> *const c_char {
+            if file.is_null() {
+                return ptr::null();
             }
-        }
-    })
+            // SAFETY: non-null handle; borrowed immutably.
+            let guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &*guard;
+            // Only a live reader/writer reports an error (matches C's mode check).
+            if state.mode != GzMode::Read && state.mode != GzMode::Write {
+                return ptr::null();
+            }
+            let code = state.err;
+            if !errnum.is_null() {
+                // SAFETY: `errnum` is a non-null, caller-owned `int` slot.
+                unsafe { *errnum = code.as_c_int() };
+            }
+            // Return the same text the idiomatic `gz::gzerror` reports, but as a
+            // stable, NUL-terminated pointer (see the module docs). `Z_MEM_ERROR`
+            // deliberately stores no heap message, so synthesise the literal
+            // `"out of memory"` without allocating; otherwise hand back a pointer
+            // into the handle's owned `msg_c` mirror of `msg` — the specific
+            // `"{path}: {detail}"` string, or the empty string when no detail is
+            // present. The pointer stays valid until the next `gz*` call records a
+            // new error and replaces `msg_c`, exactly matching the C lifetime.
+            if code == ReturnCode::MemError {
+                c"out of memory".as_ptr()
+            } else {
+                match &state.msg_c {
+                    Some(cs) => cs.as_ptr(),
+                    None => c"".as_ptr(),
+                }
+            }
+        })
+    }
 }
 
 /// `void gzclearerr(gzFile file)` (`ZLIB_1.2.0.2`)
@@ -1065,72 +1698,132 @@ pub unsafe extern "C" fn gzerror(file: gzFile, errnum: *mut c_int) -> *const c_c
 /// handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzclearerr(file: gzFile) {
-    // Void return: catch any panic and swallow it (never unwind into C).
-    let _ = std::panic::catch_unwind(|| {
-        if file.is_null() {
-            return;
-        }
-        // SAFETY: non-null handle; borrowed, not owned.
-        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
-        let state = &mut *guard;
-        gz::gzclearerr(state);
-    });
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file,);
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        // Void return: catch any panic and swallow it (never unwind into C).
+        let _ = std::panic::catch_unwind(|| {
+            if file.is_null() {
+                return;
+            }
+            // SAFETY: non-null handle; borrowed, not owned.
+            let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+            let state = &mut *guard;
+            gz::gzclearerr(state);
+        });
+    }
 }
 
 /// `int gzclose(gzFile file)`
 ///
 /// Flushes and closes `file` (finishing the gzip stream and freeing buffers for
-/// writers), reclaiming the boxed state. Returns a zlib return code, or
-/// `Z_STREAM_ERROR` for a null handle.
+/// writers), reclaiming the boxed state and closing the descriptor. Returns a
+/// zlib return code: `Z_STREAM_ERROR` for a null handle or one in neither
+/// direction, `Z_ERRNO` if the platform close failed, otherwise the finalizer's
+/// accumulated status.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzclose(file: gzFile) -> c_int {
-    guard_int(Z_STREAM_ERROR, || {
-        if file.is_null() {
-            return Z_STREAM_ERROR;
-        }
-        // SAFETY: `file` was produced by `gzopen*`/`gzdopen` as
-        // `Box::into_raw(Box<GzHandle>)`; reconstruct the box exactly once to
-        // take ownership, then hand its inner `Box<GzState>` to the idiomatic
-        // close (which dispatches on read/write mode). The `gzFile_s` prefix is
-        // dropped with the handle.
-        let handle = unsafe { Box::from_raw(file as *mut GzHandle) };
-        gz::gzclose(handle.state)
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file,);
+        Z_STREAM_ERROR
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_int(Z_STREAM_ERROR, || {
+            if file.is_null() {
+                return Z_STREAM_ERROR;
+            }
+            // SAFETY: `file` was produced by `gzopen*`/`gzdopen` as
+            // `Box::into_raw(Box<GzHandle>)` and has not been closed. `take_for_close`
+            // inspects the direction through a borrow and reclaims the box exactly
+            // once, only when a live direction is present — so a handle it refuses is
+            // left valid for the caller, as in C.
+            let Some(handle) = (unsafe { take_for_close(file, CloseDirection::Either) }) else {
+                return Z_STREAM_ERROR;
+            };
+            // The idiomatic finalizer performs every C step except `close(fd)` and
+            // hands the descriptor back; `finish_close` performs that close and
+            // applies C's precedence. The `gzFile_s` prefix drops with the handle.
+            let (status, released) = gz::gzclose_release(handle.state);
+            finish_close(status, released)
+        })
+    }
 }
 
 /// `int gzclose_r(gzFile file)` (`ZLIB_1.2.3.5`)
 ///
-/// Closes a read stream specifically. Returns a zlib return code, or
-/// `Z_STREAM_ERROR` for a null handle.
+/// Closes a read stream specifically. Returns a zlib return code:
+/// `Z_STREAM_ERROR` for a null handle **or one not opened for reading** (in which
+/// case the handle is left untouched and may be closed with [`gzclose_w`], exactly
+/// as in C), `Z_ERRNO` if the platform close failed, otherwise `Z_OK` or a
+/// preserved `Z_BUF_ERROR`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzclose_r(file: gzFile) -> c_int {
-    guard_int(Z_STREAM_ERROR, || {
-        if file.is_null() {
-            return Z_STREAM_ERROR;
-        }
-        // SAFETY: `file` was produced as `Box::into_raw(Box<GzHandle>)`;
-        // reconstruct the owning box exactly once and hand off its inner state.
-        let handle = unsafe { Box::from_raw(file as *mut GzHandle) };
-        gz::gzclose_r(handle.state)
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file,);
+        Z_STREAM_ERROR
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_int(Z_STREAM_ERROR, || {
+            if file.is_null() {
+                return Z_STREAM_ERROR;
+            }
+            // SAFETY: `file` was produced as `Box::into_raw(Box<GzHandle>)` and has
+            // not been closed. The box is reclaimed only if the handle is a reader,
+            // mirroring C's `if (state->mode != GZ_READ) return Z_STREAM_ERROR;`
+            // *preceding* every `free`/`close`; a writer is therefore refused without
+            // being consumed, so no use-after-free or double-free window exists.
+            let Some(handle) = (unsafe { take_for_close(file, CloseDirection::Read) }) else {
+                return Z_STREAM_ERROR;
+            };
+            let (status, released) = gz::gzclose_r_release(handle.state);
+            finish_close(status, released)
+        })
+    }
 }
 
 /// `int gzclose_w(gzFile file)` (`ZLIB_1.2.3.5`)
 ///
 /// Closes a write stream specifically, emitting the final `Z_FINISH` block and
-/// the gzip trailer. Returns a zlib return code, or `Z_STREAM_ERROR` for a null
-/// handle.
+/// the gzip trailer. Returns a zlib return code: `Z_STREAM_ERROR` for a null
+/// handle **or one not opened for writing** (in which case the handle is left
+/// untouched and may be closed with [`gzclose_r`], exactly as in C), `Z_ERRNO` if
+/// the platform close failed, otherwise the accumulated flush status.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzclose_w(file: gzFile) -> c_int {
-    guard_int(Z_STREAM_ERROR, || {
-        if file.is_null() {
-            return Z_STREAM_ERROR;
-        }
-        // SAFETY: `file` was produced as `Box::into_raw(Box<GzHandle>)`;
-        // reconstruct the owning box exactly once and hand off its inner state.
-        let handle = unsafe { Box::from_raw(file as *mut GzHandle) };
-        gz::gzclose_w(handle.state)
-    })
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (file,);
+        Z_STREAM_ERROR
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_int(Z_STREAM_ERROR, || {
+            if file.is_null() {
+                return Z_STREAM_ERROR;
+            }
+            // SAFETY: `file` was produced as `Box::into_raw(Box<GzHandle>)` and has
+            // not been closed. The box is reclaimed only if the handle is a writer,
+            // mirroring C's `if (state->mode != GZ_WRITE) return Z_STREAM_ERROR;`
+            // *preceding* every `free`/`close`; a reader is therefore refused without
+            // being consumed, so no use-after-free or double-free window exists.
+            let Some(handle) = (unsafe { take_for_close(file, CloseDirection::Write) }) else {
+                return Z_STREAM_ERROR;
+            };
+            let (status, released) = gz::gzclose_w_release(handle.state);
+            finish_close(status, released)
+        })
+    }
 }
 
 // ===========================================================================
@@ -1146,35 +1839,45 @@ pub unsafe extern "C" fn gzclose_w(file: gzFile) -> c_int {
 #[cfg(windows)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzopen_w(path: *const u16, mode: *const c_char) -> gzFile {
-    guard_ptr(ptr::null_mut(), || -> gzFile {
-        if path.is_null() || mode.is_null() {
-            return ptr::null_mut();
-        }
-        // SAFETY: `path` is a non-null, NUL-terminated wide string; count its
-        // code units up to (excluding) the terminator.
-        let len = unsafe {
-            let mut n = 0usize;
-            while *path.add(n) != 0 {
-                n += 1;
+    #[cfg(not(feature = "gz-io"))]
+    {
+        let _ = (path, mode);
+        ptr::null_mut()
+    }
+
+    #[cfg(feature = "gz-io")]
+    {
+        guard_ptr(ptr::null_mut(), || -> gzFile {
+            if path.is_null() || mode.is_null() {
+                return ptr::null_mut();
             }
-            n
-        };
-        // SAFETY: `path[..len]` are `len` initialized `u16` code units.
-        let units = unsafe { slice::from_raw_parts(path, len) };
-        use std::os::windows::ffi::OsStringExt;
-        let os = std::ffi::OsString::from_wide(units);
-        // SAFETY: `mode` is non-null (checked) and NUL-terminated.
-        let Ok(mode_str) = (unsafe { CStr::from_ptr(mode) }).to_str() else {
-            return ptr::null_mut();
-        };
-        box_state(gz::gzopen(std::path::PathBuf::from(os), mode_str))
-    })
+            // SAFETY: `path` is a non-null, NUL-terminated wide string; count its
+            // code units up to (excluding) the terminator.
+            let len = unsafe {
+                let mut n = 0usize;
+                while *path.add(n) != 0 {
+                    n += 1;
+                }
+                n
+            };
+            // SAFETY: `path[..len]` are `len` initialized `u16` code units.
+            let units = unsafe { slice::from_raw_parts(path, len) };
+            use std::os::windows::ffi::OsStringExt;
+            let os = std::ffi::OsString::from_wide(units);
+            // SAFETY: `mode` is non-null (checked) and NUL-terminated.
+            let Ok(mode_str) = (unsafe { CStr::from_ptr(mode) }).to_str() else {
+                return ptr::null_mut();
+            };
+            box_state(gz::gzopen(std::path::PathBuf::from(os), mode_str))
+        })
+    }
 }
 
 // ===========================================================================
 // Tests
 // ===========================================================================
 
+#[cfg(feature = "gz-io")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1612,6 +2315,452 @@ mod tests {
             assert_eq!(&rest, b"EFGHIJ");
             assert_eq!(gztell(rf), data.len() as z_off_t);
             assert_eq!(gzclose_r(rf), Z_OK);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // =======================================================================
+    // Descriptor lifecycle: direction validation, `gzdopen` ownership, and the
+    // fallible platform close.
+    //
+    // Every expectation below was captured from reference zlib built from this
+    // repository's own C sources; see the `gzlife` differential harness. The
+    // three contracts pinned here are:
+    //
+    //   1. a wrong-direction close frees nothing and returns Z_STREAM_ERROR, so
+    //      the caller's handle stays live and closable  (`gzread.c` L650-L651,
+    //      `gzwrite.c` L677-L678);
+    //   2. no `gzdopen` failure closes the caller's descriptor
+    //      (`gzlib.c` L150-L197 and L206-L210 precede L263); and
+    //   3. a failing `close(2)` surfaces as Z_ERRNO
+    //      (`gzread.c` L665-L667, `gzwrite.c` L695-L696).
+    // =======================================================================
+
+    /// Decompresses `path` with the independent `flate2`/`miniz_oxide` decoder,
+    /// proving the gzip member is complete and well-formed.
+    fn decode_gzip_file(path: &std::path::Path) -> std::vec::Vec<u8> {
+        use std::io::Read as _;
+        let f = std::fs::File::open(path).expect("open for verification");
+        let mut out = std::vec::Vec::new();
+        flate2::read::GzDecoder::new(f)
+            .read_to_end(&mut out)
+            .expect("stream decodes as gzip");
+        out
+    }
+
+    /// A wrong-direction close is a **pure no-op**: it reports `Z_STREAM_ERROR`,
+    /// frees nothing, and leaves the handle fully usable — so the caller can keep
+    /// working and then close it with the correct finalizer.
+    ///
+    /// This is the regression test for the use-after-free / double-free defect in
+    /// which the owning `Box<GzHandle>` was reconstructed *before* the direction
+    /// was validated (CWE-416, CWE-415). Under that ordering the first refused
+    /// call already deallocated the handle, so this test's continued use of it
+    /// was a use-after-free and the final correct close a double free —
+    /// reproduced against the C harness as an immediate
+    /// `free(): double free detected in tcache 2` abort.
+    ///
+    /// Mirrors reference-zlib harness cases `1a`, `1b`, `1c`, and `1d`.
+    #[test]
+    fn wrong_direction_close_is_a_no_op_and_leaves_the_handle_usable() {
+        let (path, cpath) = unique_path("wrongdir");
+        unsafe {
+            // ---- writer refuses gzclose_r, three times, then closes cleanly.
+            let wf = gzopen(cpath.as_ptr(), c"wb".as_ptr());
+            assert!(!wf.is_null());
+            let head = b"payload";
+            assert_eq!(
+                gzwrite(wf, head.as_ptr() as voidpc, head.len() as c_uint),
+                head.len() as c_int
+            );
+
+            // C `1d`: repeated wrong-direction closes each return Z_STREAM_ERROR.
+            for attempt in 0..3 {
+                assert_eq!(
+                    gzclose_r(wf),
+                    Z_STREAM_ERROR,
+                    "gzclose_r on a writer must be refused (attempt {attempt})"
+                );
+            }
+
+            // The handle survived every refusal: it still reports its position and
+            // still accepts writes.
+            assert_eq!(gztell(wf), head.len() as z_off_t);
+            let tail = b" and more";
+            assert_eq!(
+                gzwrite(wf, tail.as_ptr() as voidpc, tail.len() as c_uint),
+                tail.len() as c_int
+            );
+
+            // C `1d`: the correct finalizer then succeeds — exactly one teardown.
+            assert_eq!(gzclose_w(wf), Z_OK);
+        }
+
+        // C `1c`: everything written before and after the refusals is present and
+        // the member is properly finalized.
+        assert_eq!(decode_gzip_file(&path), b"payload and more".to_vec());
+
+        unsafe {
+            // ---- reader refuses gzclose_w, three times, then closes cleanly.
+            let rf = gzopen(cpath.as_ptr(), c"rb".as_ptr());
+            assert!(!rf.is_null());
+
+            let mut first = [0u8; 7];
+            assert_eq!(
+                gzread(rf, first.as_mut_ptr() as voidp, first.len() as c_uint),
+                7
+            );
+            assert_eq!(&first, b"payload");
+
+            for attempt in 0..3 {
+                assert_eq!(
+                    gzclose_w(rf),
+                    Z_STREAM_ERROR,
+                    "gzclose_w on a reader must be refused (attempt {attempt})"
+                );
+            }
+
+            // Reading resumes exactly where it left off — nothing was torn down.
+            let mut rest = [0u8; 9];
+            assert_eq!(
+                gzread(rf, rest.as_mut_ptr() as voidp, rest.len() as c_uint),
+                9
+            );
+            assert_eq!(&rest, b" and more");
+            assert_eq!(gzclose_r(rf), Z_OK);
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A refused close must leave the live `gzFile_s` prefix **bit-for-bit**
+    /// untouched.
+    ///
+    /// C mutates nothing on a wrong-direction close, so the `gzgetc` macro
+    /// fast-path must still be armed afterwards. The direction is therefore read
+    /// through a plain borrow rather than a [`GzBorrow`] guard, whose
+    /// [`reconcile`](GzHandle::reconcile) would clear `have`/`next` as a side
+    /// effect.
+    #[test]
+    fn refused_close_leaves_the_gzgetc_prefix_untouched() {
+        let (path, cpath) = unique_path("refuseprefix");
+        let data = b"ABCDEFGHIJ";
+        unsafe {
+            let wf = gzopen(cpath.as_ptr(), c"wb".as_ptr());
+            assert!(!wf.is_null());
+            assert_eq!(
+                gzwrite(wf, data.as_ptr() as voidpc, data.len() as c_uint),
+                data.len() as c_int
+            );
+            assert_eq!(gzclose_w(wf), Z_OK);
+
+            let rf = gzopen(cpath.as_ptr(), c"rb".as_ptr());
+            assert!(!rf.is_null());
+
+            // One real read populates the prefix for the macro fast path.
+            assert_eq!(gzgetc(rf), b'A' as c_int);
+            let before = {
+                let handle = &*(rf as *const GzHandle);
+                assert!(handle.prefix.have >= 1, "prefix must be armed");
+                (handle.prefix.have, handle.prefix.next, handle.prefix.pos)
+            };
+
+            // A refused close must not touch the prefix.
+            assert_eq!(gzclose_w(rf), Z_STREAM_ERROR);
+            let after = {
+                let handle = &*(rf as *const GzHandle);
+                (handle.prefix.have, handle.prefix.next, handle.prefix.pos)
+            };
+            assert_eq!(before, after, "a refused close must not mutate the prefix");
+
+            // And the macro fast path still works, byte-exactly.
+            let handle = &mut *(rf as *mut GzHandle);
+            let macro_byte = *handle.prefix.next;
+            assert_eq!(macro_byte, b'B');
+            handle.prefix.have -= 1;
+            handle.prefix.next = handle.prefix.next.add(1);
+            handle.prefix.pos += 1;
+
+            assert_eq!(gztell(rf), 2);
+            assert_eq!(gzgetc(rf), b'C' as c_int);
+            assert_eq!(gzclose_r(rf), Z_OK);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `gzclose` accepts either direction, dispatching as C's
+    /// `state->mode == GZ_READ ? gzclose_r(file) : gzclose_w(file)` does.
+    #[test]
+    fn gzclose_dispatches_on_either_direction() {
+        let (path, cpath) = unique_path("dispatch");
+        let data = b"either direction";
+        unsafe {
+            let wf = gzopen(cpath.as_ptr(), c"wb".as_ptr());
+            assert!(!wf.is_null());
+            assert_eq!(
+                gzwrite(wf, data.as_ptr() as voidpc, data.len() as c_uint),
+                data.len() as c_int
+            );
+            assert_eq!(gzclose(wf), Z_OK, "gzclose finalizes a writer");
+
+            let rf = gzopen(cpath.as_ptr(), c"rb".as_ptr());
+            assert!(!rf.is_null());
+            let mut buf = std::vec![0u8; data.len()];
+            assert_eq!(
+                gzread(rf, buf.as_mut_ptr() as voidp, buf.len() as c_uint),
+                data.len() as c_int
+            );
+            assert_eq!(gzclose(rf), Z_OK, "gzclose closes a reader");
+        }
+        assert_eq!(decode_gzip_file(&path), data.to_vec());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Probes whether `fd` is still an open descriptor, without taking ownership
+    /// of it — the `fstat`-based analogue of the C harness's
+    /// `fcntl(fd, F_GETFD) != -1`.
+    #[cfg(unix)]
+    fn fd_is_alive(fd: c_int) -> bool {
+        // SAFETY: wrapping the descriptor in a `ManuallyDrop<File>` gives a
+        // borrow-only view: `metadata()` issues an `fstat` and the `File` is never
+        // dropped, so the descriptor is neither closed nor otherwise disturbed. A
+        // closed or never-valid descriptor answers `EBADF`.
+        let probe = core::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+        probe.metadata().is_ok()
+    }
+
+    /// A failed `gzdopen` must leave the caller's descriptor **open**.
+    ///
+    /// C validates the entire mode grammar before it stores the descriptor in
+    /// `state->fd` (`gzlib.c` L150-L197 precede L263), so a rejected `gzdopen`
+    /// never closes `fd` and the caller may retry or close it itself. Adopting the
+    /// descriptor into a [`std::fs::File`] before validating would close it on the
+    /// failure path, silently turning the caller's own later `close(fd)` into a
+    /// double close (CWE-672).
+    ///
+    /// Mirrors reference-zlib harness case `2`, mode for mode.
+    #[cfg(unix)]
+    #[test]
+    fn failed_gzdopen_leaves_the_callers_descriptor_open() {
+        use std::os::fd::IntoRawFd;
+
+        // Every mode reference zlib rejects: read+write, forced-transparent read,
+        // `G` while writing, and three strings with no r/w/a at all.
+        let rejected: [&core::ffi::CStr; 6] = [c"r+", c"rT", c"wG", c"b", c"", c"9"];
+
+        let (path, _cpath) = unique_path("dopenfail");
+        std::fs::write(&path, b"seed").unwrap();
+
+        for mode in rejected {
+            let fd = std::fs::File::open(&path).unwrap().into_raw_fd();
+            assert!(fd_is_alive(fd), "descriptor must start open");
+
+            // SAFETY: `fd` is a live descriptor and `mode` is a NUL-terminated
+            // C string literal.
+            let gz = unsafe { gzdopen(fd, mode.as_ptr()) };
+            assert!(
+                gz.is_null(),
+                "gzdopen must reject mode {mode:?} exactly as C does"
+            );
+            assert!(
+                fd_is_alive(fd),
+                "a rejected gzdopen must NOT close the caller's descriptor (mode {mode:?})"
+            );
+
+            // The caller still owns it, so the caller closes it.
+            // SAFETY: `fd` is still open and unowned by any Rust value.
+            drop(unsafe { std::fs::File::from_raw_fd(fd) });
+        }
+
+        // A negative descriptor is rejected outright (C `if (fd == -1 || ...)`).
+        // SAFETY: no descriptor is dereferenced on this path.
+        assert!(unsafe { gzdopen(-1, c"rb".as_ptr()) }.is_null());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A **successful** `gzdopen` takes ownership: the descriptor stays open while
+    /// the handle lives and is closed by the finalizer.
+    ///
+    /// Mirrors reference-zlib harness case `2b`.
+    #[cfg(unix)]
+    #[test]
+    fn successful_gzdopen_transfers_descriptor_ownership() {
+        use std::os::fd::IntoRawFd;
+
+        let (path, _cpath) = unique_path("dopenown");
+        let data = b"ownership test";
+        let fd = std::fs::File::create(&path).unwrap().into_raw_fd();
+
+        // SAFETY: `fd` is a live descriptor being handed to `gzdopen`, and the
+        // mode is a NUL-terminated literal.
+        let wf = unsafe { gzdopen(fd, c"wb".as_ptr()) };
+        assert!(!wf.is_null());
+        assert!(
+            fd_is_alive(fd),
+            "the adopted descriptor stays open while the handle lives"
+        );
+
+        // SAFETY: `wf` is a live handle from `gzdopen`; the buffer is valid for
+        // the length given.
+        assert_eq!(
+            unsafe { gzwrite(wf, data.as_ptr() as voidpc, data.len() as c_uint) },
+            data.len() as c_int
+        );
+        // SAFETY: `wf` is a live write handle, closed exactly once here.
+        assert_eq!(unsafe { gzclose_w(wf) }, Z_OK);
+        assert!(
+            !fd_is_alive(fd),
+            "the finalizer must close the descriptor it owns"
+        );
+
+        assert_eq!(decode_gzip_file(&path), data.to_vec());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A failing platform close surfaces as `Z_ERRNO` from **both** finalizers,
+    /// and the gzip member is still finalized first.
+    ///
+    /// C: `gzclose_w` does `if (close(state->fd) == -1) ret = Z_ERRNO;` *after*
+    /// the `Z_FINISH` flush (`gzwrite.c` L685-L696), and `gzclose_r` does
+    /// `return ret ? Z_ERRNO : err;` (`gzread.c` L665-L667). Mirrors
+    /// reference-zlib harness cases `3r`, `3w`, and `3b`.
+    #[test]
+    fn injected_close_failure_reports_z_errno_for_both_directions() {
+        let (path, cpath) = unique_path("closefail");
+        let data = b"close failure path";
+
+        unsafe {
+            // ---- write side: Z_FINISH still runs, then the close fails.
+            let wf = gzopen(cpath.as_ptr(), c"wb".as_ptr());
+            assert!(!wf.is_null());
+            assert_eq!(
+                gzwrite(wf, data.as_ptr() as voidpc, data.len() as c_uint),
+                data.len() as c_int
+            );
+            assert_eq!(
+                with_forced_close_failure(|| gzclose_w(wf)),
+                Z_ERRNO,
+                "a failing close(2) overrides the accumulated write status"
+            );
+        }
+        // The member was finalized before the close was attempted, so it is
+        // complete and independently decodable despite the reported error.
+        assert_eq!(decode_gzip_file(&path), data.to_vec());
+
+        unsafe {
+            // ---- read side.
+            let rf = gzopen(cpath.as_ptr(), c"rb".as_ptr());
+            assert!(!rf.is_null());
+            let mut buf = std::vec![0u8; data.len()];
+            assert_eq!(
+                gzread(rf, buf.as_mut_ptr() as voidp, buf.len() as c_uint),
+                data.len() as c_int
+            );
+            assert_eq!(&buf[..], &data[..]);
+            assert_eq!(
+                with_forced_close_failure(|| gzclose_r(rf)),
+                Z_ERRNO,
+                "a failing close(2) turns Z_OK into Z_ERRNO on the read side"
+            );
+
+            // ---- C `3b`: with the seam disarmed both directions report Z_OK.
+            let rf = gzopen(cpath.as_ptr(), c"rb".as_ptr());
+            assert!(!rf.is_null());
+            assert_eq!(gzclose_r(rf), Z_OK);
+
+            let wf = gzopen(cpath.as_ptr(), c"wb".as_ptr());
+            assert!(!wf.is_null());
+            assert_eq!(gzclose_w(wf), Z_OK);
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A wrong-direction rejection outranks a close failure, because a refused
+    /// close releases no descriptor and therefore never reaches `close(2)`.
+    #[test]
+    fn close_failure_does_not_mask_a_wrong_direction_rejection() {
+        let (path, cpath) = unique_path("failmask");
+        unsafe {
+            let wf = gzopen(cpath.as_ptr(), c"wb".as_ptr());
+            assert!(!wf.is_null());
+
+            assert_eq!(
+                with_forced_close_failure(|| gzclose_r(wf)),
+                Z_STREAM_ERROR,
+                "the direction check precedes the close, so Z_STREAM_ERROR wins"
+            );
+
+            // The handle is untouched and still closes cleanly with the seam
+            // disarmed.
+            assert_eq!(gzclose_w(wf), Z_OK);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// [`finish_close`]'s full precedence table: a released descriptor that closes
+    /// cleanly passes the status through, one that fails yields `Z_ERRNO`, and a
+    /// refusal (no descriptor) passes the status through untouched.
+    #[test]
+    fn finish_close_precedence_table() {
+        let (path, _cpath) = unique_path("precedence");
+
+        // No descriptor released (the wrong-direction arm): status passes through.
+        assert_eq!(finish_close(Z_STREAM_ERROR, None), Z_STREAM_ERROR);
+        assert_eq!(finish_close(Z_OK, None), Z_OK);
+
+        // Descriptor released and the close succeeds: status passes through, for
+        // both a success and a preserved error status.
+        let f = std::fs::File::create(&path).unwrap();
+        assert_eq!(finish_close(Z_OK, Some(f)), Z_OK);
+        let f = std::fs::File::create(&path).unwrap();
+        let buf_error = ReturnCode::BufError.as_c_int();
+        assert_eq!(finish_close(buf_error, Some(f)), buf_error);
+
+        // Descriptor released and the close fails: Z_ERRNO overrides everything.
+        let f = std::fs::File::create(&path).unwrap();
+        assert_eq!(
+            with_forced_close_failure(|| finish_close(Z_OK, Some(f))),
+            Z_ERRNO
+        );
+        let f = std::fs::File::create(&path).unwrap();
+        assert_eq!(
+            with_forced_close_failure(|| finish_close(buf_error, Some(f))),
+            Z_ERRNO,
+            "a close failure overrides an accumulated error status too"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `take_for_close` reclaims the box only for a matching direction, and the
+    /// `CloseDirection::Either` screen accepts both live directions.
+    #[test]
+    fn take_for_close_only_claims_a_matching_direction() {
+        let (path, cpath) = unique_path("takeonly");
+        unsafe {
+            let wf = gzopen(cpath.as_ptr(), c"wb".as_ptr());
+            assert!(!wf.is_null());
+
+            // A reader-only request is refused, leaving the handle intact.
+            assert!(take_for_close(wf, CloseDirection::Read).is_none());
+            // `Either` accepts a writer.
+            let claimed = take_for_close(wf, CloseDirection::Either);
+            assert!(claimed.is_some());
+            // Give the reclaimed box back to the finalizer so it is not leaked and
+            // the descriptor is closed exactly once.
+            let (status, released) =
+                gz::gzclose_w_release(claimed.expect("writer was claimed").state);
+            assert_eq!(finish_close(status, released), Z_OK);
+
+            let rf = gzopen(cpath.as_ptr(), c"rb".as_ptr());
+            assert!(!rf.is_null());
+            assert!(take_for_close(rf, CloseDirection::Write).is_none());
+            let claimed = take_for_close(rf, CloseDirection::Either);
+            let (status, released) =
+                gz::gzclose_r_release(claimed.expect("reader was claimed").state);
+            assert_eq!(finish_close(status, released), Z_OK);
         }
         let _ = std::fs::remove_file(&path);
     }

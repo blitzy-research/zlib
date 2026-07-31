@@ -120,10 +120,10 @@ use zlib_rs::inflate::back::{InFunc, OutFunc, inflate_back, inflate_back_end, in
 use zlib_rs::inflate::inflate_get_header;
 use zlib_rs::inflate::tables::{CodeType, InflateTableError};
 use zlib_rs::inflate::{
-    Code, ENOUGH, ENOUGH_DISTS, ENOUGH_LENS, MAXBITS, inflate, inflate_codes_used, inflate_copy,
-    inflate_end, inflate_init, inflate_init2, inflate_mark, inflate_prime, inflate_reset,
-    inflate_reset_keep, inflate_reset2, inflate_set_dictionary, inflate_sync, inflate_sync_point,
-    inflate_table, inflate_undermine,
+    Code, ENOUGH, ENOUGH_DISTS, ENOUGH_LENS, InflateOutcome, MAXBITS, inflate, inflate_codes_used,
+    inflate_copy, inflate_end, inflate_init, inflate_init2, inflate_mark, inflate_prime,
+    inflate_reset, inflate_reset_keep, inflate_reset2, inflate_set_dictionary, inflate_sync,
+    inflate_sync_point, inflate_table, inflate_undermine,
 };
 use zlib_rs::stream::{AllocBuffer, Allocator, ZeroValid};
 use zlib_rs::{ReturnCode, ZStream, ZlibError};
@@ -2543,9 +2543,15 @@ fn raw_inflate_never_writes_the_adler_mirror() {
     assert_eq!(outcome.code, ReturnCode::StreamEnd);
     assert_eq!(&out[..outcome.produced], &payload[..]);
     assert_eq!(strm.adler, POISON, "a raw decode wrote the adler mirror");
-    assert!(
-        outcome.commit_totals,
-        "an ordinary return must commit the byte totals"
+    // An ordinary return runs C's full epilogue, so the running byte totals
+    // advance together with the reported progress (`inflate.c` L1139-L1142).
+    assert_eq!(
+        strm.total_in, outcome.consumed as u64,
+        "an ordinary return must commit total_in"
+    );
+    assert_eq!(
+        strm.total_out, outcome.produced as u64,
+        "an ordinary return must commit total_out"
     );
     assert_eq!(rc(inflate_end(&mut strm)), ReturnCode::Ok);
 }
@@ -2580,14 +2586,20 @@ fn a_wrapped_header_error_does_not_write_the_adler_mirror() {
 
 /// C's `case DICT` with no dictionary runs `RESTORE(); return Z_NEED_DICT;`
 /// (`inflate.c` L701-L703), committing the cursors but jumping over the
-/// `total_in`/`total_out` updates at L1141-L1142 — which
-/// [`InflateOutcome::commit_totals`] reports. The DICTID is still published into
-/// `adler` (C L696) so the caller can pick the right dictionary.
+/// `total_in`/`total_out` updates at L1141-L1142. The DICTID is still published
+/// into `adler` (C L696) so the caller can pick the right dictionary.
+///
+/// The quirk is observable in exactly one place — the C `z_stream`'s running
+/// totals — so it is asserted where a C caller sees it: through the `extern "C"`
+/// [`ffi_inflate`], on a stream initialized by [`inflateInit2_`]. The idiomatic
+/// half of the test pins the same contract on [`ZStream`]'s own counters, which
+/// the early return likewise bypasses.
 #[test]
-fn need_dict_reports_that_totals_must_not_be_committed() {
+fn need_dict_leaves_the_running_byte_totals_behind() {
     // zlib header with FDICT set, then the 4-byte big-endian dictionary id.
     const FDICT_HEADER: [u8; 6] = [0x78, 0x3F, 0xDE, 0xAD, 0xBE, 0xEF];
 
+    // --- idiomatic API: ZStream's own totals must not advance ----------------
     let mut strm = ZStream::new();
     assert_eq!(rc(inflate_init2(&mut strm, 15)), ReturnCode::Ok);
     let mut out = vec![0u8; 64];
@@ -2599,13 +2611,226 @@ fn need_dict_reports_that_totals_must_not_be_committed() {
         FDICT_HEADER.len(),
         "C's RESTORE() commits the input cursor before returning Z_NEED_DICT"
     );
-    assert!(
-        !outcome.commit_totals,
-        "C returns before its total bookkeeping on the Z_NEED_DICT path"
+    assert_eq!(
+        strm.total_in, 0,
+        "C returns before its total_in bookkeeping on the Z_NEED_DICT path"
+    );
+    assert_eq!(
+        strm.total_out, 0,
+        "C returns before its total_out bookkeeping on the Z_NEED_DICT path"
     );
     assert_eq!(
         strm.adler, 0xDEAD_BEEF,
         "the requested dictionary id must be published into adler (C L696)"
+    );
+    assert_eq!(rc(inflate_end(&mut strm)), ReturnCode::Ok);
+
+    // --- C ABI: the z_stream mirror a C caller actually inspects -------------
+    let mut cstrm = zeroed_stream();
+    // SAFETY: `cstrm` is a valid caller-owned `z_stream`; `c"1"` is a valid
+    // version string whose first byte matches the library version, and the
+    // reported size is the true `sizeof(z_stream)`.
+    let init = unsafe {
+        inflateInit2_(
+            &mut cstrm,
+            15,
+            c"1".as_ptr(),
+            core::mem::size_of::<z_stream>() as c_int,
+        )
+    };
+    assert_eq!(
+        init,
+        ReturnCode::Ok.as_c_int(),
+        "inflateInit2_ must succeed"
+    );
+
+    let mut cout = [0u8; 64];
+    cstrm.next_in = FDICT_HEADER.as_ptr();
+    cstrm.avail_in = FDICT_HEADER.len() as c_uint;
+    cstrm.next_out = cout.as_mut_ptr();
+    cstrm.avail_out = cout.len() as c_uint;
+
+    // SAFETY: `cstrm` holds a valid inflate state and its cursors describe the
+    // live local buffers with matching `avail_*` counts.
+    let ret = unsafe { ffi_inflate(&mut cstrm, Z_NO_FLUSH) };
+    assert_eq!(
+        ret,
+        ReturnCode::NeedDict.as_c_int(),
+        "an FDICT header with no dictionary supplied must return Z_NEED_DICT"
+    );
+    assert_eq!(
+        cstrm.avail_in, 0,
+        "RESTORE() commits avail_in before the direct return (inflate.c L701-L703)"
+    );
+    assert_eq!(
+        cstrm.next_in,
+        // SAFETY: the header was fully consumed, so one-past-the-end of the
+        // fixture is the correct in-bounds-or-end cursor value.
+        unsafe { FDICT_HEADER.as_ptr().add(FDICT_HEADER.len()) },
+        "RESTORE() commits next_in before the direct return"
+    );
+    assert_eq!(
+        cstrm.total_in, 0,
+        "C jumps over `strm->total_in += in` (inflate.c L1141) on this path"
+    );
+    assert_eq!(
+        cstrm.total_out, 0,
+        "C jumps over `strm->total_out += out` (inflate.c L1142) on this path"
+    );
+    assert_eq!(
+        cstrm.adler, 0xDEAD_BEEF,
+        "the requested dictionary id must reach the C caller's adler field"
+    );
+
+    // SAFETY: `cstrm` was initialized by `inflateInit2_` and still owns its state.
+    assert_eq!(
+        unsafe { inflateEnd(&mut cstrm) },
+        ReturnCode::Ok.as_c_int(),
+        "inflateEnd must succeed"
+    );
+}
+
+/// The second of C's two `RESTORE()`-then-return-directly paths: the `inf_leave`
+/// `updatewindow` failure runs `RESTORE()` (`inflate.c` L1132), so the cursors
+/// keep every byte just decoded, and then `state->mode = MEM; return
+/// Z_MEM_ERROR;` (L1136-L1137) jumps over the total bookkeeping at L1141-L1142.
+///
+/// Reference C, linked into the same differential harness as this test's fixture,
+/// reports `rc = Z_MEM_ERROR` with `600` bytes delivered through
+/// `next_out`/`avail_out` and `584` through `next_in`/`avail_in`, while
+/// `total_in` and `total_out` both stay at `0`. A port that committed the totals
+/// here — or that discarded the delivered bytes — would diverge observably.
+#[test]
+fn window_allocation_failure_keeps_the_bytes_but_not_the_totals() {
+    const STATE_SIZE: usize = zlib_rs::inflate::InflateState::C_LAYOUT_SIZE;
+    // `windowBits = -9` => a 512-byte raw window, allocated lazily by `inflate`.
+    const WINDOW_9: usize = 1 << 9;
+
+    // A payload whose second half repeats its first half, so the decode really
+    // emits back-references and the engine really needs a window at inf_leave.
+    let mut payload: Vec<u8> = (0..600u32).map(|i| ((i * 7 + 3) % 251) as u8).collect();
+    for i in 300..600 {
+        payload[i] = payload[i - 300];
+    }
+    let stream = compress_at(&payload, -9);
+
+    let cap = MemCap {
+        // Enough for the state reservation, one byte short of the window.
+        budget: core::cell::Cell::new(STATE_SIZE + WINDOW_9 - 1),
+    };
+    let mut strm = zeroed_stream();
+    strm.zalloc = Some(cap_alloc);
+    strm.zfree = Some(cap_free);
+    strm.opaque = (&cap as *const MemCap) as *mut c_void;
+
+    // SAFETY: `strm` is a valid caller-owned `z_stream` with a live capped
+    // allocator installed; `c"1"`'s first byte matches the library version and
+    // the reported size is the true `sizeof(z_stream)`.
+    let init = unsafe {
+        inflateInit2_(
+            &mut strm,
+            -9,
+            c"1".as_ptr(),
+            core::mem::size_of::<z_stream>() as c_int,
+        )
+    };
+    assert_eq!(
+        init,
+        ReturnCode::Ok.as_c_int(),
+        "a budget covering the state must let inflateInit2_ succeed",
+    );
+
+    let mut out = vec![0u8; 2_048];
+    strm.next_in = stream.as_ptr();
+    strm.avail_in = stream.len() as c_uint;
+    strm.next_out = out.as_mut_ptr();
+    strm.avail_out = out.len() as c_uint;
+
+    // SAFETY: `strm` holds a valid inflate state and its cursors describe the live
+    // local buffers with matching `avail_*` counts.
+    let ret = unsafe { ffi_inflate(&mut strm, Z_NO_FLUSH) };
+    assert_eq!(
+        ret,
+        ReturnCode::MemError.as_c_int(),
+        "the refused window allocation must surface as Z_MEM_ERROR",
+    );
+    assert_eq!(
+        out.len() - strm.avail_out as usize,
+        payload.len(),
+        "RESTORE() at inflate.c L1132 commits the output cursor, so every decoded \
+         byte stays delivered",
+    );
+    assert_eq!(
+        stream.len() - strm.avail_in as usize,
+        stream.len(),
+        "RESTORE() likewise commits the input cursor",
+    );
+    assert_eq!(
+        &out[..payload.len()],
+        &payload[..],
+        "the delivered bytes must be the real decoded payload",
+    );
+    assert_eq!(
+        strm.total_in, 0,
+        "C jumps over `strm->total_in += in` (inflate.c L1141) on this path",
+    );
+    assert_eq!(
+        strm.total_out, 0,
+        "C jumps over `strm->total_out += out` (inflate.c L1142) on this path",
+    );
+
+    // SAFETY: `strm` was initialized by `inflateInit2_` and still owns its state.
+    assert_eq!(
+        unsafe { inflateEnd(&mut strm) },
+        ReturnCode::Ok.as_c_int(),
+        "inflateEnd must succeed",
+    );
+}
+
+/// The public [`InflateOutcome`] must stay exactly `{code, consumed, produced}`.
+///
+/// It is a root-visible public type that mirrors the deflate engine's
+/// `DeflateOutcome` field-for-field, so any added field is a breaking change for
+/// downstream exhaustive struct literals and destructuring patterns. This test is
+/// compiled as a *separate crate* against the public API, so it fails to compile
+/// — loudly, at the exact spot — if a field is ever added or renamed. Anything
+/// the FFI boundary needs beyond these three values must travel in a
+/// crate-private wrapper instead (the `commit_totals` flag does).
+#[test]
+fn inflate_outcome_keeps_its_three_field_public_shape() {
+    // Exhaustive struct literal: a fourth public field breaks this line.
+    let outcome = InflateOutcome {
+        code: ReturnCode::StreamEnd,
+        consumed: 7,
+        produced: 11,
+    };
+    // Exhaustive destructuring (no `..` rest pattern): the same guarantee from
+    // the read side, which is how downstream code most often observes the type.
+    let InflateOutcome {
+        code,
+        consumed,
+        produced,
+    } = outcome;
+    assert_eq!(code, ReturnCode::StreamEnd);
+    assert_eq!(consumed, 7);
+    assert_eq!(produced, 11);
+
+    // The engine must return exactly this type, so a real call is assignable to
+    // an exhaustively-built value with no conversion.
+    let payload: Vec<u8> = (0..1_024u32).map(|i| (i % 251) as u8).collect();
+    let stream = compress_at(&payload, 15);
+    let mut strm = ZStream::new();
+    assert_eq!(rc(inflate_init2(&mut strm, 15)), ReturnCode::Ok);
+    let mut out = vec![0u8; payload.len() + 64];
+    let real: InflateOutcome = inflate(&mut strm, &stream, &mut out, Z_FINISH);
+    assert_eq!(
+        real,
+        InflateOutcome {
+            code: ReturnCode::StreamEnd,
+            consumed: stream.len(),
+            produced: payload.len(),
+        },
+        "a full decode must be describable by an exhaustive three-field literal"
     );
     assert_eq!(rc(inflate_end(&mut strm)), ReturnCode::Ok);
 }

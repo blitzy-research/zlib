@@ -105,6 +105,89 @@ pub(crate) enum How {
     Gzip = 2,
 }
 
+/// The owned OS file handle, with an explicit **release** path so a close can be
+/// made *fallible* — the safe-Rust stand-in for the C `int fd` member.
+///
+/// # Why a newtype rather than a plain [`File`]
+///
+/// RAII closes a descriptor from [`Drop`], which cannot report failure: the
+/// standard library's `File::drop` discards the `close(2)` result. Reference zlib
+/// *does* report it — `gzclose_w` returns [`Z_ERRNO`](ReturnCode::ErrNo) when
+/// `close(state->fd) == -1` (`gzwrite.c` L695-L696, overriding whatever status
+/// the flush accumulated), and `gzclose_r` returns it via
+/// `return ret ? Z_ERRNO : err;` (`gzread.c` L665-L667). Matching that requires
+/// handing the descriptor *out* of the state so the C-ABI boundary can close it
+/// itself and inspect the result.
+///
+/// This wrapper makes that hand-off explicit while keeping every existing call
+/// site unchanged: it [`Deref`](core::ops::Deref)s to [`File`], so
+/// `state.file.read(..)`, `.write(..)`, and `.seek(..)` all still work, and only
+/// [`release`](Self::release) can take the handle away.
+///
+/// # Invariant
+///
+/// The handle is present for the whole useful life of a [`GzState`].
+/// [`release`](Self::release) is called exactly once, by the close finalizers in
+/// `src/gz/close.rs`, as the last act before the state is dropped — so no code
+/// can observe a released handle. The [`Deref`](core::ops::Deref) impls document
+/// that as their panic condition; it is unreachable by construction and covered
+/// by tests.
+pub(crate) struct GzFile {
+    /// The owned handle, or [`None`] once [`release`](Self::release) has taken it
+    /// for an explicit close.
+    handle: Option<File>,
+}
+
+impl GzFile {
+    /// Wraps an owned [`File`] (the descriptor C stores in `state->fd`).
+    #[inline]
+    pub(crate) const fn new(handle: File) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    /// Hands the owned handle to the caller so it can perform an explicit,
+    /// *fallible* close, returning [`None`] if it was already released.
+    ///
+    /// After this the wrapper closes nothing: the descriptor's lifetime belongs
+    /// entirely to the returned [`File`] (or to whatever raw descriptor the
+    /// caller extracts from it). The state must not be used afterwards.
+    #[inline]
+    pub(crate) fn release(&mut self) -> Option<File> {
+        self.handle.take()
+    }
+}
+
+impl core::ops::Deref for GzFile {
+    type Target = File;
+
+    /// # Panics
+    ///
+    /// If the handle has already been [`release`](Self::release)d. Unreachable by
+    /// construction: release happens only in the close finalizers, immediately
+    /// before the owning [`GzState`] is dropped.
+    #[inline]
+    fn deref(&self) -> &File {
+        self.handle
+            .as_ref()
+            .expect("gz file handle used after release")
+    }
+}
+
+impl core::ops::DerefMut for GzFile {
+    /// # Panics
+    ///
+    /// If the handle has already been [`release`](Self::release)d; see
+    /// [`Deref::deref`](core::ops::Deref::deref).
+    #[inline]
+    fn deref_mut(&mut self) -> &mut File {
+        self.handle
+            .as_mut()
+            .expect("gz file handle used after release")
+    }
+}
+
 /// The complete internal state of an open gzip file — the safe-Rust port of the
 /// C `gz_state` structure from `gzguts.h`.
 ///
@@ -150,10 +233,12 @@ pub struct GzState {
     /// The owned OS file handle (replaces the C `int fd`).
     ///
     /// All I/O is performed through the safe [`std::io::Read`],
-    /// [`std::io::Write`], and [`std::io::Seek`] traits on this handle; dropping
-    /// the `GzState` closes the descriptor (the RAII replacement for the C
-    /// `close(fd)`).
-    pub(crate) file: File,
+    /// [`std::io::Write`], and [`std::io::Seek`] traits on this handle, which the
+    /// `GzFile` wrapper exposes by [`Deref`](core::ops::Deref). Dropping the
+    /// `GzState` closes the descriptor (the RAII replacement for the C
+    /// `close(fd)`) *unless* a close finalizer has released it first so the C-ABI
+    /// boundary can perform a fallible close — see `GzFile`.
+    pub(crate) file: GzFile,
 
     /// The path (or synthetic `<fd:N>` name from `gzdopen`) used when building
     /// error messages (C `char *path`).
@@ -314,8 +399,11 @@ impl Drop for GzState {
     /// * `strm` (`ZStream`) runs its own `Drop`, which performs
     ///   the `inflateEnd`/`deflateEnd`-equivalent teardown of the engine state;
     ///   and
-    /// * `file` (`File`) closes the underlying descriptor —
-    ///   subsuming the C `close(fd)`.
+    /// * `file` (`GzFile`) closes the underlying descriptor —
+    ///   subsuming the C `close(fd)` — *unless* a close finalizer already
+    ///   `released` it so the C-ABI boundary could close it
+    ///   explicitly and report a failure as [`Z_ERRNO`](ReturnCode::ErrNo), which
+    ///   reference zlib does and an error-discarding `Drop` cannot.
     ///
     /// This explicit `Drop` therefore exists to *document* the RAII contract
     /// (and to give the sibling modules a single place to reason about
@@ -442,7 +530,7 @@ mod tests {
             next: 0,
             pos: 0,
             mode: GzMode::Read,
-            file,
+            file: GzFile::new(file),
             path: String::from(path),
             size: 0,
             want: 0,
@@ -564,6 +652,60 @@ mod tests {
         s.clear_error();
         assert_eq!(s.err, ReturnCode::Ok);
         assert_eq!(s.msg, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // The `GzFile` release hand-off
+    // -----------------------------------------------------------------------
+
+    /// [`GzFile`] must behave as the owned handle everywhere except for the one
+    /// explicit hand-off: [`GzFile::release`] yields the [`File`] exactly once, and
+    /// the released handle is still open so the FFI layer can close it itself and
+    /// observe the result (C `close(state->fd)`).
+    #[test]
+    fn gz_file_releases_its_handle_exactly_once() {
+        let mut s = test_state("archive.gz");
+
+        // Before release the wrapper is transparent: `Deref` reaches the `File`.
+        assert!(
+            s.file.metadata().is_ok(),
+            "Deref must reach a live File before release"
+        );
+
+        let released = s
+            .file
+            .release()
+            .expect("the first release yields the handle");
+        assert!(
+            released.metadata().is_ok(),
+            "the released descriptor must still be open"
+        );
+
+        // A second release yields nothing: the hand-off is single-shot, so the
+        // descriptor can never be closed twice through this path.
+        assert!(
+            s.file.release().is_none(),
+            "release must be single-shot so no double close is possible"
+        );
+
+        // Dropping the state after a release must not attempt any close — the
+        // descriptor's lifetime now belongs entirely to `released`.
+        drop(s);
+        assert!(
+            released.metadata().is_ok(),
+            "dropping a released state must not close the handed-off descriptor"
+        );
+    }
+
+    /// Deref-after-release panics with the documented message. Unreachable in
+    /// production (release happens only as the last act of a close finalizer), but
+    /// pinned so the invariant fails loudly rather than silently if that changes.
+    #[test]
+    #[should_panic(expected = "gz file handle used after release")]
+    fn deref_after_release_panics() {
+        let mut s = test_state("archive.gz");
+        let _released = s.file.release().expect("handle present");
+        let _ = s.file.metadata();
     }
 
     // -----------------------------------------------------------------------
@@ -874,7 +1016,7 @@ mod tests {
             next: 0,
             pos: 0,
             mode: GzMode::Write,
-            file,
+            file: GzFile::new(file),
             path: path.display().to_string(),
             size: 0,
             want: DROP_CONTRACT_WANT,

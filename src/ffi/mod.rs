@@ -57,26 +57,53 @@
 //! | [`util`]    | `compress.c`, `uncompr.c`, `adler32.c`, `crc32.c`, `zutil.c`   | one-call, checksum, and version/error shims                |
 //! | [`deflate`](mod@deflate) | `deflate.c`, `zlib.h`                                          | `deflate*` compression shims                               |
 //! | [`inflate`](mod@inflate) | `inflate.c`, `infback.c`, `zlib.h`                             | `inflate*` / `inflateBack*` decompression shims            |
-//! | `gz`        | `gzlib.c`, `gzread.c`, `gzwrite.c`, `gzclose.c`, `gzguts.h`    | `gz*` file-I/O shims (Cargo feature `gz-io`)               |
+//! | [`gz`](mod@gz) | `gzlib.c`, `gzread.c`, `gzwrite.c`, `gzclose.c`, `gzguts.h`  | `gz*` file-I/O shims (always linked; functional with `gz-io`) |
 //!
 //! ## Feature gating
 //!
-//! The `gz` submodule maps zlib's gzip file-I/O layer, which fundamentally
-//! requires the standard library for filesystem access. It is therefore compiled
-//! only when the `gz-io` Cargo feature is enabled (which implies `std` and
-//! `gzip`), matching the gating in `crate::gz` and the `#[cfg(feature =
-//! "gz-io")] pub mod gz;` declaration in `src/lib.rs`. The `#[cfg(feature =
-//! "gz-io")]` attribute on the `pub mod gz;` declaration below is the single
-//! gate for `src/ffi/gz.rs`: that file deliberately does **not** repeat it as a
-//! module-level `#![cfg(…)]`, because an inner `cfg` duplicating the one on the
-//! `mod` declaration is reported as a `clippy::duplicated_attributes` error by
-//! the Clippy shipped with the pinned MSRV toolchain (`rust-toolchain.toml`).
-//! A build **without** `gz-io` still links the complete set of core
-//! (`deflate`/`inflate`/`checksum`/one-call/version) symbols: [`types`],
-//! [`util`], [`deflate`](mod@deflate), and [`inflate`](mod@inflate) are always compiled so the core zlib
-//! symbol table is always present for linkage.
+//! **Every one of the four shim submodules is compiled unconditionally, so the
+//! emitted `cdylib`/`staticlib` presents the complete zlib C symbol table in
+//! every Cargo feature configuration** (AAP §0.3.1, §0.8.1 D-4). A C consumer
+//! links against one ABI, not against a per-feature subset: a missing
+//! `gzbuffer` would be a link failure, which is a strictly worse outcome than a
+//! symbol that resolves and reports an error.
 //!
-//! Within the `gz-io` layer, `gzprintf`/`gzvprintf` are always exported as
+//! The `gz` submodule maps zlib's gzip file-I/O layer, which fundamentally
+//! requires the standard library for filesystem access. Feature gating for it is
+//! therefore applied **inside each function body**, never to the `mod`
+//! declaration or to the `#[unsafe(no_mangle)]` items:
+//!
+//! * With `gz-io` enabled (implied by the default feature set, and itself
+//!   implying `std` and `gzip`), every `gz*` shim delegates to `crate::gz` and
+//!   behaves exactly as the C original.
+//! * Without `gz-io`, every `gz*` shim still exists as an exported symbol with
+//!   its exact C signature and returns that entry point's documented failure
+//!   sentinel — `NULL` for the pointer-returning `gzopen`/`gzopen64`/`gzdopen`/
+//!   `gzgets`/`gzerror` family, `-1` for `gzread`/`gzgetc`/`gzungetc`/`gzseek`/
+//!   `gztell`/`gzoffset` and friends, `0` for `gzwrite`/`gzeof`/`gzdirect` and
+//!   the `z_size_t`-returning `gzfread`/`gzfwrite`, `Z_STREAM_ERROR` for
+//!   `gzsetparams`/`gzflush`/`gzclose`/`gzclose_r`/`gzclose_w`, and a no-op for
+//!   the `void`-returning `gzclearerr`. This is the same shape as the
+//!   `gzprintf`/`gzvprintf` concession below: the symbol resolves, and the
+//!   failure is observable through the return value rather than at link time.
+//!
+//! Only the *helpers* that genuinely need `std` — the `GzHandle`/`GzBorrow`
+//! ownership types, the boxing and close plumbing, the platform `close(2)`
+//! binding and the path conversion — carry `#[cfg(feature = "gz-io")]`, so a
+//! `--no-default-features` build compiles no unreachable machinery while still
+//! emitting all 34 `gz*` symbols. Every core
+//! (`deflate`/`inflate`/`checksum`/one-call/version) symbol is likewise always
+//! present: [`types`], [`util`], [`deflate`](mod@deflate), and
+//! [`inflate`](mod@inflate) have never been gated.
+//!
+//! The per-configuration proof lives in this module's own test suite: the
+//! signature guards are un-gated (so they only compile if the symbol exists in
+//! the row under test), `every_exported_c_symbol_resolves_to_a_live_address`
+//! takes the address of all 96 exported entry points, and
+//! `no_exported_gz_symbol_is_feature_gated` fails if a future edit re-applies a
+//! `cfg` to a `#[unsafe(no_mangle)]` site.
+//!
+//! `gzprintf`/`gzvprintf` are always exported as
 //! ABI-compatible **error-returning stubs** that yield `Z_STREAM_ERROR`:
 //! rendering a C `va_list` from Rust requires the unstable (nightly-only)
 //! `c_variadic` feature, so — precisely as zlib documents for a build without
@@ -144,9 +171,12 @@
 // Submodule declarations
 // ===========================================================================
 //
-// `types` is the foundational module every shim builds on; `util`, `deflate`,
-// and `inflate` are always compiled so the core zlib symbol table is always
-// present for linkage. `gz` is feature-gated (see the module-level docs above).
+// `types` is the foundational module every shim builds on. All four shim
+// modules — `util`, `deflate`, `inflate`, and `gz` — are compiled
+// unconditionally so the emitted `cdylib`/`staticlib` presents the complete
+// zlib C symbol table in every feature configuration (AAP §0.3.1, §0.8.1 D-4).
+// `gz` applies its `gz-io` gating inside each function body, never to the `mod`
+// declaration or to an exported item (see the module-level docs above).
 
 pub mod deflate;
 pub mod inflate;
@@ -160,7 +190,10 @@ pub mod util;
 // core (`src/stream.rs`) delegates to via `AllocHook::try_alloc_zeroed`.
 pub(crate) mod alloc;
 
-#[cfg(feature = "gz-io")]
+// The gzip file-I/O shims. Declared unconditionally: each of the 34 exported
+// `gz*` entry points has exactly one definition whose *body* is gated on
+// `gz-io`, so the symbol resolves in every configuration and returns its
+// documented failure sentinel when the feature is off.
 pub mod gz;
 
 // ===========================================================================
@@ -180,12 +213,10 @@ pub mod gz;
 // / `inflate` shim functions live in the value namespace, so both coexist.)
 
 pub use deflate::*;
+pub use gz::*;
 pub use inflate::*;
 pub use types::*;
 pub use util::*;
-
-#[cfg(feature = "gz-io")]
-pub use gz::*;
 
 // ===========================================================================
 // Compile-time symbol-presence guards
@@ -259,7 +290,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "gz-io")]
     #[test]
     fn gz_symbols_have_expected_c_signatures() {
         use crate::ffi::types::gzFile;
@@ -274,7 +304,6 @@ mod tests {
     // fixed signatures. This guard fails to compile if either symbol is dropped
     // or its fixed leading parameters drift, catching the "missing
     // gzprintf/gzvprintf" regression at build time.
-    #[cfg(feature = "gz-io")]
     #[test]
     fn default_gzprintf_stub_symbols_are_present() {
         use crate::ffi::types::gzFile;
@@ -672,10 +701,14 @@ mod tests {
     // -- gz family (`src/ffi/gz.rs`, 33 exported names) ----------------------
     //
     // `gzopen`, `gzprintf`, and `gzvprintf` are bound by the two gz guards
-    // above; the six guards below cover the remaining thirty. Every one carries
-    // `#[cfg(feature = "gz-io")]`, matching the module-level gate on
-    // `src/ffi/gz.rs`, so a `--no-default-features` build compiles them out
-    // cleanly.
+    // above; the six guards below cover the remaining thirty. **None of them is
+    // feature-gated**, and that is deliberate: `src/ffi/gz.rs` declares exactly
+    // one definition per exported name in every configuration and gates only
+    // the function *bodies* on `gz-io` (AAP §0.3.1, §0.8.1 D-4). Because these
+    // guards coerce the function *items* to `unsafe extern "C"` fn-pointer
+    // *types*, they only compile if the symbol genuinely exists — so leaving
+    // them un-gated is what makes a `--no-default-features` build prove its own
+    // symbol completeness rather than merely skipping the check.
 
     /// The `gz*` open and configuration entry points.
     ///
@@ -683,7 +716,6 @@ mod tests {
     /// exclusive definitions in `src/ffi/gz.rs` (`#[cfg(unix)]` and
     /// `#[cfg(not(unix))]`) with identical signatures, so the symbol exists on
     /// every platform and an unconditional binding proves both arms agree.
-    #[cfg(feature = "gz-io")]
     #[test]
     fn gz_open_and_config_symbols_have_expected_c_signatures() {
         use crate::ffi::types::gzFile;
@@ -708,7 +740,6 @@ mod tests {
     /// `gzungetc` takes the character **first**; and `gzgetc_` is a separate
     /// exported symbol from `gzgetc`, because `zlib.h` defines `gzgetc` as a
     /// macro and keeps `gzgetc_` for backward compatibility.
-    #[cfg(feature = "gz-io")]
     #[test]
     fn gz_read_symbols_have_expected_c_signatures() {
         use crate::ffi::types::{gzFile, voidp, z_size_t};
@@ -728,7 +759,6 @@ mod tests {
 
     /// The `gz*` write entry points. `gzfwrite` mirrors C's `fwrite` argument
     /// order — buffer, size, nitems, file — and returns `z_size_t`.
-    #[cfg(feature = "gz-io")]
     #[test]
     fn gz_write_symbols_have_expected_c_signatures() {
         use crate::ffi::types::{gzFile, voidpc, z_size_t};
@@ -749,7 +779,6 @@ mod tests {
     /// has a 64-bit twin, and the two differ only in `z_off_t` (C `long`) versus
     /// `z_off64_t` (always 64-bit) — indistinguishable on LP64, divergent on
     /// 32-bit Windows.
-    #[cfg(feature = "gz-io")]
     #[test]
     fn gz_seek_and_position_symbols_have_expected_c_signatures() {
         use crate::ffi::types::{gzFile, z_off_t, z_off64_t};
@@ -779,7 +808,6 @@ mod tests {
     /// The `gz*` status, error, and close entry points. `gzclearerr` is the one
     /// exported symbol in the whole C surface that returns **nothing**, so its
     /// function-pointer type carries no `->` clause at all.
-    #[cfg(feature = "gz-io")]
     #[test]
     fn gz_status_error_and_close_symbols_have_expected_c_signatures() {
         use crate::ffi::types::gzFile;
@@ -810,7 +838,7 @@ mod tests {
     /// `#if defined(_WIN32) && !defined(Z_SOLO)` and `src/ffi/gz.rs` mirrors that
     /// with `#[cfg(windows)]` — so the guard must carry the `windows` predicate
     /// too, or a non-Windows build fails to compile.
-    #[cfg(all(feature = "gz-io", windows))]
+    #[cfg(windows)]
     #[test]
     fn gz_wide_open_symbol_has_expected_c_signature() {
         use crate::ffi::types::gzFile;
@@ -1140,5 +1168,376 @@ mod tests {
              {guarded_locals:?}",
             guarded_locals.len()
         );
+    }
+
+    /// The free-function surface `crate::ffi::types` publishes, pinned by name.
+    ///
+    /// `types.rs` is glob-re-exported by every shim module (`use
+    /// crate::ffi::types::*;`), so anything `pub` there becomes part of the
+    /// crate's public API the moment it is written. That is fine for the ABI
+    /// mirrors and the conversion helpers a re-implementor genuinely needs, and
+    /// wrong for init-sequence plumbing that mutates a caller's `z_stream` in
+    /// place and has exactly one correct call site — inside the five versioned
+    /// `*Init*_` shims. `init_allocator_prologue` is that plumbing and is
+    /// `pub(crate)`; this test is what keeps it, and anything like it, from
+    /// drifting back into the public surface unnoticed.
+    ///
+    /// Only *free functions* are inventoried (`^pub … fn`), because they are the
+    /// items a glob import pulls into a consumer's namespace unqualified. The
+    /// `#[repr(C)]` mirrors, type aliases and inherent methods are pinned by the
+    /// ABI guards above and by the layout assertions in `crate::ffi::types`.
+    #[test]
+    fn ffi_types_publishes_exactly_the_intended_free_functions() {
+        /// The sanctioned public free functions of `crate::ffi::types`.
+        ///
+        /// Adding a name here is a deliberate public-API decision; removing one
+        /// is a breaking change. Neither may happen by accident.
+        const EXPECTED: [&str; 19] = [
+            "advance_input",
+            "advance_output",
+            "alloc_hook_from_parts",
+            "deflate_state",
+            "deflate_take",
+            "gz_header_to_idiomatic",
+            "input_ptr_valid",
+            "input_slice",
+            "output_slice",
+            "peek_handle_kind",
+            "set_adler",
+            "set_data_type",
+            "set_msg",
+            "state_ptr_from_box",
+            "state_ref",
+            "state_take",
+            "stream_buffers_valid",
+            "write_gz_header_from_idiomatic",
+            "zstream_with_caller_alloc",
+        ];
+
+        let source = strip_line_comments(&repo_file("src/ffi/types.rs"));
+        let mut found: std::vec::Vec<std::string::String> = std::vec::Vec::new();
+
+        for line in source.lines() {
+            // Column 0 only: an indented `pub fn` is an inherent method, and a
+            // `pub(crate) fn` is not part of the public surface.
+            if !line.starts_with("pub ") {
+                continue;
+            }
+            let Some(after_fn) = line.split(" fn ").nth(1) else {
+                continue;
+            };
+            let name: std::string::String = after_fn
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                found.push(name);
+            }
+        }
+        found.sort();
+        found.dedup();
+
+        let mut expected: std::vec::Vec<std::string::String> =
+            EXPECTED.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+
+        assert_eq!(
+            found, expected,
+            "the public free-function surface of src/ffi/types.rs changed. Added \
+             names must be a deliberate public-API decision; init-sequence \
+             plumbing such as `init_allocator_prologue` must stay `pub(crate)`."
+        );
+        assert!(
+            !found.iter().any(|n| n == "init_allocator_prologue"),
+            "`init_allocator_prologue` mutates a caller's z_stream and has one \
+             correct call site; it must remain `pub(crate)`."
+        );
+    }
+
+    /// Every exported C symbol resolves to a live, distinct code address **in
+    /// the configuration under test**.
+    ///
+    /// This is the per-feature-row artifact check. The signature guards above
+    /// prove a symbol's *type* is right; they are also, by themselves, a
+    /// sufficient existence proof only because they are un-gated — coercing
+    /// `crate::ffi::gz::gzbuffer` to a fn pointer simply does not compile if
+    /// that item was cfg'd away. This test makes the existence claim explicit
+    /// and total: it names all 95 non-Windows exports at once, takes each
+    /// address, and requires every one to be a real, non-null, unique function.
+    ///
+    /// Why that matters: the emitted `cdylib`/`staticlib` must present the
+    /// complete zlib C symbol table in *every* Cargo feature configuration (AAP
+    /// §0.3.1, §0.8.1 D-4). A C consumer links against one ABI, so a
+    /// `--no-default-features` build that quietly dropped the 15 gzip
+    /// `zlib.map` globals (`gzbuffer`, `gzclearerr`, `gzclose_r`, `gzclose_w`,
+    /// `gzdirect`, `gzfread`, `gzfwrite`, `gzgetc_`, `gzoffset`, `gzoffset64`,
+    /// `gzopen64`, `gzseek64`, `gztell64`, `gzungetc`, `gzvprintf`) would be an
+    /// unlinkable artifact, not a smaller one. Because `cargo test` runs this
+    /// module once per feature row, every row now carries its own proof.
+    ///
+    /// Distinctness is asserted as well as non-nullness: two names collapsing to
+    /// one address would mean a shim had been aliased to another (for example by
+    /// a copy-paste that pointed `gzclose_r` at `gzclose_w`), which no signature
+    /// guard can catch when the signatures happen to match.
+    #[test]
+    fn every_exported_c_symbol_resolves_to_a_live_address() {
+        /// Builds `(name, address)` pairs from `module::symbol` paths.
+        ///
+        /// `stringify!` keeps the printed name and the resolved item in lockstep,
+        /// so a table entry can never disagree with the symbol it measures.
+        macro_rules! export_addresses {
+            ($( $module:ident :: $symbol:ident ),* $(,)?) => {
+                std::vec![ $( (
+                    std::stringify!($symbol),
+                    crate::ffi::$module::$symbol as *const ()
+                ) ),* ]
+            };
+        }
+
+        // `gzopen_w` exists only on Windows, exactly as `zlib.h` gates it with
+        // `#if defined(_WIN32) && !defined(Z_SOLO)`. Building it as a separate
+        // (possibly empty) tail keeps the main table immutable and needs no
+        // `cfg` inside the macro invocation.
+        let windows_only: std::vec::Vec<(&str, *const ())> = {
+            #[cfg(windows)]
+            {
+                std::vec![("gzopen_w", crate::ffi::gz::gzopen_w as *const ())]
+            }
+            #[cfg(not(windows))]
+            {
+                std::vec::Vec::new()
+            }
+        };
+
+        let table: std::vec::Vec<(&str, *const ())> = export_addresses![
+            // deflate.rs — 17 names
+            deflate::deflateInit2_,
+            deflate::deflateInit_,
+            deflate::deflate,
+            deflate::deflateEnd,
+            deflate::deflateReset,
+            deflate::deflateResetKeep,
+            deflate::deflateParams,
+            deflate::deflateTune,
+            deflate::deflateBound,
+            deflate::deflateBound_z,
+            deflate::deflatePending,
+            deflate::deflateUsed,
+            deflate::deflatePrime,
+            deflate::deflateSetDictionary,
+            deflate::deflateGetDictionary,
+            deflate::deflateSetHeader,
+            deflate::deflateCopy,
+            // inflate.rs — 21 names
+            inflate::inflateInit2_,
+            inflate::inflateInit_,
+            inflate::inflateBackInit_,
+            inflate::inflate,
+            inflate::inflateEnd,
+            inflate::inflateReset,
+            inflate::inflateReset2,
+            inflate::inflateResetKeep,
+            inflate::inflateSetDictionary,
+            inflate::inflateGetDictionary,
+            inflate::inflateSync,
+            inflate::inflateSyncPoint,
+            inflate::inflatePrime,
+            inflate::inflateCopy,
+            inflate::inflateMark,
+            inflate::inflateValidate,
+            inflate::inflateUndermine,
+            inflate::inflateCodesUsed,
+            inflate::inflateGetHeader,
+            inflate::inflateBack,
+            inflate::inflateBackEnd,
+            // util.rs — 25 names
+            util::compress2,
+            util::compress2_z,
+            util::compress,
+            util::compress_z,
+            util::compressBound,
+            util::compressBound_z,
+            util::uncompress2,
+            util::uncompress2_z,
+            util::uncompress,
+            util::uncompress_z,
+            util::adler32,
+            util::adler32_z,
+            util::adler32_combine,
+            util::adler32_combine64,
+            util::crc32,
+            util::crc32_z,
+            util::crc32_combine,
+            util::crc32_combine64,
+            util::crc32_combine_gen,
+            util::crc32_combine_gen64,
+            util::crc32_combine_op,
+            util::get_crc_table,
+            util::zlibVersion,
+            util::zError,
+            util::zlibCompileFlags,
+            // gz.rs — 32 names
+            gz::gzopen,
+            gz::gzopen64,
+            gz::gzdopen,
+            gz::gzbuffer,
+            gz::gzsetparams,
+            gz::gzread,
+            gz::gzfread,
+            gz::gzgetc,
+            gz::gzgetc_,
+            gz::gzgets,
+            gz::gzungetc,
+            gz::gzwrite,
+            gz::gzfwrite,
+            gz::gzputc,
+            gz::gzputs,
+            gz::gzflush,
+            gz::gzvprintf,
+            gz::gzprintf,
+            gz::gzseek,
+            gz::gzseek64,
+            gz::gzrewind,
+            gz::gztell,
+            gz::gztell64,
+            gz::gzoffset,
+            gz::gzoffset64,
+            gz::gzeof,
+            gz::gzdirect,
+            gz::gzerror,
+            gz::gzclearerr,
+            gz::gzclose,
+            gz::gzclose_r,
+            gz::gzclose_w
+        ]
+        .into_iter()
+        .chain(windows_only)
+        .collect();
+
+        let expected = if cfg!(windows) { 96 } else { 95 };
+        assert_eq!(
+            table.len(),
+            expected,
+            "the address table must cover every exported C symbol for this \
+             target ({expected} expected)"
+        );
+
+        for (name, address) in &table {
+            assert!(
+                !address.is_null(),
+                "exported symbol `{name}` resolved to a null address"
+            );
+        }
+
+        let mut seen: std::vec::Vec<(*const (), &str)> = std::vec::Vec::new();
+        for (name, address) in &table {
+            if let Some((_, other)) = seen.iter().find(|(seen_at, _)| seen_at == address) {
+                panic!("exported symbols `{name}` and `{other}` share one address");
+            }
+            seen.push((*address, name));
+        }
+
+        // The table is complete with respect to the source of truth: every
+        // `#[unsafe(no_mangle)]` site in the four shim modules, minus the one
+        // name this target legitimately does not build.
+        let (mut declared, _) = exported_symbol_inventory();
+        if !cfg!(windows) {
+            declared.retain(|name| name != "gzopen_w");
+        }
+        declared.sort();
+
+        let mut measured: std::vec::Vec<std::string::String> =
+            table.iter().map(|(name, _)| name.to_string()).collect();
+        measured.sort();
+
+        assert_eq!(
+            measured, declared,
+            "the address table drifted from the `#[unsafe(no_mangle)]` inventory; \
+             every declared export must be measured here so each feature row \
+             proves its own symbol completeness"
+        );
+    }
+
+    /// No exported `gz*` symbol may be feature-gated.
+    ///
+    /// `src/ffi/gz.rs` keeps exactly one definition per exported name and gates
+    /// only the function *bodies* on `gz-io`, so the symbol table is identical in
+    /// every feature row. Re-applying a `cfg` to a `#[unsafe(no_mangle)]` item —
+    /// or restoring the module-level gate on `pub mod gz;` — would silently shrink
+    /// the artifact back to 63 symbols and 39 of the 54 `zlib.map` globals. That
+    /// regression is invisible to a default-features test run, so it is pinned
+    /// here at the source level, where it is visible in every row.
+    ///
+    /// Platform gates are the one sanctioned exception: `gzdopen` has two
+    /// mutually exclusive `unix` / `not(unix)` arms and `gzopen_w` is
+    /// Windows-only, matching `zlib.h`. Both are allow-listed by predicate, so a
+    /// feature predicate can never slip in under their cover.
+    #[test]
+    fn no_exported_gz_symbol_is_feature_gated() {
+        let source = strip_line_comments(&repo_file("src/ffi/gz.rs"));
+        let lines: std::vec::Vec<&str> = source.lines().collect();
+
+        assert!(
+            !source.contains("#![cfg("),
+            "src/ffi/gz.rs must not carry a module-level `#![cfg(…)]`: the whole \
+             file has to compile in every feature row so all 34 gz* symbols are \
+             emitted"
+        );
+
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim() != "#[unsafe(no_mangle)]" {
+                continue;
+            }
+
+            // Attributes may sit on either side of `#[unsafe(no_mangle)]`.
+            let mut attrs: std::vec::Vec<&str> = std::vec::Vec::new();
+            let mut above = index;
+            while above > 0 && lines[above - 1].trim().starts_with("#[") {
+                above -= 1;
+                attrs.push(lines[above].trim());
+            }
+            for below in &lines[index + 1..] {
+                let below = below.trim();
+                if !below.starts_with("#[") {
+                    break;
+                }
+                attrs.push(below);
+            }
+
+            for attr in attrs {
+                if !attr.contains("cfg") {
+                    continue;
+                }
+                assert!(
+                    !attr.contains("feature"),
+                    "src/ffi/gz.rs line {}: an exported symbol carries the feature \
+                     gate `{attr}`. Gate the function BODY instead so the symbol \
+                     still links in a --no-default-features build.",
+                    index + 1
+                );
+                assert!(
+                    attr.contains("unix") || attr.contains("windows"),
+                    "src/ffi/gz.rs line {}: unexpected gate `{attr}` on an exported \
+                     symbol; only the platform gates zlib.h itself applies are \
+                     allowed here.",
+                    index + 1
+                );
+            }
+        }
+
+        // The `mod` declaration and the re-export must both be unconditional.
+        let root = strip_line_comments(&repo_file("src/ffi/mod.rs"));
+        for (index, line) in root.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed != "pub mod gz;" && trimmed != "pub use gz::*;" {
+                continue;
+            }
+            let previous = root.lines().nth(index.wrapping_sub(1)).unwrap_or("").trim();
+            assert!(
+                !previous.contains("#[cfg("),
+                "src/ffi/mod.rs: `{trimmed}` must be unconditional, but it is \
+                 preceded by `{previous}`"
+            );
+        }
     }
 }

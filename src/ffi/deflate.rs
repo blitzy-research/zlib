@@ -2005,11 +2005,14 @@ mod tests {
     /// (the common zeroed `z_stream`) and both halves supplied (routed through the
     /// caller's allocator).
     ///
-    /// A wholly absent pair is deliberately left absent — see
-    /// [`crate::ffi::types::init_allocator_prologue`], whose doc records why: the
-    /// substitution is confined to the *half*-present case so a hookless caller's
-    /// allocation count and engine-state footprint stay byte-for-byte what they
-    /// have always been (AAP §0.6.5).
+    /// A wholly absent pair is substituted per half, exactly as C substitutes
+    /// `zcalloc`/`zcfree` (`deflate.c` L400-L414), so the caller's `z_stream`
+    /// publishes two non-null halves afterwards. That publication is pure ABI
+    /// shape: [`crate::ffi::types::CAllocator::is_builtin_pair`] recognizes the
+    /// crate's own substitutes and reports *no* hook, so the engine keeps using
+    /// the global-allocator path and a hookless caller's allocation count and
+    /// engine-state footprint stay byte-for-byte what they have always been
+    /// (AAP §0.6.5).
     #[test]
     fn init_accepts_both_hooks_and_neither_hook() {
         let mut strm = zeroed_stream();
@@ -2020,9 +2023,14 @@ mod tests {
         );
         assert!(!strm.state.is_null());
         assert!(
-            strm.zalloc.is_none() && strm.zfree.is_none(),
-            "a wholly absent pair is left absent, which selects the global \
-             allocator and keeps a hookless caller's footprint unchanged"
+            strm.zalloc.is_some() && strm.zfree.is_some(),
+            "C substitutes each missing half unconditionally (`deflate.c` \
+             L400-L414), so a hookless caller's stream publishes a complete pair"
+        );
+        assert!(
+            crate::ffi::types::publishes_builtin_alloc_pair(&strm),
+            "the published pair must be the crate's own built-ins — the \
+             counterpart of C's zcalloc/zcfree — not a caller hook"
         );
         assert!(strm.opaque.is_null(), "a zeroed cookie stays zeroed");
         assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);

@@ -60,7 +60,7 @@ use core::{ptr, slice};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use crate::gz_header::GzHeader;
+use crate::gz_header::{GzHeader, HeaderPublication};
 use crate::stream::{AllocBuffer, AllocHook, Allocator, ZStream, ZeroValid};
 
 // ===========================================================================
@@ -385,8 +385,9 @@ impl CAllocator {
     /// substituting the *missing half* in place — `zcalloc` for a null `zalloc`,
     /// `zcfree` for a null `zfree` (`inflate.c` L183-L196, `deflate.c`
     /// L400-L414, `infback.c` L37-L50). [`init_allocator_prologue`] reproduces
-    /// that substitution byte-for-byte, so a stream this crate initialized
-    /// **always** carries a complete pair and this predicate is `false` for it.
+    /// that substitution byte-for-byte and per half, so a stream this crate
+    /// initialized **always** carries two non-null halves and this predicate is
+    /// `false` for it.
     ///
     /// The predicate therefore has exactly one job: detecting a stream whose
     /// allocator fields were mutated *after* initialization, which is the same
@@ -401,10 +402,61 @@ impl CAllocator {
     pub(crate) const fn is_half_present(&self) -> bool {
         self.zalloc.is_some() != self.zfree.is_some()
     }
+
+    /// Whether **both** captured halves are this crate's own built-in
+    /// substitutes rather than anything the caller supplied.
+    ///
+    /// [`init_allocator_prologue`] fills in every missing half with
+    /// [`default_zalloc`](crate::ffi::alloc::default_zalloc) /
+    /// [`default_zfree`](crate::ffi::alloc::default_zfree), exactly as C fills
+    /// in `zcalloc`/`zcfree` (`deflate.c` L400-L414, `inflate.c` L183-L196,
+    /// `infback.c` L37-L50). When the caller supplied *neither* half, the pair a
+    /// stream ends up publishing is therefore entirely the library's own default
+    /// allocator — the counterpart of C's `zcalloc`/`zcfree`, not a caller hook.
+    ///
+    /// [`Allocator::hook`] consults this predicate so such a stream reports **no
+    /// hook** and keeps using the crate's default (global-allocator) path. That
+    /// is what AAP §0.6.5 requires: the engine-state footprint is charged to the
+    /// caller only when they actually installed an allocator, so a hookless C
+    /// caller's allocation count and footprint stay byte-for-byte what they have
+    /// always been. A *half*-present pair is deliberately **not** matched here:
+    /// the caller's own half is real and must be honored, so such a stream keeps
+    /// an active hook (a deliberately failing caller `zalloc` still surfaces as
+    /// `Z_MEM_ERROR` rather than being bypassed), exactly as in C.
+    ///
+    /// The built-ins are `pub(crate)` and are never exported (they mirror
+    /// `zlib.map` `local:` entries), so a caller cannot supply either address
+    /// and this predicate cannot mistake a genuine hook for a substitute.
+    #[inline]
+    #[must_use]
+    pub(crate) fn is_builtin_pair(&self) -> bool {
+        match (self.zalloc, self.zfree) {
+            (Some(zalloc), Some(zfree)) => {
+                core::ptr::fn_addr_eq(
+                    zalloc,
+                    crate::ffi::alloc::default_zalloc
+                        as unsafe extern "C" fn(*mut c_void, c_uint, c_uint) -> *mut c_void,
+                ) && core::ptr::fn_addr_eq(
+                    zfree,
+                    crate::ffi::alloc::default_zfree
+                        as unsafe extern "C" fn(*mut c_void, *mut c_void),
+                )
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Reproduces C's `*Init*_` allocator prologue on a caller's [`z_stream`] and
 /// returns the resulting [`CAllocator`].
+///
+/// Crate-private: this is init-sequence plumbing for the five versioned `*Init*_`
+/// shims in [`crate::ffi::deflate`] and [`crate::ffi::inflate`], and it mutates a
+/// caller's `z_stream` in place. It is deliberately **not** part of the public
+/// surface — an external caller with a raw `z_stream` wants a full
+/// `deflateInit2_`/`inflateInit2_`, never this prologue on its own, and exposing
+/// it would publish an `unsafe fn` whose only correct use site is inside the
+/// initializers themselves.
 ///
 /// All three C initializers — `deflateInit2_` (`deflate.c` L399-L414),
 /// `inflateInit2_` (`inflate.c` L182-L196) and `inflateBackInit_`
@@ -433,31 +485,30 @@ impl CAllocator {
 /// `Z_MEM_ERROR` rather than being bypassed), the missing half is filled in, and
 /// initialization proceeds.
 ///
-/// # A wholly absent pair is left absent
+/// # Every missing half is substituted, including a wholly absent pair
 ///
-/// The substitution is confined to the *half*-present case. When the caller
-/// supplied **neither** half, both fields are left null, which selects the
-/// crate's global-allocator path — the built-in allocator for this port, exactly
-/// as `zcalloc`/`zcfree` are for C. That is required by AAP §0.6.5: charging the
-/// engine-state footprint to the caller happens only when they actually installed
-/// a hook, so that a hookless C caller's footprint stays byte-for-byte what it
-/// has always been. See [`Allocator::reserves_state_footprint`], whose entire
-/// purpose is that requirement. Substituting the built-ins here would make every
-/// hookless stream pay a real `sizeof(deflate_state)` reservation it does not pay
-/// today, purely for accounting symmetry with a hook the caller never supplied.
+/// The two `if` tests are independent in C and are independent here: a caller
+/// who supplied neither half gets **both** built-ins published into their
+/// `z_stream`, precisely as `deflate.c` L400-L414 publishes both `zcalloc` and
+/// `zcfree`. After any successful initialization — and after a failed one that
+/// got past the version guard — a C caller inspecting `strm->zalloc` and
+/// `strm->zfree` therefore sees the same non-null shape reference zlib leaves
+/// behind, so nothing observable through the ABI differs.
 ///
-/// One consequence is observable and is recorded here rather than glossed over:
-/// after a *hookless* initialization, reference C leaves `strm->zalloc` and
-/// `strm->zfree` holding its own built-ins, whereas this crate leaves both null.
-/// It affects nothing else — every return code, every `msg`/`opaque` mutation,
-/// every allocation count and every byte of output is identical, and the null
-/// fields are internally consistent (nothing in this crate rejects a stream for
-/// carrying them, so `deflateCopy`/`inflateCopy` and every other entry point
-/// behave the same). `zlib.h` documents these three fields as *inputs* the
-/// application initializes before the call (L140, L235, L385, L551, L863, L1117)
-/// and never as outputs the library publishes, so no documented contract depends
-/// on the difference. This is a consequence of the AAP §0.6.5 footprint
-/// requirement, not an independently authorized divergence.
+/// Publishing the built-ins does **not** change which allocator the engine
+/// actually uses. [`CAllocator::is_builtin_pair`] recognizes a pair that consists
+/// solely of this crate's own substitutes, and [`Allocator::hook`] answers "no
+/// hook" for it, so such a stream keeps the crate's default global-allocator
+/// path. That preserves AAP §0.6.5's requirement that the engine-state footprint
+/// is charged to the caller only when they actually installed an allocator: a
+/// hookless caller's allocation count and footprint stay byte-for-byte what they
+/// have always been. See [`Allocator::reserves_state_footprint`], whose entire
+/// purpose is that requirement.
+///
+/// A *half*-present pair behaves differently and must: the caller's own half is
+/// real, so the completed pair stays an **active** hook and every buffer is
+/// charged to it. A deliberately failing caller `zalloc` therefore still
+/// surfaces as `Z_MEM_ERROR` rather than being bypassed, exactly as in C.
 ///
 /// # Safety
 ///
@@ -466,29 +517,22 @@ impl CAllocator {
 /// and written (`msg`, `zalloc`, `zfree`, `opaque`); no hook pointer is
 /// dereferenced here.
 #[inline]
-pub unsafe fn init_allocator_prologue(strm: &mut z_stream) -> CAllocator {
+pub(crate) unsafe fn init_allocator_prologue(strm: &mut z_stream) -> CAllocator {
     // Step 1 — `strm->msg = Z_NULL;` (deflate.c L399, inflate.c L182,
     // infback.c L36). Unconditional, and ahead of the allocator inspection, so
     // every subsequent `return` in the initializer reports a clean `msg`.
     strm.msg = core::ptr::null_mut();
 
-    // Whether the caller supplied exactly one half. Captured *before* either
-    // branch runs, so step 3 cannot observe the pointer step 2 just installed.
-    let complete_the_pair = strm.zalloc.is_some() != strm.zfree.is_some();
-
     // Step 2 — `if (strm->zalloc == 0) { strm->zalloc = zcalloc; strm->opaque = 0; }`
     // (deflate.c L400-L407, inflate.c L183-L190, infback.c L37-L44).
     //
-    // The `complete_the_pair` conjunct is the one place this differs from C's
-    // literal text, and it is deliberate: it confines the substitution to the
-    // half-present case and leaves a WHOLLY absent pair absent, which selects
-    // this crate's global-allocator path — the built-in allocator here, exactly
-    // as `zcalloc`/`zcfree` are C's, and the case AAP §0.6.3 and §0.6.5 govern
-    // (see this function's doc comment). The behavior a C caller can observe for
-    // a half-present pair is identical either way; for a wholly absent pair the
-    // conjunct is what keeps a hookless caller's allocation count and footprint
-    // unchanged.
-    if complete_the_pair && strm.zalloc.is_none() {
+    // Unconditional per half, exactly as C writes it: a caller who supplied
+    // neither half gets both built-ins published, so the `z_stream` a C caller
+    // inspects afterwards carries the same non-null shape reference zlib leaves
+    // behind. Which allocator the engine *uses* is decided separately by
+    // `CAllocator::is_builtin_pair` / `Allocator::hook`, so a hookless caller's
+    // allocation count and footprint stay unchanged (AAP §0.6.5).
+    if strm.zalloc.is_none() {
         strm.zalloc = Some(crate::ffi::alloc::default_zalloc);
         strm.opaque = core::ptr::null_mut();
     }
@@ -496,13 +540,32 @@ pub unsafe fn init_allocator_prologue(strm: &mut z_stream) -> CAllocator {
     // Step 3 — `if (strm->zfree == 0) strm->zfree = zcfree;` (deflate.c
     // L408-L413, inflate.c L191-L196, infback.c L45-L50). Note that C does NOT
     // touch `opaque` on this branch.
-    if complete_the_pair && strm.zfree.is_none() {
+    if strm.zfree.is_none() {
         strm.zfree = Some(crate::ffi::alloc::default_zfree);
     }
 
     // SAFETY: `strm` is a valid `&z_stream`; `from_stream` only copies the plain
     // `Copy` allocator fields out and never dereferences a hook pointer.
     unsafe { CAllocator::from_stream(strm) }
+}
+
+/// Whether `strm`'s published `zalloc`/`zfree` pair consists solely of this
+/// crate's built-in substitutes — the shape [`init_allocator_prologue`] leaves
+/// behind for a caller who supplied neither half, mirroring the `zcalloc`/`zcfree`
+/// pair reference zlib publishes (`deflate.c` L400-L414).
+///
+/// Test-only: it lets the FFI regression tests assert C-shaped publication
+/// without hard-coding raw function addresses.
+#[cfg(test)]
+#[inline]
+#[must_use]
+pub(crate) fn publishes_builtin_alloc_pair(strm: &z_stream) -> bool {
+    CAllocator {
+        zalloc: strm.zalloc,
+        zfree: strm.zfree,
+        opaque: strm.opaque,
+    }
+    .is_builtin_pair()
 }
 
 impl Allocator for CAllocator {
@@ -513,13 +576,15 @@ impl Allocator for CAllocator {
     /// The returned [`AllocBuffer`] is a [`Foreign`](AllocBuffer::Foreign)
     /// region carved from the caller's `zalloc` (and released through their
     /// `zfree` on drop) whenever this [`CAllocator`] carries an active
-    /// [`hook`](Allocator::hook); with **both** hooks null, or for an empty
-    /// request, it uses a global-allocator [`Vec`](AllocBuffer::Owned), matching
-    /// AAP §0.6.3's "otherwise `std::alloc` is used" clause and C's substitution
-    /// of `zcalloc`/`zcfree` for a wholly absent pair (`deflate.c` L400-L414).
+    /// [`hook`](Allocator::hook); with **both** hooks null — or with a pair made
+    /// up solely of the crate's own built-in substitutes, which is what a
+    /// hookless caller ends up publishing — or for an empty request, it uses a
+    /// global-allocator [`Vec`](AllocBuffer::Owned), matching AAP §0.6.3's
+    /// "otherwise `std::alloc` is used" clause and C's substitution of
+    /// `zcalloc`/`zcfree` for a wholly absent pair (`deflate.c` L400-L414).
     ///
     /// A *half*-present pair never reaches this method from a C entry point:
-    /// [`init_allocator_prologue`] has already completed it by substituting the
+    /// `init_allocator_prologue` has already completed it by substituting the
     /// crate's built-in for the missing half, exactly as C's `*Init*_` prologues
     /// substitute `zcalloc`/`zcfree` (`deflate.c` L400-L414, `inflate.c`
     /// L183-L196, `infback.c` L37-L50). The caller's own half is therefore
@@ -544,9 +609,22 @@ impl Allocator for CAllocator {
     /// Exposes the caller's `zalloc`/`zfree`/`opaque` triple as an
     /// [`AllocHook`], so buffers this allocator produces (directly, or lazily on
     /// a state it initializes) are backed by the caller's allocator.
+    ///
+    /// A pair consisting *solely* of this crate's own built-in substitutes —
+    /// which is what `init_allocator_prologue` publishes when the caller
+    /// supplied neither half, mirroring C's `zcalloc`/`zcfree` — is **not** a
+    /// caller hook and yields [`AllocHook::none`], selecting the crate's default
+    /// global-allocator path. See `CAllocator::is_builtin_pair`: this is what
+    /// keeps a hookless C caller's allocation count and engine-state footprint
+    /// byte-for-byte unchanged (AAP §0.6.5) even though the raw `z_stream` fields
+    /// are now populated exactly as C populates them.
     #[inline]
     fn hook(&self) -> AllocHook {
-        AllocHook::new(self.zalloc, self.zfree, self.opaque)
+        if self.is_builtin_pair() {
+            AllocHook::none()
+        } else {
+            AllocHook::new(self.zalloc, self.zfree, self.opaque)
+        }
     }
 
     /// The engine-state footprint is charged to the caller only when they
@@ -653,14 +731,14 @@ pub const unsafe fn alloc_hook_from_parts(
 /// [`z_stream::state`], honoring caller hooks when the pair is complete and
 /// global-allocating when neither half is present (see [`CAllocator`]).
 ///
-/// # Use [`init_allocator_prologue`] in an `*Init*_` shim
+/// # Use `init_allocator_prologue` in an `*Init*_` shim
 ///
 /// This constructor reads the triple exactly as it finds it, so it is the right
 /// tool only where that triple is already known-complete — for example when it
 /// has been cloned out of an initialized handle. The `deflateInit2_`,
 /// `inflateInit2_`, and `inflateBackInit_` shims must additionally reproduce C's
 /// initialization prologue (clear `msg`, substitute a missing half of the pair),
-/// so they call [`init_allocator_prologue`] and hand its result to
+/// so they call `init_allocator_prologue` and hand its result to
 /// [`ZStream::with_allocator`] instead.
 ///
 /// # Safety
@@ -1084,33 +1162,6 @@ unsafe fn cstr_bytes(ptr: *const c_uchar) -> Vec<u8> {
     unsafe { slice::from_raw_parts(ptr, len) }.to_vec()
 }
 
-/// Copies at most `cap` content bytes of `src` to `dst` and NUL-terminates when
-/// room remains, mirroring the C `inflateGetHeader` name/comment truncation
-/// (the NUL is stored only if the content did not fill the whole capacity).
-///
-/// # Safety
-///
-/// `dst` must be non-null and point at a buffer of at least `cap` writable
-/// bytes.
-unsafe fn write_cstr_bounded(dst: *mut c_uchar, src: &[u8], cap: usize) {
-    if cap == 0 {
-        return;
-    }
-    let n = core::cmp::min(src.len(), cap);
-    // SAFETY: `dst` has `cap` writable bytes and `n <= cap`, so the copy stays
-    // in bounds; `src` and `dst` are distinct buffers.
-    unsafe {
-        ptr::copy_nonoverlapping(src.as_ptr(), dst, n);
-    }
-    if n < cap {
-        // SAFETY: `n < cap`, so `dst.add(n)` addresses a writable byte within
-        // the buffer.
-        unsafe {
-            *dst.add(n) = 0;
-        }
-    }
-}
-
 /// Converts a raw [`gz_header`] (as passed to `deflateSetHeader`) into the
 /// idiomatic [`GzHeader`], or [`None`] when `head`
 /// is null.
@@ -1166,33 +1217,39 @@ pub unsafe fn gz_header_to_idiomatic(head: *const gz_header) -> Option<GzHeader>
         hcrc: h.hcrc != 0,
         // C tri-state `done`: only `1` means "header fully read".
         done: h.done == 1,
-        // `c_uint` is `u32` on every Rust target, so these assign directly.
-        // Carrying `extra_len` across preserves a value the caller may already
-        // have set: on the `inflateGetHeader` path the engine overwrites it from
-        // the stream's declared XLEN only when the header actually carries an
-        // `FEXTRA` field, so a stream without one must leave the caller's value
-        // intact (`inflate.c` L596-L606).
-        extra_len: h.extra_len,
+        // `c_uint` is `u32` on every Rust target, so these assign directly. The
+        // caller's `extra_len` is *not* carried into a field of `GzHeader` — it is
+        // consumed above to size the `extra` copy, which is its only role in this
+        // direction, and on the read-back path the decoder reports the stream's
+        // declared `XLEN` through `HeaderPublication::extra_len` instead.
         extra_max: h.extra_max,
         name_max: h.name_max,
         comm_max: h.comm_max,
     })
 }
 
-/// Writes an idiomatic [`GzHeader`] back into a
-/// caller-provided raw [`gz_header`] (as used by `inflateGetHeader`), honoring
-/// the caller's `extra_max`/`name_max`/`comm_max` capacities and never
-/// overrunning the caller's buffers.
+/// Writes an idiomatic [`GzHeader`] back into a caller-provided raw
+/// [`gz_header`] (as used by `inflateGetHeader`), honoring the caller's
+/// `extra_max`/`name_max`/`comm_max` capacities and never overrunning the
+/// caller's buffers.
 ///
-/// Scalar fields (`text`, `time`, `xflags`, `os`, `hcrc`, `done`) are always
-/// written, as is `extra_len`, which receives the extra field's **declared**
-/// length even when the copy into `extra` is truncated to `extra_max` — and even
-/// when `extra` is null. This matches C, where `inflate` writes `head->extra_len`
-/// from the header's `XLEN` independently of the clamped copy (`inflate.c`
-/// L599-L600 vs L614-L621). `zlib.h` specifies the truncation signal
-/// (`extra_len > extra_max`); the null-`extra` length query is not spelled out
-/// there but falls out of that same unconditional write, so reference zlib
-/// permits it de facto and this port must too.
+/// This is the **bulk** publisher, for callers holding a header that is already
+/// complete and no record of how it was parsed. It publishes every field C
+/// assigns, copies each captured buffer from offset `0`, and NUL-terminates
+/// `name`/`comment` when the capacity leaves room — exactly what reference zlib
+/// has done by the time it sets `head->done = 1`.
+///
+/// One field is deliberately left alone: the extra field's **declared** `XLEN`
+/// (C `head->extra_len`). It is a decoder observation that cannot be recovered
+/// from a finished [`GzHeader`] — `extra.len()` is the *captured* count, which is
+/// smaller precisely in the truncation case the field exists to report — so
+/// inventing a value here would destroy the caller's `extra_len > extra_max`
+/// truncation signal. The decoder path publishes the real `XLEN` through
+/// `publish_gz_header` instead.
+///
+/// While a stream is still being decoded, use `publish_gz_header`: C assigns
+/// each field inside its own parser state, and a bulk write would zero scalars
+/// the stream has not reached and terminate a half-received name.
 ///
 /// # Safety
 ///
@@ -1200,6 +1257,50 @@ pub unsafe fn gz_header_to_idiomatic(head: *const gz_header) -> Option<GzHeader>
 /// `name`/`comment` pointers are non-null, each must address at least
 /// `extra_max`/`name_max`/`comm_max` writable bytes respectively.
 pub unsafe fn write_gz_header_from_idiomatic(head: *mut gz_header, src: &GzHeader) {
+    // SAFETY: forwards this function's own contract unchanged.
+    unsafe { publish_gz_header(head, src, &HeaderPublication::for_completed_header(src)) }
+}
+
+/// Publishes into a caller-provided raw [`gz_header`] exactly the assignments
+/// `published` records — reference zlib's *incremental* gzip-header schedule.
+///
+/// # Why the schedule matters
+///
+/// C never mirrors a header wholesale. Each field is written inside the parser
+/// state that decodes it, straight into the caller's struct and buffers, so a
+/// caller polling between `inflate` calls sees only what the stream has actually
+/// delivered and keeps its own values everywhere else. Reproducing that requires
+/// three things a bulk copy cannot do:
+///
+/// * **Unreached scalars stay untouched.** `text`/`time`/`xflags`/`os`/`hcrc` are
+///   written only once their own state has run (`inflate.c` `FLAGS`/`TIME`/`OS`/
+///   `HCRC`). Writing them eagerly would overwrite a caller's sentinels with
+///   zeros before the header carried any value at all.
+/// * **`done` is tri-state.** `-1` ("this stream has no gzip header", assigned in
+///   the `HEAD` non-gzip branch) is not expressible as a [`bool`], so it arrives
+///   through `HeaderDone`. `0` is written by `inflateGetHeader` at registration
+///   and is never re-published here.
+/// * **The name/comment NUL is a decoded byte, not a formatting flourish.** C
+///   stores the field's terminating NUL only when it actually reads it *and* it
+///   fits within `name_max`/`comm_max` — a name that exactly fills the buffer is
+///   left unterminated, and a name still arriving has no terminator yet.
+///
+/// Buffer bytes are written at the offset C wrote them: the record carries how
+/// many bytes this call appended, and the owned `Vec`'s new length gives the end,
+/// so the destination offset is `len - stored`. Every write is additionally
+/// clamped to the caller's declared capacity, so a hand-built [`GzHeader`] whose
+/// vectors exceed `*_max` truncates instead of overrunning.
+///
+/// # Safety
+///
+/// `head` must be null or point at a valid [`gz_header`]. When its `extra`/
+/// `name`/`comment` pointers are non-null, each must address at least
+/// `extra_max`/`name_max`/`comm_max` writable bytes respectively.
+pub(crate) unsafe fn publish_gz_header(
+    head: *mut gz_header,
+    src: &GzHeader,
+    published: &HeaderPublication,
+) {
     if head.is_null() {
         return;
     }
@@ -1208,71 +1309,132 @@ pub unsafe fn write_gz_header_from_idiomatic(head: *mut gz_header, src: &GzHeade
     // fields.
     let h = unsafe { &mut *head };
 
-    h.text = c_int::from(src.text);
-    h.time = src.time as c_ulong;
-    // `xflags`/`os` are C `int` (== `i32`), assigned directly.
-    h.xflags = src.xflags;
-    h.os = src.os;
-    h.hcrc = c_int::from(src.hcrc);
-    h.done = c_int::from(src.done);
+    // --- scalars: each written only by the state that assigns it in C ---------
+    if published.text {
+        h.text = c_int::from(src.text);
+    }
+    if published.time {
+        h.time = src.time as c_ulong;
+    }
+    if published.os {
+        // C assigns `xflags` and `os` together under one guard (`inflate.c`
+        // L539-L542), so one flag covers both.
+        h.xflags = src.xflags;
+        h.os = src.os;
+    }
+    if published.hcrc {
+        h.hcrc = c_int::from(src.hcrc);
+    }
+    if let Some(done) = published.done {
+        // The tri-state reaches the caller verbatim: `-1` for "not a gzip header",
+        // `1` for "header complete".
+        h.done = done.as_c_int() as c_int;
+    }
 
-    // Publish the **declared** extra-field length, unconditionally — not the
-    // number of bytes that fit. C writes `head->extra_len` from the stream's
-    // 16-bit `XLEN` in the `EXLEN` state (`inflate.c` L599-L600), gated on
-    // neither `extra`'s nullity nor `extra_max`'s size, and separately clamps the
-    // copy (`inflate.c` L614-L621). Reproducing both halves is what makes
-    // `extra_len > extra_max` a usable truncation signal per `zlib.h`, and what
-    // lets a caller pass a null `extra` purely to learn the length and get the
-    // real value instead of zero — de-facto reference-zlib behavior that falls
-    // out of the same unconditional write. When the stream
-    // carried no `FEXTRA` field the engine left this at whatever the caller
-    // supplied, so writing it back is then a no-op.
-    h.extra_len = src.extra_len as c_uint;
-    if let Some(extra) = &src.extra {
-        if !h.extra.is_null() {
-            let cap = h.extra_max as usize;
-            let n = core::cmp::min(cap, extra.len());
-            // SAFETY: `h.extra` has `extra_max` writable bytes and `n <= cap`.
-            unsafe {
-                ptr::copy_nonoverlapping(extra.as_ptr(), h.extra, n);
-            }
-        }
-    } else {
-        // No extra field: null the caller's pointer, as C does with
-        // `state->head->extra = Z_NULL` on the no-`FEXTRA` branch (`inflate.c`
+    // --- extra ---------------------------------------------------------------
+    if let Some(declared_xlen) = published.extra_len {
+        // The stream's declared 16-bit `XLEN`, published unconditionally and
+        // *unclamped* — gated on neither `extra`'s nullity nor `extra_max`'s size
+        // (`inflate.c` L599-L600), while the copy below is separately clamped
+        // (L614-L621). Reproducing both halves is what makes
+        // `extra_len > extra_max` a usable truncation signal per `zlib.h`, and
+        // what lets a caller pass a null `extra` purely to learn the length.
+        h.extra_len = declared_xlen as c_uint;
+    }
+    if published.extra_null {
+        // C's no-`FEXTRA` branch: `state->head->extra = Z_NULL` (`inflate.c`
         // L605-L606). That assignment is how a C caller distinguishes "the header
         // declared no extra field" from "it declared one"; leaving a stale
         // non-null pointer would misreport an absent field as present.
-        //
-        // Both ways of reaching `None` want exactly this. If the caller supplied
-        // no buffer, `inflateGetHeader` set the slot to `None` and the pointer is
-        // already null, so this is a no-op. If the stream carried no `FEXTRA`,
-        // the engine set it to `None` and nulling is precisely C's behavior. A
-        // stream whose header has not yet reached the `EXLEN` state — including a
-        // raw zlib stream, where `done` is reported as `-1` — keeps the slot at
-        // `Some(empty)`, so nothing is nulled prematurely, matching C, which
-        // likewise only assigns once it reaches that state.
         h.extra = ptr::null_mut();
     }
-    if let Some(name) = &src.name {
-        // Nested `if` rather than an `if let ... && ...` chain, which is
-        // unstable before Rust 1.88 (this crate's MSRV is 1.85).
-        if !h.name.is_null() {
-            // SAFETY: `h.name` has `name_max` writable bytes.
+    if published.extra_stored != 0 {
+        if let Some(extra) = &src.extra {
+            // SAFETY: bounded by `extra_max`; see `copy_tail_bounded`.
             unsafe {
-                write_cstr_bounded(h.name, name, h.name_max as usize);
+                copy_tail_bounded(h.extra, extra, published.extra_stored, h.extra_max as usize);
             }
         }
     }
-    if let Some(comment) = &src.comment {
-        // Nested `if` rather than an `if let ... && ...` chain, which is
-        // unstable before Rust 1.88 (this crate's MSRV is 1.85).
-        if !h.comment.is_null() {
-            // SAFETY: `h.comment` has `comm_max` writable bytes.
+
+    // --- name ----------------------------------------------------------------
+    if published.name_null {
+        // C's no-`FNAME` branch: `state->head->name = Z_NULL` (`inflate.c`
+        // L643-L644).
+        h.name = ptr::null_mut();
+    }
+    if let Some(name) = &src.name {
+        let cap = h.name_max as usize;
+        if published.name_stored != 0 {
+            // SAFETY: bounded by `name_max`; see `copy_tail_bounded`.
             unsafe {
-                write_cstr_bounded(h.comment, comment, h.comm_max as usize);
+                copy_tail_bounded(h.name, name, published.name_stored, cap);
             }
         }
+        if published.name_terminated && !h.name.is_null() && name.len() < cap {
+            // SAFETY: `h.name` has `name_max` writable bytes and
+            // `name.len() < cap`, so this byte is inside the buffer. C stores the
+            // NUL at `head->name[state->length]`, and `state->length` is exactly
+            // the number of content bytes captured so far.
+            unsafe {
+                *h.name.add(name.len()) = 0;
+            }
+        }
+    }
+
+    // --- comment -------------------------------------------------------------
+    if published.comment_null {
+        // C's no-`FCOMMENT` branch: `state->head->comment = Z_NULL` (`inflate.c`
+        // L665-L666).
+        h.comment = ptr::null_mut();
+    }
+    if let Some(comment) = &src.comment {
+        let cap = h.comm_max as usize;
+        if published.comment_stored != 0 {
+            // SAFETY: bounded by `comm_max`; see `copy_tail_bounded`.
+            unsafe {
+                copy_tail_bounded(h.comment, comment, published.comment_stored, cap);
+            }
+        }
+        if published.comment_terminated && !h.comment.is_null() && comment.len() < cap {
+            // SAFETY: `h.comment` has `comm_max` writable bytes and
+            // `comment.len() < cap`, so this byte is inside the buffer.
+            unsafe {
+                *h.comment.add(comment.len()) = 0;
+            }
+        }
+    }
+}
+
+/// Copies the last `stored` bytes of `src` into `dst` at the offset they occupy
+/// in `src`, clamped to `cap` writable bytes; a null `dst` or a zero `cap` is a
+/// no-op.
+///
+/// This is the byte-placement rule C uses for `head->extra`, `head->name`, and
+/// `head->comment`: it writes each decoded byte at the running index it was
+/// captured at, so a field delivered across several `inflate` calls lands
+/// contiguously without any call rewriting an earlier call's bytes.
+///
+/// # Safety
+///
+/// `dst` must be null or point at a buffer of at least `cap` writable bytes.
+unsafe fn copy_tail_bounded(dst: *mut c_uchar, src: &[u8], stored: usize, cap: usize) {
+    if dst.is_null() || cap == 0 {
+        return;
+    }
+    // `stored` can never exceed `src.len()` for a record the decoder produced;
+    // `saturating_sub` keeps a hand-built record in bounds instead of wrapping.
+    let offset = src.len().saturating_sub(stored);
+    if offset >= cap {
+        return;
+    }
+    let n = core::cmp::min(src.len() - offset, cap - offset);
+    // SAFETY: `offset < cap` and `offset + n <= cap`, so the destination range
+    // `dst[offset..offset + n]` lies inside the caller's `cap` writable bytes;
+    // `src[offset..offset + n]` is in bounds because `offset + n <= src.len()`;
+    // and the two buffers are distinct (the source is this crate's owned `Vec`).
+    unsafe {
+        ptr::copy_nonoverlapping(src.as_ptr().add(offset), dst.add(offset), n);
     }
 }
 
@@ -2679,6 +2841,279 @@ mod tests {
         assert_eq!(out.extra_len, 10);
     }
 
+    /// A poisoned `gz_header` whose buffers are pre-filled with a sentinel, for
+    /// asserting exactly which bytes [`publish_gz_header`] wrote.
+    #[cfg(feature = "gzip")]
+    struct PoisonedRawHeader {
+        head: gz_header,
+        extra: alloc::vec::Vec<u8>,
+        name: alloc::vec::Vec<u8>,
+        comment: alloc::vec::Vec<u8>,
+    }
+
+    #[cfg(feature = "gzip")]
+    impl PoisonedRawHeader {
+        const POISON: u8 = 0x7e;
+        const SCALAR: c_int = 9;
+        const TIME: c_ulong = 0xDEAD_BEEF;
+        const XLEN: c_uint = 12345;
+
+        fn new(cap: usize) -> Self {
+            let mut this = Self {
+                head: gz_header {
+                    text: Self::SCALAR,
+                    time: Self::TIME,
+                    xflags: Self::SCALAR,
+                    os: Self::SCALAR,
+                    extra: ptr::null_mut(),
+                    extra_len: Self::XLEN,
+                    extra_max: cap as c_uint,
+                    name: ptr::null_mut(),
+                    name_max: cap as c_uint,
+                    comment: ptr::null_mut(),
+                    comm_max: cap as c_uint,
+                    hcrc: Self::SCALAR,
+                    done: Self::SCALAR,
+                },
+                extra: alloc::vec![Self::POISON; cap],
+                name: alloc::vec![Self::POISON; cap],
+                comment: alloc::vec![Self::POISON; cap],
+            };
+            this.head.extra = this.extra.as_mut_ptr();
+            this.head.name = this.name.as_mut_ptr();
+            this.head.comment = this.comment.as_mut_ptr();
+            this
+        }
+    }
+
+    /// Finding #11 — an empty [`HeaderPublication`] must authorize **no** write,
+    /// so a call that reached no gzip header state leaves the caller's struct and
+    /// every capture buffer exactly as it found them.
+    ///
+    /// This is the property a bulk mirror cannot have, and it is what makes C's
+    /// sentinel-based "has this field arrived yet?" idiom work: C assigns each
+    /// field inside its own parser state, so anything the stream has not reached
+    /// still holds the caller's value.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn publish_gz_header_writes_nothing_for_an_empty_publication() {
+        let mut raw = PoisonedRawHeader::new(8);
+        let src = GzHeader::new()
+            .with_name(b"nm".to_vec())
+            .with_comment(b"cm".to_vec())
+            .with_extra(alloc::vec![1u8, 2]);
+
+        // SAFETY: `raw.head`'s buffers are sized by its `*_max` fields.
+        unsafe {
+            publish_gz_header(&mut raw.head, &src, &HeaderPublication::default());
+        }
+
+        assert_eq!(raw.head.text, PoisonedRawHeader::SCALAR);
+        assert_eq!(raw.head.time, PoisonedRawHeader::TIME);
+        assert_eq!(raw.head.xflags, PoisonedRawHeader::SCALAR);
+        assert_eq!(raw.head.os, PoisonedRawHeader::SCALAR);
+        assert_eq!(raw.head.hcrc, PoisonedRawHeader::SCALAR);
+        assert_eq!(raw.head.done, PoisonedRawHeader::SCALAR);
+        assert_eq!(raw.head.extra_len, PoisonedRawHeader::XLEN);
+        assert!(!raw.head.extra.is_null() && !raw.head.name.is_null());
+        assert!(!raw.head.comment.is_null());
+        assert!(
+            raw.extra.iter().all(|&b| b == PoisonedRawHeader::POISON)
+                && raw.name.iter().all(|&b| b == PoisonedRawHeader::POISON)
+                && raw.comment.iter().all(|&b| b == PoisonedRawHeader::POISON),
+            "an empty publication must not touch a single buffer byte"
+        );
+    }
+
+    /// Finding #11 — buffer bytes are written at the offset C wrote them, so a
+    /// field delivered across several `inflate` calls lands contiguously and no
+    /// call rewrites an earlier call's bytes.
+    ///
+    /// C's `EXTRA` state copies to `head->extra + (extra_len - state->length)`
+    /// (`inflate.c` L614-L621) — the count already consumed. The record carries
+    /// how many bytes *this* call appended, and the owned `Vec`'s new length gives
+    /// the end, so the destination offset is `len - stored`. Feeding the same
+    /// growing `Vec` in two instalments and asserting the untouched tail proves the
+    /// arithmetic.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn publish_gz_header_writes_each_instalment_at_cs_offset() {
+        let mut raw = PoisonedRawHeader::new(8);
+
+        // Call 1: two bytes of extra and two of the name arrive.
+        let mut src = GzHeader::new()
+            .with_extra(alloc::vec![0xA1u8, 0xA2])
+            .with_name(b"ab".to_vec());
+        let first = HeaderPublication {
+            extra_stored: 2,
+            name_stored: 2,
+            ..HeaderPublication::default()
+        };
+        // SAFETY: buffers are sized by the `*_max` fields.
+        unsafe { publish_gz_header(&mut raw.head, &src, &first) };
+        assert_eq!(&raw.extra[..2], &[0xA1, 0xA2]);
+        assert!(
+            raw.extra[2..]
+                .iter()
+                .all(|&b| b == PoisonedRawHeader::POISON)
+        );
+        assert_eq!(&raw.name[..2], b"ab");
+        assert_eq!(
+            raw.name[2],
+            PoisonedRawHeader::POISON,
+            "the name is still arriving, so it carries no terminator yet"
+        );
+
+        // Call 2: one more extra byte and two more name bytes, then the NUL.
+        src.extra.as_mut().unwrap().push(0xA3);
+        src.name.as_mut().unwrap().extend_from_slice(b"cd");
+        let second = HeaderPublication {
+            extra_stored: 1,
+            name_stored: 2,
+            name_terminated: true,
+            ..HeaderPublication::default()
+        };
+        // SAFETY: buffers are sized by the `*_max` fields.
+        unsafe { publish_gz_header(&mut raw.head, &src, &second) };
+        assert_eq!(
+            &raw.extra[..3],
+            &[0xA1, 0xA2, 0xA3],
+            "the second instalment appended rather than restarting at offset 0"
+        );
+        assert!(
+            raw.extra[3..]
+                .iter()
+                .all(|&b| b == PoisonedRawHeader::POISON)
+        );
+        assert_eq!(&raw.name[..4], b"abcd");
+        assert_eq!(raw.name[4], 0, "the decoded NUL is now stored");
+        assert!(
+            raw.name[5..]
+                .iter()
+                .all(|&b| b == PoisonedRawHeader::POISON)
+        );
+    }
+
+    /// Finding #8 — the tri-state `done` reaches the C caller verbatim, including
+    /// the `-1` that says "this stream carries no gzip header" and which a Rust
+    /// [`bool`] cannot represent (`inflate.c` L505-L506).
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn publish_gz_header_publishes_the_tri_state_done_verbatim() {
+        let src = GzHeader::new();
+        for (recorded, expected) in [
+            (crate::gz_header::HeaderDone::NotGzip, -1),
+            (crate::gz_header::HeaderDone::Pending, 0),
+            (crate::gz_header::HeaderDone::Complete, 1),
+        ] {
+            let mut raw = PoisonedRawHeader::new(4);
+            let published = HeaderPublication {
+                done: Some(recorded),
+                ..HeaderPublication::default()
+            };
+            // SAFETY: buffers are sized by the `*_max` fields.
+            unsafe { publish_gz_header(&mut raw.head, &src, &published) };
+            assert_eq!(raw.head.done, expected, "done must survive as {expected}");
+            // Nothing else was authorized, so nothing else moved.
+            assert_eq!(raw.head.text, PoisonedRawHeader::SCALAR);
+            assert_eq!(raw.head.hcrc, PoisonedRawHeader::SCALAR);
+        }
+    }
+
+    /// Finding #11 — the `*_null` flags publish C's `Z_NULL` assignments for an
+    /// absent field (`inflate.c` L605-L606, L643-L644, L665-L666) without touching
+    /// the buffer the caller handed over.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn publish_gz_header_nulls_only_the_pointers_the_record_names() {
+        let src = GzHeader::new();
+        let mut raw = PoisonedRawHeader::new(4);
+        let published = HeaderPublication {
+            extra_null: true,
+            comment_null: true,
+            ..HeaderPublication::default()
+        };
+        // SAFETY: buffers are sized by the `*_max` fields.
+        unsafe { publish_gz_header(&mut raw.head, &src, &published) };
+
+        assert!(raw.head.extra.is_null(), "EXLEN's no-FEXTRA branch");
+        assert!(raw.head.comment.is_null(), "COMMENT's no-FCOMMENT branch");
+        assert!(
+            !raw.head.name.is_null(),
+            "an unrecorded field's pointer must survive"
+        );
+        assert!(
+            raw.extra.iter().all(|&b| b == PoisonedRawHeader::POISON)
+                && raw.comment.iter().all(|&b| b == PoisonedRawHeader::POISON),
+            "nulling a pointer must not write into the buffer it pointed at"
+        );
+        assert_eq!(
+            raw.head.extra_len,
+            PoisonedRawHeader::XLEN,
+            "C's no-FEXTRA branch nulls `extra` and never touches `extra_len`"
+        );
+    }
+
+    /// Finding #10 — the declared `XLEN` is published **unclamped**, from the
+    /// record rather than from `extra.len()`.
+    ///
+    /// C assigns `head->extra_len = (unsigned)hold` in `EXLEN` (`inflate.c`
+    /// L599-L600) gated on neither `extra`'s nullity nor `extra_max`'s size, while
+    /// the copy is separately clamped. That asymmetry is the entire truncation
+    /// contract: `extra_len > extra_max` is a C caller's only signal that bytes
+    /// were dropped, so reporting the captured count instead would make silent
+    /// data loss undetectable.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn publish_gz_header_reports_the_declared_xlen_unclamped() {
+        // A two-byte capacity capturing two of a declared ten bytes.
+        let src = GzHeader::new().with_extra(alloc::vec![0xB1u8, 0xB2]);
+        let mut raw = PoisonedRawHeader::new(2);
+        let published = HeaderPublication {
+            extra_len: Some(10),
+            extra_stored: 2,
+            ..HeaderPublication::default()
+        };
+        // SAFETY: buffers are sized by the `*_max` fields.
+        unsafe { publish_gz_header(&mut raw.head, &src, &published) };
+
+        assert_eq!(
+            raw.head.extra_len, 10,
+            "the DECLARED length, not the copied 2"
+        );
+        assert!(raw.head.extra_len > raw.head.extra_max);
+        assert_eq!(raw.extra, alloc::vec![0xB1u8, 0xB2]);
+
+        // A pure length query: no buffer at all, yet the length still lands.
+        let mut head = gz_header {
+            text: 0,
+            time: 0,
+            xflags: 0,
+            os: 0,
+            extra: ptr::null_mut(),
+            extra_len: 0,
+            extra_max: 0,
+            name: ptr::null_mut(),
+            name_max: 0,
+            comment: ptr::null_mut(),
+            comm_max: 0,
+            hcrc: 0,
+            done: 0,
+        };
+        // SAFETY: every buffer pointer is null, which the publisher handles.
+        unsafe {
+            publish_gz_header(
+                &mut head,
+                &GzHeader::new(),
+                &HeaderPublication {
+                    extra_len: Some(10),
+                    ..HeaderPublication::default()
+                },
+            );
+        }
+        assert_eq!(head.extra_len, 10);
+    }
+
     // -- panic-guard tests --------------------------------------------------
     //
     // Every fallible shim body in `src/ffi/**` runs inside one of the four
@@ -2841,6 +3276,188 @@ mod tests {
         let live: *mut c_int = &raw mut value;
         assert_eq!(guard_ptr(ptr::null_mut(), || live), live);
         assert_eq!(value, 42, "the guard moves pointers, never the pointee");
+    }
+
+    /// `init_allocator_prologue` must reproduce C's allocator prologue for all
+    /// **four** states of the `zalloc`/`zfree` pair.
+    ///
+    /// C's text (`deflate.c` L399-L414, `inflate.c` L182-L196, `infback.c`
+    /// L36-L50) is three independent statements, and the two `if`s do not
+    /// consult each other:
+    ///
+    /// ```text
+    /// strm->msg = Z_NULL;
+    /// if (strm->zalloc == 0) { strm->zalloc = zcalloc; strm->opaque = 0; }
+    /// if (strm->zfree  == 0)   strm->zfree  = zcfree;
+    /// ```
+    ///
+    /// So every missing half is filled in — including *both* of them — and
+    /// `opaque` is cleared on the `zalloc` branch and nowhere else. This test
+    /// pins each cell of that matrix, plus the AAP §0.6.5 footprint rule: a
+    /// caller who supplied nothing must still end up with the crate's default
+    /// (global-allocator) path, which is what `CAllocator::is_builtin_pair`
+    /// decides.
+    #[test]
+    fn prologue_substitutes_every_missing_allocator_half_exactly_as_c_does() {
+        let cookie = ptr::without_provenance_mut::<c_void>(0xC0FF_EE00);
+        let stale = c"stale".as_ptr().cast_mut();
+
+        // A genuine caller pair. Never invoked: this test only observes which
+        // halves the prologue publishes and how they are classified.
+        extern "C" fn caller_zalloc(
+            _opaque: *mut c_void,
+            _items: c_uint,
+            _size: c_uint,
+        ) -> *mut c_void {
+            ptr::null_mut()
+        }
+        extern "C" fn caller_zfree(_opaque: *mut c_void, _address: *mut c_void) {}
+
+        // --- neither half supplied (the zeroed `z_stream`) -------------------
+        let mut strm = zeroed_stream();
+        strm.msg = stale;
+        // SAFETY: `strm` is a live, exclusively-owned `z_stream`; the prologue
+        // only reads and writes its plain `Copy` fields.
+        let alloc = unsafe { init_allocator_prologue(&mut strm) };
+        assert!(strm.msg.is_null(), "`strm->msg = Z_NULL` is unconditional");
+        assert!(
+            strm.zalloc.is_some() && strm.zfree.is_some(),
+            "C fills in BOTH missing halves, so the caller's stream publishes a \
+             complete pair (`deflate.c` L400-L414)"
+        );
+        assert!(
+            publishes_builtin_alloc_pair(&strm),
+            "the published pair must be this crate's own built-ins"
+        );
+        assert!(
+            alloc.is_builtin_pair(),
+            "a pair made solely of the crate's substitutes is not a caller hook"
+        );
+        assert!(
+            !alloc.hook().is_active(),
+            "a hookless caller must keep the crate's default global-allocator \
+             path (AAP §0.6.5)"
+        );
+        assert!(
+            !alloc.reserves_state_footprint(),
+            "a hookless caller's engine-state footprint must stay exactly what \
+             it has always been (AAP §0.6.5)"
+        );
+        assert!(!alloc.is_half_present());
+
+        // --- `zalloc` only: the caller's half is honored, `zfree` filled in ---
+        let mut strm = zeroed_stream();
+        strm.zalloc = Some(caller_zalloc);
+        strm.opaque = cookie;
+        // SAFETY: as above.
+        let alloc = unsafe { init_allocator_prologue(&mut strm) };
+        assert!(strm.zfree.is_some(), "the missing `zfree` is substituted");
+        assert!(
+            ptr::eq(strm.opaque, cookie),
+            "C does NOT touch `opaque` on the `zfree` branch (`deflate.c` \
+             L408-L413)"
+        );
+        assert!(
+            alloc.hook().is_active(),
+            "one caller-supplied half makes the completed pair a live hook, so a \
+             failing caller `zalloc` still surfaces as Z_MEM_ERROR"
+        );
+        assert!(!alloc.is_half_present());
+
+        // --- `zfree` only: `zalloc` filled in AND `opaque` cleared -----------
+        let mut strm = zeroed_stream();
+        strm.zfree = Some(caller_zfree);
+        strm.opaque = cookie;
+        // SAFETY: as above.
+        let alloc = unsafe { init_allocator_prologue(&mut strm) };
+        assert!(strm.zalloc.is_some(), "the missing `zalloc` is substituted");
+        assert!(
+            strm.opaque.is_null(),
+            "C clears `opaque` on exactly the `zalloc` branch, because the cookie \
+             belonged to the allocator being replaced (`deflate.c` L405-L406)"
+        );
+        assert!(alloc.hook().is_active());
+        assert!(!alloc.is_half_present());
+
+        // --- both halves supplied: nothing is substituted at all -------------
+        let mut strm = zeroed_stream();
+        strm.zalloc = Some(caller_zalloc);
+        strm.zfree = Some(caller_zfree);
+        strm.opaque = cookie;
+        // SAFETY: as above.
+        let alloc = unsafe { init_allocator_prologue(&mut strm) };
+        assert!(
+            ptr::eq(strm.opaque, cookie),
+            "a complete pair is left exactly as the caller supplied it"
+        );
+        assert!(
+            alloc.hook().is_active() && !alloc.is_builtin_pair(),
+            "a complete caller pair backs every buffer"
+        );
+        assert!(!alloc.is_half_present());
+    }
+
+    /// `is_builtin_pair` must recognize the crate's own substitutes and must not
+    /// mistake anything else for them.
+    ///
+    /// The predicate rests on `core::ptr::fn_addr_eq`, so this is also the guard
+    /// that would catch a toolchain or codegen arrangement under which the
+    /// comparison stopped identifying the built-ins — the failure mode would
+    /// otherwise be silent (a hookless caller's buffers moving from the global
+    /// allocator to `malloc`, changing the footprint AAP §0.6.5 pins).
+    #[test]
+    fn is_builtin_pair_identifies_only_the_crate_substitutes() {
+        let builtin = CAllocator {
+            zalloc: Some(crate::ffi::alloc::default_zalloc),
+            zfree: Some(crate::ffi::alloc::default_zfree),
+            opaque: ptr::null_mut(),
+        };
+        assert!(
+            builtin.is_builtin_pair(),
+            "fn_addr_eq must identify the crate's own built-in allocator halves"
+        );
+
+        let absent = CAllocator {
+            zalloc: None,
+            zfree: None,
+            opaque: ptr::null_mut(),
+        };
+        assert!(
+            !absent.is_builtin_pair(),
+            "an absent pair is not a built-in pair (it is already hookless)"
+        );
+
+        // A caller pair that reports out-of-memory: never invoked here, only its
+        // address is compared.
+        extern "C" fn caller_zalloc(
+            _opaque: *mut c_void,
+            _items: c_uint,
+            _size: c_uint,
+        ) -> *mut c_void {
+            ptr::null_mut()
+        }
+        extern "C" fn caller_zfree(_opaque: *mut c_void, _address: *mut c_void) {}
+
+        let foreign = CAllocator {
+            zalloc: Some(caller_zalloc),
+            zfree: Some(caller_zfree),
+            opaque: ptr::null_mut(),
+        };
+        assert!(
+            !foreign.is_builtin_pair(),
+            "a genuine caller pair must never be mistaken for the substitutes"
+        );
+        assert!(foreign.hook().is_active());
+        assert!(foreign.reserves_state_footprint());
+
+        // Mixed pairs — one caller half, one substitute — are live hooks.
+        let mixed = CAllocator {
+            zalloc: Some(caller_zalloc),
+            zfree: Some(crate::ffi::alloc::default_zfree),
+            opaque: ptr::null_mut(),
+        };
+        assert!(!mixed.is_builtin_pair());
+        assert!(mixed.hook().is_active());
     }
 
     // -- test helpers -------------------------------------------------------

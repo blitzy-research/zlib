@@ -80,6 +80,9 @@ use crate::constants::{DEF_WBITS, MAX_WBITS, Z_BLOCK, Z_DEFLATED, Z_FINISH, Z_TR
 use crate::error::{ReturnCode, ZlibError};
 #[cfg(feature = "gzip")]
 use crate::gz_header::GzHeader;
+#[cfg(feature = "gzip")]
+use crate::gz_header::HeaderDone;
+use crate::gz_header::HeaderPublication;
 use crate::stream::{AllocBuffer, Allocator, StreamState, ZStream, ZeroValid, try_box};
 
 use crate::inflate::fast::inflate_fast;
@@ -115,8 +118,24 @@ pub struct InflateOutcome {
     pub consumed: usize,
     /// Number of output bytes written to the supplied `output` slice.
     pub produced: usize,
-    /// Whether `consumed`/`produced` should also be added to a C `z_stream`'s
-    /// `total_in`/`total_out` mirrors.
+}
+
+/// An [`InflateOutcome`] paired with the C-mirror total-commit flag that only
+/// the FFI boundary needs — deliberately **crate-private**.
+///
+/// The flag is *not* a field of [`InflateOutcome`]: that type is part of this
+/// crate's public API and mirrors the deflate engine's `DeflateOutcome`
+/// field-for-field, so adding a field to it would break every downstream
+/// exhaustive struct literal and destructuring pattern. Callers of the public
+/// [`inflate`] need `code`/`consumed`/`produced` and nothing more; the C
+/// `z_stream` mirror is an FFI concern, so it travels in this wrapper returned by
+/// the crate-private [`inflate_tracked`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TrackedInflateOutcome {
+    /// The public outcome, exactly as [`inflate`] returns it.
+    pub(crate) outcome: InflateOutcome,
+    /// Whether `outcome.consumed`/`outcome.produced` should also be added to a C
+    /// `z_stream`'s `total_in`/`total_out` mirrors.
     ///
     /// Normally `true`: C's `inflate` epilogue advances the cursors and the
     /// running totals together (`inflate.c` L1139-L1142).
@@ -144,7 +163,34 @@ pub struct InflateOutcome {
     /// (the early returns bypass the epilogue that updates them), and pure-Rust
     /// callers that track their own byte counts from `consumed`/`produced` should
     /// keep counting normally — the bytes really were transferred.
-    pub commit_totals: bool,
+    pub(crate) commit_totals: bool,
+    /// Which of C's individual `state->head->…` assignments this call performed,
+    /// so the FFI boundary can reproduce reference zlib's incremental gzip-header
+    /// publication schedule instead of bulk-mirroring the owned header. See
+    /// [`HeaderPublication`].
+    pub(crate) header: HeaderPublication,
+}
+
+impl TrackedInflateOutcome {
+    /// The ordinary epilogue result: C advances the cursors and the totals
+    /// together (`inflate.c` L1139-L1142).
+    #[inline]
+    fn committed(
+        code: ReturnCode,
+        consumed: usize,
+        produced: usize,
+        header: HeaderPublication,
+    ) -> Self {
+        Self {
+            outcome: InflateOutcome {
+                code,
+                consumed,
+                produced,
+            },
+            commit_totals: true,
+            header,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -735,13 +781,29 @@ pub fn inflate_prime<A: Allocator>(strm: &mut ZStream<A>, bits: i32, value: i32)
 /// uses the exact C formula (L1147-L1149). The slow path here and the fast path
 /// in [`fast::inflate_fast`] are both free of `unsafe`, and together decode
 /// byte-identically to reference zlib.
-#[allow(clippy::too_many_lines)]
 pub fn inflate<A: Allocator>(
     strm: &mut ZStream<A>,
     input: &[u8],
     output: &mut [u8],
     flush: i32,
 ) -> InflateOutcome {
+    inflate_tracked(strm, input, output, flush).outcome
+}
+
+/// The full implementation of [`inflate`], additionally reporting whether the C
+/// `z_stream` `total_in`/`total_out` mirrors may be advanced.
+///
+/// This is the crate-private entry point the FFI boundary calls; every public
+/// caller goes through [`inflate`], which discards the extra flag. Keeping the
+/// flag out of [`InflateOutcome`] preserves that type's public
+/// `{code, consumed, produced}` shape (see [`TrackedInflateOutcome`]).
+#[allow(clippy::too_many_lines)]
+pub(crate) fn inflate_tracked<A: Allocator>(
+    strm: &mut ZStream<A>,
+    input: &[u8],
+    output: &mut [u8],
+    flush: i32,
+) -> TrackedInflateOutcome {
     // ---- guard: an inflate state must be installed (C `inflateStateCheck`) ---
     //
     // Take the boxed state *out* of `strm` for the duration of the call. This
@@ -753,20 +815,20 @@ pub fn inflate<A: Allocator>(
         // Not an inflate stream — put back whatever we removed and error out.
         StreamState::Deflate(d) => {
             strm.set_deflate_state(d);
-            return InflateOutcome {
-                code: ReturnCode::StreamError,
-                consumed: 0,
-                produced: 0,
-                commit_totals: true,
-            };
+            return TrackedInflateOutcome::committed(
+                ReturnCode::StreamError,
+                0,
+                0,
+                HeaderPublication::default(),
+            );
         }
         StreamState::None => {
-            return InflateOutcome {
-                code: ReturnCode::StreamError,
-                consumed: 0,
-                produced: 0,
-                commit_totals: true,
-            };
+            return TrackedInflateOutcome::committed(
+                ReturnCode::StreamError,
+                0,
+                0,
+                HeaderPublication::default(),
+            );
         }
     };
 
@@ -793,6 +855,12 @@ pub fn inflate<A: Allocator>(
     // reset after the trailer check folds the final data bytes.
     let mut outck = io.left();
     let mut ret = ReturnCode::Ok;
+    // Records which `state->head->…` assignments this call performs, so the FFI
+    // boundary can replay exactly C's incremental publication schedule. With the
+    // `gzip` feature off every gzip-header state is compiled out, so nothing ever
+    // records anything and the empty record is published (a no-op).
+    #[cfg_attr(not(feature = "gzip"), allow(unused_mut))]
+    let mut header_pub = HeaderPublication::default();
 
     'inf_leave: loop {
         match state.mode {
@@ -820,9 +888,14 @@ pub fn inflate<A: Allocator>(
                         state.mode = InflateMode::Flags;
                         continue 'inf_leave;
                     }
-                    // Not gzip: mark any requested header as "not a gzip header".
-                    if let Some(head) = state.head.as_mut() {
-                        head.done = false;
+                    // C `if (state->head != Z_NULL) state->head->done = -1;`
+                    // (`inflate.c` L505-L506): the stream carries no gzip header,
+                    // so a registered header is marked "not gzip" rather than
+                    // merely "not finished". The idiomatic `done` is a `bool` and
+                    // stays `false`; the `-1` travels to the C caller through the
+                    // publication record.
+                    if state.head.is_some() {
+                        header_pub.done = Some(HeaderDone::NotGzip);
                     }
                 }
                 // zlib header validation. The `wrap & 1` guard is present only
@@ -898,6 +971,7 @@ pub fn inflate<A: Allocator>(
                 }
                 if let Some(head) = state.head.as_mut() {
                     head.text = ((io.hold >> 8) & 1) != 0;
+                    header_pub.text = true;
                 }
                 if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 {
                     crc2(&mut state.check, io.hold);
@@ -913,6 +987,7 @@ pub fn inflate<A: Allocator>(
                 }
                 if let Some(head) = state.head.as_mut() {
                     head.time = io.hold;
+                    header_pub.time = true;
                 }
                 if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 {
                     crc4(&mut state.check, io.hold);
@@ -929,6 +1004,7 @@ pub fn inflate<A: Allocator>(
                 if let Some(head) = state.head.as_mut() {
                     head.xflags = (io.hold & 0xff) as i32;
                     head.os = (io.hold >> 8) as i32;
+                    header_pub.os = true;
                 }
                 if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 {
                     crc2(&mut state.check, io.hold);
@@ -957,8 +1033,14 @@ pub fn inflate<A: Allocator>(
                     // write is also what lets a caller supply no `extra` buffer
                     // at all purely to learn the length — de-facto reference-zlib
                     // behavior rather than a `zlib.h`-documented pattern.
-                    if let Some(head) = state.head.as_mut() {
-                        head.extra_len = io.hold;
+                    //
+                    // It is a wire-level quantity with no idiomatic counterpart
+                    // (`extra.len()` already reports what was captured), so it
+                    // travels in the publication record and is published straight
+                    // into the C caller's `extra_len` instead of occupying a field
+                    // of the public `GzHeader`.
+                    if state.head.is_some() {
+                        header_pub.extra_len = Some(io.hold);
                     }
                     if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 {
                         crc2(&mut state.check, io.hold);
@@ -966,6 +1048,7 @@ pub fn inflate<A: Allocator>(
                     io.init_bits();
                 } else if let Some(head) = state.head.as_mut() {
                     head.extra = None;
+                    header_pub.extra_null = true;
                 }
                 state.mode = InflateMode::Extra;
                 continue 'inf_leave;
@@ -989,6 +1072,11 @@ pub fn inflate<A: Allocator>(
                                     let room = extra_max - extra.len();
                                     let n = core::cmp::min(copy, room);
                                     extra.extend_from_slice(&io.input[io.next..io.next + n]);
+                                    // C wrote those `n` bytes at `head->extra +
+                                    // (extra_len - length)`, which is exactly the
+                                    // Vec offset they landed at; the boundary
+                                    // recovers it as `extra.len() - stored`.
+                                    header_pub.extra_stored += n;
                                 }
                             }
                         }
@@ -1017,14 +1105,23 @@ pub fn inflate<A: Allocator>(
                     loop {
                         last_byte = io.input[io.next + copy];
                         copy += 1;
-                        // Store the name without its terminating NUL, bounded by
-                        // `name_max`; the Vec length is the write index.
-                        if last_byte != 0 {
-                            if let Some(head) = state.head.as_mut() {
-                                let name_max = head.name_max as usize;
-                                if let Some(name) = head.name.as_mut() {
-                                    if name.len() < name_max {
+                        // C stores every byte it reads — the terminating NUL
+                        // included — into `head->name[state->length++]` while
+                        // `state->length < head->name_max` (`inflate.c`
+                        // L632-L637). The owned `Vec` keeps only the content bytes
+                        // (this type documents "no trailing NUL"), so `Vec::len()`
+                        // *is* C's `state->length` and the terminator is recorded
+                        // as a flag for the boundary to write. A name that exactly
+                        // fills `name_max` therefore stays unterminated, as in C.
+                        if let Some(head) = state.head.as_mut() {
+                            let name_max = head.name_max as usize;
+                            if let Some(name) = head.name.as_mut() {
+                                if name.len() < name_max {
+                                    if last_byte == 0 {
+                                        header_pub.name_terminated = true;
+                                    } else {
                                         name.push(last_byte);
+                                        header_pub.name_stored += 1;
                                     }
                                 }
                             }
@@ -1042,6 +1139,7 @@ pub fn inflate<A: Allocator>(
                     }
                 } else if let Some(head) = state.head.as_mut() {
                     head.name = None;
+                    header_pub.name_null = true;
                 }
                 state.length = 0;
                 state.mode = InflateMode::Comment;
@@ -1058,12 +1156,19 @@ pub fn inflate<A: Allocator>(
                     loop {
                         last_byte = io.input[io.next + copy];
                         copy += 1;
-                        if last_byte != 0 {
-                            if let Some(head) = state.head.as_mut() {
-                                let comm_max = head.comm_max as usize;
-                                if let Some(comment) = head.comment.as_mut() {
-                                    if comment.len() < comm_max {
+                        // Same accounting as `NAME` above: the terminating NUL is
+                        // one of C's counted bytes against `comm_max`
+                        // (`inflate.c` L654-L659), so it is recorded as a flag
+                        // rather than pushed into the content `Vec`.
+                        if let Some(head) = state.head.as_mut() {
+                            let comm_max = head.comm_max as usize;
+                            if let Some(comment) = head.comment.as_mut() {
+                                if comment.len() < comm_max {
+                                    if last_byte == 0 {
+                                        header_pub.comment_terminated = true;
+                                    } else {
                                         comment.push(last_byte);
+                                        header_pub.comment_stored += 1;
                                     }
                                 }
                             }
@@ -1081,6 +1186,7 @@ pub fn inflate<A: Allocator>(
                     }
                 } else if let Some(head) = state.head.as_mut() {
                     head.comment = None;
+                    header_pub.comment_null = true;
                 }
                 state.mode = InflateMode::Hcrc;
                 continue 'inf_leave;
@@ -1102,6 +1208,8 @@ pub fn inflate<A: Allocator>(
                 if let Some(head) = state.head.as_mut() {
                     head.hcrc = ((flags >> 9) & 1) != 0;
                     head.done = true;
+                    header_pub.hcrc = true;
+                    header_pub.done = Some(HeaderDone::Complete);
                 }
                 // C `strm->adler = state->check = crc32(0L, Z_NULL, 0)`
                 // (`inflate.c` L690): the gzip header is complete, so the CRC-32
@@ -1164,10 +1272,13 @@ pub fn inflate<A: Allocator>(
                     let consumed = io.next;
                     let produced = io.put;
                     strm.set_inflate_state(state);
-                    return InflateOutcome {
-                        code: ReturnCode::NeedDict,
-                        consumed,
-                        produced,
+                    return TrackedInflateOutcome {
+                        outcome: InflateOutcome {
+                            code: ReturnCode::NeedDict,
+                            consumed,
+                            produced,
+                        },
+                        header: header_pub,
                         // C runs `RESTORE()` and returns *directly* here
                         // (`inflate.c` L701-L703), jumping over the
                         // `strm->total_in += in; strm->total_out += out;`
@@ -1808,22 +1919,12 @@ pub fn inflate<A: Allocator>(
                 // FFI parity. The stream cursors are left unadvanced, matching
                 // C skipping `RESTORE()`.
                 strm.set_inflate_state(state);
-                return InflateOutcome {
-                    code: ReturnCode::MemError,
-                    consumed: 0,
-                    produced: 0,
-                    commit_totals: true,
-                };
+                return TrackedInflateOutcome::committed(ReturnCode::MemError, 0, 0, header_pub);
             }
             InflateMode::Sync => {
                 // C `case SYNC: default: return Z_STREAM_ERROR;`.
                 strm.set_inflate_state(state);
-                return InflateOutcome {
-                    code: ReturnCode::StreamError,
-                    consumed: 0,
-                    produced: 0,
-                    commit_totals: true,
-                };
+                return TrackedInflateOutcome::committed(ReturnCode::StreamError, 0, 0, header_pub);
             }
         }
     }
@@ -1868,15 +1969,18 @@ pub fn inflate<A: Allocator>(
         // `InflateMode::Mem` arm above.
         state.mode = InflateMode::Mem;
         strm.set_inflate_state(state);
-        return InflateOutcome {
-            code: ReturnCode::MemError,
-            // C reaches this return *after* `RESTORE()` (`inflate.c` L1132), so
-            // `next_in`/`avail_in`/`next_out`/`avail_out` are already committed
-            // and the caller keeps every byte decoded during this call — the
-            // window allocation failed, not the decode. Reporting `0`/`0` here
-            // used to silently discard that output.
-            consumed: io.next,
-            produced: io.put,
+        return TrackedInflateOutcome {
+            header: header_pub,
+            outcome: InflateOutcome {
+                code: ReturnCode::MemError,
+                // C reaches this return *after* `RESTORE()` (`inflate.c` L1132),
+                // so `next_in`/`avail_in`/`next_out`/`avail_out` are already
+                // committed and the caller keeps every byte decoded during this
+                // call — the window allocation failed, not the decode. Reporting
+                // `0`/`0` here used to silently discard that output.
+                consumed: io.next,
+                produced: io.put,
+            },
             // ...but C's `state->mode = MEM; return Z_MEM_ERROR;` at L1136-L1137
             // jumps over the total bookkeeping at L1141-L1142, so the totals must
             // NOT advance. Measured against reference C: a failing window
@@ -1934,14 +2038,9 @@ pub fn inflate<A: Allocator>(
     strm.total_out += produced as u64;
     strm.set_inflate_state(state);
 
-    InflateOutcome {
-        code: ret,
-        consumed,
-        produced,
-        // The normal epilogue path: C advances the cursors and the totals
-        // together (`inflate.c` L1139-L1142).
-        commit_totals: true,
-    }
+    // The normal epilogue path: C advances the cursors and the totals together
+    // (`inflate.c` L1139-L1142).
+    TrackedInflateOutcome::committed(ret, consumed, produced, header_pub)
 }
 
 // ===========================================================================

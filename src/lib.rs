@@ -380,16 +380,25 @@ pub mod inflate;
 pub mod stream;
 pub mod util;
 
-// The gzip file-I/O layer fundamentally requires the standard library
+// The IDIOMATIC gzip file-I/O layer fundamentally requires the standard library
 // (`std::fs`/`std::io`), so it is compiled only when the `gz-io` feature is
-// enabled (which implies `std` + `gzip`). This matches the feature gating in
-// `src/gz/**` and `src/ffi/gz.rs`; a bare `no_std` build omits it entirely.
+// enabled (which implies `std` + `gzip`); a bare `no_std` build omits it
+// entirely. This gate governs the Rust-facing API only. The C-facing `gz*`
+// symbols in `src/ffi/gz.rs` are deliberately NOT gated this way — see the
+// `pub mod ffi` note below.
 #[cfg(feature = "gz-io")]
 pub mod gz;
 
 // The FFI drop-in boundary is declared UNCONDITIONALLY so the emitted
 // `cdylib`/`staticlib` always presents the full zlib C symbol table for
-// linkage. Any part of `ffi` that needs `std` is gated internally; the module
+// linkage. This holds for the WHOLE table in EVERY feature configuration, not
+// just for the core engines: `src/ffi/mod.rs` declares all four shim submodules
+// (`types`, `util`, `deflate`, `inflate`, `gz`) unconditionally, and each of the
+// 34 `gz*` entry points has exactly one definition whose *body* — never the
+// exported item — is gated on `gz-io`. Without the feature those symbols still
+// resolve and return their documented failure sentinel, so a C consumer links
+// against one ABI regardless of how the crate was configured (AAP §0.3.1,
+// §0.8.1 D-4). Only `std`-dependent internals inside `ffi` are gated; the module
 // declaration itself is never feature-gated.
 //
 // Carve-out 2 of 2 for the crate-wide `#![deny(unsafe_code)]` above: this is the
@@ -924,7 +933,14 @@ mod tests {
     /// * `pub mod ffi;` carries **no** `cfg`. Gating it would shrink the emitted
     ///   `cdylib`/`staticlib` symbol table below the 54 `zlib.map` globals a
     ///   drop-in consumer links against, while every default-feature gate stayed
-    ///   green.
+    ///   green. This check owns only the *root* declaration; an unconditional
+    ///   `pub mod ffi;` is necessary but not sufficient, because a `cfg` on any
+    ///   child shim module would shrink the table just as effectively. That
+    ///   second half is pinned inside the boundary itself, by
+    ///   `crate::ffi`'s `no_exported_gz_symbol_is_feature_gated` and
+    ///   `every_exported_c_symbol_resolves_to_a_live_address` — the latter
+    ///   resolving all 95 exports to live addresses once per feature row, so no
+    ///   configuration can claim completeness without demonstrating it.
     /// * `mod no_std_support`'s gate is character-for-character the crate's own
     ///   `no_std` predicate. If the two ever diverge, the freestanding build
     ///   either redefines lang items `std` already provides or loses the

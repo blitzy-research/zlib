@@ -166,6 +166,22 @@ pub use write::{gzflush, gzfwrite, gzprintf, gzputc, gzputs, gzvprintf, gzwrite}
 /// writer must be closed explicitly to produce a valid stream.
 pub use close::{gzclose, gzclose_r, gzclose_w};
 
+// The descriptor-releasing close finalizers and the mode pre-validator, surfaced
+// at crate visibility for `src/ffi/gz.rs` only.
+//
+// Both exist because reference zlib's C contract depends on operations this
+// layer cannot perform: reporting a failing `close(2)` as `Z_ERRNO`
+// (`gzread.c` L665-L667, `gzwrite.c` L695-L696), which needs an `unsafe` libc
+// call, and rejecting an invalid `gzdopen` mode *before* the caller's descriptor
+// is adopted (`gzlib.c` L150-L197 precede L263), which needs to happen before
+// the `unsafe` `File::from_raw_fd`. Both `unsafe` operations belong to the FFI
+// boundary (AAP §0.6.2, §0.8.1 D-6), so this layer supplies the safe halves —
+// "finalize everything and hand me the still-open descriptor" and "is this mode
+// acceptable?" — and the shim supplies the `unsafe` remainder.
+pub(crate) use close::{gzclose_r_release, gzclose_release, gzclose_w_release};
+pub(crate) use open::validate_mode;
+pub(crate) use state::GzFile;
+
 #[cfg(test)]
 mod tests {
     //! Module-root smoke tests: verify the load-bearing shared constant and that

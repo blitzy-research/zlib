@@ -71,12 +71,27 @@
 //!   makes it diagnosable.
 //!
 //! The distinction is enforced one level down as well, where a tool is first
-//! looked for. "No such command" and "not executable" mean *absent* and lead to
-//! the next candidate; every other spawn error, and any non-zero `--version`,
-//! mean the tool exists and something went wrong, and those can never produce a
-//! skip. So a machine with a broken `cc` alongside a working `gcc` proceeds
-//! normally, while a machine whose only compiler is broken **fails and says so**,
-//! rather than claiming no compiler was found — which would not be true.
+//! looked for. **Exactly one spawn error means *absent*: "no such command"**
+//! ([`NotFound`]). Every other spawn error — including *"found it, but you may
+//! not execute it"* ([`PermissionDenied`]) — and any non-zero `--version` mean a
+//! tool exists and something is wrong with it or with the machine's access to it,
+//! and none of those may ever produce a skip. So a machine with a broken or
+//! unreadable `cc` alongside a working `gcc` proceeds normally, while a machine
+//! whose only compiler cannot be used **fails and says so**, rather than claiming
+//! no compiler was found — which would not be true.
+//!
+//! Permission denial is called out because grouping it with absence is the exact
+//! mistake this section exists to prevent (CWE-754, CWE-703). A `gcc` that is
+//! present on `PATH` but `chmod 000` — from a hardening policy, a container
+//! uid/gid mismatch, a half-finished install, or deliberate tampering — is *not*
+//! an uninstalled compiler. `PermissionDenied` is the kernel confirming a matching
+//! executable **was found**; treating that as "nothing is installed" would let a
+//! sabotaged or misconfigured environment silence the conformance gate and still
+//! report green. It is therefore classified [`Probe::Unusable`], which no code
+//! path can convert into a skip.
+//!
+//! [`NotFound`]: std::io::ErrorKind::NotFound
+//! [`PermissionDenied`]: std::io::ErrorKind::PermissionDenied
 //!
 //! # How to run it
 //!
@@ -981,12 +996,21 @@ fn compiler_candidates() -> Vec<String> {
 /// actually observed when an assertion about the classification fails.
 #[derive(Debug)]
 enum Probe {
-    /// Nothing usable is installed under this name. The spawn failed with
-    /// [`NotFound`] — no such command anywhere on `PATH` — or with
-    /// [`PermissionDenied`], meaning a matching file exists but cannot be
-    /// executed, so there is still no command to run. Both say "try the next
-    /// candidate", and if every candidate answers this way then there genuinely
-    /// is no C compiler and a skip is the truthful outcome.
+    /// Nothing is installed under this name. The spawn failed with exactly one
+    /// error kind — [`NotFound`], meaning no matching command exists anywhere on
+    /// `PATH`. That says "try the next candidate", and if every candidate answers
+    /// this way then there genuinely is no C compiler and a skip is the truthful
+    /// outcome.
+    ///
+    /// [`NotFound`] is **the only** kind admitted here, and deliberately so.
+    /// [`PermissionDenied`] in particular is *not* absence: it is the kernel
+    /// confirming that a matching executable **was found** and that this process
+    /// may not run it. Classifying that as absent — as an earlier revision of this
+    /// harness did — lets a present-but-blocked compiler produce a printed
+    /// `SKIPPED — no working C compiler found`, a statement that is false on a
+    /// machine which demonstrably has one, and it lets the byte-identity gate
+    /// report green without comparing a byte (CWE-754, CWE-703). It is classified
+    /// [`Probe::Unusable`] instead, which no code path can turn into a skip.
     ///
     /// [`NotFound`] is unambiguous here only because [`temp_root`] has already
     /// proved the spawn's working directory exists; otherwise a bad `TMPDIR`
@@ -995,11 +1019,14 @@ enum Probe {
     /// [`NotFound`]: std::io::ErrorKind::NotFound
     /// [`PermissionDenied`]: std::io::ErrorKind::PermissionDenied
     Absent,
-    /// Something *is* installed under this name but could not be used: it
-    /// spawned and exited non-zero, or the spawn failed for a reason that is not
-    /// "no such command" — a resource limit, an I/O error, a broken wrapper. The
-    /// payload records which, so the eventual message is diagnosable. This
-    /// outcome can never produce a skip.
+    /// A tool exists under this name but could not be used: it spawned and exited
+    /// non-zero, the machine refused to execute it ([`PermissionDenied`]), or the
+    /// spawn failed for some other reason that is not "no such command" — a
+    /// resource limit, an I/O error, a broken interpreter line. The payload
+    /// records which, so the eventual message is diagnosable and names the
+    /// remedy. This outcome can never produce a skip.
+    ///
+    /// [`PermissionDenied`]: std::io::ErrorKind::PermissionDenied
     Unusable(String),
     /// The tool answered `--version` successfully. Carries the first line of its
     /// banner, printed later as evidence of which toolchain produced the oracle.
@@ -1039,16 +1066,27 @@ fn probe_tool(name: &str) -> Probe {
         .output()
     {
         Ok(out) => out,
-        // The one classification that matters: only "no such command" and "not
-        // executable" mean absent. Every other `io::Error` describes a machine
-        // that tried to run the tool and failed, which is a defect to report.
-        Err(err)
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
+        // The one classification that matters, and it admits exactly one error
+        // kind: only "no such command" means absent. Every other `io::Error`
+        // describes a machine on which a matching tool was found and could not be
+        // run, which is a defect to report.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Probe::Absent;
+        }
+        // Permission denial gets its own message because it has its own remedy.
+        // The kernel found a matching executable and refused to exec it, so the
+        // fix is the file's mode bits or this process's identity — not installing
+        // a compiler. Reporting it as absence would be a false statement about the
+        // machine and would let the gate skip while a compiler sat right there
+        // (CWE-754, CWE-703).
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Probe::Unusable(format!(
+                "`{name} --version` was found but could not be executed: {err} (io kind {:?}). \
+                 A matching executable exists and this process is not permitted to run it, which \
+                 is NOT an absent compiler: check the file's execute bits and this process's \
+                 user, or point CC at a compiler it may run.",
+                err.kind()
+            ));
         }
         Err(err) => {
             return Probe::Unusable(format!(
@@ -1074,9 +1112,13 @@ fn probe_tool(name: &str) -> Probe {
 
 /// Probes for a compiler and, independently, for `ar`.
 ///
-/// Returns [`None`] for exactly one condition: **no C compiler is installed
-/// under any candidate name**. That is the environmental fact the module header
-/// promises will skip.
+/// Returns [`None`] for exactly one condition: **no C compiler exists under any
+/// candidate name**, every probe having failed with [`NotFound`]. That is the
+/// environmental fact the module header promises will skip, and it is the only
+/// one. A candidate that exists but cannot be executed does *not* qualify — see
+/// [`Probe::Absent`] for why conflating the two is a false-green.
+///
+/// [`NotFound`]: std::io::ErrorKind::NotFound
 ///
 /// A missing `ar` is not a reason to skip either: the archive step exists to
 /// mirror the recipe AAP §0.6.4 measured, and linking the objects straight into
@@ -1084,25 +1126,43 @@ fn probe_tool(name: &str) -> Probe {
 ///
 /// # Panics
 ///
-/// Panics when a compiler *is* installed but no candidate could be used. Saying
-/// "no working C compiler found" in that situation would be false, and passing
-/// the test on the strength of a false statement is the exact false-green this
+/// Panics when a compiler *is* installed but no candidate could be used —
+/// including when every candidate was found and refused execution. Saying "no
+/// working C compiler found" in either situation would be false, and passing the
+/// test on the strength of a false statement is the exact false-green this
 /// harness exists to prevent. Every unusable candidate is listed with the reason
 /// it failed, so the report is actionable rather than merely loud.
 fn probe_toolchain() -> Option<Toolchain> {
+    probe_toolchain_from(compiler_candidates())
+}
+
+/// [`probe_toolchain`] over an explicit candidate list.
+///
+/// Split out for one reason: it makes the "every candidate exists and none can be
+/// used" path — the false-green this finding was about — reachable from a
+/// self-test without mutating `$CC`, which several tests in this binary share a
+/// process with and could not do safely.
+///
+/// # Panics
+///
+/// As [`probe_toolchain`].
+fn probe_toolchain_from(candidates: Vec<String>) -> Option<Toolchain> {
     let mut unusable: Vec<String> = Vec::new();
     let mut chosen: Option<(String, String)> = None;
 
-    for candidate in compiler_candidates() {
+    for candidate in candidates {
         match probe_tool(&candidate) {
             Probe::Usable(version) => {
                 chosen = Some((candidate, version));
                 break;
             }
-            // Recorded, not fatal on the spot: a broken `cc` wrapper alongside a
-            // working `gcc` is a real and benign configuration, so the search
-            // continues. What must not happen is the search *ending* in a skip
-            // while this list is non-empty.
+            // Recorded, not fatal on the spot: a broken or unreadable `cc`
+            // wrapper alongside a working `gcc` is a real and benign
+            // configuration, so the search continues. What must not happen is the
+            // search *ending* in a skip while this list is non-empty — which is
+            // precisely why permission denial has to land here and not in
+            // `Absent`. An all-denied toolchain leaves this list full, and the
+            // `else` arm below then fails instead of skipping.
             Probe::Unusable(why) => unusable.push(why),
             Probe::Absent => {}
         }
@@ -1111,9 +1171,10 @@ fn probe_toolchain() -> Option<Toolchain> {
     let Some((cc, version)) = chosen else {
         if !unusable.is_empty() {
             panic!(
-                "a C compiler is installed but no candidate could be used, so the live C-oracle \
+                "a C compiler is present but no candidate could be used, so the live C-oracle \
                  sweep cannot run — and must not be reported as skipped:\n  - {}\n\
-                 Point CC at a working compiler, or repair the tools listed above.",
+                 Point CC at a compiler this process can execute, or repair the tools listed \
+                 above.",
                 unusable.join("\n  - ")
             );
         }
@@ -1125,15 +1186,20 @@ fn probe_toolchain() -> Option<Toolchain> {
         // Absent is expected on an MSVC toolchain, where the archiver is
         // `lib.exe` rather than `ar`.
         Probe::Absent => None,
-        // Unusable is not expected — but the archive step is provably equivalent
-        // to linking the objects straight into the driver, so it cannot change a
-        // single compared byte. The honest response is therefore the documented
-        // fallback plus a notice that says out loud why it was taken: neither a
-        // skip (nothing about the sweep is impaired) nor a hard failure (nothing
-        // that affects the result has gone wrong). Note that this branch is
-        // reached only when `ar` never answered `--version`; an `ar` that
-        // answered and *then* failed to build the archive is a different
+        // Unusable is not expected — an `ar` that exits non-zero on `--version`,
+        // or one that is present and not executable — but the archive step is
+        // provably equivalent to linking the objects straight into the driver, so
+        // it cannot change a single compared byte. The honest response is
+        // therefore the documented fallback plus a notice that says out loud why
+        // it was taken: neither a skip (nothing about the sweep is impaired) nor a
+        // hard failure (nothing that affects the result has gone wrong). Note that
+        // this branch is reached only when `ar` never answered `--version`; an `ar`
+        // that answered and *then* failed to build the archive is a different
         // condition entirely and is surfaced by `run_required`.
+        //
+        // A denied `ar` reaches this arm rather than `Absent`, which is a strict
+        // improvement: the fallback is announced with its cause instead of being
+        // silently mistaken for the MSVC layout.
         Probe::Unusable(why) => {
             println!(
                 "c_oracle: note — `ar` is present but unusable, so the archive step is bypassed \
@@ -3060,19 +3126,132 @@ fn probe_classifies_a_present_but_failing_command_as_unusable() {
         other => panic!("a present-but-failing tool must be Unusable, got {other:?}"),
     }
 
-    // Case 2: present but not executable. There is still no command to run, so
-    // this is genuinely absent rather than broken — the second half of the
-    // classification, and the reason PermissionDenied is grouped with NotFound.
+    // Case 2: present but not executable. The kernel found a matching file and
+    // refused to exec it, which is the opposite of "nothing is installed". This is
+    // the case the finding was about: classifying it as Absent let a machine with
+    // a `chmod 000` compiler print `SKIPPED — no working C compiler found` and
+    // pass. It must be Unusable, and the message must name the permission remedy
+    // rather than suggesting an install.
     let not_executable = work.join("not_executable");
     fs::write(&not_executable, "#!/bin/sh\nexit 0\n").expect("file must be writable");
     fs::set_permissions(&not_executable, fs::Permissions::from_mode(0o644))
         .expect("permissions must be settable");
 
     let probe = probe_tool(not_executable.to_str().expect("path must be UTF-8"));
+    match &probe {
+        Probe::Unusable(why) => {
+            assert!(
+                why.contains("could not be executed"),
+                "the report must say the tool was found and not executed, got {why:?}"
+            );
+            assert!(
+                why.contains("NOT an absent compiler"),
+                "the report must deny the absence reading outright, got {why:?}"
+            );
+            assert!(
+                why.contains("PermissionDenied"),
+                "the io kind must reach the report so the condition is diagnosable, got {why:?}"
+            );
+        }
+        other => panic!(
+            "a present-but-non-executable file is a blocked tool, not an absent one, so it must \
+             be Unusable, got {other:?}"
+        ),
+    }
+}
+
+/// A toolchain whose every candidate is present but unusable must **fail**, never
+/// skip.
+///
+/// This is the finding's end-to-end consequence, tested at the level that
+/// actually decides the gate's verdict. [`probe_tool`] classifying a denied tool
+/// as [`Probe::Unusable`] is only half the fix: the other half is that
+/// [`probe_toolchain_from`] must convert a non-empty unusable list into a panic
+/// instead of returning [`None`], because [`None`] is what
+/// [`build_oracle`] turns into a printed `SKIPPED` and a passing test.
+///
+/// Both candidates below exist on disk and are mode `0o644`, i.e. exactly the
+/// `chmod 000` compiler this finding described. Before the fix they both probed as
+/// [`Probe::Absent`], `unusable` stayed empty, and this function returned
+/// [`None`] — a green run on a machine that had a compiler sitting right there.
+#[cfg(unix)]
+#[test]
+fn an_all_unusable_toolchain_fails_instead_of_skipping() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let work = WorkDir::new("selftest_all_denied");
+
+    let mut candidates = Vec::new();
+    for name in ["denied_cc", "denied_gcc"] {
+        let path = work.join(name);
+        fs::write(&path, "#!/bin/sh\nexit 0\n").expect("candidate must be writable");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .expect("permissions must be settable");
+        candidates.push(path.to_str().expect("path must be UTF-8").to_owned());
+    }
+
+    // `probe_toolchain_from` panics on this input, which is the whole point, so it
+    // is driven through `catch_unwind` to inspect the message. Cargo builds test
+    // targets with unwinding regardless of the `panic = "abort"` profile setting,
+    // which is what makes this observable.
+    let outcome = std::panic::catch_unwind(|| probe_toolchain_from(candidates));
+
+    let payload = match outcome {
+        Ok(Some(_)) => panic!(
+            "a toolchain whose every candidate is non-executable must not yield a usable Toolchain"
+        ),
+        Ok(None) => panic!(
+            "a toolchain whose every candidate is present but unusable returned None, which \
+             build_oracle prints as SKIPPED and passes. That is the false-green this test exists \
+             to prevent: only a genuinely absent compiler may skip."
+        ),
+        Err(payload) => payload,
+    };
+
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default()
+        .to_owned();
+
     assert!(
-        matches!(probe, Probe::Absent),
-        "a non-executable file provides no command to run, so it must be Absent, got {probe:?}"
+        message.contains("must not be reported as skipped"),
+        "the failure must state outright that this is not a skip, got {message:?}"
     );
+    assert!(
+        message.contains("denied_cc") && message.contains("denied_gcc"),
+        "every unusable candidate must be listed so the report is actionable, got {message:?}"
+    );
+    assert!(
+        message.contains("could not be executed"),
+        "the per-candidate reason must survive into the failure, got {message:?}"
+    );
+}
+
+/// A toolchain whose every candidate is genuinely missing must skip — the one
+/// case that may.
+///
+/// The complement of the test above, and the reason that one is not simply
+/// "always fail". Without this, tightening the classification could be
+/// "satisfied" by making the harness fail on every machine, which would be just
+/// as untruthful in the other direction and would break the opt-in, additive
+/// contract the module header states.
+#[test]
+fn an_absent_toolchain_still_skips() {
+    let candidates = vec![
+        "zlib_rs_c_oracle_absent_cc_7d13a4".to_owned(),
+        "zlib_rs_c_oracle_absent_gcc_7d13a4".to_owned(),
+    ];
+
+    let outcome = std::panic::catch_unwind(|| probe_toolchain_from(candidates));
+    match outcome {
+        Ok(None) => {}
+        Ok(Some(_)) => panic!("names that do not exist must not resolve to a Toolchain"),
+        Err(_) => panic!(
+            "a genuinely absent compiler is the one condition that may skip; it must not fail"
+        ),
+    }
 }
 
 /// The work directory this harness builds and runs C code in must be created

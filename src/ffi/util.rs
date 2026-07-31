@@ -285,11 +285,28 @@ pub unsafe extern "C" fn compressBound_z(source_len: z_size_t) -> z_size_t {
 /// `Z_NEED_DICT`→`Z_DATA_ERROR`, all-input-consumed `Z_BUF_ERROR`→
 /// `Z_DATA_ERROR`) — and reports `(consumed, produced, Result<(), code>)`.
 ///
-/// The `produced` count is authoritative on **every** path that reaches the
-/// decode loop (success *and* failure), so the FFI shims can publish
-/// `*destLen = total_out` on all paths exactly as C's `uncompress2_z` does
-/// (`uncompr.c`: `*destLen = stream.total_out;` runs before the error-mapping
-/// `return`). The trailing `Result` carries only the mapped return code.
+/// # Both counts are seeded with the caller's own values
+///
+/// C's `uncompress2_z` does **not** zero `*destLen` up front — unlike
+/// `compress2_z`, which really does (`compress.c` L36). It keeps the caller's
+/// capacity in a local (`left = *destLen`, `uncompr.c` L41) and only at the end
+/// computes `*sourceLen -= len; *destLen -= left;` (L74-L75). Those two writes
+/// sit **after** `err = inflateInit(&stream); if (err != Z_OK) return err;`
+/// (L51-L52), so an initialization failure returns with *both* caller counts
+/// untouched.
+///
+/// This core therefore seeds `consumed` with the declared input length and
+/// `produced` with the declared output capacity — the caller's own values — so
+/// that a path which never reaches C's accounting leaves the shims publishing
+/// exactly what the caller passed in, i.e. no observable change. Seeding
+/// `produced` at zero would instead report a spurious `*destLen = 0` for a
+/// stream whose engine never even started.
+///
+/// [`crate::util::uncompress2`] overwrites both counts unconditionally once it
+/// reaches the accounting, so on every path that *does* run the decode loop the
+/// reported values are authoritative on success **and** on failure — which is
+/// what lets a caller who hit `Z_BUF_ERROR` still see the partial output length,
+/// exactly as in C. The trailing `Result` carries only the mapped return code.
 ///
 /// # Safety
 ///
@@ -312,11 +329,27 @@ unsafe fn uncompress2_engine(
     // engine caps its input at `avail`, then it is overwritten with the number
     // of bytes actually consumed (C `*sourceLen -= len`).
     let mut consumed = avail;
-    // `produced` is a pure out-parameter (seeded at zero, matching C's
-    // `*destLen = 0;` before the decode loop). `util::uncompress2` overwrites
-    // it on every path that reaches the decode loop, so it is correct on both
-    // the success and error arms below.
-    let mut produced = 0usize;
+    // `produced` is a pure out-parameter, seeded with the caller's declared
+    // capacity rather than zero. C keeps that capacity in `left` and never
+    // publishes anything until `*destLen -= left` (`uncompr.c` L75), which is
+    // reached only *after* `inflateInit` succeeded (L51-L52); so an
+    // initialization failure must leave the caller's count exactly as it was.
+    // `util::uncompress2` overwrites this on every path that reaches the
+    // accounting, so the value is authoritative on both the success and error
+    // arms below and this seed is observable only on the no-engine path.
+    let mut produced = cap;
+
+    // Test-only seam reproducing `uncompr.c` L51-L52: `inflateInit` failed, so
+    // the function returns before the accounting at L74-L75 and neither caller
+    // count may be written. Genuine initialization failure is otherwise
+    // unreachable from these entry points (C zeroes the allocator hooks at
+    // L47-L49, so there is no caller hook to fail), which is precisely why the
+    // publication contract needs a deterministic test.
+    #[cfg(test)]
+    if tests::forcing_engine_init_failure() {
+        return (consumed, produced, Err(ReturnCode::MemError.as_c_int()));
+    }
+
     let result = match util::uncompress2(dst, src, &mut consumed, &mut produced) {
         Ok(_) => Ok(()),
         Err(rc) => Err(rc.as_c_int()),
@@ -332,6 +365,20 @@ unsafe fn uncompress2_engine(
 /// `Z_DATA_ERROR` for corrupt/truncated input (or a needed preset dictionary),
 /// `Z_BUF_ERROR` when `dest` is too small, or `Z_MEM_ERROR` on allocation
 /// failure.
+///
+/// # Write schedule for `*dest_len` and `*source_len`
+///
+/// Both are strictly in/out and follow C's schedule (`uncompr.c` L36-L81):
+///
+/// * on argument-validation failure (either length pointer null, or a null data
+///   pointer paired with a non-zero length) **neither** is touched — C returns
+///   `Z_STREAM_ERROR` at L36-L38 before reading them;
+/// * if stream initialization fails, **neither** is touched either — C returns at
+///   L52, before the accounting at L74-L75. Unlike `compress2_z`, `uncompress2_z`
+///   never zeroes `*destLen` up front;
+/// * on every path that reaches the decode loop, both are **overwritten** with
+///   the bytes actually consumed and produced — on success *and* on error, so a
+///   `Z_BUF_ERROR` still reports the partial output length.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn uncompress2(
     dest: *mut Bytef,
@@ -354,10 +401,15 @@ pub unsafe extern "C" fn uncompress2(
         // SAFETY: the pointer/length couplings were validated above.
         let (consumed, produced, result) = unsafe { uncompress2_engine(dest, cap, source, avail) };
         // C writes back BOTH counts after the decode loop, on success *and* on
-        // error (`uncompr.c`: `*sourceLen -= len + stream.avail_in;` and
-        // `*destLen = stream.total_out;` both run before the error-mapping
-        // `return`). Publishing the produced count on the error path is what lets
-        // a caller relying on the partial output length observe it.
+        // error: `*sourceLen -= len;` and `*destLen -= left;` (`uncompr.c`
+        // L74-L75) both run before the error-mapping `return`. Publishing the
+        // produced count on the error path is what lets a caller relying on the
+        // partial output length observe it. Those writes are *subtractions* from
+        // the caller's own values and are reached only after `inflateInit`
+        // succeeded (L51-L52), so `uncompress2_engine` seeds both counts with the
+        // caller's values and an engine that never started republishes them
+        // unchanged — C never zeroes `*destLen` here (only `compress2_z` does,
+        // `compress.c` L36).
         // SAFETY: `source_len` is non-null (checked above).
         unsafe { *source_len = consumed as uLong };
         // SAFETY: `dest_len` is non-null (checked above).
@@ -391,7 +443,9 @@ pub unsafe extern "C" fn uncompress2_z(
         // SAFETY: the pointer/length couplings were validated above.
         let (consumed, produced, result) = unsafe { uncompress2_engine(dest, cap, source, avail) };
         // As in [`uncompress2`], both counts are published on every path
-        // (success and error), matching C `uncompress2_z`.
+        // (success and error), matching C `uncompress2_z` L74-L75 — and both are
+        // seeded with the caller's own values, so a path that never reaches that
+        // accounting leaves them unchanged rather than reporting a spurious zero.
         // SAFETY: `source_len` is non-null (checked above).
         unsafe { *source_len = consumed };
         // SAFETY: `dest_len` is non-null (checked above).
@@ -645,6 +699,7 @@ mod tests {
     // it emits; tests need a couple more for clarity).
     const Z_DATA_ERROR: c_int = ReturnCode::DataError.as_c_int();
     const Z_BUF_ERROR: c_int = ReturnCode::BufError.as_c_int();
+    const Z_MEM_ERROR: c_int = ReturnCode::MemError.as_c_int();
 
     /// Read a shim-returned C string back into a Rust byte slice for comparison.
     ///
@@ -654,6 +709,42 @@ mod tests {
     unsafe fn cstr_bytes<'a>(p: *const c_char) -> &'a [u8] {
         // SAFETY: the callee returns a pointer to a `'static` C-string literal.
         unsafe { CStr::from_ptr(p) }.to_bytes()
+    }
+
+    // -- engine-initialization-failure seam ---------------------------------
+
+    std::thread_local! {
+        /// When set, [`uncompress2_engine`] returns before driving the engine,
+        /// reproducing C's `err = inflateInit(&stream); if (err != Z_OK) return
+        /// err;` (`uncompr.c` L51-L52).
+        ///
+        /// Thread-local because the test harness runs each `#[test]` on its own
+        /// thread, so concurrently running tests cannot observe one another's
+        /// flag. Genuine initialization failure is unreachable from these entry
+        /// points (C zeroes the allocator hooks at `uncompr.c` L47-L49, so there
+        /// is no caller hook to make fail), which is exactly why the publication
+        /// contract needs a deterministic seam rather than a hopeful OOM test.
+        static FORCE_ENGINE_INIT_FAILURE: core::cell::Cell<bool> =
+            const { core::cell::Cell::new(false) };
+    }
+
+    /// Whether this thread is currently forcing the initialization-failure path.
+    pub(super) fn forcing_engine_init_failure() -> bool {
+        FORCE_ENGINE_INIT_FAILURE.get()
+    }
+
+    /// Runs `body` with the initialization-failure seam armed, clearing it again
+    /// afterwards even if `body` panics.
+    fn with_forced_engine_init_failure<R>(body: impl FnOnce() -> R) -> R {
+        struct Disarm;
+        impl Drop for Disarm {
+            fn drop(&mut self) {
+                FORCE_ENGINE_INIT_FAILURE.set(false);
+            }
+        }
+        FORCE_ENGINE_INIT_FAILURE.set(true);
+        let _disarm = Disarm;
+        body()
     }
 
     // ---------------------------------------------------------------- checksum
@@ -1203,6 +1294,103 @@ mod tests {
             &plain[..],
             "output is the payload"
         );
+    }
+
+    /// An initialization failure must leave **both** caller counts untouched, in
+    /// all four `uncompress*` shims.
+    ///
+    /// C's `uncompress2_z` returns at `uncompr.c` L52 — before the `*sourceLen -=
+    /// len; *destLen -= left;` accounting at L74-L75 — and, unlike `compress2_z`
+    /// (`compress.c` L36), it never zeroes `*destLen` up front. The `uLong`
+    /// wrapper at L83-L91 copies its locals back unconditionally, but those
+    /// locals still hold the caller's original values, so the caller observes no
+    /// change through that path either.
+    ///
+    /// The sentinel capacity here is deliberately smaller than the buffer and
+    /// distinct from both zero and the buffer length, so a spurious
+    /// `*destLen = 0` — the defect this test guards — is unmistakable.
+    #[test]
+    fn uncompress_leaves_both_counts_untouched_when_engine_init_fails() {
+        const CAP_SENTINEL: usize = 17;
+        const AVAIL_SENTINEL: usize = 8;
+
+        // The canonical 8-byte empty zlib stream: CMF/FLG `78 9c`, one final
+        // stored block `03 00`, then the big-endian Adler-32 of no bytes.
+        let src = [0x78u8, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
+        assert_eq!(src.len(), AVAIL_SENTINEL);
+
+        // --- uncompress2 (uLong) --------------------------------------------
+        let mut out = [0u8; 64];
+        let mut out_len: uLongf = CAP_SENTINEL as uLongf;
+        let mut src_len: uLong = AVAIL_SENTINEL as uLong;
+        let rc = with_forced_engine_init_failure(|| unsafe {
+            uncompress2(out.as_mut_ptr(), &mut out_len, src.as_ptr(), &mut src_len)
+        });
+        assert_eq!(
+            rc, Z_MEM_ERROR,
+            "the init failure code is returned verbatim"
+        );
+        assert_eq!(
+            out_len as usize, CAP_SENTINEL,
+            "C returns before `*destLen -= left`, so the capacity must survive; \
+             reporting 0 here would invent a produced count for a stream whose \
+             engine never started"
+        );
+        assert_eq!(
+            src_len as usize, AVAIL_SENTINEL,
+            "C returns before `*sourceLen -= len`, so the available count must \
+             survive"
+        );
+
+        // --- uncompress2_z (size_t) -----------------------------------------
+        let mut out_len_z: z_size_t = CAP_SENTINEL;
+        let mut src_len_z: z_size_t = AVAIL_SENTINEL;
+        let rc = with_forced_engine_init_failure(|| unsafe {
+            uncompress2_z(
+                out.as_mut_ptr(),
+                &mut out_len_z,
+                src.as_ptr(),
+                &mut src_len_z,
+            )
+        });
+        assert_eq!(rc, Z_MEM_ERROR);
+        assert_eq!(out_len_z, CAP_SENTINEL);
+        assert_eq!(src_len_z, AVAIL_SENTINEL);
+
+        // --- uncompress (uLong, consumed count discarded) -------------------
+        let mut out_len: uLongf = CAP_SENTINEL as uLongf;
+        let rc = with_forced_engine_init_failure(|| unsafe {
+            uncompress(
+                out.as_mut_ptr(),
+                &mut out_len,
+                src.as_ptr(),
+                AVAIL_SENTINEL as uLong,
+            )
+        });
+        assert_eq!(rc, Z_MEM_ERROR);
+        assert_eq!(out_len as usize, CAP_SENTINEL);
+
+        // --- uncompress_z (size_t, consumed count discarded) ----------------
+        let mut out_len_z: z_size_t = CAP_SENTINEL;
+        let rc = with_forced_engine_init_failure(|| unsafe {
+            uncompress_z(
+                out.as_mut_ptr(),
+                &mut out_len_z,
+                src.as_ptr(),
+                AVAIL_SENTINEL,
+            )
+        });
+        assert_eq!(rc, Z_MEM_ERROR);
+        assert_eq!(out_len_z, CAP_SENTINEL);
+
+        // The seam must be disarmed again: the very same call now succeeds and
+        // publishes real counts, proving the counts are not simply never written.
+        let mut out_len: uLongf = out.len() as uLongf;
+        let mut src_len: uLong = AVAIL_SENTINEL as uLong;
+        let rc = unsafe { uncompress2(out.as_mut_ptr(), &mut out_len, src.as_ptr(), &mut src_len) };
+        assert_eq!(rc, Z_OK, "the seam is thread-local and armed only in-scope");
+        assert_eq!(out_len, 0, "the fixture decodes to an empty payload");
+        assert_eq!(src_len as usize, AVAIL_SENTINEL, "all input is consumed");
     }
 
     // ------------------------------------------------------------- version/err

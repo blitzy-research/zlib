@@ -62,7 +62,7 @@ use crate::deflate;
 use crate::error::ReturnCode;
 use crate::gz::GZBUFSIZE;
 use crate::gz::read::gz_look;
-use crate::gz::state::{GzMode, GzState, How};
+use crate::gz::state::{GzFile, GzMode, GzState, How};
 use crate::gz::write::{gz_comp, gz_zero};
 
 /// The `O_NONBLOCK` open flag, applied on unix when the mode string requests it
@@ -219,6 +219,28 @@ fn parse_mode(mode: &str) -> Result<ParsedMode, ReturnCode> {
     })
 }
 
+/// Validates a `gz*` mode string *without* opening or adopting anything — the
+/// pre-flight half of [`parse_mode`].
+///
+/// This exists for one reason: C `gz_open` performs every mode-grammar rejection
+/// **before** it stores the caller's descriptor in `state->fd`
+/// (`gzlib.c` L150-L197 precede L263), so a rejected `gzdopen` leaves the
+/// caller's descriptor open and reusable. The C-ABI `gzdopen` shim in
+/// `src/ffi/gz.rs` must therefore decide whether the mode is acceptable *before*
+/// it wraps the raw `fd` in a [`File`], because a [`File`] closes its descriptor
+/// on drop. Calling this first reproduces C's contract exactly; [`gz_open`]
+/// re-parses the same string afterwards, which is pure (no I/O, no allocation)
+/// and therefore free of side effects.
+///
+/// # Errors
+///
+/// Exactly the errors [`parse_mode`] reports: [`ReturnCode::StreamError`] when
+/// the string contains `'+'`, carries no `'r'`/`'w'`/`'a'`, forces a transparent
+/// read (`'T'` while reading), or applies `'G'` while writing or appending.
+pub(crate) fn validate_mode(mode: &str) -> Result<(), ReturnCode> {
+    parse_mode(mode).map(|_| ())
+}
+
 // ===========================================================================
 // Internal helpers: gz_reset (gzlib.c L68-89) and gz_open (gzlib.c L120-287).
 // ===========================================================================
@@ -371,7 +393,7 @@ fn gz_open(path: &Path, file: Option<File>, mode: &str) -> Result<Box<GzState>, 
         pos: 0,
         // identity / configuration
         mode: effective_mode,
-        file: handle,
+        file: GzFile::new(handle),
         path: path.display().to_string(),
         size: 0,
         want: GZBUFSIZE,
@@ -1041,7 +1063,7 @@ mod tests {
             next: 0,
             pos: 0,
             mode,
-            file,
+            file: GzFile::new(file),
             path: String::from("test"),
             size: 0,
             want: GZBUFSIZE,
@@ -1158,6 +1180,44 @@ mod tests {
         assert_eq!(parse_mode("rGT").unwrap_err(), ReturnCode::StreamError);
         // ...T then G while reading -> ends gzip-only (-1) -> accepted.
         assert_eq!(parse_mode("rTG").expect("valid").direct, -1);
+    }
+
+    /// [`validate_mode`] must accept and reject exactly what [`parse_mode`] does.
+    ///
+    /// The C-ABI `gzdopen` shim relies on this to decide whether a mode is usable
+    /// *before* it wraps the caller's raw descriptor in a [`File`], reproducing C's
+    /// ordering (`gzlib.c` L150-L197 precede L263) so that a rejected `gzdopen`
+    /// never closes the caller's descriptor. Any divergence between the two would
+    /// either close a descriptor C leaves open or adopt one C would have refused.
+    #[test]
+    fn validate_mode_agrees_with_parse_mode() {
+        // The six strings reference zlib rejects, verified against the C
+        // conformance harness: read+write, forced-transparent read, gzip-only
+        // write, and three with no r/w/a at all.
+        for mode in ["r+", "rT", "wG", "b", "", "9"] {
+            assert_eq!(
+                validate_mode(mode).unwrap_err(),
+                ReturnCode::StreamError,
+                "validate_mode must reject {mode:?}"
+            );
+            assert!(
+                parse_mode(mode).is_err(),
+                "parse_mode must agree about {mode:?}"
+            );
+        }
+
+        // Representative accepted strings across both directions and both
+        // transparency settings.
+        for mode in ["rb", "wb", "ab", "wb9", "rG", "wT", "rTG", "wbx", "r"] {
+            assert!(
+                validate_mode(mode).is_ok(),
+                "validate_mode must accept {mode:?}"
+            );
+            assert!(
+                parse_mode(mode).is_ok(),
+                "parse_mode must agree about {mode:?}"
+            );
+        }
     }
 
     // -- gzbuffer ------------------------------------------------------------

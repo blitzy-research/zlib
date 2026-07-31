@@ -85,7 +85,7 @@ use crate::stream::ZStream;
 // only referenced by the gzip-only `inflateGetHeader` path and the header
 // write-back inside `inflate`, so gate their imports to avoid unused warnings.
 #[cfg(feature = "gzip")]
-use crate::ffi::types::{gz_header, write_gz_header_from_idiomatic};
+use crate::ffi::types::{gz_header, publish_gz_header};
 #[cfg(feature = "gzip")]
 use crate::gz_header::GzHeader;
 
@@ -724,8 +724,10 @@ pub unsafe extern "C" fn inflateBackInit_(
         // The resulting triple charges the *state* footprint to the caller's
         // allocator, matching the single
         // `ZALLOC(strm, 1, sizeof(struct inflate_state))` C makes (`infback.c`
-        // L51). A wholly absent pair leaves the reservation unmade, exactly as a
-        // C caller with both hooks null gets the built-in allocator.
+        // L51). A caller who supplied *neither* half gets both built-ins
+        // published into their `z_stream` (as C publishes `zcalloc`/`zcfree`) but
+        // no active hook, so the reservation stays unmade and the built-in
+        // allocator serves the state — see `CAllocator::is_builtin_pair`.
         // SAFETY: `sref` is a valid, exclusively-owned `&mut z_stream`; only its
         // plain `Copy` `msg`/allocator fields are read and written, and no hook
         // pointer is dereferenced.
@@ -840,7 +842,12 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
         // fails in its header before `inflate.c` L550/L690) publishes the
         // caller's own value straight back. See `seed_adler_mirror`.
         seed_adler_mirror(&mut handle.zs, caller_adler);
-        let outcome = crate::inflate::inflate(&mut handle.zs, input, output, flush);
+        // The crate-private tracked form additionally reports whether the C
+        // `total_in`/`total_out` mirrors may advance; the public
+        // `crate::inflate::inflate` discards that flag (see
+        // `TrackedInflateOutcome`).
+        let tracked = crate::inflate::inflate_tracked(&mut handle.zs, input, output, flush);
+        let outcome = tracked.outcome;
 
         // Snapshot observable fields out of the handle before its borrow ends.
         let adler = handle.zs.adler;
@@ -853,8 +860,17 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
         let msg = handle.zs.msg;
 
         // gzip header write-back: if the caller registered a `gz_header` via
-        // `inflateGetHeader`, mirror whatever the engine has captured so far into
-        // it, honoring the caller's `extra_max`/`name_max`/`comm_max` capacities.
+        // `inflateGetHeader`, publish exactly the assignments this call performed,
+        // honoring the caller's `extra_max`/`name_max`/`comm_max` capacities.
+        //
+        // Publishing the *schedule* rather than the whole owned header is
+        // load-bearing. C writes each field inside its own parser state, directly
+        // into the caller's struct, so a caller polling between `inflate` calls
+        // sees only what the stream has delivered. Mirroring the owned value
+        // wholesale would instead zero every scalar the decode has not reached
+        // yet, NUL-terminate a half-received name, and flatten the tri-state
+        // `done` to `0` — all observable divergences (AAP §0.8.1 D-4, standard
+        // S5). See `publish_gz_header`.
         #[cfg(feature = "gzip")]
         {
             let head_ptr = handle.head;
@@ -864,7 +880,7 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
                         // SAFETY: `head_ptr` is the caller's `gz_header`, still
                         // valid (registered via `inflateGetHeader`); the helper
                         // writes only within the recorded `*_max` capacities.
-                        unsafe { write_gz_header_from_idiomatic(head_ptr, gh) };
+                        unsafe { publish_gz_header(head_ptr, gh, &tracked.header) };
                     }
                 }
             }
@@ -875,14 +891,15 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
         // C's two `RESTORE()`-then-return-directly paths commit the cursors but
         // jump over `strm->total_in += in; strm->total_out += out;`
         // (`inflate.c` L1141-L1142). Snapshot the totals so they can be rolled
-        // back for exactly those returns; see `InflateOutcome::commit_totals`.
+        // back for exactly those returns; see
+        // `TrackedInflateOutcome::commit_totals`.
         let (prev_total_in, prev_total_out) = (sref.total_in, sref.total_out);
         // SAFETY: `outcome.consumed <= input.len() == avail_in`, so advancing by
         // that amount keeps `next_in`/`avail_in`/`total_in` consistent.
         unsafe { advance_input(sref, outcome.consumed) };
         // SAFETY: `outcome.produced <= output.len() == avail_out`, as above.
         unsafe { advance_output(sref, outcome.produced) };
-        if !outcome.commit_totals {
+        if !tracked.commit_totals {
             sref.total_in = prev_total_in;
             sref.total_out = prev_total_out;
         }
@@ -1268,7 +1285,7 @@ pub unsafe extern "C" fn inflateCopy(dest: z_streamp, source: z_streamp) -> c_in
         // C reaches the same verdict through `inflateStateCheck(source)`, which
         // rejects a source whose `zalloc` or `zfree` is null (`inflate.c` L90-L91,
         // called from `inflateCopy` before its `ZALLOC(source, …)`). A stream this
-        // crate initialized can only carry both hooks or neither, so this can fire
+        // crate initialized always carries two non-null halves, so this can fire
         // only if the fields were mutated after init; rejecting keeps the copy from
         // silently allocating out of the global heap while the caller believes
         // their hook owns the memory.
@@ -1487,15 +1504,13 @@ pub unsafe extern "C" fn inflateGetHeader(strm: z_streamp, head: gz_headerp) -> 
                 } else {
                     Some(alloc::vec::Vec::new())
                 },
-                // Seed the caller's own `extra_len` rather than defaulting it to
-                // zero. C only assigns `head->extra_len` when the header actually
-                // carries an `FEXTRA` field (`inflate.c` L596-L600); for a stream
-                // without one it leaves the caller's field exactly as it found it
+                // The caller's `extra_len` needs no seeding: C assigns
+                // `head->extra_len` only when the header actually carries an
+                // `FEXTRA` field (`inflate.c` L596-L600), and for a stream without
+                // one it leaves the caller's field exactly as it found it
                 // (`inflate.c` L605-L606 nulls `extra`, never `extra_len`).
-                // Carrying the value in means the unconditional writeback in
-                // `write_gz_header_from_idiomatic` reproduces both cases: a
-                // declared `XLEN` overwrites it, and no `FEXTRA` leaves it alone.
-                extra_len: raw.extra_len,
+                // `publish_gz_header` writes the field only when the decoder
+                // reports a declared `XLEN`, so both cases fall out for free.
                 extra_max: raw.extra_max,
                 name_max: raw.name_max,
                 comm_max: raw.comm_max,
@@ -2436,6 +2451,562 @@ mod tests {
         );
 
         assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+    }
+
+    // -- inflateGetHeader: the INCREMENTAL publication schedule -------------
+
+    /// The poison byte every capture buffer is pre-filled with, so any write the
+    /// library was not authorized to make is visible.
+    #[cfg(feature = "gzip")]
+    const HDR_POISON: u8 = 0x7e;
+
+    /// Which optional gzip header fields [`gzip_stream_with_fields`] should emit.
+    #[cfg(feature = "gzip")]
+    #[derive(Clone, Copy)]
+    struct HeaderFields {
+        extra: bool,
+        name: bool,
+        comment: bool,
+        hcrc: bool,
+    }
+
+    #[cfg(feature = "gzip")]
+    impl HeaderFields {
+        /// Every optional field present.
+        const ALL: Self = Self {
+            extra: true,
+            name: true,
+            comment: true,
+            hcrc: true,
+        };
+        /// No optional field present — a bare `FLG == 0` gzip member.
+        const NONE: Self = Self {
+            extra: false,
+            name: false,
+            comment: false,
+            hcrc: false,
+        };
+    }
+
+    /// The `FEXTRA` payload every fixture in this section declares.
+    #[cfg(feature = "gzip")]
+    const HDR_EXTRA: &[u8] = b"ABCDEF";
+    /// The `FNAME` every fixture declares — nine content bytes, so `name_max`
+    /// values of 9 and 10 straddle C's "the NUL is a counted byte" rule.
+    #[cfg(feature = "gzip")]
+    const HDR_NAME: &[u8] = b"hello.txt";
+    /// The `FCOMMENT` every fixture declares.
+    #[cfg(feature = "gzip")]
+    const HDR_COMMENT: &[u8] = b"note";
+    /// The `MTIME` every fixture declares, chosen so all four bytes differ.
+    #[cfg(feature = "gzip")]
+    const HDR_TIME: c_ulong = 0x1122_3344;
+
+    /// Builds a gzip member carrying exactly the header fields `fields` names,
+    /// using this crate's own encoder through `deflateSetHeader`.
+    ///
+    /// Mirrors the `build_stream_flags` fixture of the differential C harness this
+    /// section's expectations were measured against, so the Rust assertions and
+    /// the reference-C observations describe the same bytes.
+    #[cfg(feature = "gzip")]
+    fn gzip_stream_with_fields(fields: HeaderFields) -> Vec<u8> {
+        use crate::constants::{Z_DEFAULT_STRATEGY, Z_DEFLATED, Z_FINISH};
+        use crate::ffi::deflate::{deflate, deflateEnd, deflateInit2_, deflateSetHeader};
+
+        let mut d = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                deflateInit2_(
+                    &mut d,
+                    6,
+                    Z_DEFLATED,
+                    31,
+                    8,
+                    Z_DEFAULT_STRATEGY,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+
+        let mut extra = HDR_EXTRA.to_vec();
+        let mut name = HDR_NAME.to_vec();
+        name.push(0);
+        let mut comment = HDR_COMMENT.to_vec();
+        comment.push(0);
+
+        let mut head = zeroed_gz_header();
+        head.text = 1;
+        head.time = HDR_TIME;
+        head.os = 3;
+        if fields.extra {
+            head.extra = extra.as_mut_ptr();
+            head.extra_len = HDR_EXTRA.len() as c_uint;
+        }
+        if fields.name {
+            head.name = name.as_mut_ptr();
+        }
+        if fields.comment {
+            head.comment = comment.as_mut_ptr();
+        }
+        head.hcrc = c_int::from(fields.hcrc);
+        assert_eq!(unsafe { deflateSetHeader(&mut d, &mut head) }, Z_OK);
+
+        let payload: Vec<u8> = (0..64u8).map(|i| b'a' + (i % 26)).collect();
+        let mut out = vec![0u8; payload.len() + 256];
+        d.next_in = payload.as_ptr();
+        d.avail_in = payload.len() as c_uint;
+        d.next_out = out.as_mut_ptr();
+        d.avail_out = out.len() as c_uint;
+        assert_eq!(unsafe { deflate(&mut d, Z_FINISH) }, Z_STREAM_END);
+        let produced = out.len() - d.avail_out as usize;
+        out.truncate(produced);
+        assert_eq!(unsafe { deflateEnd(&mut d) }, Z_OK);
+        out
+    }
+
+    /// A caller's `gz_header` with every scalar poisoned and capture buffers
+    /// pre-filled with [`HDR_POISON`], the shape the differential C harness uses.
+    ///
+    /// A capacity of `0` hands over a null pointer, which is how a C caller
+    /// declines to capture a field.
+    #[cfg(feature = "gzip")]
+    struct PoisonedHeader {
+        head: crate::ffi::types::gz_header,
+        extra: Vec<u8>,
+        name: Vec<u8>,
+        comment: Vec<u8>,
+    }
+
+    #[cfg(feature = "gzip")]
+    impl PoisonedHeader {
+        /// Poison value for `text`, `xflags`, `os` and `hcrc` — a value no gzip
+        /// header can legitimately produce for any of them.
+        const SCALAR: c_int = 9;
+        /// Poison value for `time`.
+        const TIME: c_ulong = 0xDEAD_BEEF;
+        /// Poison value for `extra_len`.
+        const XLEN: c_uint = 12345;
+
+        fn new(extra_max: usize, name_max: usize, comm_max: usize) -> Self {
+            let mut this = Self {
+                head: zeroed_gz_header(),
+                extra: vec![HDR_POISON; extra_max],
+                name: vec![HDR_POISON; name_max],
+                comment: vec![HDR_POISON; comm_max],
+            };
+            this.head.text = Self::SCALAR;
+            this.head.time = Self::TIME;
+            this.head.xflags = Self::SCALAR;
+            this.head.os = Self::SCALAR;
+            this.head.hcrc = Self::SCALAR;
+            this.head.done = Self::SCALAR;
+            this.head.extra_len = Self::XLEN;
+            this.head.extra_max = extra_max as c_uint;
+            this.head.name_max = name_max as c_uint;
+            this.head.comm_max = comm_max as c_uint;
+            // Pointers are taken after the vectors are in their final place.
+            if extra_max != 0 {
+                this.head.extra = this.extra.as_mut_ptr();
+            }
+            if name_max != 0 {
+                this.head.name = this.name.as_mut_ptr();
+            }
+            if comm_max != 0 {
+                this.head.comment = this.comment.as_mut_ptr();
+            }
+            this
+        }
+    }
+
+    /// Registers a poisoned header on a `window_bits`-framed stream, feeds
+    /// `stream` `step` bytes per `inflate` call, and invokes `observe` after every
+    /// call — the Rust equivalent of the differential harness's `drive`.
+    ///
+    /// Stops as soon as `done` reports completion (`1`), because the publication
+    /// schedule is fully observed by then. A `done == -1` ("this stream carries no
+    /// gzip header") case keeps running to the end of the stream so callers can
+    /// also assert the final return code — matching the differential C harness,
+    /// whose loop is likewise gated on `done == 1`.
+    #[cfg(feature = "gzip")]
+    fn drive_header<F: FnMut(&PoisonedHeader)>(
+        window_bits: c_int,
+        step: usize,
+        stream: &[u8],
+        hdr: &mut PoisonedHeader,
+        mut observe: F,
+    ) -> c_int {
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    window_bits,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        assert_eq!(unsafe { inflateGetHeader(&mut strm, &mut hdr.head) }, Z_OK);
+        assert_eq!(hdr.head.done, 0, "registration clears `done` to 0");
+
+        let mut out = vec![0u8; stream.len() * 8 + 512];
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+
+        let mut off = 0usize;
+        let mut rc = Z_OK;
+        while off < stream.len() && rc == Z_OK {
+            let n = core::cmp::min(step, stream.len() - off);
+            strm.next_in = stream[off..].as_ptr();
+            strm.avail_in = n as c_uint;
+            off += n;
+            rc = unsafe { inflate(&mut strm, Z_NO_FLUSH) };
+            observe(hdr);
+            if hdr.head.done == 1 {
+                break;
+            }
+        }
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+        rc
+    }
+
+    /// Finding #11 — each gzip header scalar must be published **only** by the
+    /// parser state that assigns it in C, never eagerly.
+    ///
+    /// C writes into the caller's `gz_header` from inside `FLAGS` (`text`), `TIME`
+    /// (`time`), `OS` (`xflags` and `os`, one statement pair under one guard) and
+    /// `HCRC` (`hcrc`, `done`) — `inflate.c` L523-L524, L531-L532, L539-L542,
+    /// L686-L689. A caller polling between calls therefore sees its own values in
+    /// every field the stream has not reached yet, which is exactly what makes a
+    /// sentinel-based "has this arrived?" test work in C.
+    ///
+    /// Feeding the header one byte per call and poisoning every scalar pins the
+    /// ordering: at the moment `text` first changes, `time`/`xflags`/`os`/`hcrc`
+    /// must still hold poison, and so on down the chain. The expectations were
+    /// measured against reference C zlib built from this repository's own
+    /// `inflate.c`, which yields exactly this staircase.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn get_header_publishes_each_scalar_only_when_its_own_state_runs() {
+        let stream = gzip_stream_with_fields(HeaderFields::ALL);
+        let mut hdr = PoisonedHeader::new(16, 16, 16);
+
+        let mut saw_text = false;
+        let mut saw_time = false;
+        let mut saw_os = false;
+        let rc = drive_header(31, 1, &stream, &mut hdr, |h| {
+            let head = &h.head;
+            if !saw_text && head.text != PoisonedHeader::SCALAR {
+                saw_text = true;
+                assert_eq!(head.text, 1, "FLAGS publishes the real FTEXT bit");
+                assert_eq!(
+                    head.time,
+                    PoisonedHeader::TIME,
+                    "`time` belongs to the TIME state, which has not run yet"
+                );
+                assert_eq!(head.xflags, PoisonedHeader::SCALAR, "OS has not run yet");
+                assert_eq!(head.os, PoisonedHeader::SCALAR, "OS has not run yet");
+                assert_eq!(head.hcrc, PoisonedHeader::SCALAR, "HCRC has not run yet");
+            }
+            if !saw_time && head.time != PoisonedHeader::TIME {
+                saw_time = true;
+                assert!(saw_text, "TIME runs after FLAGS");
+                assert_eq!(head.time, HDR_TIME);
+                assert_eq!(head.xflags, PoisonedHeader::SCALAR, "OS has not run yet");
+                assert_eq!(head.os, PoisonedHeader::SCALAR, "OS has not run yet");
+                assert_eq!(head.hcrc, PoisonedHeader::SCALAR, "HCRC has not run yet");
+            }
+            if !saw_os && head.os != PoisonedHeader::SCALAR {
+                saw_os = true;
+                assert!(saw_time, "OS runs after TIME");
+                assert_eq!(head.os, 3);
+                assert_eq!(head.xflags, 0, "C assigns xflags and os together");
+                assert_eq!(head.hcrc, PoisonedHeader::SCALAR, "HCRC has not run yet");
+            }
+        });
+
+        assert_eq!(rc, Z_OK);
+        assert!(saw_text && saw_time && saw_os, "every state must have run");
+        // HCRC is last: it publishes `hcrc` and completes the header.
+        assert_eq!(hdr.head.hcrc, 1);
+        assert_eq!(hdr.head.done, 1);
+        assert_eq!(hdr.head.extra_len, HDR_EXTRA.len() as c_uint);
+        assert_eq!(&hdr.extra[..HDR_EXTRA.len()], HDR_EXTRA);
+        assert_eq!(
+            &hdr.extra[HDR_EXTRA.len()..],
+            &[HDR_POISON; 10],
+            "the copy stops at the captured length; the tail stays the caller's"
+        );
+        // Nine content bytes plus C's counted NUL, then untouched poison.
+        assert_eq!(&hdr.name[..HDR_NAME.len()], HDR_NAME);
+        assert_eq!(hdr.name[HDR_NAME.len()], 0);
+        assert!(
+            hdr.name[HDR_NAME.len() + 1..]
+                .iter()
+                .all(|&b| b == HDR_POISON)
+        );
+        assert_eq!(&hdr.comment[..HDR_COMMENT.len()], HDR_COMMENT);
+        assert_eq!(hdr.comment[HDR_COMMENT.len()], 0);
+    }
+
+    /// Finding #8 — a stream that turns out **not** to carry a gzip header must
+    /// report C's `done == -1`, which a [`bool`] cannot express.
+    ///
+    /// With auto-detect framing (`windowBits = 47`) the decoder does not know
+    /// which wrapper it has until the first two bytes arrive. When they are not
+    /// `1f 8b`, C's `HEAD` state runs `if (state->head != Z_NULL)
+    /// state->head->done = -1;` (`inflate.c` L505-L506) and proceeds as zlib.
+    /// That `-1` is the only way a caller can distinguish "there is no gzip header
+    /// to wait for" from "the gzip header has not arrived yet"; collapsing it to
+    /// `0` leaves such a caller polling forever.
+    ///
+    /// Nothing else may be touched: no gzip header exists, so every scalar keeps
+    /// the caller's poison and no capture buffer is written — in particular no
+    /// premature NUL, which a bulk mirror of an empty owned header would emit.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn get_header_reports_done_minus_one_for_a_zlib_stream_under_auto_detect() {
+        // Both delivery granularities: byte-at-a-time (the decision is made on
+        // the second byte) and the whole stream in one call.
+        for step in [1usize, usize::MAX] {
+            let mut hdr = PoisonedHeader::new(16, 16, 16);
+            let rc = drive_header(47, step, ZLIB_STREAM, &mut hdr, |_| {});
+            assert_eq!(
+                rc, Z_STREAM_END,
+                "the zlib stream still decodes (step {step})"
+            );
+            assert_eq!(
+                hdr.head.done, -1,
+                "a non-gzip stream must report done == -1 (step {step})"
+            );
+            assert_eq!(hdr.head.text, PoisonedHeader::SCALAR);
+            assert_eq!(hdr.head.time, PoisonedHeader::TIME);
+            assert_eq!(hdr.head.xflags, PoisonedHeader::SCALAR);
+            assert_eq!(hdr.head.os, PoisonedHeader::SCALAR);
+            assert_eq!(hdr.head.hcrc, PoisonedHeader::SCALAR);
+            assert_eq!(hdr.head.extra_len, PoisonedHeader::XLEN);
+            assert!(
+                hdr.extra.iter().all(|&b| b == HDR_POISON)
+                    && hdr.name.iter().all(|&b| b == HDR_POISON)
+                    && hdr.comment.iter().all(|&b| b == HDR_POISON),
+                "no gzip header exists, so no capture buffer may be written — \
+                 not even a terminating NUL (step {step})"
+            );
+            assert!(
+                !hdr.head.extra.is_null()
+                    && !hdr.head.name.is_null()
+                    && !hdr.head.comment.is_null(),
+                "the no-field nulling belongs to EXLEN/NAME/COMMENT, which a \
+                 non-gzip stream never reaches (step {step})"
+            );
+        }
+    }
+
+    /// Finding #11 — a name or comment still arriving must stay **unterminated**.
+    ///
+    /// C stores the field's NUL only when it actually decodes that byte
+    /// (`inflate.c` L632-L637 / L654-L659), so a caller polling mid-field sees the
+    /// bytes delivered so far followed by its own memory. A boundary that mirrors
+    /// an owned `Vec` as a C string instead writes a terminator after every call,
+    /// which reads as "the name is complete" while more bytes are still coming.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn get_header_leaves_a_partially_received_name_unterminated() {
+        let stream = gzip_stream_with_fields(HeaderFields::ALL);
+        let mut hdr = PoisonedHeader::new(16, 16, 16);
+
+        let mut saw_partial_name = false;
+        let mut saw_partial_comment = false;
+        drive_header(31, 1, &stream, &mut hdr, |h| {
+            // Number of leading bytes that are no longer poison == bytes stored.
+            let stored = |buf: &[u8]| buf.iter().take_while(|&&b| b != HDR_POISON).count();
+            let n = stored(&h.name);
+            if n > 0 && n < HDR_NAME.len() {
+                saw_partial_name = true;
+                assert_eq!(&h.name[..n], &HDR_NAME[..n]);
+                assert_eq!(
+                    h.name[n], HDR_POISON,
+                    "the byte after a partially received name must still be the \
+                     caller's — C has not decoded the NUL yet"
+                );
+            }
+            let c = stored(&h.comment);
+            if c > 0 && c < HDR_COMMENT.len() {
+                saw_partial_comment = true;
+                assert_eq!(&h.comment[..c], &HDR_COMMENT[..c]);
+                assert_eq!(h.comment[c], HDR_POISON, "no premature comment NUL");
+            }
+        });
+
+        assert!(
+            saw_partial_name && saw_partial_comment,
+            "one byte per call must expose at least one partial state per field"
+        );
+        // Once complete, both carry C's counted NUL.
+        assert_eq!(hdr.name[HDR_NAME.len()], 0);
+        assert_eq!(hdr.comment[HDR_COMMENT.len()], 0);
+    }
+
+    /// Finding #11 — C counts the terminating NUL against `name_max`/`comm_max`
+    /// like any other decoded byte, so a name that *exactly* fills the buffer is
+    /// left unterminated.
+    ///
+    /// `inflate.c` L632-L637 stores under `state->length < head->name_max` and
+    /// increments `state->length` for the NUL too. With a nine-byte name:
+    /// `name_max == 9` stores nine content bytes and drops the NUL; `name_max ==
+    /// 10` stores the NUL as the tenth byte; `name_max == 5` truncates the content
+    /// and never reaches the NUL. All three were confirmed against reference C.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn get_header_applies_cs_counted_nul_accounting_to_name_max() {
+        let stream = gzip_stream_with_fields(HeaderFields::ALL);
+
+        // Exact fit: nine content bytes, no room left for the counted NUL.
+        let mut hdr = PoisonedHeader::new(8, HDR_NAME.len(), 8);
+        drive_header(31, usize::MAX, &stream, &mut hdr, |_| {});
+        assert_eq!(hdr.head.done, 1);
+        assert_eq!(
+            hdr.name, HDR_NAME,
+            "a name that exactly fills name_max is NOT NUL-terminated, exactly \
+             as in C — the terminator is one of the counted bytes"
+        );
+
+        // One more byte of capacity: the NUL now fits and is stored.
+        let mut hdr = PoisonedHeader::new(8, HDR_NAME.len() + 1, 8);
+        drive_header(31, usize::MAX, &stream, &mut hdr, |_| {});
+        assert_eq!(hdr.head.done, 1);
+        assert_eq!(&hdr.name[..HDR_NAME.len()], HDR_NAME);
+        assert_eq!(hdr.name[HDR_NAME.len()], 0, "the counted NUL now fits");
+
+        // Truncating capacity: content is cut and the NUL is never reached.
+        let mut hdr = PoisonedHeader::new(4, 5, 3);
+        drive_header(31, 3, &stream, &mut hdr, |_| {});
+        assert_eq!(hdr.head.done, 1);
+        assert_eq!(hdr.name, &HDR_NAME[..5], "content truncated, no terminator");
+        assert_eq!(hdr.comment, &HDR_COMMENT[..3], "same rule for the comment");
+        assert_eq!(
+            hdr.extra,
+            &HDR_EXTRA[..4],
+            "the extra copy is clamped to extra_max while extra_len reports XLEN"
+        );
+        assert_eq!(hdr.head.extra_len, HDR_EXTRA.len() as c_uint);
+    }
+
+    /// Finding #11 — an **absent** optional field must null the caller's pointer
+    /// and leave its buffer untouched.
+    ///
+    /// C assigns `head->extra = Z_NULL` (`inflate.c` L605-L606), `head->name =
+    /// Z_NULL` (L643-L644) and `head->comment = Z_NULL` (L665-L666) on the
+    /// respective "flag not set" branches. That store is how a C caller tells "the
+    /// header declared no such field" from "it declared one"; leaving a stale
+    /// non-null pointer misreports an absent field as present. The buffer itself
+    /// is never written, so the caller's bytes must survive intact.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn get_header_nulls_the_pointer_of_every_absent_field() {
+        // One case per field, plus the bare header that omits all three.
+        let cases: [(HeaderFields, bool, bool, bool); 4] = [
+            (
+                HeaderFields {
+                    extra: false,
+                    ..HeaderFields::ALL
+                },
+                true,
+                false,
+                false,
+            ),
+            (
+                HeaderFields {
+                    name: false,
+                    ..HeaderFields::ALL
+                },
+                false,
+                true,
+                false,
+            ),
+            (
+                HeaderFields {
+                    comment: false,
+                    ..HeaderFields::ALL
+                },
+                false,
+                false,
+                true,
+            ),
+            (HeaderFields::NONE, true, true, true),
+        ];
+
+        for (fields, extra_absent, name_absent, comment_absent) in cases {
+            let stream = gzip_stream_with_fields(fields);
+            let mut hdr = PoisonedHeader::new(16, 16, 16);
+            let rc = drive_header(31, 1, &stream, &mut hdr, |_| {});
+            assert_eq!(rc, Z_OK);
+            assert_eq!(hdr.head.done, 1, "the header still completes");
+
+            assert_eq!(
+                hdr.head.extra.is_null(),
+                extra_absent,
+                "extra pointer nulled iff the header declared no FEXTRA"
+            );
+            assert_eq!(
+                hdr.head.name.is_null(),
+                name_absent,
+                "name pointer nulled iff the header declared no FNAME"
+            );
+            assert_eq!(
+                hdr.head.comment.is_null(),
+                comment_absent,
+                "comment pointer nulled iff the header declared no FCOMMENT"
+            );
+
+            if extra_absent {
+                assert!(hdr.extra.iter().all(|&b| b == HDR_POISON));
+                assert_eq!(
+                    hdr.head.extra_len,
+                    PoisonedHeader::XLEN,
+                    "no FEXTRA means EXLEN never assigns extra_len either"
+                );
+            } else {
+                assert_eq!(hdr.head.extra_len, HDR_EXTRA.len() as c_uint);
+            }
+            if name_absent {
+                assert!(
+                    hdr.name.iter().all(|&b| b == HDR_POISON),
+                    "an absent name must not write a single byte, NUL included"
+                );
+            }
+            if comment_absent {
+                assert!(hdr.comment.iter().all(|&b| b == HDR_POISON));
+            }
+            // The HCRC state always publishes `hcrc` and `done`, even when the
+            // FHCRC bit is clear (`inflate.c` L686-L689 is outside the
+            // `flags & 0x0200` guard).
+            assert_eq!(hdr.head.hcrc, c_int::from(fields.hcrc));
+        }
+    }
+
+    /// Finding #11 — the same schedule holds when the FHCRC bit is clear: the
+    /// `HCRC` state's `head->hcrc = (flags >> 9) & 1; head->done = 1;` pair sits
+    /// *outside* the `flags & 0x0200` guard (`inflate.c` L686-L689), so `hcrc` is
+    /// published as `0` rather than left poisoned.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn get_header_publishes_a_zero_hcrc_when_the_stream_carries_no_header_crc() {
+        let stream = gzip_stream_with_fields(HeaderFields {
+            hcrc: false,
+            ..HeaderFields::ALL
+        });
+        let mut hdr = PoisonedHeader::new(16, 16, 16);
+        drive_header(31, 1, &stream, &mut hdr, |_| {});
+        assert_eq!(hdr.head.done, 1);
+        assert_eq!(
+            hdr.head.hcrc, 0,
+            "HCRC publishes the FHCRC bit unconditionally, so a stream without \
+             one reports 0 instead of keeping the caller's value"
+        );
     }
 
     // -- inflateBack --------------------------------------------------------
@@ -3748,14 +4319,17 @@ mod tests {
     /// zeroed `z_stream`); both halves supplied routes through the caller's
     /// allocator.
     ///
-    /// A wholly absent pair is deliberately left absent — see
-    /// [`crate::ffi::types::init_allocator_prologue`], whose doc records why: the
-    /// substitution is confined to the *half*-present case so a hookless caller's
-    /// allocation count and engine-state footprint stay byte-for-byte what they
-    /// have always been (AAP §0.6.5).
+    /// A wholly absent pair is substituted per half, exactly as C substitutes
+    /// `zcalloc`/`zcfree` (`inflate.c` L183-L196), so the caller's `z_stream`
+    /// publishes two non-null halves afterwards. That publication is pure ABI
+    /// shape: [`crate::ffi::types::CAllocator::is_builtin_pair`] recognizes the
+    /// crate's own substitutes and reports *no* hook, so the engine keeps using
+    /// the global-allocator path and a hookless caller's allocation count and
+    /// engine-state footprint stay byte-for-byte what they have always been
+    /// (AAP §0.6.5).
     #[test]
     fn init_accepts_both_hooks_and_neither_hook() {
-        // Neither: global allocator, exactly as before.
+        // Neither: both halves substituted in place, global allocator still used.
         let mut strm = zeroed_stream();
         assert_eq!(
             unsafe { inflateInit_(&mut strm, VERSION.as_ptr(), size_of::<z_stream>() as c_int) },
@@ -3764,9 +4338,14 @@ mod tests {
         );
         assert!(!strm.state.is_null());
         assert!(
-            strm.zalloc.is_none() && strm.zfree.is_none(),
-            "a wholly absent pair is left absent, which selects the global \
-             allocator and keeps a hookless caller's footprint unchanged"
+            strm.zalloc.is_some() && strm.zfree.is_some(),
+            "C substitutes each missing half unconditionally (`inflate.c` \
+             L183-L196), so a hookless caller's stream publishes a complete pair"
+        );
+        assert!(
+            crate::ffi::types::publishes_builtin_alloc_pair(&strm),
+            "the published pair must be the crate's own built-ins — the \
+             counterpart of C's zcalloc/zcfree — not a caller hook"
         );
         assert!(strm.opaque.is_null(), "a zeroed cookie stays zeroed");
         assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
@@ -3904,11 +4483,13 @@ mod tests {
     /// `zmemcpy(dest, source, sizeof(z_stream))` (L1355). Both of the *valid*
     /// hook configurations are asserted:
     ///
-    /// * a source initialized with **no** hooks at all: the prologue leaves a
-    ///   wholly absent pair absent (see
+    /// * a source initialized with **no** hooks at all: the prologue substituted
+    ///   the crate's built-ins for both halves (see
     ///   [`crate::ffi::types::init_allocator_prologue`]), the source is still a
     ///   valid stream, the copy succeeds, and the destination inherits the same
-    ///   absent triple — which is what selects the global allocator for it too;
+    ///   built-in triple — which is what selects the global allocator for it too,
+    ///   because [`crate::ffi::types::CAllocator::is_builtin_pair`] reports no
+    ///   hook for it;
     /// * a source with a **complete** caller-supplied pair: the copy succeeds and
     ///   the destination inherits both halves *and* the cookie verbatim, so its
     ///   buffers are charged to the caller's arena rather than the global heap.
@@ -3924,9 +4505,9 @@ mod tests {
             Z_OK
         );
         assert!(
-            src.zalloc.is_none() && src.zfree.is_none(),
-            "a wholly absent pair is left absent, so a hookless caller's \
-             footprint is unchanged (AAP §0.6.5)"
+            crate::ffi::types::publishes_builtin_alloc_pair(&src),
+            "both halves are substituted with the crate's built-ins, which report \
+             no hook, so a hookless caller's footprint is unchanged (AAP §0.6.5)"
         );
 
         let mut dst = zeroed_stream();
@@ -3938,9 +4519,9 @@ mod tests {
         );
         assert!(!dst.state.is_null());
         assert!(
-            dst.zalloc.is_none() && dst.zfree.is_none() && dst.opaque.is_null(),
+            crate::ffi::types::publishes_builtin_alloc_pair(&dst) && dst.opaque.is_null(),
             "C's zmemcpy hands the destination the source's allocator triple \
-             verbatim, absent halves included"
+             verbatim, substituted built-ins included"
         );
         assert_eq!(unsafe { inflateEnd(&mut dst) }, Z_OK);
         assert_eq!(unsafe { inflateEnd(&mut src) }, Z_OK);
@@ -3988,9 +4569,24 @@ mod tests {
         );
 
         // Mutate the source into an invalid half-present pair after a successful
-        // init, which is the only way this state is reachable.
-        src.zalloc = Some(always_fail_zalloc);
+        // init, which is the only way this state is reachable: the prologue
+        // always leaves two non-null halves behind, so the mutation has to null
+        // one of them. Both directions are exercised.
+        let published_zalloc = src.zalloc;
+        let published_zfree = src.zfree;
 
+        src.zfree = None;
+        let mut dst = zeroed_stream();
+        assert_eq!(
+            unsafe { inflateCopy(&mut dst, &mut src) },
+            Z_STREAM_ERROR,
+            "a source whose zfree was nulled after init must be rejected, exactly \
+             as `inflateStateCheck` (`inflate.c` L90-L91) rejects it"
+        );
+        assert!(dst.state.is_null(), "a rejected copy must install no state");
+        src.zfree = published_zfree;
+
+        src.zalloc = None;
         let mut dst = zeroed_stream();
         assert_eq!(
             unsafe { inflateCopy(&mut dst, &mut src) },
@@ -3999,8 +4595,8 @@ mod tests {
              by the global heap while the caller believes their hook owns it"
         );
         assert!(dst.state.is_null(), "a rejected copy must install no state");
+        src.zalloc = published_zalloc;
 
-        src.zalloc = None;
         assert_eq!(unsafe { inflateEnd(&mut src) }, Z_OK);
     }
 }

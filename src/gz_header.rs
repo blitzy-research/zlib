@@ -22,7 +22,7 @@
 //! | `int xflags`                       | [`xflags`](GzHeader::xflags): `i32`            |
 //! | `int os`                           | [`os`](GzHeader::os): `i32`                    |
 //! | `Bytef *extra`                     | [`extra`](GzHeader::extra): `Option<Vec<u8>>`  |
-//! | `uInt extra_len`                   | [`extra_len`](GzHeader::extra_len): `u32`      |
+//! | `uInt extra_len`                   | crate-private `HeaderPublication::extra_len`   |
 //! | `uInt extra_max`                   | [`extra_max`](GzHeader::extra_max): `u32`      |
 //! | `Bytef *name`                      | [`name`](GzHeader::name): `Option<Vec<u8>>`    |
 //! | `uInt name_max`                    | [`name_max`](GzHeader::name_max): `u32`        |
@@ -53,9 +53,23 @@
 //!     marshalling, not gzip framing.
 //! * **`done` is a `bool` here.** The C field is tri-state: `inflateGetHeader`
 //!   sets it to `1` when the header is fully parsed and to `-1` when the stream
-//!   turns out to be a raw zlib stream with no gzip header. That `-1` sentinel
-//!   is a boundary concern surfaced in `src/ffi/types.rs`; the idiomatic type
-//!   models only the "header fully read" flag as a [`bool`].
+//!   turns out to be a raw zlib stream with no gzip header. The idiomatic type
+//!   models only the "header fully read" flag as a [`bool`]; the `-1` sentinel
+//!   travels losslessly to the C caller through the crate-private `HeaderDone`
+//!   discriminant recorded in `HeaderPublication`.
+//! * **The declared `XLEN` is crate-private.** C's `gz_header.extra_len` reports
+//!   the extra field's *declared* 16-bit length even when the copy into `extra`
+//!   was clamped to `extra_max`, which is how a C caller detects truncation. That
+//!   is a wire-level decoder observation with no idiomatic use — `extra.len()` is
+//!   already the authoritative count of captured bytes — so it is carried in
+//!   the crate-private `HeaderPublication::extra_len` and published only into the
+//!   C caller's struct, keeping [`GzHeader`]'s public shape stable.
+//! * **Publication is incremental, not bulk.** Reference zlib writes each
+//!   `gz_header` field *inside its own parser state* and stores `name`/`comment`
+//!   bytes into the caller's buffers as they arrive, so a caller polling between
+//!   `inflate` calls sees exactly the fields the stream has delivered and nothing
+//!   more. `HeaderPublication` records which of those assignments a given call
+//!   performed so the FFI boundary can reproduce the schedule byte-for-byte.
 //! * **Read-only capacities.** [`extra_max`](GzHeader::extra_max),
 //!   [`name_max`](GzHeader::name_max), and [`comm_max`](GzHeader::comm_max)
 //!   bound how many bytes `inflateGetHeader` will store into the respective
@@ -166,44 +180,19 @@ pub struct GzHeader {
     /// Corresponds to the C `gz_header.extra` pointer: [`None`] is a `Z_NULL`
     /// pointer (no extra field), while `Some(bytes)` holds the extra-field bytes
     /// actually stored. When *reading*, that may be **fewer** bytes than the
-    /// stream declared — see [`extra_len`](GzHeader::extra_len).
+    /// stream declared, because the copy is clamped to
+    /// [`extra_max`](GzHeader::extra_max).
+    ///
+    /// The stream's **declared** 16-bit `XLEN` — C `gz_header.extra_len`, whose
+    /// excess over `extra_max` is a C caller's only truncation signal — is
+    /// deliberately *not* a field of this type. It is a wire-level quantity that
+    /// only the decoder observes and only a C `gz_header` has room to report, so
+    /// it travels as crate-private parser metadata (`HeaderPublication`) and is
+    /// published straight into the C caller's `extra_len` by the FFI boundary. An
+    /// idiomatic caller reads `extra.as_ref().map_or(0, Vec::len)` for the number
+    /// of bytes actually captured, which is the only number a `Vec` can be wrong
+    /// about.
     pub extra: Option<Vec<u8>>,
-
-    /// The extra field's **declared** length, in bytes.
-    ///
-    /// Mirrors C `gz_header.extra_len`, which this crate keeps as a distinct
-    /// field rather than inferring it from `extra.len()` because the two are not
-    /// the same number:
-    ///
-    /// * **Reading** (`inflateGetHeader`): set to the full 16-bit `XLEN` the gzip
-    ///   header declared (`inflate.c` L599-L600 writes it unconditionally
-    ///   whenever a header is installed, *before* and independently of any copy).
-    ///   The copy into [`extra`](GzHeader::extra) is separately clamped to
-    ///   [`extra_max`](GzHeader::extra_max) (`inflate.c` L614-L621), so when the
-    ///   caller's buffer is too small this field still reports the true length
-    ///   while `extra` holds only the leading `extra_max` bytes.
-    ///
-    ///   `extra_len > extra_max` is therefore the caller's **only** signal that
-    ///   the extra field was truncated, exactly as `zlib.h` specifies for
-    ///   `inflateGetHeader`: once `done` is true, `extra_len` contains the actual
-    ///   extra field length, and `extra` contains that field *or that field
-    ///   truncated if `extra_max` is less than `extra_len`*. Because that write is
-    ///   unconditional, a caller may also leave `extra` as [`None`] (C `Z_NULL`)
-    ///   purely to learn the length. `zlib.h` does not spell that query out; it is
-    ///   de-facto reference-zlib behavior, and this port reproduces it.
-    ///
-    ///   Because C writes it only when the header actually carries an `FEXTRA`
-    ///   field, a stream **without** one leaves whatever value the caller had
-    ///   already placed here untouched.
-    /// * **Writing** (`deflateSetHeader`): **ignored.** The encoder emits
-    ///   `extra.len()` bytes from [`extra`](GzHeader::extra), so the `Vec` is the
-    ///   single source of truth on the write path and this field cannot desynchronize
-    ///   the emitted header. At the C boundary the two agree by construction: the
-    ///   caller's `extra_len` bytes are what get read out of their `extra` pointer
-    ///   into the `Vec`.
-    ///
-    /// Defaults to `0`.
-    pub extra_len: u32,
 
     /// Optional original file name (`FNAME`, RFC 1952).
     ///
@@ -228,9 +217,11 @@ pub struct GzHeader {
     /// `true` once the gzip header has been fully parsed while reading.
     ///
     /// Mirrors C `gz_header.done`. `inflateGetHeader` sets this to `true` when
-    /// the header is complete. (The C field additionally uses `-1` to signal a
-    /// raw zlib stream with no gzip header; that tri-state is represented only
-    /// at the FFI boundary in `src/ffi/types.rs`.) Unused when writing.
+    /// the header is complete. The C field is *tri-state* — it additionally uses
+    /// `-1` to signal that the stream turned out to carry no gzip header at all —
+    /// and that third value is carried losslessly by the crate-private
+    /// `HeaderDone` discriminant so the FFI boundary can publish it verbatim.
+    /// Unused when writing.
     pub done: bool,
 
     /// Read capacity for [`extra`](GzHeader::extra), in bytes.
@@ -381,11 +372,10 @@ impl GzHeader {
     /// updated header.
     ///
     /// The gzip "extra" field is opaque, length-prefixed binary data (RFC 1952
-    /// `FEXTRA`). [`extra_len`](GzHeader::extra_len) is set to match the stored
-    /// vector's length, keeping the pair self-consistent — which is what a caller
-    /// round-tripping a header through `deflateSetHeader` needs. (The encoder
-    /// emits `extra.len()` bytes regardless, so this is for the caller's benefit
-    /// rather than the wire format's.)
+    /// `FEXTRA`). The stored vector is the single source of truth for its length:
+    /// the deflate encoder emits exactly `extra.len()` bytes as the `XLEN` word
+    /// and payload, so there is no second length field that could desynchronize
+    /// from it.
     ///
     /// # Examples
     ///
@@ -394,15 +384,188 @@ impl GzHeader {
     ///
     /// let header = GzHeader::new().with_extra(vec![0x01, 0x02, 0x03]);
     /// assert_eq!(header.extra.as_deref(), Some(&[0x01, 0x02, 0x03][..]));
-    /// assert_eq!(header.extra_len, 3);
+    /// assert_eq!(header.extra.as_ref().map_or(0, Vec::len), 3);
     /// ```
     #[must_use]
     #[inline]
     pub fn with_extra(mut self, extra: impl Into<Vec<u8>>) -> Self {
-        let extra = extra.into();
-        self.extra_len = extra.len() as u32;
-        self.extra = Some(extra);
+        self.extra = Some(extra.into());
         self
+    }
+}
+
+/// C's tri-state `gz_header.done`, as the decoder assigns it.
+///
+/// The idiomatic [`GzHeader::done`] is a [`bool`] because only "the header was
+/// fully read" is meaningful to a Rust caller. Reference zlib, however, uses the
+/// same `int` field for a third value, and a C caller relies on it:
+///
+/// | C value | Meaning | Assigned at |
+/// |---------|---------|-------------|
+/// | `0` | not complete yet | `inflateGetHeader` registration (`inflate.c` L1228-L1229) |
+/// | `-1` | the stream carries **no** gzip header | the `HEAD` non-gzip branch (`inflate.c` L505-L506) |
+/// | `1` | the gzip header is complete | the `HCRC` state (`inflate.c` L686-L689) |
+///
+/// All three C values are modelled, so the discriminant is a lossless mirror of
+/// the field rather than a widened [`bool`]. Whether a given `inflate` call
+/// assigned `done` *at all* is a separate question, carried by wrapping this enum
+/// in an [`Option`] whose [`None`] means "this call assigned nothing".
+///
+/// `-1` matters because it is the only way a caller using auto-detect framing
+/// (`windowBits = 47`) can distinguish "this was a zlib stream, so there is no
+/// gzip header to wait for" from "the gzip header has not arrived yet". Collapsing
+/// it to `0` would leave such a caller polling forever.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub(crate) enum HeaderDone {
+    /// C `head->done = -1`: the stream turned out not to carry a gzip header.
+    ///
+    /// Gated on the `gzip` feature because the C assignment is gated the same
+    /// way: `inflate.c` L505-L506 sits inside `#ifdef GUNZIP`, so a `libz` built
+    /// without gzip support cannot produce `-1` either. Mirroring the
+    /// preprocessor structure keeps the enum an exact model of the field in
+    /// *every* configuration rather than a superset in one of them.
+    #[cfg(feature = "gzip")]
+    NotGzip = -1,
+    /// C `head->done = 0`: the header is not complete yet. Written by
+    /// `inflateGetHeader` at registration, and by the bulk publisher for a
+    /// [`GzHeader`] whose [`done`](GzHeader::done) is still `false`.
+    Pending = 0,
+    /// C `head->done = 1`: the gzip header was parsed to completion.
+    Complete = 1,
+}
+
+impl HeaderDone {
+    /// The C `int` value of this discriminant, for the FFI boundary.
+    #[inline]
+    pub(crate) const fn as_c_int(self) -> i32 {
+        self as i32
+    }
+}
+
+/// Which of reference zlib's individual `state->head->…` assignments a single
+/// `inflate` call performed.
+///
+/// # Why this exists
+///
+/// C does not publish a gzip header in one go. Each field is assigned *inside its
+/// own parser state*, writing directly into the caller's `gz_header` and its
+/// `name`/`comment`/`extra` buffers as the bytes arrive (`inflate.c`: `FLAGS`
+/// assigns `text`, `TIME` assigns `time`, `OS` assigns `xflags` and `os`, `EXLEN`
+/// assigns `extra_len` *or* nulls `extra`, `EXTRA`/`NAME`/`COMMENT` append bytes
+/// *or* null their pointer, and `HCRC` assigns `hcrc` and `done`). A caller that
+/// polls its `gz_header` between calls therefore observes precisely the fields the
+/// stream has delivered so far, with its own values still in place everywhere
+/// else — including *no* NUL terminator after a partially received name.
+///
+/// The safe decoder here fills an owned [`GzHeader`] instead, so the FFI boundary
+/// would otherwise have to mirror the whole owned value after every call. That
+/// bulk write is observably wrong: it zeroes scalars C has not reached, terminates
+/// a half-received name, and cannot express `done == -1`. This record closes the
+/// gap by reporting, per call, exactly which assignments happened, so the boundary
+/// performs exactly those writes (AAP §0.8.1 D-4, standard S5).
+///
+/// # Per-call, not cumulative
+///
+/// Every field describes **this** call only. C assigns each scalar once, so a
+/// boundary that replays only the current call's assignments reproduces the
+/// schedule without tracking history. The byte counters are the number of bytes
+/// appended *during this call*, which combined with the owned `Vec`'s new length
+/// gives the exact destination offset C wrote at.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HeaderPublication {
+    /// `head->done`, when this call assigned it (`-1` in `HEAD`, `1` in `HCRC`).
+    pub(crate) done: Option<HeaderDone>,
+    /// `FLAGS` assigned `head->text` (`inflate.c` L523-L524).
+    pub(crate) text: bool,
+    /// `TIME` assigned `head->time` (`inflate.c` L531-L532).
+    pub(crate) time: bool,
+    /// `OS` assigned `head->xflags` **and** `head->os` — one C statement pair
+    /// under a single guard (`inflate.c` L539-L542).
+    pub(crate) os: bool,
+    /// `HCRC` assigned `head->hcrc` (`inflate.c` L686-L688).
+    pub(crate) hcrc: bool,
+    /// `EXLEN` assigned `head->extra_len` from the stream's declared 16-bit
+    /// `XLEN` (`inflate.c` L599-L600). Written only when the header actually
+    /// carries an `FEXTRA` field, and never clamped to `extra_max` — the excess
+    /// is the caller's truncation signal.
+    pub(crate) extra_len: Option<u32>,
+    /// `EXLEN`'s no-`FEXTRA` branch assigned `head->extra = Z_NULL`
+    /// (`inflate.c` L605-L606).
+    pub(crate) extra_null: bool,
+    /// Bytes `EXTRA` appended to `head->extra` during this call
+    /// (`inflate.c` L614-L621).
+    pub(crate) extra_stored: usize,
+    /// `NAME`'s no-`FNAME` branch assigned `head->name = Z_NULL`
+    /// (`inflate.c` L643-L644).
+    pub(crate) name_null: bool,
+    /// Content bytes `NAME` appended to `head->name` during this call, excluding
+    /// the terminator (`inflate.c` L632-L637).
+    pub(crate) name_stored: usize,
+    /// `NAME` stored the field's terminating NUL into `head->name`. C counts that
+    /// NUL against `name_max` like any other byte, so a name that exactly fills
+    /// the buffer is left **unterminated** and this stays `false`.
+    pub(crate) name_terminated: bool,
+    /// `COMMENT`'s no-`FCOMMENT` branch assigned `head->comment = Z_NULL`
+    /// (`inflate.c` L665-L666).
+    pub(crate) comment_null: bool,
+    /// Content bytes `COMMENT` appended to `head->comment` during this call,
+    /// excluding the terminator (`inflate.c` L654-L659).
+    pub(crate) comment_stored: usize,
+    /// `COMMENT` stored the field's terminating NUL into `head->comment`, subject
+    /// to the same `comm_max` accounting as
+    /// [`name_terminated`](HeaderPublication::name_terminated).
+    pub(crate) comment_terminated: bool,
+}
+
+impl HeaderPublication {
+    /// The record describing a header that is already **complete**, derived from
+    /// the owned [`GzHeader`] alone.
+    ///
+    /// Used by the bulk publisher `write_gz_header_from_idiomatic`, whose
+    /// callers hold a finished header and no parser history: every scalar C
+    /// assigns has been assigned, every captured byte is present from offset `0`,
+    /// and `name`/`comment` carry the terminator C would have stored — subject to
+    /// the same "only if it fits within the capacity" rule the publisher applies.
+    ///
+    /// Two choices keep the bulk publisher's long-standing public behaviour
+    /// byte-for-byte intact (standard S5):
+    ///
+    /// * The declared `XLEN` is reported as `extra.len()`, the number of bytes the
+    ///   owned header actually carries. A *finished* [`GzHeader`] is the only
+    ///   input here, so no wire-level `XLEN` is available to report instead, and
+    ///   the captured length is the closest true statement about it.
+    /// * The `*_null` flags stay `false` even for an absent field, so a bulk
+    ///   publish never overwrites the C caller's `extra`/`name`/`comment` buffer
+    ///   pointers with `Z_NULL`. Nulling is a *decoder* observation
+    ///   (`inflate.c` L605-L606, L643-L644, L665-L666) that the incremental
+    ///   publisher reports from parser state; inventing it here would destroy a
+    ///   caller's buffer pointer.
+    #[must_use]
+    pub(crate) fn for_completed_header(src: &GzHeader) -> Self {
+        Self {
+            done: Some(if src.done {
+                HeaderDone::Complete
+            } else {
+                HeaderDone::Pending
+            }),
+            text: true,
+            time: true,
+            os: true,
+            hcrc: true,
+            extra_len: src
+                .extra
+                .as_ref()
+                .map(|extra| u32::try_from(extra.len()).unwrap_or(u32::MAX)),
+            extra_null: false,
+            extra_stored: src.extra.as_ref().map_or(0, Vec::len),
+            name_null: false,
+            name_stored: src.name.as_ref().map_or(0, Vec::len),
+            name_terminated: true,
+            comment_null: false,
+            comment_stored: src.comment.as_ref().map_or(0, Vec::len),
+            comment_terminated: true,
+        }
     }
 }
 
@@ -519,5 +682,122 @@ mod tests {
         let header = GzHeader::new().with_name(b"dbg".to_vec());
         let rendered = alloc::format!("{header:?}");
         assert!(rendered.contains("GzHeader"));
+    }
+
+    /// Finding #10 — `GzHeader`'s public field set is part of the crate's API, so
+    /// it is pinned by an **exhaustive** struct expression and an **exhaustive**
+    /// destructuring pattern (no `..` in either).
+    ///
+    /// Every field a caller can name is a compatibility commitment: an exhaustive
+    /// struct literal in downstream code stops compiling the moment a field is
+    /// added, and a `let Self { .. }` destructuring stops compiling the moment one
+    /// is removed. Wire-level decoder observations therefore belong in the
+    /// crate-private [`HeaderPublication`] record, not here — which is what
+    /// removing the short-lived public `extra_len` field restored.
+    #[test]
+    fn public_field_set_is_exactly_the_thirteen_c_mirrored_fields() {
+        // Exhaustive construction: adding a field breaks this line.
+        let header = GzHeader {
+            text: true,
+            time: 42,
+            xflags: 2,
+            os: 3,
+            extra: Some(vec![7, 8]),
+            name: Some(b"n".to_vec()),
+            comment: Some(b"c".to_vec()),
+            hcrc: true,
+            done: true,
+            extra_max: 16,
+            name_max: 32,
+            comm_max: 64,
+        };
+        // Exhaustive destructuring: removing or renaming a field breaks this one.
+        let GzHeader {
+            text,
+            time,
+            xflags,
+            os,
+            extra,
+            name,
+            comment,
+            hcrc,
+            done,
+            extra_max,
+            name_max,
+            comm_max,
+        } = header;
+        assert!(text && hcrc && done);
+        assert_eq!((time, xflags, os), (42, 2, 3));
+        assert_eq!(extra.as_deref(), Some(&[7, 8][..]));
+        assert_eq!(name.as_deref(), Some(&b"n"[..]));
+        assert_eq!(comment.as_deref(), Some(&b"c"[..]));
+        assert_eq!((extra_max, name_max, comm_max), (16, 32, 64));
+    }
+
+    /// `HeaderDone` is a lossless mirror of C's tri-state `head->done`, so its
+    /// discriminants must be exactly `-1`, `0` and `1` (`inflate.c` L505-L506,
+    /// L1228-L1229, L686-L689). The FFI boundary publishes `as_c_int()` verbatim.
+    #[test]
+    fn header_done_discriminants_match_the_c_field() {
+        assert_eq!(HeaderDone::Pending.as_c_int(), 0);
+        assert_eq!(HeaderDone::Complete.as_c_int(), 1);
+        // `#[repr(i32)]` makes the cast and the accessor agree.
+        assert_eq!(HeaderDone::Complete as i32, 1);
+        // `-1` exists only where C's own `#ifdef GUNZIP` puts it.
+        #[cfg(feature = "gzip")]
+        {
+            assert_eq!(HeaderDone::NotGzip.as_c_int(), -1);
+            assert_eq!(HeaderDone::NotGzip as i32, -1);
+        }
+    }
+
+    /// A default [`HeaderPublication`] must record **nothing**: a call that
+    /// reached no header state may not cause a single write into the caller's
+    /// `gz_header`, which is the whole point of the record.
+    #[test]
+    fn default_header_publication_authorizes_no_write() {
+        let p = HeaderPublication::default();
+        assert!(p.done.is_none());
+        assert!(!p.text && !p.time && !p.os && !p.hcrc);
+        assert!(p.extra_len.is_none());
+        assert!(!p.extra_null && !p.name_null && !p.comment_null);
+        assert_eq!((p.extra_stored, p.name_stored, p.comment_stored), (0, 0, 0));
+        assert!(!p.name_terminated && !p.comment_terminated);
+    }
+
+    /// The bulk record derived from a finished header must authorize every scalar
+    /// C assigns, report the captured extra length, terminate both C strings, and
+    /// — critically — **never** null the caller's buffer pointers: nulling is a
+    /// decoder observation the incremental publisher reports, and inventing it in
+    /// a bulk publish would destroy a caller's buffer pointer.
+    #[test]
+    fn bulk_header_publication_matches_the_legacy_publisher() {
+        let src = GzHeader::new()
+            .with_extra(vec![1, 2, 3])
+            .with_name(b"n.bin".to_vec());
+        let p = HeaderPublication::for_completed_header(&src);
+
+        assert!(p.text && p.time && p.os && p.hcrc);
+        assert_eq!(p.done, Some(HeaderDone::Pending), "src.done is false");
+        assert_eq!(p.extra_len, Some(3));
+        assert_eq!(p.extra_stored, 3);
+        assert_eq!(p.name_stored, 5);
+        assert_eq!(p.comment_stored, 0, "an absent comment stores nothing");
+        assert!(p.name_terminated && p.comment_terminated);
+        assert!(
+            !p.extra_null && !p.name_null && !p.comment_null,
+            "a bulk publish must not overwrite the caller's buffer pointers, \
+             even for an absent field"
+        );
+
+        // A completed header reports `Complete`, and an absent extra field
+        // leaves the C caller's `extra_len` alone.
+        let done = GzHeader {
+            done: true,
+            ..GzHeader::new()
+        };
+        let p = HeaderPublication::for_completed_header(&done);
+        assert_eq!(p.done, Some(HeaderDone::Complete));
+        assert_eq!(p.extra_len, None);
     }
 }

@@ -849,7 +849,7 @@ mod tests {
 
     use super::*;
 
-    use crate::gz::state::How;
+    use crate::gz::state::{GzFile, How};
     use crate::stream::ZStream;
     use std::fs::File;
     use std::io::Read;
@@ -892,7 +892,7 @@ mod tests {
             next: 0,
             pos: 0,
             mode: GzMode::Write,
-            file,
+            file: GzFile::new(file),
             path: path.display().to_string(),
             size: 0,
             want,

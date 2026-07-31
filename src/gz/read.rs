@@ -1048,6 +1048,7 @@ pub(crate) fn finish_read(state: &GzState) -> ReturnCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gz::state::GzFile;
     use crate::stream::ZStream;
     use std::fs::File;
     use std::io::Write as _;
@@ -1107,7 +1108,7 @@ mod tests {
             next: 0,
             pos: 0,
             mode: GzMode::Read,
-            file,
+            file: GzFile::new(file),
             path: path.to_string_lossy().into_owned(),
             size: 0,
             want,
