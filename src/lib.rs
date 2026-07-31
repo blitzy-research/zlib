@@ -114,13 +114,13 @@
 #![warn(missing_docs)]
 // Every `unsafe` block in SHIPPED crate code must carry an immediately-adjacent
 // `// SAFETY:` justification (AAP §0.7.2 standard S2 / User Constraint 3). Like
-// `missing_docs`
-// this is a `warn` (never a `deny`) so it cannot break a plain build, but the
-// CI `-D warnings` gate promotes it to an error for the production library
-// target, preventing recurrence of the undocumented-`unsafe` finding across the
-// FFI boundary. The lint is relaxed to `allow` under `cfg(test)` so it governs
-// only the shipped `cdylib`/`staticlib`/`rlib` (whose `unsafe` lives in
-// `src/ffi/**`), not the crate's inline `#[cfg(test)]` unit tests.
+// `missing_docs` this is a `warn` (never a `deny`) so it cannot break a plain
+// build, but the CI `-D warnings` gate promotes it to an error for the
+// production library target, preventing recurrence of the
+// undocumented-`unsafe` finding across the FFI boundary. The lint is relaxed
+// to `allow` under `cfg(test)` so it governs only the shipped
+// `cdylib`/`staticlib`/`rlib` (whose `unsafe` lives in `src/ffi/**`), not the
+// crate's inline `#[cfg(test)]` unit tests.
 #![warn(clippy::undocumented_unsafe_blocks)]
 #![cfg_attr(test, allow(clippy::undocumented_unsafe_blocks))]
 // `unsafe` is DENIED crate-wide, converting the migration's unsafe-containment
@@ -903,15 +903,108 @@ mod tests {
         );
     }
 
-    /// `OS_CODE` — the gzip-header operating-system byte — is declared in exactly
-    /// one module, and the gzip emission path reads that one declaration.
+    /// The predicate that both applies `#![no_std]` to the crate and gates the
+    /// runtime-support module. The two MUST stay in lockstep: the module supplies
+    /// the `#[global_allocator]`/`#[panic_handler]` that only a genuinely
+    /// freestanding build lacks, so a wider predicate is a duplicate-lang-item
+    /// error and a narrower one silently drops the items the link needs.
+    const RUNTIME_GATE: &str = "all(not(feature = \"std\"), not(test), panic = \"abort\")";
+
+    /// Each `#[allow(unsafe_code)]` carve-out is attached to its designated
+    /// boundary — and to nothing else.
     ///
-    /// This has to be a *source-level* guard because no value assertion can catch
-    /// the defect it protects against. `OS_CODE` is `3` on Linux, so a module that
-    /// re-declares its own `const OS_CODE: u8 = 3` agrees with the canonical
-    /// constant on every currently exercised CI target while silently emitting `3`
-    /// where reference zlib emits `10` on Windows (`zutil.h` L156-L158) or `19` on
-    /// Apple (L168-L170). Counting declarations catches that on every platform.
+    /// [`unsafe_code_denial_has_exactly_two_scoped_carve_outs`] *counts* the
+    /// carve-outs; it cannot see what they are attached to. Moving one onto a core
+    /// module keeps the count at two, keeps the crate compiling, and keeps the
+    /// boundary scan green for exactly as long as that module happens to contain
+    /// no `unsafe` — so the permission would widen with nothing to reveal it.
+    ///
+    /// The same walk pins two further properties nothing else observes:
+    ///
+    /// * `pub mod ffi;` carries **no** `cfg`. Gating it would shrink the emitted
+    ///   `cdylib`/`staticlib` symbol table below the 54 `zlib.map` globals a
+    ///   drop-in consumer links against, while every default-feature gate stayed
+    ///   green.
+    /// * `mod no_std_support`'s gate is character-for-character the crate's own
+    ///   `no_std` predicate. If the two ever diverge, the freestanding build
+    ///   either redefines lang items `std` already provides or loses the
+    ///   allocator and panic handler it must supply — and, because the module is
+    ///   compiled by `--no-default-features` alone, a default `cargo build`
+    ///   cannot see either outcome.
+    #[test]
+    fn each_carve_out_is_attached_to_its_designated_boundary() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let text =
+            std::fs::read_to_string(root.join("src/lib.rs")).expect("src/lib.rs must be readable");
+        let lines: alloc::vec::Vec<&str> = text.lines().collect();
+
+        // Each carve-out, as (guarded item, other attributes in its group).
+        let mut guarded: alloc::vec::Vec<(&str, alloc::vec::Vec<&str>)> = alloc::vec::Vec::new();
+
+        for (i, line) in lines.iter().enumerate() {
+            if line.trim() != "#[allow(unsafe_code)]" {
+                continue;
+            }
+
+            // An attribute group is a run of attributes and comments bounded by
+            // blank lines, so collect siblings in both directions and stop at the
+            // first blank line or non-attribute, non-comment line.
+            let mut attrs: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+            let mut j = i;
+            while j > 0 {
+                j -= 1;
+                let above = lines[j].trim();
+                if above.starts_with("//") {
+                    continue;
+                }
+                if above.starts_with("#[") {
+                    attrs.push(above);
+                    continue;
+                }
+                break;
+            }
+
+            let mut item = None;
+            for below in lines.iter().skip(i + 1) {
+                let below = below.trim();
+                if below.is_empty() || below.starts_with("//") {
+                    continue;
+                }
+                if below.starts_with("#[") {
+                    attrs.push(below);
+                    continue;
+                }
+                item = Some(below);
+                break;
+            }
+
+            guarded.push((
+                item.expect("an `#[allow(unsafe_code)]` must guard a following item"),
+                attrs,
+            ));
+        }
+
+        let runtime_cfg = alloc::format!("#[cfg({RUNTIME_GATE})]");
+        assert_eq!(
+            guarded,
+            alloc::vec![
+                ("mod no_std_support {", alloc::vec![runtime_cfg.as_str()]),
+                ("pub mod ffi;", alloc::vec::Vec::new()),
+            ],
+            "the two `unsafe_code` carve-outs must guard exactly `mod \
+             no_std_support` (gated on the crate's own `no_std` predicate) and an \
+             UNCONDITIONAL `pub mod ffi;` — nothing else, and neither with an \
+             extra `cfg`"
+        );
+
+        // The module gate and the crate's `no_std` gate are the same predicate.
+        assert!(
+            text.contains(&alloc::format!("#![cfg_attr({RUNTIME_GATE}, no_std)]")),
+            "the crate `no_std` gate must use the same predicate as the \
+             runtime-support module it keeps in lockstep"
+        );
+    }
+
     /// Every CI job whose gate is meaningful only on a particular toolchain,
     /// paired with the channel it must resolve to.
     ///
@@ -1030,6 +1123,15 @@ mod tests {
         );
     }
 
+    /// `OS_CODE` — the gzip-header operating-system byte — is declared in exactly
+    /// one module, and the gzip emission path reads that one declaration.
+    ///
+    /// This has to be a *source-level* guard because no value assertion can catch
+    /// the defect it protects against. `OS_CODE` is `3` on Linux, so a module that
+    /// re-declares its own `const OS_CODE: u8 = 3` agrees with the canonical
+    /// constant on every currently exercised CI target while silently emitting `3`
+    /// where reference zlib emits `10` on Windows (`zutil.h` L156-L158) or `19` on
+    /// Apple (L168-L170). Counting declarations catches that on every platform.
     #[test]
     fn os_code_is_declared_in_exactly_one_module() {
         let mut declaring: alloc::vec::Vec<(std::string::String, usize)> = alloc::vec::Vec::new();
