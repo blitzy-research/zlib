@@ -348,7 +348,7 @@ pub fn deflate_init2<A: Allocator>(
     // Rust allocator therefore serves engine memory, and a caller-installed
     // `zalloc`/`zfree` still backs every buffer (AAP §0.6.3 has-hook clause,
     // §0.6.5).
-    let state = DeflateState::new_in_with(
+    let state = match DeflateState::new_in_with_detail(
         strm.allocator(),
         level,
         method,
@@ -356,7 +356,21 @@ pub fn deflate_init2<A: Allocator>(
         mem_level,
         strategy,
         wrap,
-    )?;
+    ) {
+        Ok(state) => state,
+        Err(err) => {
+            // C records a diagnostic for exactly one of its two allocation
+            // failure points: the working-buffer check at `deflate.c` L505-L514
+            // does `strm->msg = ERR_MSG(Z_MEM_ERROR)` before returning, while the
+            // state-object check at L440-L442 returns with `strm->msg` still
+            // NULL. `ZStream::set_msg` is this crate's `ERR_MSG`, so the message
+            // text ("insufficient memory") comes from the same table C uses.
+            if err.sets_mem_message {
+                strm.set_msg(err.code.as_return_code());
+            }
+            return Err(err.code);
+        }
+    };
     strm.set_deflate_state(state);
 
     // Finish exactly as C does: `return deflateReset(strm);`.

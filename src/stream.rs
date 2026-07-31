@@ -301,10 +301,25 @@ pub type ZfreeFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
 /// allocator carries [`AllocHook::none`], so the historical global-allocator
 /// path is entirely unchanged.
 ///
-/// A hook is *active* only when **both** `zalloc` and `zfree` are present — a
-/// caller that supplies one without the other does not get a usable custom
-/// allocator (matching zlib, which uses the built-in allocator unless both are
-/// set), and allocation falls back to the global allocator.
+/// A hook is *active* only when **both** `zalloc` and `zfree` are present, since
+/// a region obtained from one must be released through the other. Two
+/// configurations reach this type from a C caller, and they are handled
+/// differently:
+///
+/// * **Neither half supplied** — the hook is inactive and allocation uses the
+///   global allocator. This matches C, whose init prologues substitute *both*
+///   built-ins (`zcalloc`/`zcfree`) for a wholly absent pair.
+/// * **Exactly one half supplied** — rejected at the C initialization boundary
+///   with `Z_STREAM_ERROR` before any buffer is built, so an active-vs-inactive
+///   decision is never made for such a pair. C substitutes only the *missing*
+///   half and keeps the one the caller gave (`inflate.c` L183-L196,
+///   `deflate.c` L400-L414, `infback.c` L37-L50); this crate cannot, because
+///   `zcalloc`/`zcfree` are unexported `local:` symbols and pairing a caller's
+///   `zalloc` with the global deallocator would be undefined behavior. Ignoring
+///   the supplied half instead would silently discard the caller's
+///   out-of-memory signal, which AAP §0.6.3 forbids. See
+///   `CAllocator::is_half_present` in `crate::ffi::types` for the full
+///   rationale and the documented divergence (AAP §0.8.2).
 ///
 /// # Constructing one
 ///
@@ -682,8 +697,10 @@ impl<T: Copy + Default + ZeroValid> AllocBuffer<T> {
     where
         T: 'static,
     {
-        // Fast path / default: no custom allocator, an empty request, or a
-        // zero-sized element type. `try_owned` matches C `zcalloc`'s zero fill and
+        // Fast path / default: an inactive hook (a C caller who supplied neither
+        // half; a half-present pair is rejected at the `*Init*_` boundary and
+        // never arrives here), an empty request, or a zero-sized element type.
+        // `try_owned` matches C `zcalloc`'s zero fill and
         // is the exact historical (global-allocator) behavior, but reserves
         // fallibly so global-heap exhaustion is reported rather than aborting; for
         // a zero-sized `T` it allocates nothing at all, which is why such a request
@@ -750,7 +767,9 @@ impl<T: Copy + Default + ZeroValid> AllocBuffer<T> {
         }
         let count = total / elem;
 
-        // Fast path / default: no custom allocator, or an empty request.
+        // Fast path / default: an inactive hook (neither half supplied; a
+        // half-present pair is rejected at the `*Init*_` boundary), or an empty
+        // request.
         if !hook.is_active() || count == 0 {
             return Self::try_owned(count);
         }

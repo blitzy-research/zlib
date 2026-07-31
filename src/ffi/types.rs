@@ -366,6 +366,44 @@ impl CAllocator {
             opaque: strm.opaque,
         }
     }
+
+    /// Whether exactly one half of the `zalloc`/`zfree` pair was supplied.
+    ///
+    /// Such a pair is unusable, and the C library agrees: `inflateStateCheck`
+    /// (`inflate.c` L90-L91) and `deflateStateCheck` (`deflate.c` L540-L541)
+    /// both classify a stream whose `zalloc` **or** `zfree` is null as invalid,
+    /// so every entry point after initialization answers `Z_STREAM_ERROR`. C's
+    /// three `*Init*_` prologues only avoid tripping that check by substituting
+    /// the *missing half* in place — `zcalloc` for a null `zalloc`, `zcfree` for
+    /// a null `zfree` (`inflate.c` L183-L196, `deflate.c` L400-L414,
+    /// `infback.c` L37-L50) — and under `Z_SOLO`, where those built-ins do not
+    /// exist, they return `Z_STREAM_ERROR` outright.
+    ///
+    /// This crate cannot perform C's in-place substitution. `zcalloc`/`zcfree`
+    /// are `local:` symbols in `zlib.map` and are deliberately not exported, and
+    /// pairing a caller's `zalloc` with the Rust global deallocator (or vice
+    /// versa) would free a region through an allocator that never owned it —
+    /// undefined behavior, which the crate's containment rules forbid. Silently
+    /// ignoring the half the caller *did* supply is equally wrong: it discards
+    /// their out-of-memory signal, so a deliberately failing `zalloc` would be
+    /// bypassed and the call would report success where C reports
+    /// `Z_MEM_ERROR`. AAP §0.6.3 states the required semantics directly — "a
+    /// null `zalloc` propagates as an allocation failure rather than silently
+    /// falling back".
+    ///
+    /// The initialization entry points therefore reject a half-present pair with
+    /// `Z_STREAM_ERROR`, which is both the code C's own state checks produce for
+    /// such a stream and the code C's `Z_SOLO` build returns from init. This is a
+    /// deliberate, documented divergence (AAP §0.8.2): a caller who supplies
+    /// exactly one hook *and* whose supplied `zalloc` would have succeeded gets
+    /// `Z_STREAM_ERROR` here where a non-`Z_SOLO` C build would have completed
+    /// using the substituted half. Supplying both hooks, or neither, behaves
+    /// identically to C.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn is_half_present(&self) -> bool {
+        self.zalloc.is_some() != self.zfree.is_some()
+    }
 }
 
 impl Allocator for CAllocator {
@@ -376,10 +414,17 @@ impl Allocator for CAllocator {
     /// The returned [`AllocBuffer`] is a [`Foreign`](AllocBuffer::Foreign)
     /// region carved from the caller's `zalloc` (and released through their
     /// `zfree` on drop) whenever this [`CAllocator`] carries an active
-    /// [`hook`](Allocator::hook); with null hooks or an empty request it uses a
-    /// global-allocator [`Vec`](AllocBuffer::Owned), matching AAP §0.6.3's
-    /// "otherwise `std::alloc` is used" clause and C's substitution of `zcalloc`
-    /// for a null `zalloc` (`deflate.c` L401-L414). Soundness is preserved because
+    /// [`hook`](Allocator::hook); with **both** hooks null, or for an empty
+    /// request, it uses a global-allocator [`Vec`](AllocBuffer::Owned), matching
+    /// AAP §0.6.3's "otherwise `std::alloc` is used" clause and C's substitution
+    /// of `zcalloc`/`zcfree` for a wholly absent pair (`deflate.c` L400-L414).
+    ///
+    /// A *half*-present pair never reaches this method from a C entry point: the
+    /// `*Init*_` shims reject it with `Z_STREAM_ERROR` before constructing any
+    /// buffer, because C's per-half substitution is unavailable here and ignoring
+    /// the supplied half would discard the caller's out-of-memory signal. See
+    /// `CAllocator::is_half_present` for the full rationale, the C citations,
+    /// and the documented divergence. Soundness is preserved because
     /// the returned buffer knows its own backing store and frees it the matching
     /// way on [`Drop`] — the historical unsoundness of dropping a foreign-backed
     /// `Vec` through the global allocator cannot occur.
@@ -989,6 +1034,12 @@ pub unsafe fn gz_header_to_idiomatic(head: *const gz_header) -> Option<GzHeader>
         // C tri-state `done`: only `1` means "header fully read".
         done: h.done == 1,
         // `c_uint` is `u32` on every Rust target, so these assign directly.
+        // Carrying `extra_len` across preserves a value the caller may already
+        // have set: on the `inflateGetHeader` path the engine overwrites it from
+        // the stream's declared XLEN only when the header actually carries an
+        // `FEXTRA` field, so a stream without one must leave the caller's value
+        // intact (`inflate.c` L596-L606).
+        extra_len: h.extra_len,
         extra_max: h.extra_max,
         name_max: h.name_max,
         comm_max: h.comm_max,
@@ -1001,8 +1052,11 @@ pub unsafe fn gz_header_to_idiomatic(head: *const gz_header) -> Option<GzHeader>
 /// overrunning the caller's buffers.
 ///
 /// Scalar fields (`text`, `time`, `xflags`, `os`, `hcrc`, `done`) are always
-/// written. `extra_len` is set to the *full* source length even when the copy
-/// into `extra` is truncated to `extra_max`, matching C `inflate`.
+/// written, as is `extra_len`, which receives the extra field's **declared**
+/// length even when the copy into `extra` is truncated to `extra_max` — and even
+/// when `extra` is null, which is the documented length-query pattern. This
+/// matches C, where `inflate` writes `head->extra_len` from the header's `XLEN`
+/// independently of the clamped copy (`inflate.c` L599-L600 vs L614-L621).
 ///
 /// # Safety
 ///
@@ -1026,6 +1080,17 @@ pub unsafe fn write_gz_header_from_idiomatic(head: *mut gz_header, src: &GzHeade
     h.hcrc = c_int::from(src.hcrc);
     h.done = c_int::from(src.done);
 
+    // Publish the **declared** extra-field length, unconditionally — not the
+    // number of bytes that fit. C writes `head->extra_len` from the stream's
+    // 16-bit `XLEN` in the `EXLEN` state (`inflate.c` L599-L600), gated on
+    // neither `extra`'s nullity nor `extra_max`'s size, and separately clamps the
+    // copy (`inflate.c` L614-L621). Reproducing both halves is what makes
+    // `extra_len > extra_max` a usable truncation signal per `zlib.h`, and what
+    // makes the documented length-query pattern — a null `extra` purely to learn
+    // the length — return the real length instead of zero. When the stream
+    // carried no `FEXTRA` field the engine left this at whatever the caller
+    // supplied, so writing it back is then a no-op.
+    h.extra_len = src.extra_len as c_uint;
     if let Some(extra) = &src.extra {
         if !h.extra.is_null() {
             let cap = h.extra_max as usize;
@@ -1035,8 +1100,22 @@ pub unsafe fn write_gz_header_from_idiomatic(head: *mut gz_header, src: &GzHeade
                 ptr::copy_nonoverlapping(extra.as_ptr(), h.extra, n);
             }
         }
-        // Report the full length even if the copy was truncated (C parity).
-        h.extra_len = extra.len() as c_uint;
+    } else {
+        // No extra field: null the caller's pointer, as C does with
+        // `state->head->extra = Z_NULL` on the no-`FEXTRA` branch (`inflate.c`
+        // L605-L606). That assignment is how a C caller distinguishes "the header
+        // declared no extra field" from "it declared one"; leaving a stale
+        // non-null pointer would misreport an absent field as present.
+        //
+        // Both ways of reaching `None` want exactly this. If the caller supplied
+        // no buffer, `inflateGetHeader` set the slot to `None` and the pointer is
+        // already null, so this is a no-op. If the stream carried no `FEXTRA`,
+        // the engine set it to `None` and nulling is precisely C's behavior. A
+        // stream whose header has not yet reached the `EXLEN` state — including a
+        // raw zlib stream, where `done` is reported as `-1` — keeps the slot at
+        // `Some(empty)`, so nothing is nulled prematurely, matching C, which
+        // likewise only assigns once it reaches that state.
+        h.extra = ptr::null_mut();
     }
     if let Some(name) = &src.name {
         // Nested `if` rather than an `if let ... && ...` chain, which is

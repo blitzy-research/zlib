@@ -160,6 +160,22 @@ pub unsafe extern "C" fn deflateInit2_(
         // valid `z_stream` uniquely owned by the caller for this call.
         let s = unsafe { &mut *strm };
 
+        // Reject a half-present allocator pair here, matching C's prologue order:
+        // the allocator is tested straight after the version and null-stream
+        // guards and *before* the level/method/`windowBits`/`memLevel`/strategy
+        // validation (`deflate.c` L392-L414). C substitutes the missing half in
+        // place; this crate cannot (`zcalloc`/`zcfree` are unexported, and mixing
+        // a caller hook with the global allocator is UB), and ignoring the
+        // supplied half would silently swallow the caller's out-of-memory signal
+        // (AAP §0.6.3). `Z_STREAM_ERROR` is what C's own `deflateStateCheck`
+        // yields for such a stream (`deflate.c` L540-L541) and what its `Z_SOLO`
+        // init returns. See `CAllocator::is_half_present` for the divergence note.
+        // SAFETY: `s` is a valid `&z_stream`; only its `Copy` allocator fields are
+        // read, and the hook pointers are never dereferenced.
+        if unsafe { CAllocator::from_stream(s) }.is_half_present() {
+            return Z_STREAM_ERROR;
+        }
+
         // The engine takes a validated `Strategy` enum; an out-of-range value
         // is rejected exactly as C's `deflateInit2_` rejects it.
         let Some(strategy) = Strategy::from_c_int(strategy) else {
@@ -167,7 +183,8 @@ pub unsafe extern "C" fn deflateInit2_(
         };
 
         // Build the idiomatic stream, honoring any caller `zalloc`/`zfree`/
-        // `opaque` (falls back to the global allocator when they are null).
+        // `opaque` (falls back to the global allocator when *both* are null; a
+        // half-present pair was rejected above).
         // SAFETY: `s` is a valid `&z_stream`; only its `Copy` allocator fields
         // are read.
         let mut zs = unsafe { zstream_with_caller_alloc(s) };
@@ -175,6 +192,15 @@ pub unsafe extern "C" fn deflateInit2_(
         if let Err(err) =
             engine::deflate_init2(&mut zs, level, method, window_bits, mem_level, strategy)
         {
+            // Publish the engine's diagnostic before bailing out. C's
+            // working-buffer failure stores `ERR_MSG(Z_MEM_ERROR)` into
+            // `strm->msg` and its own internal `deflateEnd` leaves the field
+            // alone (`deflate.c` L505-L514, L1293-L1310), so the message is still
+            // readable by the caller after `deflateInit2_` returns `Z_MEM_ERROR`.
+            // Returning without this write left `strm->msg` NULL where C supplies
+            // "insufficient memory". `msg_ptr` yields null when the engine set no
+            // message, which is exactly C's state-object-failure behavior.
+            set_msg(s, msg_ptr(&zs));
             return err.as_return_code().as_c_int();
         }
 
@@ -1367,6 +1393,93 @@ mod tests {
         strm.opaque = (budget as *const Budget).cast_mut().cast::<c_void>();
     }
 
+    // =======================================================================
+    // `strm->msg` lifecycle parity
+    //
+    // C writes `strm->msg` in `deflate.c` at only three places: L400 (cleared by
+    // `deflateInit2_`), L511 (`ERR_MSG(Z_MEM_ERROR)` on a working-buffer
+    // failure) and L652 (cleared by `deflateResetKeep`). `deflateEnd`
+    // (L1293-L1310) never touches it — which is precisely what makes L511's
+    // message readable, since L512 calls `deflateEnd` before returning.
+    // =======================================================================
+
+    /// C's L505-L514 branch stores `ERR_MSG(Z_MEM_ERROR)` before returning, and
+    /// its own internal `deflateEnd` call leaves the field alone, so the caller
+    /// can read "insufficient memory" after `deflateInit2_` fails.
+    #[test]
+    fn init_publishes_insufficient_memory_when_a_working_buffer_is_refused() {
+        // C issues five requests: the state object, then window/prev/head/
+        // pending_buf. Permitting 1..=4 lets the state succeed and starves a
+        // working buffer, which is C's message-recording path.
+        for permitted in 1..=4 {
+            let budget = Budget {
+                remaining: core::sync::atomic::AtomicUsize::new(permitted),
+            };
+            let mut strm = zeroed_stream();
+            attach_budget(&mut strm, &budget);
+            let rc = unsafe { deflateInit_(&mut strm, 6, ver(), size_of::<z_stream>() as c_int) };
+            assert_eq!(rc, Z_MEM_ERROR, "permitted={permitted}");
+            assert!(
+                strm.state.is_null(),
+                "permitted={permitted}: no state may be installed"
+            );
+            assert!(
+                !strm.msg.is_null(),
+                "permitted={permitted}: C sets strm->msg at deflate.c L511"
+            );
+            // SAFETY: `msg` points at one of the `'static` `z_errmsg` strings.
+            let msg = unsafe { core::ffi::CStr::from_ptr(strm.msg) };
+            assert_eq!(
+                msg.to_bytes(),
+                b"insufficient memory",
+                "permitted={permitted}: must be ERR_MSG(Z_MEM_ERROR)"
+            );
+        }
+    }
+
+    /// The *other* failure point — the state object at `deflate.c` L440-L442 —
+    /// returns immediately and leaves `strm->msg` NULL. The distinction is
+    /// observable, so it must be reproduced rather than collapsed.
+    #[test]
+    fn init_leaves_msg_null_when_the_state_reservation_is_refused() {
+        let budget = Budget {
+            remaining: core::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut strm = zeroed_stream();
+        attach_budget(&mut strm, &budget);
+        assert_eq!(
+            unsafe { deflateInit_(&mut strm, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_MEM_ERROR,
+        );
+        assert!(
+            strm.msg.is_null(),
+            "C returns at L441 before reaching the ERR_MSG at L511, so msg stays NULL"
+        );
+    }
+
+    /// `deflateEnd` must not clear `strm->msg`: C's `deflateEnd`
+    /// (`deflate.c` L1293-L1310) frees the buffers and the state, nulls
+    /// `strm->state`, and returns — nothing else. A caller may therefore report
+    /// the diagnostic *after* tearing the stream down.
+    #[test]
+    fn deflate_end_preserves_the_error_message() {
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe { deflateInit_(&mut strm, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK,
+        );
+        // Stand in for a diagnostic the caller is holding across teardown, exactly
+        // as C's own `deflateInit2_` does at L511 before calling `deflateEnd`.
+        let marker = c"insufficient memory";
+        strm.msg = marker.as_ptr().cast_mut();
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+        assert_eq!(
+            strm.msg,
+            marker.as_ptr().cast_mut(),
+            "deflateEnd must leave strm->msg exactly as it found it",
+        );
+    }
+
     /// Every handle installation must be fallible **before** the caller's
     /// `z_stream` is mutated. When the caller's allocator refuses the very first
     /// request — the state reservation C makes and checks immediately at
@@ -1703,5 +1816,128 @@ mod tests {
         assert_eq!(unsafe { deflateEnd(&mut src) }, Z_OK);
         assert_eq!(stats.frees(), 10, "every region reaches the caller's zfree");
         assert_eq!(stats.live_bytes(), 0);
+    }
+
+    /// A `zalloc` that always refuses, proving the caller's out-of-memory signal
+    /// is never bypassed. It allocates nothing, so no matching `zfree` is needed.
+    unsafe extern "C" fn always_fail_zalloc(
+        _opaque: *mut c_void,
+        _items: c_uint,
+        _size: c_uint,
+    ) -> *mut c_void {
+        ptr::null_mut()
+    }
+
+    /// A `zfree` that must never run in the half-present tests.
+    unsafe extern "C" fn never_called_zfree(_opaque: *mut c_void, _address: *mut c_void) {
+        panic!("zfree must not be called: init rejected the half-present hook pair");
+    }
+
+    /// QA-03 regression — `deflateInit2_` must reject a caller who supplied
+    /// exactly one half of the `zalloc`/`zfree` pair.
+    ///
+    /// C substitutes only the *missing* half (`deflate.c` L400-L414), so a
+    /// supplied-but-failing `zalloc` is still called and still yields
+    /// `Z_MEM_ERROR`. This crate cannot substitute per half, and ignoring the
+    /// supplied half would silently discard the caller's OOM signal (AAP §0.6.3).
+    /// `Z_STREAM_ERROR` is what C's own `deflateStateCheck` yields for such a
+    /// stream (`deflate.c` L540-L541) and what its `Z_SOLO` init returns
+    /// (documented divergence, AAP §0.8.2).
+    #[test]
+    fn init_rejects_a_half_present_allocator_pair() {
+        // zalloc only.
+        let mut strm = zeroed_stream();
+        strm.zalloc = Some(always_fail_zalloc);
+        assert_eq!(
+            unsafe { deflateInit_(&mut strm, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_STREAM_ERROR,
+            "a zalloc supplied without a zfree must be rejected, not silently \
+             replaced by the global allocator"
+        );
+        assert!(
+            strm.state.is_null(),
+            "a rejected init must install no state"
+        );
+
+        // zfree only: `never_called_zfree` panics if reached, proving the
+        // rejection precedes any allocation or release.
+        let mut strm = zeroed_stream();
+        strm.zfree = Some(never_called_zfree);
+        assert_eq!(
+            unsafe { deflateInit_(&mut strm, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_STREAM_ERROR,
+            "a zfree supplied without a zalloc must be rejected"
+        );
+        assert!(
+            strm.state.is_null(),
+            "a rejected init must install no state"
+        );
+    }
+
+    /// A half-present pair is rejected *before* the level/method/`windowBits`/
+    /// `memLevel`/strategy validation, matching C's prologue order
+    /// (`deflate.c` L392-L414) — and `Z_VERSION_ERROR` still outranks it, since C
+    /// checks the version first.
+    #[test]
+    fn half_present_hook_is_ordered_exactly_as_c_orders_it() {
+        // A bad strategy *and* a half hook: C reaches the allocator first, and
+        // both paths answer Z_STREAM_ERROR, so the observable code is the same.
+        let mut strm = zeroed_stream();
+        strm.zalloc = Some(always_fail_zalloc);
+        assert_eq!(
+            unsafe {
+                deflateInit2_(
+                    &mut strm,
+                    6,
+                    Z_DEFLATED,
+                    MAX_WBITS,
+                    DEF_MEM_LEVEL,
+                    99,
+                    ver(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_STREAM_ERROR
+        );
+        assert!(strm.state.is_null());
+
+        // A bad version *and* a half hook: the version guard wins, exactly as in
+        // C where it precedes the allocator prologue.
+        let mut strm = zeroed_stream();
+        strm.zalloc = Some(always_fail_zalloc);
+        assert_eq!(
+            unsafe { deflateInit_(&mut strm, 6, ptr::null(), size_of::<z_stream>() as c_int) },
+            Z_VERSION_ERROR,
+            "the version guard must still outrank the allocator check"
+        );
+        assert!(strm.state.is_null());
+    }
+
+    /// The two *valid* configurations must be untouched: neither half supplied
+    /// (the common zeroed `z_stream`, matching C's substitution of both built-ins)
+    /// and both halves supplied (routed through the caller's allocator).
+    #[test]
+    fn init_accepts_both_hooks_and_neither_hook() {
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe { deflateInit_(&mut strm, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK,
+            "a zeroed z_stream must still initialize"
+        );
+        assert!(!strm.state.is_null());
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+
+        let budget = Budget {
+            remaining: core::sync::atomic::AtomicUsize::new(64),
+        };
+        let mut strm = zeroed_stream();
+        attach_budget(&mut strm, &budget);
+        assert_eq!(
+            unsafe { deflateInit_(&mut strm, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK,
+            "a complete hook pair with budget must initialize"
+        );
+        assert!(!strm.state.is_null());
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
     }
 }

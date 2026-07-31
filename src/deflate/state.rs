@@ -828,6 +828,55 @@ pub struct DeflateState {
     pub(crate) state_alloc: AllocBuffer<u8>,
 }
 
+/// A `deflateInit2_` construction failure, carrying the extra bit of information
+/// C's two distinct allocation-failure points make observable.
+///
+/// C checks the state object and the four working buffers at *different* places,
+/// and only the second one records a diagnostic:
+///
+/// * `deflate.c` L440-L442 — `s = ZALLOC(strm, 1, sizeof(deflate_state)); if (s
+///   == Z_NULL) return Z_MEM_ERROR;`. An immediate return; `strm->msg` is left as
+///   `inflateInit`/`deflateInit` found it (NULL, cleared at L400).
+/// * `deflate.c` L505-L514 — if any of `window`/`prev`/`head`/`pending_buf` is
+///   NULL, C sets `strm->msg = ERR_MSG(Z_MEM_ERROR)` ("insufficient memory"),
+///   calls `deflateEnd(strm)`, and *then* returns `Z_MEM_ERROR`. Because
+///   `deflateEnd` never touches `strm->msg` (`deflate.c` L1293-L1310), the
+///   message survives for the caller to read.
+///
+/// Collapsing both into a bare [`ZlibError::MemError`] would lose that
+/// distinction and leave `strm->msg` NULL where C supplies a message, so the
+/// constructor reports which point was reached (standard S5: no silent behavior
+/// change).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeflateInitError {
+    /// The zlib error code to report.
+    pub(crate) code: ZlibError,
+    /// Whether C would have stored `ERR_MSG(Z_MEM_ERROR)` into `strm->msg`
+    /// before returning — true only for a working-buffer failure.
+    pub(crate) sets_mem_message: bool,
+}
+
+impl DeflateInitError {
+    /// A failure at one of the points where C leaves `strm->msg` untouched.
+    #[inline]
+    const fn plain(code: ZlibError) -> Self {
+        Self {
+            code,
+            sets_mem_message: false,
+        }
+    }
+
+    /// The working-buffer failure of `deflate.c` L505-L514, where C records
+    /// `ERR_MSG(Z_MEM_ERROR)`.
+    #[inline]
+    const fn working_buffer() -> Self {
+        Self {
+            code: ZlibError::MemError,
+            sets_mem_message: true,
+        }
+    }
+}
+
 impl DeflateState {
     /// Reads byte `index` of the **symbol region** overlaid inside
     /// [`pending_buf`](Self::pending_buf).
@@ -1222,7 +1271,7 @@ impl DeflateState {
     ///
     /// See [`new`](Self::new) for the parameter contract, the I/O-side-reset note,
     /// and the errors.
-    pub fn new_in_with<A: Allocator>(
+    pub(crate) fn new_in_with_detail<A: Allocator>(
         alloc: &A,
         level: i32,
         method: i32,
@@ -1230,7 +1279,7 @@ impl DeflateState {
         mem_level: i32,
         strategy: Strategy,
         wrap: i32,
-    ) -> Result<Box<DeflateState>, ZlibError> {
+    ) -> Result<Box<DeflateState>, DeflateInitError> {
         let hook = alloc.hook();
         // Resolve the default level exactly as deflateInit2_ does.
         let level = if level == Z_DEFAULT_COMPRESSION {
@@ -1246,7 +1295,7 @@ impl DeflateState {
             || !(0..=9).contains(&level)
             || (window_bits == 8 && wrap != 1)
         {
-            return Err(ZlibError::StreamError);
+            return Err(DeflateInitError::plain(ZlibError::StreamError));
         }
 
         // "until 256-byte window bug fixed": an 8-bit window is bumped to 9.
@@ -1286,7 +1335,7 @@ impl DeflateState {
         let state_alloc = if alloc.reserves_state_footprint() {
             match alloc.allocate_zeroed_items::<u8>(1, Self::C_LAYOUT_SIZE) {
                 Some(cell) => cell,
-                None => return Err(ZlibError::MemError),
+                None => return Err(DeflateInitError::plain(ZlibError::MemError)),
             }
         } else {
             AllocBuffer::default()
@@ -1332,7 +1381,9 @@ impl DeflateState {
         let (Some(window), Some(prev), Some(head), Some(pending_buf)) =
             (window, prev, head, pending_buf)
         else {
-            return Err(ZlibError::MemError);
+            // C's L505-L514 branch: it records `ERR_MSG(Z_MEM_ERROR)` in
+            // `strm->msg` here, unlike the state-object check at L440-L442.
+            return Err(DeflateInitError::working_buffer());
         };
 
         let mut state = try_box(DeflateState {
@@ -1402,7 +1453,9 @@ impl DeflateState {
             alloc_hook: hook,
             state_alloc,
         })
-        .ok_or(ZlibError::MemError)?;
+        // The `Box` itself stands in for C's `ZALLOC(strm, 1,
+        // sizeof(deflate_state))` at L441, which returns with `strm->msg` unset.
+        .ok_or(DeflateInitError::plain(ZlibError::MemError))?;
 
         // Reproduce the state-resetting portion of deflateReset. The I/O-side
         // reset (total_in/total_out = 0, adler = initial_adler(wrap)) is the
@@ -1411,6 +1464,40 @@ impl DeflateState {
         state.lm_init();
 
         Ok(state)
+    }
+
+    /// Builds a boxed [`DeflateState`], allocating the state footprint and every
+    /// working buffer through `alloc`.
+    ///
+    /// This is the allocator-generic public constructor. It reports failures as a
+    /// plain [`ZlibError`]; the deflate driver uses the crate-internal
+    /// `new_in_with_detail` instead, because it also needs to know which of C's
+    /// two allocation-failure points was reached in order to reproduce
+    /// `strm->msg` exactly (see the private `DeflateInitError` type).
+    ///
+    /// Both of those names are deliberately referenced as plain code spans rather
+    /// than intra-doc links: they are `pub(crate)`, so linking them from a public
+    /// item would emit `rustdoc::private_intra_doc_links`, and the crate's
+    /// `cargo doc --no-deps` gate is warning-free.
+    ///
+    /// Every request uses the method whose `(items, size)` shape matches the
+    /// corresponding C `ZALLOC`, so an inspecting or bounded allocator observes
+    /// exactly the arguments `deflateInit2_` passes (AAP §0.6.3, §0.6.5).
+    ///
+    /// See [`new`](Self::new) for the parameter contract, the I/O-side-reset note,
+    /// and the errors.
+    #[inline]
+    pub fn new_in_with<A: Allocator>(
+        alloc: &A,
+        level: i32,
+        method: i32,
+        window_bits: i32,
+        mem_level: i32,
+        strategy: Strategy,
+        wrap: i32,
+    ) -> Result<Box<DeflateState>, ZlibError> {
+        Self::new_in_with_detail(alloc, level, method, window_bits, mem_level, strategy, wrap)
+            .map_err(|e| e.code)
     }
 
     /// Deep-copies this state for `deflateCopy`, **preserving the allocator** and

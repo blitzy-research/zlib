@@ -112,6 +112,36 @@ pub struct InflateOutcome {
     pub consumed: usize,
     /// Number of output bytes written to the supplied `output` slice.
     pub produced: usize,
+    /// Whether `consumed`/`produced` should also be added to a C `z_stream`'s
+    /// `total_in`/`total_out` mirrors.
+    ///
+    /// Normally `true`: C's `inflate` epilogue advances the cursors and the
+    /// running totals together (`inflate.c` L1139-L1142).
+    ///
+    /// It is `false` on the two paths where C executes its `RESTORE()` macro —
+    /// committing `next_in`/`avail_in`/`next_out`/`avail_out` — and then returns
+    /// *directly*, jumping over the `strm->total_in += in; strm->total_out += out;`
+    /// bookkeeping at L1141-L1142:
+    ///
+    /// * `case DICT` with `havedict == 0`: `RESTORE(); return Z_NEED_DICT;`
+    ///   (`inflate.c` L701-L703).
+    /// * the `inf_leave` `updatewindow` failure: `RESTORE()` at L1132, then
+    ///   `state->mode = MEM; return Z_MEM_ERROR;` at L1136-L1137.
+    ///
+    /// On those paths a C caller therefore receives the bytes and the advanced
+    /// cursors while `total_in`/`total_out` stay behind — permanently, since the
+    /// per-call `in`/`out` counters are recomputed from `avail_*` on the next
+    /// entry. Reproducing that quirk is required for observable parity (AAP §0.8.1
+    /// D-4, standard S5); measured against reference C, a preset-dictionary stream
+    /// reports `total_in == 0` at its `Z_NEED_DICT` return and finishes at
+    /// `total_in == 34` for a 40-byte stream.
+    ///
+    /// This concerns only the C `z_stream` mirror maintained by the FFI boundary.
+    /// [`ZStream`]'s own `total_in`/`total_out` are already correct on both paths
+    /// (the early returns bypass the epilogue that updates them), and pure-Rust
+    /// callers that track their own byte counts from `consumed`/`produced` should
+    /// keep counting normally — the bytes really were transferred.
+    pub commit_totals: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -724,6 +754,7 @@ pub fn inflate<A: Allocator>(
                 code: ReturnCode::StreamError,
                 consumed: 0,
                 produced: 0,
+                commit_totals: true,
             };
         }
         StreamState::None => {
@@ -731,6 +762,7 @@ pub fn inflate<A: Allocator>(
                 code: ReturnCode::StreamError,
                 consumed: 0,
                 produced: 0,
+                commit_totals: true,
             };
         }
     };
@@ -824,7 +856,15 @@ pub fn inflate<A: Allocator>(
                 }
                 state.dmax = 1u32 << len;
                 state.flags = 0; // indicate zlib header
+                // C `strm->adler = state->check = adler32(0L, Z_NULL, 0)`
+                // (`inflate.c` L550): the caller-visible `adler` mirror is
+                // published here, not left to the epilogue. Each of C's seven
+                // `strm->adler` assignments is individually placed and guarded,
+                // and reproducing them one-for-one is what lets the epilogue
+                // carry C's own `(wrap & 4) && out` guard instead of writing
+                // unconditionally (AAP §0.6.2 ABI field fidelity).
                 state.check = ADLER32_INIT;
+                strm.adler = state.check;
                 state.mode = if (io.hold & 0x200) != 0 {
                     InflateMode::DictId
                 } else {
@@ -901,8 +941,21 @@ pub fn inflate<A: Allocator>(
                         break 'inf_leave;
                     }
                     state.length = io.hold;
-                    // (Rust `GzHeader` has no `extra_len` field; the `extra`
-                    // Vec's own length tracks how many bytes have been stored.)
+                    // Record the **declared** XLEN, matching C's
+                    // `head->extra_len = (unsigned)hold` (`inflate.c` L599-L600).
+                    // Note what C does *not* condition this on: it is written
+                    // whenever a header is installed, irrespective of whether
+                    // `extra` is non-null or how small `extra_max` is. That is
+                    // deliberate and is the whole truncation contract of
+                    // `inflateGetHeader` — the copy below is clamped to
+                    // `extra_max` (`inflate.c` L614-L621) while this field keeps
+                    // the true length, so `extra_len > extra_max` is the caller's
+                    // only signal that bytes were dropped. It also serves the
+                    // documented length-query pattern, where the caller supplies
+                    // no `extra` buffer at all purely to learn the length.
+                    if let Some(head) = state.head.as_mut() {
+                        head.extra_len = io.hold;
+                    }
                     if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 {
                         crc2(&mut state.check, io.hold);
                     }
@@ -1046,7 +1099,11 @@ pub fn inflate<A: Allocator>(
                     head.hcrc = ((flags >> 9) & 1) != 0;
                     head.done = true;
                 }
+                // C `strm->adler = state->check = crc32(0L, Z_NULL, 0)`
+                // (`inflate.c` L690): the gzip header is complete, so the CRC-32
+                // over the *payload* starts fresh and is mirrored to the caller.
                 state.check = CRC32_INIT;
+                strm.adler = state.check;
                 state.mode = InflateMode::Type;
                 continue 'inf_leave;
             }
@@ -1077,19 +1134,29 @@ pub fn inflate<A: Allocator>(
                 if io.need_bits(32).is_none() {
                     break 'inf_leave;
                 }
+                // C `strm->adler = state->check = ZSWAP32(hold)` (`inflate.c`
+                // L696): publish the requested dictionary's Adler-32 id so a
+                // caller that receives `Z_NEED_DICT` can select the right
+                // dictionary from `strm->adler`.
                 state.check = zswap32(io.hold);
+                strm.adler = state.check;
                 io.init_bits();
                 state.mode = InflateMode::Dict;
                 continue 'inf_leave;
             }
             InflateMode::Dict => {
                 if !state.havedict {
-                    // C: `RESTORE(); return Z_NEED_DICT;` — no epilogue. Expose
-                    // the dictionary id in `adler` so the caller can select the
-                    // right dictionary, then hand the state back.
+                    // C: `RESTORE(); return Z_NEED_DICT;` — no epilogue, and
+                    // notably **no** `strm->adler` assignment in this arm
+                    // (`inflate.c` L700-L704). The dictionary id the caller needs
+                    // was already published by the `DictId` arm above (C
+                    // L696), which falls straight through to here on the first
+                    // pass. Re-entering this arm on a later call — a caller that
+                    // got `Z_NEED_DICT` and called `inflate` again without
+                    // supplying a dictionary — must therefore leave the field
+                    // exactly as the caller left it, which is what C does.
                     state.hold = io.hold;
                     state.bits = io.bits;
-                    strm.adler = state.check;
                     let consumed = io.next;
                     let produced = io.put;
                     strm.set_inflate_state(state);
@@ -1097,9 +1164,19 @@ pub fn inflate<A: Allocator>(
                         code: ReturnCode::NeedDict,
                         consumed,
                         produced,
+                        // C runs `RESTORE()` and returns *directly* here
+                        // (`inflate.c` L701-L703), jumping over the
+                        // `strm->total_in += in; strm->total_out += out;`
+                        // bookkeeping at L1141-L1142. The caller therefore sees
+                        // the advanced cursors but unchanged totals.
+                        commit_totals: false,
                     };
                 }
+                // C `strm->adler = state->check = adler32(0L, Z_NULL, 0)`
+                // (`inflate.c` L705): the dictionary has been accepted, so the
+                // running Adler-32 restarts over the decompressed data.
                 state.check = ADLER32_INIT;
+                strm.adler = state.check;
                 state.mode = InflateMode::Type;
                 continue 'inf_leave;
             }
@@ -1560,8 +1637,24 @@ pub fn inflate<A: Allocator>(
                     io.drop_bits(extra);
                     state.back += extra as i32;
                 }
-                // The `INFLATE_STRICT` `offset > dmax` guard is not enabled in
-                // the default build, so it is intentionally omitted for parity.
+                // C `#ifdef INFLATE_STRICT` (`inflate.c` L1010-L1015): reject a
+                // distance that exceeds the maximum the zlib header's window size
+                // permits. This is the *slow path's* half of the check; the fast
+                // loop carries the other half (`inffast.c` L156-L162, ported at
+                // `crate::inflate::fast`). C compiles both from the same macro, so
+                // they must be gated together — enforcing it on only one path
+                // would make acceptance depend on how much output buffer the
+                // caller happened to supply, which is precisely the kind of
+                // configuration-dependent divergence the strict feature exists to
+                // rule out. Off by default, so a default build stays byte-exact
+                // and accepts exactly what reference zlib accepts
+                // (AAP §0.8.2 Divergence 2).
+                #[cfg(feature = "inflate_strict")]
+                if state.offset > state.dmax {
+                    strm.msg = Some("invalid distance too far back");
+                    state.mode = InflateMode::Bad;
+                    continue 'inf_leave;
+                }
                 state.mode = InflateMode::Match;
                 continue 'inf_leave;
             }
@@ -1643,6 +1736,11 @@ pub fn inflate<A: Allocator>(
                         let start = io.put - produced;
                         state.check =
                             update_check(state.flags, state.check, &io.output[start..io.put]);
+                        // C mirrors the freshly-folded check into `strm->adler`
+                        // inside this very guard (`inflate.c` L1078-L1080) —
+                        // `if ((state->wrap & 4) && out) strm->adler =
+                        // state->check = UPDATE_CHECK(...)`.
+                        strm.adler = state.check;
                     }
                     outck = io.left();
                     // Compare the stored trailer with the computed check. For a
@@ -1710,6 +1808,7 @@ pub fn inflate<A: Allocator>(
                     code: ReturnCode::MemError,
                     consumed: 0,
                     produced: 0,
+                    commit_totals: true,
                 };
             }
             InflateMode::Sync => {
@@ -1719,6 +1818,7 @@ pub fn inflate<A: Allocator>(
                     code: ReturnCode::StreamError,
                     consumed: 0,
                     produced: 0,
+                    commit_totals: true,
                 };
             }
         }
@@ -1766,8 +1866,19 @@ pub fn inflate<A: Allocator>(
         strm.set_inflate_state(state);
         return InflateOutcome {
             code: ReturnCode::MemError,
-            consumed: 0,
-            produced: 0,
+            // C reaches this return *after* `RESTORE()` (`inflate.c` L1132), so
+            // `next_in`/`avail_in`/`next_out`/`avail_out` are already committed
+            // and the caller keeps every byte decoded during this call — the
+            // window allocation failed, not the decode. Reporting `0`/`0` here
+            // used to silently discard that output.
+            consumed: io.next,
+            produced: io.put,
+            // ...but C's `state->mode = MEM; return Z_MEM_ERROR;` at L1136-L1137
+            // jumps over the total bookkeeping at L1141-L1142, so the totals must
+            // NOT advance. Measured against reference C: a failing window
+            // allocation mid-stream yields `total_out == 0` with 600 bytes
+            // already delivered through `next_out`/`avail_out`.
+            commit_totals: false,
         };
     }
 
@@ -1781,6 +1892,14 @@ pub fn inflate<A: Allocator>(
     if (state.wrap & 4) != 0 && produced_since_ck != 0 {
         let start = io.put - produced_since_ck;
         state.check = update_check(state.flags, state.check, &io.output[start..io.put]);
+        // C publishes the check mirror *inside* this guard (`inflate.c`
+        // L1144-L1146: `if ((state->wrap & 4) && out) strm->adler = state->check
+        // = UPDATE_CHECK(...)`). The write used to sit below, unguarded, which
+        // clobbered `strm->adler` on exactly the paths where C leaves it alone —
+        // raw framing (`wrap == 0`, where C's `inflateResetKeep` deliberately
+        // skips the field per its "ill-conceived Java test suite" comment at
+        // `inflate.c` L108-L109) and early-error paths that produce no output.
+        strm.adler = state.check;
     }
 
     // data_type: the exact C formula (inflate.c L1147-L1149) — low 7 bits are
@@ -1809,13 +1928,15 @@ pub fn inflate<A: Allocator>(
     // state so subsequent calls resume where this one left off.
     strm.total_in += consumed as u64;
     strm.total_out += produced as u64;
-    strm.adler = state.check;
     strm.set_inflate_state(state);
 
     InflateOutcome {
         code: ret,
         consumed,
         produced,
+        // The normal epilogue path: C advances the cursors and the totals
+        // together (`inflate.c` L1139-L1142).
+        commit_totals: true,
     }
 }
 

@@ -108,6 +108,7 @@ use core::ptr;
 
 #[cfg(feature = "gzip")]
 use zlib_rs::GzHeader;
+use zlib_rs::checksum::adler32;
 use zlib_rs::constants::{DEF_MEM_LEVEL, Strategy, Z_DEFLATED, Z_FINISH, Z_NO_FLUSH, Z_TREES};
 use zlib_rs::deflate::{DeflateState, deflate, deflate_end, deflate_init2};
 use zlib_rs::ffi::{
@@ -120,8 +121,9 @@ use zlib_rs::inflate::inflate_get_header;
 use zlib_rs::inflate::tables::{CodeType, InflateTableError};
 use zlib_rs::inflate::{
     Code, ENOUGH, ENOUGH_DISTS, ENOUGH_LENS, MAXBITS, inflate, inflate_codes_used, inflate_copy,
-    inflate_end, inflate_init, inflate_init2, inflate_mark, inflate_prime, inflate_reset2,
-    inflate_set_dictionary, inflate_sync, inflate_sync_point, inflate_table, inflate_undermine,
+    inflate_end, inflate_init, inflate_init2, inflate_mark, inflate_prime, inflate_reset,
+    inflate_reset_keep, inflate_reset2, inflate_set_dictionary, inflate_sync, inflate_sync_point,
+    inflate_table, inflate_undermine,
 };
 use zlib_rs::stream::{AllocBuffer, Allocator, ZeroValid};
 use zlib_rs::{ReturnCode, ZStream, ZlibError};
@@ -2053,5 +2055,576 @@ fn external_allocator_round_trip_is_byte_identical() {
     assert_eq!(outcome.code, ReturnCode::StreamEnd);
     assert_eq!(outcome.produced, payload.len());
     assert_eq!(decoded, payload, "round trip must be lossless");
+    assert_eq!(rc(inflate_end(&mut strm)), ReturnCode::Ok);
+}
+
+// ===========================================================================
+// Incrementally delivered input — the `inflate_fast` entry contract
+//
+// `inffast.c`'s header comment lists five entry assumptions, four of which the
+// C driver genuinely guarantees (`mode == LEN`, six input bytes, 258 output
+// bytes, `start >= avail_out`). The fifth, `state->bits < 8`, is prose only: C
+// neither enforces nor provides it. Its own slow-path code lookups pull whole
+// *speculative* bytes — `for (;;) { here = lencode[BITS(lenbits)]; if
+// (here.bits <= bits) break; PULLBYTE(); }` (`inflate.c` L924-L928, and
+// identically at L976-L980 for the distance code) — then drop only the width of
+// the code actually decoded (`inflate.c` L940 / L992). A short code decoded
+// after a speculative pull leaves a whole byte buffered, and the very next
+// `case LEN` re-enters `inflate_fast` as soon as `have >= 6 && left >= 258`
+// (`inflate.c` L914-L922) — with `bits >= 8`. The same holds across an
+// `inflate()` call boundary, because the driver's `inf_leave` epilogue does not
+// normalize `bits` the way `inflate_fast`'s does.
+//
+// That makes the condition ordinary rather than exceptional for any caller that
+// feeds input in small increments — the canonical `zpipe.c` streaming pattern —
+// and reference zlib decodes such streams byte-exactly. The unit tests beside
+// `inflate_fast` pin the routine's own behaviour under a carried-in byte; this
+// test pins the property end to end through the public streaming API, over the
+// chunk sizes and framings that provoke it.
+// ===========================================================================
+
+/// Streams `compressed` through inflate `in_chunk` input bytes at a time into an
+/// `out_chunk`-byte output buffer — the `zpipe.c` pattern — and returns the final
+/// return code together with everything produced.
+///
+/// Presenting only `in_chunk` bytes per call is what forces the decoder to
+/// suspend mid-symbol and resume with bits already buffered.
+fn stream_inflate(
+    compressed: &[u8],
+    window_bits: i32,
+    in_chunk: usize,
+    out_chunk: usize,
+) -> (ReturnCode, Vec<u8>) {
+    let mut strm = ZStream::new();
+    assert_eq!(
+        rc(inflate_init2(&mut strm, window_bits)),
+        ReturnCode::Ok,
+        "inflate_init2({window_bits})",
+    );
+
+    let mut out = Vec::new();
+    let mut window = vec![0u8; out_chunk];
+    let mut consumed = 0usize;
+    let mut code = ReturnCode::Ok;
+
+    // Bounded so a no-progress regression halts instead of hanging, while leaving
+    // ample room for the smallest chunk sizes exercised here.
+    let cap = compressed.len() * 64 + 4_096;
+    for _ in 0..cap {
+        let end = core::cmp::min(consumed + in_chunk, compressed.len());
+        let outcome = inflate(
+            &mut strm,
+            &compressed[consumed..end],
+            &mut window,
+            Z_NO_FLUSH,
+        );
+        consumed += outcome.consumed;
+        out.extend_from_slice(&window[..outcome.produced]);
+        code = outcome.code;
+        if code == ReturnCode::StreamEnd {
+            break;
+        }
+        assert_eq!(
+            code,
+            ReturnCode::Ok,
+            "a well-formed stream must stay continuable (wb={window_bits}, \
+             in_chunk={in_chunk}, out_chunk={out_chunk})",
+        );
+        // No progress and no input left to give: the loop would spin forever.
+        if outcome.consumed == 0 && outcome.produced == 0 && consumed == compressed.len() {
+            break;
+        }
+    }
+
+    assert_eq!(rc(inflate_end(&mut strm)), ReturnCode::Ok);
+    (code, out)
+}
+
+/// Compresses `payload` with this crate's encoder at `window_bits`.
+fn compress_at(payload: &[u8], window_bits: i32) -> Vec<u8> {
+    let mut strm = ZStream::new();
+    assert_eq!(
+        rc(deflate_init2(
+            &mut strm,
+            6,
+            Z_DEFLATED,
+            window_bits,
+            DEF_MEM_LEVEL,
+            Strategy::Default,
+        )),
+        ReturnCode::Ok,
+        "deflate_init2({window_bits})",
+    );
+    let mut out = vec![0u8; payload.len() + payload.len() / 2 + 1_024];
+    let outcome = deflate(&mut strm, payload, &mut out, Z_FINISH);
+    assert_eq!(outcome.code, ReturnCode::StreamEnd, "deflate must finish");
+    assert_eq!(outcome.consumed, payload.len());
+    out.truncate(outcome.produced);
+    assert_eq!(rc(deflate_end(&mut strm)), ReturnCode::Ok);
+    out
+}
+
+/// Incrementally delivered input must decode byte-exactly at every framing.
+///
+/// Each `(in_chunk, out_chunk)` pair is chosen to sit on a boundary of the fast
+/// loop's entry contract: `in_chunk == 6` is exactly `INFLATE_FAST_MIN_INPUT`, so
+/// the decoder alternates between the slow path and one fast-loop entry per
+/// refill and re-enters it with whatever the slow path left buffered;
+/// `out_chunk == 258` is exactly `INFLATE_FAST_MIN_OUTPUT`, the smallest buffer
+/// for which the fast loop runs at all. `in_chunk == 32` with a large
+/// `out_chunk` is the ordinary `zpipe.c` shape.
+///
+/// The assertion is byte-exact recovery plus `Z_STREAM_END`, across raw, zlib,
+/// gzip and auto-detect framings. Before the fast loop's entry invariant was
+/// corrected this aborted the process on the majority of these combinations: a
+/// `debug_assert!` failure under `panic = "abort"` (set for **both** profiles,
+/// `Cargo.toml` L173-L205), which across the C ABI is an unrecoverable
+/// `SIGABRT` rather than an error return.
+#[test]
+fn incrementally_delivered_input_decodes_byte_exactly() {
+    // Mixed entropy: repeated phrases give the encoder long back-references while
+    // the counter and the pseudo-random tail keep the literal alphabet wide, so
+    // the stream carries dynamic Huffman blocks with codes of many different
+    // widths — which is what makes a speculative byte pull leave a whole byte
+    // buffered. Several sizes, including one just over the 258-byte minimum.
+    let payloads: [Vec<u8>; 4] = [
+        {
+            let mut v = Vec::new();
+            for i in 0..4u32 {
+                v.extend_from_slice(b"the quick brown fox jumps over the lazy dog; ");
+                v.extend_from_slice(&i.to_le_bytes());
+            }
+            v
+        },
+        {
+            let mut v = Vec::new();
+            for i in 0..60u32 {
+                v.extend_from_slice(b"deflate/inflate parity, byte for byte. ");
+                v.extend_from_slice(&i.to_be_bytes());
+            }
+            v
+        },
+        {
+            // A deterministic pseudo-random tail after compressible text: forces a
+            // mix of stored/static/dynamic blocks and wide literal coverage.
+            let mut v = Vec::new();
+            let mut seed: u32 = 0x1234_5678;
+            for i in 0..500u32 {
+                v.extend_from_slice(b"zlib-rs ");
+                v.extend_from_slice(&i.to_le_bytes());
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                v.push((seed >> 16) as u8);
+                v.push((seed >> 8) as u8);
+            }
+            v
+        },
+        {
+            let mut v = Vec::new();
+            let mut seed: u32 = 0x9E37_79B9;
+            for _ in 0..20_000 {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                v.push((seed >> 24) as u8);
+            }
+            // Long runs after incompressible data: distance codes reach far back.
+            for i in 0..400u32 {
+                v.extend_from_slice(b"tail-run-tail-run-tail-run ");
+                v.extend_from_slice(&i.to_le_bytes());
+            }
+            v
+        },
+    ];
+
+    // (inflate window_bits, deflate window_bits). 47 is inflate-only auto-detect,
+    // so its producer is the gzip wrapper it must detect.
+    #[cfg(feature = "gzip")]
+    const FRAMINGS: [(i32, i32); 4] = [(15, 15), (-15, -15), (31, 31), (47, 31)];
+    #[cfg(not(feature = "gzip"))]
+    const FRAMINGS: [(i32, i32); 2] = [(15, 15), (-15, -15)];
+
+    for payload in &payloads {
+        assert!(
+            payload.len() >= 150,
+            "fixtures must exceed the 150-byte floor"
+        );
+        for (inflate_bits, deflate_bits) in FRAMINGS {
+            let compressed = compress_at(payload, deflate_bits);
+            for in_chunk in [6usize, 8, 32] {
+                for out_chunk in [258usize, 4_096] {
+                    let (code, decoded) =
+                        stream_inflate(&compressed, inflate_bits, in_chunk, out_chunk);
+                    assert_eq!(
+                        code,
+                        ReturnCode::StreamEnd,
+                        "wb={inflate_bits} in_chunk={in_chunk} out_chunk={out_chunk}: \
+                         the stream must reach Z_STREAM_END",
+                    );
+                    assert_eq!(
+                        decoded.len(),
+                        payload.len(),
+                        "wb={inflate_bits} in_chunk={in_chunk} out_chunk={out_chunk}: \
+                         decoded length must match",
+                    );
+                    assert!(
+                        decoded == *payload,
+                        "wb={inflate_bits} in_chunk={in_chunk} out_chunk={out_chunk}: \
+                         decoded bytes must match the payload exactly",
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// INFLATE_STRICT — the `dmax` guard must cover BOTH decode paths
+//
+// C compiles the maximum-distance check from a single `INFLATE_STRICT` macro
+// into two places: the fast loop (`inffast.c` L156-L162) and the slow path's
+// `case DISTEXT` (`inflate.c` L1010-L1015). Those are the only two functional
+// `#ifdef INFLATE_STRICT` sites in the whole C library — `infback.c` has none of
+// its own, it merely sets `dmax = 32768`, and `inflate.h` L91 just declares the
+// field.
+//
+// Which path decodes any given symbol is decided purely by how much input and
+// output the caller happens to supply: the fast loop runs only when `have >= 6
+// && left >= 258` (`inflate.c` L914-L922). Porting one guard and not the other
+// therefore makes *acceptance of a stream* depend on the caller's buffer sizes —
+// the same bytes accepted with a 64-byte output buffer and rejected with a
+// 4096-byte one. These tests pin both paths to the same verdict, and pin the
+// default build to reference zlib's (accept), per AAP §0.8.2 Divergence 2.
+// ===========================================================================
+
+/// Builds a zlib stream whose declared window is smaller than a back-reference it
+/// actually contains, together with the payload it encodes.
+///
+/// The body is produced with **raw** deflate at the full 32 KiB window, so the
+/// encoder is free to emit a distance of `distance`; it is then wrapped in a zlib
+/// header whose `CINFO` field declares a window of `1 << (cinfo + 8)` bytes.
+/// C computes `state->dmax = 1U << (BITS(4) + 8)` in `case HEAD`, so `cinfo == 0`
+/// declares `dmax == 256`. The stream is perfectly well-formed DEFLATE — only the
+/// *declared* window is too small — which is exactly the case `INFLATE_STRICT`
+/// exists to reject and a default build accepts.
+fn dmax_violating_stream(cinfo: u8, distance: usize) -> (Vec<u8>, Vec<u8>) {
+    // A pseudo-random prefix of exactly `distance` bytes has no internal repeats
+    // to match against, so when the prefix's first `tail` bytes are repeated the
+    // only back-reference available to the encoder is at distance `distance`.
+    const TAIL: usize = 300;
+    let mut payload = Vec::with_capacity(distance + TAIL);
+    let mut seed: u32 = 99;
+    for _ in 0..distance {
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        payload.push((seed >> 16) as u8);
+    }
+    payload.extend_from_within(..TAIL);
+
+    // Raw body at level 9 / full window.
+    let body = compress_at(&payload, -15);
+
+    // Two-byte zlib header: CM = 8 (deflate), CINFO = `cinfo`, then FCHECK chosen
+    // so the big-endian 16-bit header is a multiple of 31 (RFC 1950 §2.2).
+    let cmf = 0x08u32 | ((cinfo as u32) << 4);
+    let mut hdr = cmf << 8;
+    hdr += 31 - (hdr % 31);
+
+    let mut stream = Vec::with_capacity(body.len() + 6);
+    stream.push((hdr >> 8) as u8);
+    stream.push((hdr & 0xff) as u8);
+    stream.extend_from_slice(&body);
+    // Big-endian Adler-32 trailer over the uncompressed data (RFC 1950 §2.2).
+    // `1` is the required initial value. (C spells this
+    // `adler32(adler32(0L, Z_NULL, 0), ...)`, where the `Z_NULL` call *returns*
+    // 1; that null sentinel lives at the FFI boundary, so the idiomatic API is
+    // seeded with the literal `1`.)
+    let adler = adler32(1, &payload);
+    stream.extend_from_slice(&adler.to_be_bytes());
+
+    (stream, payload)
+}
+
+/// Streams `compressed` through inflate and reports the outcome *without*
+/// asserting success, so an expected data error can be inspected.
+///
+/// `in_chunk == 0` presents all remaining input on every call. Returns the final
+/// return code, `strm.msg`, and the number of bytes produced before stopping.
+fn stream_inflate_tolerant(
+    compressed: &[u8],
+    window_bits: i32,
+    in_chunk: usize,
+    out_chunk: usize,
+) -> (ReturnCode, Option<&'static str>, usize) {
+    let mut strm = ZStream::new();
+    assert_eq!(rc(inflate_init2(&mut strm, window_bits)), ReturnCode::Ok);
+
+    let mut window = vec![0u8; out_chunk];
+    let mut consumed = 0usize;
+    let mut produced = 0usize;
+    let mut code = ReturnCode::Ok;
+
+    let cap = compressed.len() * 64 + 4_096;
+    for _ in 0..cap {
+        let end = if in_chunk == 0 {
+            compressed.len()
+        } else {
+            core::cmp::min(consumed + in_chunk, compressed.len())
+        };
+        let outcome = inflate(
+            &mut strm,
+            &compressed[consumed..end],
+            &mut window,
+            Z_NO_FLUSH,
+        );
+        consumed += outcome.consumed;
+        produced += outcome.produced;
+        code = outcome.code;
+        if code != ReturnCode::Ok {
+            break;
+        }
+        if outcome.consumed == 0 && outcome.produced == 0 && consumed == compressed.len() {
+            break;
+        }
+    }
+
+    let msg = strm.msg;
+    assert_eq!(rc(inflate_end(&mut strm)), ReturnCode::Ok);
+    (code, msg, produced)
+}
+
+/// The `dmax` verdict must not depend on the caller's buffer sizes.
+///
+/// `out_chunk` spans both sides of `INFLATE_FAST_MIN_OUTPUT` (258) and `in_chunk`
+/// both sides of `INFLATE_FAST_MIN_INPUT` (6), so the sweep decodes the offending
+/// distance through the slow path in some rows and the fast loop in others. Every
+/// row must reach the *same* verdict:
+///
+/// * `inflate_strict` on — `Z_DATA_ERROR` with C's exact
+///   `"invalid distance too far back"` message, stopping partway through;
+/// * feature off (the default) — a complete, byte-exact decode, because reference
+///   zlib built without `INFLATE_STRICT` accepts this stream and a default build
+///   must accept exactly what reference zlib accepts.
+///
+/// Before the slow-path guard was ported, a strict build accepted the stream at
+/// every `out_chunk <= 259` and at `out_chunk == 4096` for every small
+/// `in_chunk` — rejecting it only when the fast loop happened to decode the
+/// offending symbol.
+#[test]
+fn strict_dmax_verdict_is_independent_of_buffer_sizes() {
+    // CINFO = 0 declares a 256-byte window; the body carries a distance of 556.
+    let (stream, payload) = dmax_violating_stream(0, 556);
+    assert_eq!(
+        &stream[..2],
+        &[0x08, 0x1d],
+        "the fixture's zlib header must declare CM=8, CINFO=0",
+    );
+
+    // Sanity, independent of the feature: the body itself is valid DEFLATE. Raw
+    // framing never consults `dmax` (it is fixed at 32768 by `inflateInit2`), so
+    // this recovers the payload in both feature configurations and proves the
+    // fixture is well-formed rather than corrupt.
+    let raw_body = &stream[2..stream.len() - 4];
+    let (raw_code, raw_out) = stream_inflate(raw_body, -15, raw_body.len(), payload.len() + 16);
+    assert_eq!(
+        raw_code,
+        ReturnCode::StreamEnd,
+        "the raw body must be valid"
+    );
+    assert_eq!(raw_out, payload, "the raw body must decode to the payload");
+
+    let strict = cfg!(feature = "inflate_strict");
+
+    for out_chunk in [16usize, 64, 128, 256, 257, 258, 259, 512, 4_096] {
+        for in_chunk in [0usize, 1, 2, 5, 6, 7, 64] {
+            let (code, msg, produced) = stream_inflate_tolerant(&stream, 15, in_chunk, out_chunk);
+            let row = format!("in_chunk={in_chunk} out_chunk={out_chunk}");
+            if strict {
+                assert_eq!(
+                    code,
+                    ReturnCode::DataError,
+                    "{row}: a strict build must reject a distance beyond dmax",
+                );
+                assert_eq!(
+                    msg,
+                    Some("invalid distance too far back"),
+                    "{row}: message must match C exactly",
+                );
+                assert!(
+                    produced > 0 && produced < payload.len(),
+                    "{row}: the decode must stop at the offending distance, \
+                     produced {produced} of {}",
+                    payload.len(),
+                );
+            } else {
+                assert_eq!(
+                    code,
+                    ReturnCode::StreamEnd,
+                    "{row}: a default build must accept what reference zlib accepts",
+                );
+                assert_eq!(
+                    produced,
+                    payload.len(),
+                    "{row}: the whole payload must be recovered",
+                );
+            }
+        }
+    }
+}
+
+/// A distance *within* the declared window must be accepted even by a strict
+/// build, at every buffer size — the guard must reject too-far distances without
+/// also rejecting legitimate ones.
+#[test]
+fn strict_dmax_accepts_distances_within_the_declared_window() {
+    // CINFO = 7 declares a 32768-byte window (`1 << (7 + 8)`), which comfortably
+    // covers the 556-byte distance the body carries.
+    let (stream, payload) = dmax_violating_stream(7, 556);
+    assert_eq!(
+        stream[0] & 0x0f,
+        0x08,
+        "the fixture must still declare CM=8 (deflate)",
+    );
+    assert_eq!(stream[0] >> 4, 7, "the fixture must declare CINFO=7");
+
+    for out_chunk in [16usize, 64, 258, 259, 4_096] {
+        for in_chunk in [0usize, 1, 6, 64] {
+            let (code, msg, produced) = stream_inflate_tolerant(&stream, 15, in_chunk, out_chunk);
+            let row = format!("in_chunk={in_chunk} out_chunk={out_chunk}");
+            assert_eq!(
+                code,
+                ReturnCode::StreamEnd,
+                "{row}: a distance within the declared window must be accepted \
+                 (msg={msg:?})",
+            );
+            assert_eq!(produced, payload.len(), "{row}: full payload recovered");
+        }
+    }
+}
+
+// ===========================================================================
+// `strm.adler` and total-bookkeeping lifecycle, at the idiomatic-API level
+//
+// C assigns `strm->adler` at exactly seven places in `inflate.c` (L109, L550,
+// L690, L696, L705, L1079, L1145) and at zero places in `infback.c`. Every one
+// is unreachable when `state->wrap == 0`, and a wrapped stream that fails inside
+// its header reaches none of them either. `ZStream::adler` is the engine-side
+// mirror of that field, so the same contract must hold here (AAP §0.8.1 D-4,
+// standard S5).
+// ===========================================================================
+
+/// A raw (`windowBits < 0`) stream must never have `adler` written: C reaches the
+/// field only through `inflateResetKeep`'s `if (state->wrap)` guard
+/// (`inflate.c` L108-L109) and its `wrap & 4` guarded folds (L1079, L1145).
+#[test]
+fn raw_inflate_never_writes_the_adler_mirror() {
+    const POISON: u32 = 0xAAAA_5555;
+
+    let mut strm = ZStream::new();
+    assert_eq!(rc(inflate_init2(&mut strm, -15)), ReturnCode::Ok);
+    strm.adler = POISON;
+
+    // A reset must not disturb it either (all reset entry points funnel into C's
+    // wrap-guarded write).
+    assert_eq!(rc(inflate_reset(&mut strm)), ReturnCode::Ok);
+    assert_eq!(
+        strm.adler, POISON,
+        "inflate_reset wrote adler on a raw stream"
+    );
+    assert_eq!(rc(inflate_reset_keep(&mut strm)), ReturnCode::Ok);
+    assert_eq!(
+        strm.adler, POISON,
+        "inflate_reset_keep wrote adler on a raw stream"
+    );
+
+    // A full raw decode must not disturb it: `wrap & 4` is clear.
+    let payload: Vec<u8> = (0..4_096u32).map(|i| (i % 251) as u8).collect();
+    let raw = compress_at(&payload, -15);
+    let mut out = vec![0u8; payload.len() + 64];
+    let outcome = inflate(&mut strm, &raw, &mut out, Z_FINISH);
+    assert_eq!(outcome.code, ReturnCode::StreamEnd);
+    assert_eq!(&out[..outcome.produced], &payload[..]);
+    assert_eq!(strm.adler, POISON, "a raw decode wrote the adler mirror");
+    assert!(
+        outcome.commit_totals,
+        "an ordinary return must commit the byte totals"
+    );
+    assert_eq!(rc(inflate_end(&mut strm)), ReturnCode::Ok);
+}
+
+/// A **wrapped** stream that fails inside its header reaches `BAD` before C's
+/// L550/L690 writes, so the mirror must be left alone there too. This is the
+/// case a `wrap != 0` check alone would miss.
+#[test]
+fn a_wrapped_header_error_does_not_write_the_adler_mirror() {
+    const POISON: u32 = 0xAAAA_5555;
+    // CM=8, CINFO=8 => a 16-bit window (above MAX_WBITS); FCHECK is valid so the
+    // decoder rejects the window size specifically.
+    const BAD_WINDOW: [u8; 2] = [0x88, 0x1C];
+
+    let mut strm = ZStream::new();
+    assert_eq!(rc(inflate_init2(&mut strm, 15)), ReturnCode::Ok);
+    // A wrapped init *does* write it (C L108-L109: `wrap & 1`).
+    assert_eq!(strm.adler, 1, "a wrapped init must seed adler to wrap & 1");
+    strm.adler = POISON;
+
+    let mut out = vec![0u8; 64];
+    let outcome = inflate(&mut strm, &BAD_WINDOW, &mut out, Z_NO_FLUSH);
+    assert_eq!(outcome.code, ReturnCode::DataError);
+    assert_eq!(strm.msg, Some("invalid window size"));
+    assert_eq!(
+        strm.adler, POISON,
+        "a header error wrote the adler mirror; C reaches none of its seven \
+         assignments on this path"
+    );
+    assert_eq!(rc(inflate_end(&mut strm)), ReturnCode::Ok);
+}
+
+/// C's `case DICT` with no dictionary runs `RESTORE(); return Z_NEED_DICT;`
+/// (`inflate.c` L701-L703), committing the cursors but jumping over the
+/// `total_in`/`total_out` updates at L1141-L1142 — which
+/// [`InflateOutcome::commit_totals`] reports. The DICTID is still published into
+/// `adler` (C L696) so the caller can pick the right dictionary.
+#[test]
+fn need_dict_reports_that_totals_must_not_be_committed() {
+    // zlib header with FDICT set, then the 4-byte big-endian dictionary id.
+    const FDICT_HEADER: [u8; 6] = [0x78, 0x3F, 0xDE, 0xAD, 0xBE, 0xEF];
+
+    let mut strm = ZStream::new();
+    assert_eq!(rc(inflate_init2(&mut strm, 15)), ReturnCode::Ok);
+    let mut out = vec![0u8; 64];
+    let outcome = inflate(&mut strm, &FDICT_HEADER, &mut out, Z_NO_FLUSH);
+
+    assert_eq!(outcome.code, ReturnCode::NeedDict);
+    assert_eq!(
+        outcome.consumed,
+        FDICT_HEADER.len(),
+        "C's RESTORE() commits the input cursor before returning Z_NEED_DICT"
+    );
+    assert!(
+        !outcome.commit_totals,
+        "C returns before its total bookkeeping on the Z_NEED_DICT path"
+    );
+    assert_eq!(
+        strm.adler, 0xDEAD_BEEF,
+        "the requested dictionary id must be published into adler (C L696)"
+    );
+    assert_eq!(rc(inflate_end(&mut strm)), ReturnCode::Ok);
+}
+
+/// A successful zlib decode must still publish the payload's Adler-32 through
+/// C's `wrap & 4` guarded fold (`inflate.c` L1145).
+#[test]
+fn successful_zlib_decode_publishes_the_payload_adler32() {
+    let payload: Vec<u8> = (0..10_000u32).map(|i| (i % 241) as u8).collect();
+    let stream = compress_at(&payload, 15);
+
+    let mut strm = ZStream::new();
+    assert_eq!(rc(inflate_init2(&mut strm, 15)), ReturnCode::Ok);
+    let mut out = vec![0u8; payload.len() + 64];
+    let outcome = inflate(&mut strm, &stream, &mut out, Z_FINISH);
+    assert_eq!(outcome.code, ReturnCode::StreamEnd);
+    assert_eq!(&out[..outcome.produced], &payload[..]);
+    assert_eq!(
+        strm.adler,
+        adler32(1, &payload),
+        "the published adler must be the payload's Adler-32"
+    );
     assert_eq!(rc(inflate_end(&mut strm)), ReturnCode::Ok);
 }

@@ -21,7 +21,8 @@
 //! | `uLong time`                       | [`time`](GzHeader::time): `u32`                |
 //! | `int xflags`                       | [`xflags`](GzHeader::xflags): `i32`            |
 //! | `int os`                           | [`os`](GzHeader::os): `i32`                    |
-//! | `Bytef *extra` + `uInt extra_len`  | [`extra`](GzHeader::extra): `Option<Vec<u8>>`  |
+//! | `Bytef *extra`                     | [`extra`](GzHeader::extra): `Option<Vec<u8>>`  |
+//! | `uInt extra_len`                   | [`extra_len`](GzHeader::extra_len): `u32`      |
 //! | `uInt extra_max`                   | [`extra_max`](GzHeader::extra_max): `u32`      |
 //! | `Bytef *name`                      | [`name`](GzHeader::name): `Option<Vec<u8>>`    |
 //! | `uInt name_max`                    | [`name_max`](GzHeader::name_max): `u32`        |
@@ -162,11 +163,46 @@ pub struct GzHeader {
 
     /// Optional gzip "extra" subfield block (`FEXTRA`, RFC 1952).
     ///
-    /// Combines the C `gz_header.extra` pointer with its `extra_len` length:
-    /// [`None`] corresponds to a `Z_NULL` pointer (no extra field), while
-    /// `Some(bytes)` holds the raw extra-field bytes whose length is
-    /// `bytes.len()`.
+    /// Corresponds to the C `gz_header.extra` pointer: [`None`] is a `Z_NULL`
+    /// pointer (no extra field), while `Some(bytes)` holds the extra-field bytes
+    /// actually stored. When *reading*, that may be **fewer** bytes than the
+    /// stream declared — see [`extra_len`](GzHeader::extra_len).
     pub extra: Option<Vec<u8>>,
+
+    /// The extra field's **declared** length, in bytes.
+    ///
+    /// Mirrors C `gz_header.extra_len`, which this crate keeps as a distinct
+    /// field rather than inferring it from `extra.len()` because the two are not
+    /// the same number:
+    ///
+    /// * **Reading** (`inflateGetHeader`): set to the full 16-bit `XLEN` the gzip
+    ///   header declared (`inflate.c` L599-L600 writes it unconditionally
+    ///   whenever a header is installed, *before* and independently of any copy).
+    ///   The copy into [`extra`](GzHeader::extra) is separately clamped to
+    ///   [`extra_max`](GzHeader::extra_max) (`inflate.c` L614-L621), so when the
+    ///   caller's buffer is too small this field still reports the true length
+    ///   while `extra` holds only the leading `extra_max` bytes.
+    ///
+    ///   `extra_len > extra_max` is therefore the caller's **only** signal that
+    ///   the extra field was truncated, exactly as `zlib.h` specifies for
+    ///   `inflateGetHeader`: once `done` is true, `extra_len` contains the actual
+    ///   extra field length, and `extra` contains that field *or that field
+    ///   truncated if `extra_max` is less than `extra_len`*. It is also written
+    ///   for the documented length-query pattern, where the caller leaves
+    ///   `extra` as [`None`] (C `Z_NULL`) purely to learn the length.
+    ///
+    ///   Because C writes it only when the header actually carries an `FEXTRA`
+    ///   field, a stream **without** one leaves whatever value the caller had
+    ///   already placed here untouched.
+    /// * **Writing** (`deflateSetHeader`): **ignored.** The encoder emits
+    ///   `extra.len()` bytes from [`extra`](GzHeader::extra), so the `Vec` is the
+    ///   single source of truth on the write path and this field cannot desynchronize
+    ///   the emitted header. At the C boundary the two agree by construction: the
+    ///   caller's `extra_len` bytes are what get read out of their `extra` pointer
+    ///   into the `Vec`.
+    ///
+    /// Defaults to `0`.
+    pub extra_len: u32,
 
     /// Optional original file name (`FNAME`, RFC 1952).
     ///
@@ -344,7 +380,11 @@ impl GzHeader {
     /// updated header.
     ///
     /// The gzip "extra" field is opaque, length-prefixed binary data (RFC 1952
-    /// `FEXTRA`); its length is simply the length of the stored vector.
+    /// `FEXTRA`). [`extra_len`](GzHeader::extra_len) is set to match the stored
+    /// vector's length, keeping the pair self-consistent — which is what a caller
+    /// round-tripping a header through `deflateSetHeader` needs. (The encoder
+    /// emits `extra.len()` bytes regardless, so this is for the caller's benefit
+    /// rather than the wire format's.)
     ///
     /// # Examples
     ///
@@ -353,11 +393,14 @@ impl GzHeader {
     ///
     /// let header = GzHeader::new().with_extra(vec![0x01, 0x02, 0x03]);
     /// assert_eq!(header.extra.as_deref(), Some(&[0x01, 0x02, 0x03][..]));
+    /// assert_eq!(header.extra_len, 3);
     /// ```
     #[must_use]
     #[inline]
     pub fn with_extra(mut self, extra: impl Into<Vec<u8>>) -> Self {
-        self.extra = Some(extra.into());
+        let extra = extra.into();
+        self.extra_len = extra.len() as u32;
+        self.extra = Some(extra);
         self
     }
 }

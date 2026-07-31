@@ -88,10 +88,31 @@ const INFLATE_FAST_MIN_OUTPUT: usize = 258;
 /// * `input.len() - *in_pos >= 6` (at least six input bytes available)
 /// * `output.len() - *out_pos >= 258` (at least 258 output bytes available)
 /// * `start >= output.len() - *out_pos` (`start` ≥ current `avail_out`)
-/// * `state.bits < 8`
 ///
 /// These invariants are what make the bounds-checked indexing provably
 /// panic-free for a well-formed stream, and are asserted in debug builds.
+///
+/// The C header comment additionally lists `state->bits < 8` among its entry
+/// assumptions (`inffast.c` L29). That one is **prose only: C never enforces it,
+/// and the C driver does not in fact guarantee it.** The driver's own slow-path
+/// code lookups pull *whole speculative bytes* — `for (;;) { here =
+/// lencode[BITS(lenbits)]; if (here.bits <= bits) break; PULLBYTE(); }`
+/// (`inflate.c` L924-L928, and identically at L976-L980 for the distance code) —
+/// and then drop only the width of the code actually decoded (`DROPBITS(here.bits)`,
+/// `inflate.c` L940 / L992). A short code decoded after a speculative pull
+/// therefore leaves a whole buffered byte, and the very next `case LEN` iteration
+/// re-enters this routine as soon as `have >= 6 && left >= 258` (`inflate.c`
+/// L914-L922) — with `bits >= 8`. The same is true across an `inflate()` call
+/// boundary, since the driver's `inf_leave` epilogue does not normalize `bits` the
+/// way this routine's does. Reference C decodes such streams byte-exactly, so
+/// entering with a whole buffered byte is ordinary rather than exceptional.
+///
+/// The real invariant — the one this loop depends on and the one asserted below —
+/// is that `hold` carries `bits` valid bits with `bits <= 32`, the capacity of the
+/// `u32` accumulator. Asserting the stricter C comment instead would abort debug
+/// builds on valid input, so it is deliberately not asserted; the epilogue that
+/// returns whole buffered bytes to the input is written to stay correct for
+/// `bits >= 8` as well.
 ///
 /// # Return value
 ///
@@ -131,7 +152,15 @@ pub fn inflate_fast(
         output.len() - *out_pos >= INFLATE_FAST_MIN_OUTPUT,
         "inflate_fast entry: at least {INFLATE_FAST_MIN_OUTPUT} output bytes required"
     );
-    debug_assert!(state.bits < 8, "inflate_fast entry: state.bits must be < 8");
+    // The accumulator invariant: `hold` carries `bits` valid bits and `bits`
+    // never exceeds the width of the `u32` holding them. C's header comment also
+    // claims `state->bits < 8` on entry, but nothing in C enforces or guarantees
+    // that (see the `# Entry assumptions` note above) — entering with a whole
+    // buffered byte is normal, so asserting it would abort on valid input.
+    debug_assert!(
+        state.bits <= 32,
+        "inflate_fast entry: state.bits must be <= 32 (u32 accumulator capacity)"
+    );
     debug_assert!(
         start >= output.len() - *out_pos,
         "inflate_fast entry: start must be >= avail_out"
@@ -143,6 +172,14 @@ pub fn inflate_fast(
     // driver resume mid-stream via the epilogue below.
     let mut in_idx = *in_pos;
     let mut out_idx = *out_pos;
+
+    // The input index this call started from. The epilogue needs it to bound how
+    // many whole bytes it may hand back to the input: bits that were already
+    // buffered *before* this call came from bytes at or before `in_start`, and
+    // those bytes are not ours to return a second time. C omits this bound
+    // because its entry comment claims `bits < 8`, under which the bound can
+    // never bind (see the `# Entry assumptions` note above).
+    let in_start = *in_pos;
 
     // Loop bounds. `last_safe_in`: while `in_idx < last_safe_in`, at least six
     // input bytes remain. `end_safe`: while `out_idx < end_safe`, at least 258
@@ -388,12 +425,26 @@ pub fn inflate_fast(
     }
 
     // ---- epilogue: return unused whole bytes to the input (C L290-L294) ------
-    // On entry `bits < 8`, so backing up over the whole bytes we buffered never
-    // moves `in_idx` before where it started.
-    let unused = (bits >> 3) as usize;
+    // C is `len = bits >> 3; in -= len; bits -= len << 3; hold &= (1U << bits) - 1;`
+    // and relies on its (comment-only) `bits < 8` entry claim so that `in` cannot
+    // move before where it started. Because that claim is not actually enforced by
+    // the C driver — a whole buffered byte on entry is ordinary — the byte count is
+    // clamped here to the bytes this call itself pulled. Under C's stated entry
+    // condition the clamp is provably inert: fewer than eight bits are carried in,
+    // so every whole byte still sitting in `hold` at exit was pulled by this call
+    // and `bits >> 3` can never exceed `in_idx - in_start`. When the entry
+    // condition does not hold, the clamp returns exactly the bytes this call
+    // consumed and leaves the pre-existing bits in `hold` untouched, which is the
+    // same net state C would compute had it been able to address bytes it does not
+    // own. Either way `hold`/`bits` stay mutually consistent, so no decode
+    // decision — and therefore no output byte — changes.
+    let unused = ((bits >> 3) as usize).min(in_idx - in_start);
     in_idx -= unused;
     bits -= (unused as u32) << 3;
-    hold &= (1u32 << bits) - 1;
+    // `bits == 32` (a completely full accumulator) makes `1u32 << bits` overflow,
+    // so the all-ones mask is produced without shifting: `checked_shl` yields
+    // `None`, and `0u32.wrapping_sub(1)` is `u32::MAX`.
+    hold &= 1u32.checked_shl(bits).unwrap_or(0).wrapping_sub(1);
 
     // ---- RESTORE: write locals back into the state and the caller's cursors --
     state.hold = hold;
@@ -804,5 +855,210 @@ mod tests {
         assert_eq!(msg, Some("invalid distance too far back"));
         // Only the single literal was emitted before the error.
         assert_eq!(out, b"x");
+    }
+
+    /// Like [`decode_fast`], but enters the loop the way the driver actually does
+    /// after speculatively pulling whole bytes into the bit accumulator:
+    /// `prebuffered` bytes beyond the header byte are already sitting in `hold`,
+    /// so entry `bits` is `5 + 8 * prebuffered` rather than `5`.
+    ///
+    /// `input` is the slice the routine may address and `in_pos` its starting
+    /// cursor within it, so a caller can also model the case where the buffered
+    /// bits came from a *previous* input buffer (`in_pos == 0`).
+    ///
+    /// Returns the decoded bytes, the exit mode, any error message, and the final
+    /// `(in_pos, bits)` pair — from which the total number of stream bits consumed
+    /// is `in_pos * 8 - bits`.
+    fn decode_fast_prebuffered(
+        state: &mut InflateState,
+        prebuffer: &[u8],
+        input: &[u8],
+        in_pos_start: usize,
+        out_cap: usize,
+    ) -> (Vec<u8>, InflateMode, Option<&'static str>, usize, u32) {
+        // Three header bits consumed out of `prebuffer[0]`, then every remaining
+        // `prebuffer` byte pulled whole on top. `hold` therefore carries exactly
+        // `bits` valid bits with all higher bits clear — the accumulator invariant.
+        state.hold = (prebuffer[0] as u32) >> 3;
+        state.bits = 5;
+        for &byte in &prebuffer[1..] {
+            state.hold |= (byte as u32) << state.bits;
+            state.bits += 8;
+        }
+        let mut in_pos = in_pos_start;
+        let mut output = alloc::vec![0u8; out_cap];
+        let mut out_pos = 0usize;
+        let start = output.len();
+        let msg = inflate_fast(
+            state,
+            input,
+            &mut in_pos,
+            &mut output,
+            &mut out_pos,
+            start,
+            &LENFIX,
+            &DISTFIX,
+        );
+        let mode = state.mode;
+        output.truncate(out_pos);
+        (output, mode, msg, in_pos, state.bits)
+    }
+
+    /// Entering with a whole buffered byte or more must decode identically.
+    ///
+    /// C's `inffast.c` header comment lists `state->bits < 8` as an entry
+    /// assumption, but nothing in C enforces it and the C driver does not provide
+    /// it: its slow-path code lookups pull whole speculative bytes
+    /// (`inflate.c` L924-L928) and then drop only the width of the code actually
+    /// decoded (`inflate.c` L940), so `case LEN` can re-enter this routine with
+    /// `bits >= 8`. This pins that case.
+    ///
+    /// The strong invariant asserted here is that the *total stream bits consumed*
+    /// — `in_pos * 8 - bits` on return — is identical no matter how many whole
+    /// bytes were pre-buffered on entry. That can only hold if the epilogue hands
+    /// back exactly the bytes it may (never more than this call pulled, so the
+    /// input index cannot move behind where it started) and keeps `hold`/`bits`
+    /// mutually consistent. Output equality alone would not catch a lost or
+    /// double-counted byte at the boundary.
+    #[test]
+    fn decodes_identically_when_entered_with_whole_buffered_bytes() {
+        // A mixed token stream: literals, an overlapping match, a long match with
+        // length extra bits, and a wide distance — so the loop takes the literal,
+        // second-level-free length, distance-extra and copy paths before the
+        // end-of-block code. The 32-byte pad keeps at least six input bytes
+        // available for the duration, which is this routine's real entry
+        // requirement.
+        let tokens = [
+            Tok::Lit(b'z'),
+            Tok::Lit(b'l'),
+            Tok::Lit(b'i'),
+            Tok::Lit(b'b'),
+            Tok::Match(4, 4),
+            Tok::Lit(0xC3),
+            Tok::Match(24, 3),
+            Tok::Lit(b'!'),
+            Tok::Match(131, 9),
+        ];
+        let stream = encode_fixed_block(&tokens, 32);
+
+        // Baseline: the C-documented entry condition (`bits == 5`, i.e. < 8).
+        let mut base_state = primed_fixed_state();
+        let (baseline_out, baseline_mode, baseline_msg, base_in, base_bits) =
+            decode_fast_prebuffered(&mut base_state, &stream[..1], &stream, 1, 1024);
+        let baseline_consumed = base_in * 8 - base_bits as usize;
+        assert_eq!(
+            baseline_msg, None,
+            "the baseline stream must decode cleanly"
+        );
+        assert_eq!(
+            baseline_mode,
+            InflateMode::Type,
+            "must stop at end-of-block"
+        );
+        assert!(
+            !baseline_out.is_empty(),
+            "the baseline must actually produce output"
+        );
+        // C normalizes the accumulator to under one whole byte on exit, and with
+        // nothing carried in the port must do exactly the same.
+        assert!(
+            base_bits < 8,
+            "with no bytes carried in, exit bits must be < 8, got {base_bits}",
+        );
+
+        // `prebuffered` pushes entry `bits` to 13, 21 and 29 respectively —
+        // spanning one, two and three whole buffered bytes, the range the driver
+        // can reach with a `u32` accumulator.
+        for prebuffered in 1..=3usize {
+            let mut state = primed_fixed_state();
+            // The header byte plus `prebuffered` whole bytes are already in the
+            // accumulator, so the routine receives its cursor just past them.
+            let entry_in_pos = prebuffered + 1;
+            let (out, mode, msg, in_pos, bits) = decode_fast_prebuffered(
+                &mut state,
+                &stream[..entry_in_pos],
+                &stream,
+                entry_in_pos,
+                1024,
+            );
+            let entry_bits = 5 + 8 * prebuffered;
+            assert_eq!(msg, None, "entry bits = {entry_bits}: must decode cleanly");
+            assert_eq!(
+                mode, baseline_mode,
+                "entry bits = {entry_bits}: exit mode must match the baseline",
+            );
+            assert_eq!(
+                out, baseline_out,
+                "entry bits = {entry_bits}: output must be byte-identical",
+            );
+            assert_eq!(
+                in_pos * 8 - bits as usize,
+                baseline_consumed,
+                "entry bits = {entry_bits}: total stream bits consumed must match \
+                 the baseline — the epilogue must neither lose nor double-count \
+                 a buffered byte",
+            );
+            // The cursor may never be handed back behind where this call received
+            // it: those bytes belong to whatever ran before.
+            assert!(
+                in_pos >= entry_in_pos,
+                "entry bits = {entry_bits}: in_pos went behind its entry value",
+            );
+            // At most the whole bytes carried in may still be buffered on exit;
+            // with `prebuffered == 0` this degenerates to C's `bits < 8`.
+            assert!(
+                (bits as usize) / 8 <= prebuffered,
+                "entry bits = {entry_bits}: exit bits {bits} keeps more whole bytes \
+                 buffered than were carried in",
+            );
+        }
+    }
+
+    /// The epilogue must never hand back bytes this call did not pull.
+    ///
+    /// C's byte-return step is `len = bits >> 3; in -= len;`, justified solely by
+    /// its unenforced `bits < 8` entry claim. When bits *are* carried in — which
+    /// happens across an `inflate()` call boundary, because the driver's
+    /// `inf_leave` does not normalize `bits` the way this routine's epilogue does —
+    /// the buffered bytes came from the *previous* input buffer and are not this
+    /// call's to return. This models exactly that: the accumulator is preloaded
+    /// from bytes the routine cannot address, and `in_pos` starts at 0.
+    ///
+    /// The stream is chosen so the loop pulls **nothing** (29 bits carried in cover
+    /// both the literal and the end-of-block code), leaving `in_pos == 0` with a
+    /// whole byte still buffered. Unclamped, `in_pos -= 1` underflows: a
+    /// subtract-overflow panic in a debug build, and in a release build a wrapped
+    /// `usize` that the driver then indexes with.
+    #[test]
+    fn never_returns_input_bytes_it_did_not_pull() {
+        // One literal plus end-of-block: 3 header + 8 literal + 7 EOB = 18 bits.
+        // The pad guarantees the six addressable input bytes this routine requires
+        // even after four bytes have been set aside as the "previous" buffer.
+        let stream = encode_fixed_block(&[Tok::Lit(b'Q')], 16);
+        let prebuffer = &stream[..4]; // header byte + 3 whole bytes => 29 bits
+        let input = &stream[4..];
+        assert!(
+            input.len() >= INFLATE_FAST_MIN_INPUT,
+            "the fixture must still satisfy the six-input-byte entry requirement",
+        );
+
+        let mut state = primed_fixed_state();
+        let (out, mode, msg, in_pos, bits) =
+            decode_fast_prebuffered(&mut state, prebuffer, input, 0, 1024);
+
+        assert_eq!(msg, None, "the stream must decode cleanly");
+        assert_eq!(mode, InflateMode::Type, "must stop at end-of-block");
+        assert_eq!(out, b"Q", "the literal must be emitted");
+        assert_eq!(
+            in_pos, 0,
+            "no addressable input byte was pulled, so none may be returned",
+        );
+        // 3 header + 8 literal + 7 end-of-block = 18 bits consumed out of the 29
+        // carried in, leaving 11 buffered — and none of the 29 came from `input`.
+        assert_eq!(
+            bits,
+            29 - 15,
+            "the bits still buffered must be exactly those the decode did not use",
+        );
     }
 }
