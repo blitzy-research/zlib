@@ -16,6 +16,48 @@
 //! through the [`zlib_rs::ffi`] `extern "C"` shims. Every `unsafe` block is at
 //! that FFI boundary and carries a `// SAFETY:` note (AAP §0.6.2).
 //!
+//! ## Direct `inflate_table` branch coverage (extending `cover_trees`)
+//!
+//! `infcover.c`'s `cover_trees` calls the table builder *directly*, because — as
+//! its own comment states — that is the only way to "manifest not-enough errors,
+//! since zlib insures that enough is always enough" through a byte stream. Having
+//! established the technique, C then uses it for exactly one branch.
+//! [`cover_trees`] ports that verbatim, and the `inflate_table_*` tests beside it
+//! extend the same direct-call technique to every *remaining* exit of the
+//! validation prologue at `inftrees.c` L121-L147:
+//!
+//! * over-subscription (`left < 0`, C `-1`) — [`inflate_table_rejects_over_subscribed`];
+//! * an incomplete set (`left > 0`, C `-1`) for **both** halves of C's
+//!   `(type == CODES || max != 1)` disjunction —
+//!   [`inflate_table_rejects_incomplete_set`];
+//! * the deliberate `max == 1` incomplete *acceptance* (C `0`) —
+//!   [`inflate_table_allows_incomplete_single_distance_code`];
+//! * the `max == 0` "no symbols to code at all" degenerate table (C `0` after two
+//!   invalid-code markers) —
+//!   [`inflate_table_all_zero_lengths_builds_invalid_marker`].
+//!
+//! [`enough_bounds_match_c`] pins the `ENOUGH_LENS`/`ENOUGH_DISTS`/`ENOUGH` arena
+//! bounds that the guard `cover_trees` trips compares against (`inftrees.h`
+//! L49-L51, AAP §0.6.6). Because an integration test is compiled as a separate
+//! crate, these cases additionally prove the builder, its error discriminants and
+//! its bounds are all reachable through this crate's *public* surface — the very
+//! property `infcover.c` relies on when it reaches for `inflate_table` itself.
+//!
+//! ## Mid-decode `inflateCopy` — the offset-based table references
+//!
+//! C's `inflateCopy` must re-base three interior pointers (`state->next`,
+//! `lencode`, `distcode`) that point *into* `state->codes[]`; the port stores
+//! them as integer offsets plus a table-source discriminant instead, so a deep
+//! clone is correct with no fix-up at all (AAP §0.6.3). The `inf()` driver below
+//! copies a live stream on every iteration but releases the copy immediately, so
+//! [`inflate_copy_mid_decode_resumes_identically`] closes the remaining half of
+//! that contract: it copies a stream *after* its dynamic Huffman tables have been
+//! built — observed through the public [`inflate_codes_used`], never by reading
+//! private state — then finishes the decode through the original **and** the copy
+//! and requires both to recover the input byte-for-byte. A port that copied the
+//! state the way C `memcpy`s it, without re-basing, would leave the copy's table
+//! references dangling and fail precisely here.
+//!
 //! ## Forced `Z_MEM_ERROR` (reproduced via the FFI allocator hooks)
 //!
 //! `infcover.c` forces `Z_MEM_ERROR` by installing a byte-capped allocator
@@ -77,9 +119,9 @@ use zlib_rs::inflate::back::{InFunc, OutFunc, inflate_back, inflate_back_end, in
 use zlib_rs::inflate::inflate_get_header;
 use zlib_rs::inflate::tables::{CodeType, InflateTableError};
 use zlib_rs::inflate::{
-    Code, ENOUGH_DISTS, inflate, inflate_copy, inflate_end, inflate_init, inflate_init2,
-    inflate_mark, inflate_prime, inflate_reset2, inflate_set_dictionary, inflate_sync,
-    inflate_sync_point, inflate_table, inflate_undermine,
+    Code, ENOUGH, ENOUGH_DISTS, ENOUGH_LENS, MAXBITS, inflate, inflate_codes_used, inflate_copy,
+    inflate_end, inflate_init, inflate_init2, inflate_mark, inflate_prime, inflate_reset2,
+    inflate_set_dictionary, inflate_sync, inflate_sync_point, inflate_table, inflate_undermine,
 };
 use zlib_rs::stream::{AllocBuffer, Allocator, ZeroValid};
 use zlib_rs::{ReturnCode, ZStream, ZlibError};
@@ -886,6 +928,485 @@ fn cover_fast() {
         -8,
         259,
         ReturnCode::StreamEnd,
+    );
+}
+
+// ===========================================================================
+// Extended `inflate_table` branch coverage
+//
+// `cover_trees` above is the verbatim port of infcover.c's cover_trees, which
+// reaches exactly one of `inflate_table`'s exits: the `Enough` table-arena
+// overflow. C stops there because that is the only exit a byte stream cannot
+// reach — "zlib insures that enough is always enough". The remaining exits of
+// the validation prologue (inftrees.c L121-L147) ARE reachable from a malformed
+// stream, but only through hundreds of lines of surrounding decoder, so a stream
+// fixture localises a failure poorly and never pins the boundary itself. The
+// tests below reuse C's own remedy — call the builder directly — for each one.
+//
+// Every case here is pure safe Rust: `inflate_table` is a safe public function,
+// so none of these needs (or has) an `unsafe` block.
+// ===========================================================================
+
+/// Pin the decode-table arena bounds transcribed from `inftrees.h` L49-L51.
+///
+/// `ENOUGH_LENS` and `ENOUGH_DISTS` are the exhaustive-search results that
+/// `inftrees.h` records — `enough 286 9 15` returns 852 for literal/length codes
+/// and `enough 30 6 15` returns 592 for distance codes — and `ENOUGH` is their
+/// sum. They size every decode-table arena in the decoder, and `inflate_table`
+/// compares its running `used` count against them to decide whether to return
+/// [`InflateTableError::Enough`], the exact error [`cover_trees`] forces.
+///
+/// AAP §0.6.6 records why the precise values are load-bearing: understating them
+/// lets an adversarial stream overflow the arena, while overstating them wastes
+/// memory on every stream. Preservation directive D-2 (AAP §0.8.1) therefore
+/// forbids altering them in either direction, so they are asserted here rather
+/// than assumed. `MAXBITS` is pinned alongside them because it is the DEFLATE
+/// hard limit on a code length and bounds the length-count arrays the builder
+/// indexes.
+#[test]
+fn enough_bounds_match_c() {
+    assert_eq!(ENOUGH_LENS, 852, "inftrees.h L49: `enough 286 9 15`");
+    assert_eq!(ENOUGH_DISTS, 592, "inftrees.h L50: `enough 30 6 15`");
+    assert_eq!(ENOUGH, 1444, "inftrees.h L51: ENOUGH_LENS + ENOUGH_DISTS");
+    assert_eq!(ENOUGH, ENOUGH_LENS + ENOUGH_DISTS);
+    assert_eq!(MAXBITS, 15, "the DEFLATE hard limit on a code length");
+}
+
+/// An over-subscribed set of code lengths must be rejected — `inftrees.c`
+/// L139-L143, where the Kraft accumulator goes negative and C returns `-1`.
+///
+/// Three symbols of length 1 claim three of the two available 1-bit codes, so the
+/// accumulator goes negative on its very first iteration:
+/// `left = (1 << 1) - count[1] = 2 - 3 = -1`. That check sits *before* C's
+/// `type == CODES || max != 1` disjunction, so over-subscription is rejected
+/// unconditionally — which is why all three code types are asserted here rather
+/// than one representative.
+///
+/// [`InflateTableError::Invalid`] is this port's spelling of C's `-1` return, a
+/// correspondence D-2 freezes. C returns without writing either output parameter,
+/// so the caller's arena cursor and root-bit request must both come back
+/// untouched; a port that scribbled a partial table before failing would be an
+/// observable behaviour change even though the return code matched.
+#[test]
+fn inflate_table_rejects_over_subscribed() {
+    let lens = [1u16, 1, 1];
+
+    for code_type in [CodeType::Codes, CodeType::Lens, CodeType::Dists] {
+        let mut work = [0u16; 3];
+        let mut table = [Code::default(); ENOUGH];
+        let mut table_index = 0usize;
+        let mut bits = 7usize;
+
+        assert_eq!(
+            inflate_table(
+                code_type,
+                &lens,
+                3,
+                &mut table,
+                &mut table_index,
+                &mut bits,
+                &mut work,
+            ),
+            Err(InflateTableError::Invalid),
+            "{code_type:?}: three length-1 codes over-subscribe the 1-bit space",
+        );
+        assert_eq!(table_index, 0, "{code_type:?}: no table entry is emitted");
+        assert_eq!(bits, 7, "{code_type:?}: the root-bit request is untouched");
+    }
+}
+
+/// An incomplete set of code lengths must be rejected — `inftrees.c` L146-L147,
+/// `left > 0 && (type == CODES || max != 1)` returning C's `-1`.
+///
+/// Both halves of C's disjunction are covered, because they reject for different
+/// reasons and a port could plausibly honour one and drop the other:
+///
+/// 1. **`max != 1`.** Three symbols of length 2 leave one 2-bit code unassigned.
+///    The accumulator runs `len = 1` → `left = 2`, `len = 2` → `left = 4 - 3 = 1`
+///    and thereafter only doubles, so it ends positive with `max == 2`. Rejected
+///    for every code type.
+/// 2. **`type == CODES`.** A lone length-1 code is also incomplete
+///    (`left = 2 - 1 = 1`) but has `max == 1`, so the second half of the
+///    disjunction is false and the *first* half is what rejects it: the 19-symbol
+///    code-length alphabet that encodes a dynamic block's code lengths must be
+///    complete. The identical length set is *accepted* for `Lens`/`Dists` — see
+///    [`inflate_table_allows_incomplete_single_distance_code`] — so this is the
+///    branch that distinguishes the two alphabets, and it is the whole reason C
+///    writes a disjunction instead of a single test.
+#[test]
+fn inflate_table_rejects_incomplete_set() {
+    // (1) Incomplete with max != 1 — rejected for every code type.
+    let lens = [2u16, 2, 2];
+    for code_type in [CodeType::Codes, CodeType::Lens, CodeType::Dists] {
+        let mut work = [0u16; 3];
+        let mut table = [Code::default(); ENOUGH];
+        let mut table_index = 0usize;
+        let mut bits = 7usize;
+
+        assert_eq!(
+            inflate_table(
+                code_type,
+                &lens,
+                3,
+                &mut table,
+                &mut table_index,
+                &mut bits,
+                &mut work,
+            ),
+            Err(InflateTableError::Invalid),
+            "{code_type:?}: three length-2 codes leave the 2-bit space incomplete",
+        );
+        assert_eq!(table_index, 0, "{code_type:?}: no table entry is emitted");
+        assert_eq!(bits, 7, "{code_type:?}: the root-bit request is untouched");
+    }
+
+    // (2) Incomplete with max == 1, where `type == CODES` short-circuits the
+    //     `max != 1` test: the code-length alphabet must be complete.
+    let lens = [1u16];
+    let mut work = [0u16; 1];
+    let mut table = [Code::default(); ENOUGH];
+    let mut table_index = 0usize;
+    let mut bits = 7usize;
+
+    assert_eq!(
+        inflate_table(
+            CodeType::Codes,
+            &lens,
+            1,
+            &mut table,
+            &mut table_index,
+            &mut bits,
+            &mut work,
+        ),
+        Err(InflateTableError::Invalid),
+        "a lone length-1 code is incomplete, and CODES requires completeness",
+    );
+    assert_eq!(table_index, 0, "no table entry is emitted");
+    assert_eq!(bits, 7, "the root-bit request is untouched");
+}
+
+/// A single length-1 code is incomplete yet **accepted** for the literal/length
+/// and distance alphabets — `inftrees.c` L146, with the `max != 1` half of
+/// `(type == CODES || max != 1)` evaluating false.
+///
+/// This `Ok` is deliberate and load-bearing, not a missing validation. Reference
+/// zlib accepts a dynamic block that declares exactly one distance code, and the
+/// disjunction is written the way it is precisely to let `max == 1` through for
+/// `LENS`/`DISTS` while still rejecting it for `CODES`. "Hardening" it into an
+/// error would reject streams a default-built reference zlib decodes — an
+/// acceptance-parity break, which is a behaviour change rather than an
+/// improvement.
+///
+/// Everything the builder writes on this path is pinned:
+///
+/// * `bits` comes back as `1`, because `root` is clamped down to `max`
+///   (`if (root > max) root = max`) and reported through `*bits` at
+///   `inftrees.c` L308 — the caller asked for 7;
+/// * `table_index` advances by exactly `used == 1 << root == 2`
+///   (`inftrees.c` L307);
+/// * entry 0 decodes symbol 0 of the requested alphabet — a literal for `Lens`,
+///   and `dbase[0] == 1` with `dext[0] == 16` extra bits for `Dists`;
+/// * entry 1 is the trailing invalid-code marker C fills in for the unused half
+///   of the 1-bit code space (`inftrees.c` L297-L304, `op == 64`).
+#[test]
+fn inflate_table_allows_incomplete_single_distance_code() {
+    // count[1] == 1 with count[0] == 2: one live code of length 1, so max == 1
+    // and the Kraft accumulator ends at left == 1 > 0.
+    let lens = [1u16, 0, 0];
+    let invalid_marker = Code {
+        op: 64,
+        bits: 1,
+        val: 0,
+    };
+
+    for (code_type, expected_first) in [
+        // Symbol 0 of the literal/length alphabet is literal 0, so op == 0.
+        (
+            CodeType::Lens,
+            Code {
+                op: 0,
+                bits: 1,
+                val: 0,
+            },
+        ),
+        // Symbol 0 of the distance alphabet is dbase[0] == 1 with dext[0] == 16.
+        (
+            CodeType::Dists,
+            Code {
+                op: 16,
+                bits: 1,
+                val: 1,
+            },
+        ),
+    ] {
+        let mut work = [0u16; 3];
+        let mut table = [Code::default(); ENOUGH];
+        let mut table_index = 0usize;
+        let mut bits = 7usize;
+
+        assert_eq!(
+            inflate_table(
+                code_type,
+                &lens,
+                3,
+                &mut table,
+                &mut table_index,
+                &mut bits,
+                &mut work,
+            ),
+            Ok(()),
+            "{code_type:?}: an incomplete single length-1 code is accepted",
+        );
+        assert_eq!(bits, 1, "{code_type:?}: root is clamped down to max == 1");
+        assert_eq!(table_index, 2, "{code_type:?}: used == 1 << root == 2");
+        assert_eq!(table[0], expected_first, "{code_type:?}: symbol 0 entry");
+        assert_eq!(
+            table[1], invalid_marker,
+            "{code_type:?}: trailing invalid-code marker",
+        );
+    }
+}
+
+/// All-zero code lengths build a two-entry invalid table and return `Ok` —
+/// `inftrees.c` L126-L134, the "no symbols to code at all" branch.
+///
+/// With every length zero there is no maximum length, so no code can be built at
+/// all. C does **not** report an error here: it writes two copies of the
+/// invalid-code marker (`op == 64`), sets `*bits = 1`, and returns `0` under the
+/// comment "no symbols, but wait for decoding to report error". The deferred
+/// error is the point — the marker makes the *decoder* fail on the first symbol
+/// it tries to read, which keeps the error's reporting position identical to C's.
+/// Reporting it early from the builder instead would move an observable error
+/// point, exactly the kind of change AAP §0.6.5's failure-timing parity rules
+/// out.
+///
+/// The branch precedes every type-dependent test, so all three code types are
+/// asserted. A second pass then starts from a non-zero `table_index` to pin C's
+/// `*(*table)++` semantics: the markers land at the caller's cursor rather than at
+/// the start of the arena, the cursor advances by exactly two, and nothing before
+/// it is disturbed.
+#[test]
+fn inflate_table_all_zero_lengths_builds_invalid_marker() {
+    let lens = [0u16; 4];
+    let invalid_marker = Code {
+        op: 64,
+        bits: 1,
+        val: 0,
+    };
+
+    for code_type in [CodeType::Codes, CodeType::Lens, CodeType::Dists] {
+        let mut work = [0u16; 4];
+        let mut table = [Code::default(); ENOUGH];
+        let mut table_index = 0usize;
+        let mut bits = 7usize;
+
+        assert_eq!(
+            inflate_table(
+                code_type,
+                &lens,
+                4,
+                &mut table,
+                &mut table_index,
+                &mut bits,
+                &mut work,
+            ),
+            Ok(()),
+            "{code_type:?}: no symbols defers the error to the decoder",
+        );
+        assert_eq!(
+            table[0], invalid_marker,
+            "{code_type:?}: first invalid-code marker",
+        );
+        assert_eq!(
+            table[1], invalid_marker,
+            "{code_type:?}: second invalid-code marker",
+        );
+        assert_eq!(table_index, 2, "{code_type:?}: exactly two entries written");
+        assert_eq!(
+            bits, 1,
+            "{code_type:?}: the degenerate table has 1 root bit"
+        );
+    }
+
+    // The same branch from a non-zero cursor. C writes through `*(*table)++`, an
+    // advancing caller-owned pointer, so an appended degenerate table must land
+    // at the cursor and leave every earlier entry alone.
+    const BASE: usize = 5;
+    let mut work = [0u16; 4];
+    let mut table = [Code::default(); ENOUGH];
+    let mut table_index = BASE;
+    let mut bits = 7usize;
+
+    assert_eq!(
+        inflate_table(
+            CodeType::Dists,
+            &lens,
+            4,
+            &mut table,
+            &mut table_index,
+            &mut bits,
+            &mut work,
+        ),
+        Ok(()),
+        "an appended degenerate table is built at the caller's cursor",
+    );
+    assert_eq!(
+        table_index,
+        BASE + 2,
+        "the cursor advances by two from its base",
+    );
+    assert_eq!(table[BASE], invalid_marker);
+    assert_eq!(table[BASE + 1], invalid_marker);
+    assert_eq!(bits, 1);
+    assert!(
+        table[..BASE].iter().all(|entry| *entry == Code::default()),
+        "entries before the cursor are untouched",
+    );
+}
+
+/// A stream copied mid-decode must finish identically to the original — the
+/// integration-level proof that offsets replaced C's interior table pointers.
+///
+/// C's `inflateCopy` (`inflate.c` L1328-L1367) copies the state and then re-bases
+/// `state->next`, `lencode` and `distcode`, every one of which points *into*
+/// `state->codes[]`; without that fix-up the copy's table references would still
+/// address the *original's* arena. This port stores them as integer offsets plus
+/// a table-source discriminant, so a deep clone is correct with no fix-up at all
+/// (AAP §0.6.3) — and this test is what makes that claim falsifiable instead of
+/// merely asserted.
+///
+/// The copy is taken only once the decoder is genuinely inside a dynamic block:
+/// [`inflate_codes_used`] (the port of C `inflateCodesUsed`) reports the arena
+/// cursor, so a non-zero value means dynamic Huffman tables have been built into
+/// `codes[]` and the live table references are offsets into it. That is a
+/// *public* observation — nothing here reads private state, the same discipline
+/// the module header records for the forced-`inflateBack`-mode gap.
+///
+/// The `inf()` driver already round-trips an `inflate_copy` on every iteration,
+/// but releases the copy immediately without resuming it. Resuming through both
+/// halves is the part a broken deep copy would survive there and fail here.
+#[test]
+fn inflate_copy_mid_decode_resumes_identically() {
+    // Mixed-entropy payload: repeated phrases give the match finder long
+    // distances to encode while the interleaved counter keeps the literal
+    // alphabet wide, so the encoder emits dynamic Huffman blocks with a real
+    // distance code and the decoder must build both tables into its arena.
+    let mut payload = Vec::with_capacity(64_000);
+    for i in 0..1_500u32 {
+        payload.extend_from_slice(b"the quick brown fox jumps over the lazy dog; ");
+        payload.extend_from_slice(&i.to_le_bytes());
+    }
+
+    // Compress with this crate's own encoder (zlib framing, default strategy).
+    let mut def = ZStream::new();
+    assert_eq!(
+        rc(deflate_init2(
+            &mut def,
+            6,
+            Z_DEFLATED,
+            15,
+            DEF_MEM_LEVEL,
+            Strategy::Default,
+        )),
+        ReturnCode::Ok,
+    );
+    let mut compressed = vec![0u8; payload.len() + 1024];
+    let packed = deflate(&mut def, &payload, &mut compressed, Z_FINISH);
+    assert_eq!(packed.code, ReturnCode::StreamEnd, "deflate must finish");
+    assert_eq!(packed.consumed, payload.len());
+    compressed.truncate(packed.produced);
+    assert_eq!(rc(deflate_end(&mut def)), ReturnCode::Ok);
+
+    // Decode a prefix through a deliberately small output window so the decoder
+    // stops *inside* the first dynamic block, with its tables already built.
+    let mut strm = ZStream::new();
+    assert_eq!(rc(inflate_init2(&mut strm, 15)), ReturnCode::Ok);
+
+    let mut consumed = 0usize;
+    let mut original_out = Vec::with_capacity(payload.len());
+    let mut window = [0u8; 64];
+    while original_out.len() < 4_096 {
+        let outcome = inflate(&mut strm, &compressed[consumed..], &mut window, Z_NO_FLUSH);
+        assert_eq!(
+            outcome.code,
+            ReturnCode::Ok,
+            "the prefix decode must stay continuable",
+        );
+        assert!(outcome.produced > 0, "the prefix decode must make progress");
+        consumed += outcome.consumed;
+        original_out.extend_from_slice(&window[..outcome.produced]);
+    }
+
+    // Dynamic tables are live: the arena cursor has advanced, so `lencode` and
+    // `distcode` are offsets into this state's own `codes[]` rather than the
+    // module-static fixed tables.
+    let used_at_copy = inflate_codes_used(&strm).expect("a live stream reports codes used");
+    assert!(
+        used_at_copy > 0,
+        "the decoder must be inside a dynamic block at the copy point",
+    );
+
+    // A match copy is in flight at this point, so the snapshot also carries
+    // partially-emitted length/distance state rather than sitting on a clean
+    // symbol boundary. `inflate_mark` reports it (`back` in the high bits,
+    // `was - length` in the low 16), and it must survive the clone unchanged.
+    let mark_at_copy = inflate_mark(&strm);
+    assert_ne!(
+        mark_at_copy, 0,
+        "the copy point must carry in-flight decode state, not a clean boundary",
+    );
+
+    // Snapshot the decoder. C would have to re-base three interior pointers here.
+    let mut copy = ZStream::new();
+    assert_eq!(rc(inflate_copy(&mut copy, &strm)), ReturnCode::Ok);
+    assert_eq!(
+        inflate_codes_used(&copy),
+        Some(used_at_copy),
+        "the copy inherits the source's arena cursor",
+    );
+    assert_eq!(
+        inflate_mark(&copy),
+        mark_at_copy,
+        "the copy inherits the in-flight match state",
+    );
+    // C finishes `inflateCopy` with `zmemcpy(dest, source, sizeof(z_stream))`,
+    // which carries the observable stream bookkeeping across as well.
+    assert_eq!(copy.total_in, strm.total_in, "the copy inherits total_in");
+    assert_eq!(
+        copy.total_out, strm.total_out,
+        "the copy inherits total_out"
+    );
+    assert_eq!(
+        copy.adler, strm.adler,
+        "the copy inherits the running Adler-32"
+    );
+    assert_eq!(
+        copy.data_type, strm.data_type,
+        "the copy inherits the data-type bits",
+    );
+
+    // Finish the decode independently through both halves, from the same point in
+    // the input, and require byte-identical recovery of the whole payload.
+    let mut copy_out = original_out.clone();
+    let remaining = &compressed[consumed..];
+    for (stream, sink, which) in [
+        (&mut strm, &mut original_out, "original"),
+        (&mut copy, &mut copy_out, "copy"),
+    ] {
+        let mut tail = vec![0u8; payload.len()];
+        let outcome = inflate(stream, remaining, &mut tail, Z_FINISH);
+        assert_eq!(
+            outcome.code,
+            ReturnCode::StreamEnd,
+            "{which}: the resumed decode must reach the end of the stream",
+        );
+        sink.extend_from_slice(&tail[..outcome.produced]);
+        assert_eq!(&**sink, &payload[..], "{which}: lossless recovery");
+        assert_eq!(rc(inflate_end(stream)), ReturnCode::Ok, "{which}: end");
+    }
+    assert_eq!(
+        original_out, copy_out,
+        "the copy must decode byte-identically to the original",
     );
 }
 
