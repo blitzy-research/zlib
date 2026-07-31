@@ -36,7 +36,7 @@
 //! # Byte-exact parity
 //!
 //! Decompressed output is byte-identical to reference zlib for the same input
-//! (AAP §0.6.4 / §0.7.1); the subtle return-code mapping of `uncompr.c`
+//! (AAP §0.6.4 / §0.8.1 directive D-1); the subtle return-code mapping of `uncompr.c`
 //! (L78-L81) — folding `Z_NEED_DICT` and "all input consumed but stream not
 //! finished" into `Z_DATA_ERROR` — is reproduced exactly in [`uncompress2`].
 
