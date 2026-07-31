@@ -132,6 +132,48 @@ pub fn compressBound(source_len: usize) -> usize {
 /// (`ReturnCode::MemError` is possible in principle if the engine cannot
 /// allocate its working buffers, mirroring C `Z_MEM_ERROR`.)
 pub fn compress2(dest: &mut [u8], source: &[u8], level: i32) -> Result<usize, ReturnCode> {
+    // The produced-byte count is already carried by the `Ok` arm, so the
+    // out-parameter is discarded here. The C-ABI shims call `compress2_tracked`
+    // directly instead, because C publishes the produced length on its error
+    // paths too (`compress.c` L63).
+    let mut produced = 0usize;
+    compress2_tracked(dest, source, level, &mut produced)
+}
+
+/// Compresses `source` into `dest` at `level`, reporting the produced byte count
+/// through `produced` on **every** path that reaches the deflate loop.
+///
+/// This is the tracked core of [`compress2`] — identical logic, plus an
+/// out-parameter that mirrors C `compress2_z`'s *unconditional*
+/// `*destLen = (z_size_t)(stream.next_out - dest);` (`compress.c` L63). C runs
+/// that assignment after the loop and before `deflateEnd`, so it reports a
+/// partial length on the `Z_BUF_ERROR` path just as it does on success. The
+/// C-ABI shims in `src/ffi/util.rs` need that count to reproduce the behavior
+/// exactly; [`compress2`] keeps its `Result<usize, ReturnCode>` shape and simply
+/// discards the out-parameter, since its `Ok` arm already carries the length.
+///
+/// `produced` is a pure out-parameter: it is seeded to `0` before initialization,
+/// matching C's `*destLen = 0;` (`compress.c` L36), so a failing `deflate_init`
+/// leaves it at zero exactly as C leaves `*destLen` at zero when `deflateInit`
+/// fails (`compress.c` L42-L43). Its final value always equals the `Ok` payload
+/// on the success path.
+///
+/// # Errors
+///
+/// Identical to [`compress2`]: [`ReturnCode::StreamError`] for an invalid
+/// `level`, [`ReturnCode::BufError`] when `dest` is too small, and
+/// [`ReturnCode::MemError`] if the engine cannot allocate its working buffers.
+pub(crate) fn compress2_tracked(
+    dest: &mut [u8],
+    source: &[u8],
+    level: i32,
+    produced: &mut usize,
+) -> Result<usize, ReturnCode> {
+    // C `compress2_z` zeroes the reported length before initializing the engine
+    // (`compress.c` L36: `*destLen = 0;`), so a failed `deflateInit` returns with
+    // a reported length of zero. Seed it identically.
+    *produced = 0;
+
     // Create a fresh stream and initialize the deflate engine at `level`. An
     // invalid `level` is rejected here (C `deflateInit` → `Z_STREAM_ERROR`); the
     // idiomatic `ZlibError` is remapped to its integer-equivalent `ReturnCode`.
@@ -200,6 +242,13 @@ pub fn compress2(dest: &mut [u8], source: &[u8], level: i32) -> Result<usize, Re
             break outcome.code;
         }
     };
+
+    // C publishes the produced byte count here — after the loop, before
+    // `deflateEnd`, and on every path (`compress.c` L63:
+    // `*destLen = (z_size_t)(stream.next_out - dest);`). Assigning outside the
+    // success test below is what makes a `Z_BUF_ERROR` report the bytes that did
+    // fit, exactly as the reference library does.
+    *produced = out_pos;
 
     // Release the engine. RAII (`Drop` on `strm`) would already free the state,
     // but calling `deflate_end` mirrors C `deflateEnd` and is safe: it clears the
@@ -386,6 +435,43 @@ mod tests {
         assert_eq!(compress2(&mut buf, data, 42), Err(ReturnCode::StreamError));
         // Below the range and not the Z_DEFAULT_COMPRESSION (-1) sentinel.
         assert_eq!(compress2(&mut buf, data, -2), Err(ReturnCode::StreamError));
+    }
+
+    // ---------------------------------------------------------------------
+    // compress2_tracked — the produced-count out-parameter
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn compress2_tracked_reports_the_count_on_every_post_init_path() {
+        let data = vec![b'Q'; 4096];
+
+        // Success: the out-parameter agrees with the `Ok` payload.
+        let mut roomy = vec![0u8; compress_bound(data.len())];
+        let mut produced = usize::MAX;
+        let n = compress2_tracked(&mut roomy, &data, 6, &mut produced).expect("ok");
+        assert_eq!(produced, n, "the out-parameter matches the returned length");
+
+        // Buffer error: C writes `next_out - dest` at `compress.c` L63 on this
+        // path too, so the bytes that fit are reported — and they are a
+        // byte-exact prefix of the complete stream.
+        let mut short = [0u8; 12];
+        let mut produced = usize::MAX;
+        assert_eq!(
+            compress2_tracked(&mut short, &data, 6, &mut produced),
+            Err(ReturnCode::BufError)
+        );
+        assert_eq!(produced, short.len(), "the partial count is reported");
+        assert_eq!(&short[..], &roomy[..short.len()]);
+
+        // Invalid level: C zeroes the count at `compress.c` L36 before the
+        // failing `deflateInit` (L42-L43), so zero is reported.
+        let mut buf = [0u8; 64];
+        let mut produced = usize::MAX;
+        assert_eq!(
+            compress2_tracked(&mut buf, &data, 42, &mut produced),
+            Err(ReturnCode::StreamError)
+        );
+        assert_eq!(produced, 0, "a failed initializer reports zero bytes");
     }
 
     // ---------------------------------------------------------------------

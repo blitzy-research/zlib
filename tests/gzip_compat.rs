@@ -37,8 +37,9 @@
 //!    releases resources without finalizing gzip output, so a *writer* that is
 //!    dropped instead of closed leaves an unfinished member, while the identical
 //!    payload closed with `gzclose_w` round-trips byte-for-byte. That asymmetry
-//!    is intended, not a defect (AAP §0.8.2 Divergence 5, §0.6.3), and item 6
-//!    pins it from both sides.
+//!    is intended, not a defect — it is the fifth, narrower deliberate choice
+//!    described in AAP §0.8.2, with the reasoning in §0.6.3 — and item 6 pins it
+//!    from both sides.
 //!
 //! Together with `tests/regression.rs`, `tests/round_trip.rs`, and
 //! `tests/inflate_coverage.rs`, this driver operationalizes the requirement that
@@ -1369,7 +1370,8 @@ fn gzrewind_gzseek_and_gztell_cursor_arithmetic() {
 }
 
 // ===========================================================================
-// Phase 9 — the mandatory-`gzclose` contract (AAP §0.8.2 Divergence 5).
+// Phase 9 — the mandatory-`gzclose` contract (the fifth, narrower deliberate
+// choice described in AAP §0.8.2).
 // ===========================================================================
 
 /// Drives one bare-drop scenario and asserts every property of the unfinished
@@ -1561,8 +1563,9 @@ fn assert_bare_drop_leaves_member_unfinished(
 /// `Z_FINISH` flush and no gzip trailer. The reason is that a destructor cannot
 /// surface a deferred compression or I/O error, so `gzclose`/`gzclose_w` remain
 /// mandatory to finalize output *and* to report any pending write failure. This
-/// is a documented, deliberate divergence from idiomatic Rust cleanup — AAP
-/// §0.8.2 Divergence 5 and §0.6.3, the latter noting that the alternative,
+/// is a documented, deliberate divergence from idiomatic Rust cleanup: AAP §0.8.2
+/// records it as "a fifth, narrower deliberate choice" alongside its four
+/// numbered divergences, and §0.6.3 supplies the reasoning — the alternative,
 /// silently discarding a write failure during unwinding, would be strictly worse
 /// than matching C's explicit-close contract. §0.8.2 adds that it "must not be
 /// 'improved' into an auto-finishing destructor".

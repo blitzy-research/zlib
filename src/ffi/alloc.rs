@@ -223,7 +223,7 @@ impl<T: Copy + Default + ZeroValid> Drop for CForeignBuffer<T> {
 /// its own buffer afterwards, and is entitled to place that buffer wherever it
 /// likes (a static array, a stack frame, a memory-mapped region). Allocating a
 /// replacement window would break all three of those properties at once, which
-/// is what F2 reports.
+/// is why this path must never allocate one.
 ///
 /// This type closes the gap: it presents the caller's region through the same
 /// safe [`ForeignBuffer`] interface [`crate::stream::AllocBuffer::Foreign`]
@@ -649,6 +649,111 @@ pub(crate) fn try_box<T>(value: T) -> Option<Box<T>> {
 }
 
 // ===========================================================================
+// Built-in allocator hooks — the crate's `zcalloc` / `zcfree` counterparts
+// ===========================================================================
+//
+// C's three `*Init*_` prologues complete a partially-supplied allocator pair by
+// substituting the library's own built-ins for whichever half the caller left
+// null: `zcalloc` for a null `zalloc` (also clearing `opaque`) and `zcfree` for
+// a null `zfree` (`deflate.c` L400-L414, `inflate.c` L183-L196,
+// `infback.c` L37-L50). Reproducing that behavior faithfully requires the crate
+// to own an equivalent pair, which is what the two functions below are.
+//
+// `zcalloc`/`zcfree` are `local:` entries in `zlib.map` — present in the library
+// but never exported. The counterparts here mirror that exactly: they are plain
+// crate-private Rust items with **no** `#[unsafe(no_mangle)]`, so they add
+// nothing to the emitted symbol table and cannot be reached from outside the
+// crate. Only their *addresses* ever leave, installed into a caller's
+// `z_stream.zalloc`/`zfree` by `crate::ffi::types::init_allocator_prologue`.
+//
+// They are deliberately implemented over the platform `malloc`/`free` rather
+// than the Rust global allocator, because that is precisely what C's built-ins
+// are (`zutil.c` L299-L307: `malloc(items * size)` and `free(ptr)`). A caller who
+// supplies only one half of the pair therefore ends up with the *same* mixed
+// pairing C would give them — their `zfree` releasing a `malloc`'d region, or
+// their `zalloc`'d region released by `free` — instead of a pairing that would
+// hand a region to an allocator that never owned it. The Rust global allocator
+// cannot serve here: `zfree` receives only an address, with no `Layout`, and
+// `dealloc` requires the original layout.
+//
+// Declaring `malloc`/`free` introduces no new link dependency in any
+// configuration this crate builds: a hosted build links `std`, which links the
+// platform `libc` already, and the only build that does not — the freestanding
+// `no_std` `cdylib`/`staticlib` — already requires the same symbols for the
+// private `libc`-backed global allocator in `src/lib.rs`'s `no_std_support`
+// module. AAP §0.5.2 sanctions exactly this: the platform `libc` already linked
+// by any hosted artifact introduces no *additional* C dependency and keeps the
+// shipped Rust dependency graph pure.
+
+// The C runtime allocation primitives C's own `zcalloc`/`zcfree` are built on.
+unsafe extern "C" {
+    /// Platform `void *malloc(size_t size)`.
+    fn malloc(size: usize) -> *mut c_void;
+    /// Platform `void free(void *ptr)`.
+    fn free(ptr: *mut c_void);
+}
+
+/// The crate's counterpart of C `zcalloc` (`zutil.c` L299-L302).
+///
+/// Substituted for a caller's null `z_stream.zalloc` by
+/// [`crate::ffi::types::init_allocator_prologue`], reproducing C's per-half
+/// default. Like C's built-in it returns *uninitialized* storage — the zero fill
+/// C performs is done by the consumer (`inflate.c` L199 `zmemzero`, and
+/// [`try_alloc_foreign_items`] here), not by the hook.
+///
+/// The one deliberate refinement over C: C evaluates `items * size` in
+/// `unsigned` arithmetic, which silently wraps on overflow and can hand back a
+/// region far smaller than requested. This computes the product in `usize` and
+/// reports an overflowing request as an allocation failure (a null return),
+/// which every caller already maps to `Z_MEM_ERROR`. The refinement is
+/// unobservable through the C ABI in practice, because
+/// [`try_alloc_foreign_items`] rejects a request whose `items * size` exceeds
+/// `uInt` before the hook is ever consulted.
+///
+/// # Safety
+///
+/// This is an `unsafe extern "C" fn` because it must be assignable to the C
+/// `alloc_func` pointer type. It imposes no obligation on its caller beyond the
+/// ordinary zlib `zalloc` contract: `opaque` is ignored entirely, and the
+/// returned region (when non-null) is at least `items * size` writable bytes
+/// that must be released through [`default_zfree`] exactly once.
+pub(crate) unsafe extern "C" fn default_zalloc(
+    _opaque: *mut c_void,
+    items: c_uint,
+    size: c_uint,
+) -> *mut c_void {
+    let Some(bytes) = (items as usize).checked_mul(size as usize) else {
+        // An unrepresentable request is an allocation failure, never a wrapped
+        // (and therefore undersized) one.
+        return core::ptr::null_mut();
+    };
+    // SAFETY: `malloc` accepts any `size_t` and answers with either null (out of
+    // memory) or a pointer to `bytes` writable, suitably aligned bytes. No
+    // pointer supplied by the caller is dereferenced — `opaque` is ignored.
+    unsafe { malloc(bytes) }
+}
+
+/// The crate's counterpart of C `zcfree` (`zutil.c` L304-L307).
+///
+/// Substituted for a caller's null `z_stream.zfree` by
+/// [`crate::ffi::types::init_allocator_prologue`]. As in C, `opaque` is ignored
+/// and a null address is a no-op (`free(NULL)` is defined to do nothing).
+///
+/// # Safety
+///
+/// This is an `unsafe extern "C" fn` because it must be assignable to the C
+/// `free_func` pointer type. `address` must be null or a pointer previously
+/// returned by [`default_zalloc`] (equivalently, by the platform `malloc`) and
+/// not yet released — the same obligation `zlib.h` L86 already places on any
+/// `free_func`.
+pub(crate) unsafe extern "C" fn default_zfree(_opaque: *mut c_void, address: *mut c_void) {
+    // SAFETY: per this function's `# Safety` contract `address` is null or a live
+    // region obtained from `default_zalloc`, i.e. from `malloc`, so `free` is the
+    // matching deallocator. `free(NULL)` is a defined no-op.
+    unsafe { free(address) };
+}
+
+// ===========================================================================
 // Core-declared allocation capabilities, implemented at the boundary
 // ===========================================================================
 //
@@ -687,7 +792,7 @@ impl<T: Copy + Default + ZeroValid + 'static> ForeignAlloc for T {
     }
 }
 
-// Shared counted-hook test support (F5 / F1 / F6 remediation)
+// Shared counted-hook test support
 //
 // A C `alloc_func`/`free_func` pair is a bare `extern "C"` function pointer and
 // therefore cannot capture state; the only channel is the `opaque` cookie. This
@@ -841,6 +946,116 @@ pub(crate) mod test_hook {
                 core::ptr::from_ref(self).cast::<c_void>().cast_mut(),
             )
         }
+    }
+
+    std::thread_local! {
+        /// `(zalloc, zfree)` call counts for [`BuiltinHookStats`], as
+        /// `(successful allocations, non-null frees)`.
+        ///
+        /// Thread-local rather than a process-wide `static` for two reasons. The
+        /// hooks must work with a **null** `opaque` (see [`BuiltinHookStats`]), so
+        /// there is no cookie to address per-instance state through; and the test
+        /// harness runs each `#[test]` on its own thread, so a thread-local keeps
+        /// concurrently running tests from observing one another's calls.
+        static BUILTIN_HOOK_CALLS: core::cell::Cell<(usize, usize)> =
+            const { core::cell::Cell::new((0, 0)) };
+    }
+
+    /// Counting hooks that are layout-compatible with the crate's **built-in**
+    /// allocator, for the tests that exercise C's *per-half* substitution.
+    ///
+    /// [`init_allocator_prologue`](crate::ffi::types::init_allocator_prologue)
+    /// completes a partially-supplied pair by installing
+    /// [`default_zalloc`](super::default_zalloc) or
+    /// [`default_zfree`](super::default_zfree) for the missing half, so the
+    /// resulting pair is *mixed*: one caller half and one built-in half. A test
+    /// hook for that scenario cannot use [`HookStats`], whose regions come from
+    /// the Rust global allocator and carry a private header — handing one of those
+    /// to `free`, or a `malloc`'d region to `counted_zfree`, would be undefined
+    /// behavior. The two hooks here delegate to the built-ins instead, so either
+    /// half composes correctly with the other half's substituted built-in.
+    ///
+    /// # `opaque` is ignored, exactly as C's built-ins ignore it
+    ///
+    /// C clears `strm->opaque` whenever it substitutes `zcalloc` for a missing
+    /// `zalloc` (`deflate.c` L405-L406), because the cookie belonged to the
+    /// allocator being replaced. A caller who supplied only `zfree` therefore has
+    /// **their** hook invoked with `opaque == NULL` for the rest of the stream's
+    /// life. These hooks reproduce the only design that survives that: they never
+    /// read `opaque` at all, and count through the thread-local
+    /// [`BUILTIN_HOOK_CALLS`] instead.
+    ///
+    /// Only call counts are tracked: `free` reveals no size, so there is no
+    /// `live_bytes` equivalent (balance is asserted through `allocs`/`frees`).
+    #[derive(Debug)]
+    pub(crate) struct BuiltinHookStats;
+
+    impl BuiltinHookStats {
+        /// Zeroes this thread's counters and returns the handle to read them.
+        pub(crate) fn new() -> Self {
+            BUILTIN_HOOK_CALLS.with(|c| c.set((0, 0)));
+            Self
+        }
+
+        /// Successful `zalloc` calls made on this thread since [`Self::new`].
+        pub(crate) fn allocs(&self) -> usize {
+            BUILTIN_HOOK_CALLS.with(|c| c.get().0)
+        }
+
+        /// `zfree` calls with a non-null address made on this thread since
+        /// [`Self::new`].
+        pub(crate) fn frees(&self) -> usize {
+            BUILTIN_HOOK_CALLS.with(|c| c.get().1)
+        }
+
+        /// The `alloc_func` to install into a `z_stream.zalloc`.
+        pub(crate) fn zalloc_fn(
+            &self,
+        ) -> extern "C" fn(*mut c_void, c_uint, c_uint) -> *mut c_void {
+            builtin_backed_zalloc
+        }
+
+        /// The `free_func` to install into a `z_stream.zfree`.
+        pub(crate) fn zfree_fn(&self) -> extern "C" fn(*mut c_void, *mut c_void) {
+            builtin_backed_zfree
+        }
+    }
+
+    /// Counts, then forwards to the crate's built-in `zalloc`. `opaque` is
+    /// forwarded unread.
+    extern "C" fn builtin_backed_zalloc(
+        opaque: *mut c_void,
+        items: c_uint,
+        size: c_uint,
+    ) -> *mut c_void {
+        // SAFETY: `default_zalloc` ignores `opaque` entirely and imposes no other
+        // obligation; it answers with null or a region of `items * size` bytes.
+        let raw = unsafe { super::default_zalloc(opaque, items, size) };
+        if !raw.is_null() {
+            BUILTIN_HOOK_CALLS.with(|c| {
+                let (a, f) = c.get();
+                c.set((a + 1, f));
+            });
+        }
+        raw
+    }
+
+    /// Counts, then forwards to the crate's built-in `zfree`. `opaque` is
+    /// forwarded unread.
+    extern "C" fn builtin_backed_zfree(opaque: *mut c_void, address: *mut c_void) {
+        if address.is_null() {
+            return;
+        }
+        BUILTIN_HOOK_CALLS.with(|c| {
+            let (a, f) = c.get();
+            c.set((a, f + 1));
+        });
+        // SAFETY: every non-null `address` reaching this hook was produced either
+        // by `builtin_backed_zalloc` or by the `default_zalloc` the prologue
+        // substituted — in both cases by `malloc` — so `default_zfree` is its
+        // matching deallocator, and each region is released exactly once by the
+        // single owner that holds it.
+        unsafe { super::default_zfree(opaque, address) };
     }
 
     /// Recovers the counting state from the C `opaque` cookie.
@@ -1058,7 +1273,7 @@ mod tests {
         for hook in [stats.zalloc_only_hook(), stats.zfree_only_hook()] {
             assert!(!hook.is_active());
             let buf: AllocBuffer<u16> =
-                AllocBuffer::try_zeroed(8, hook).expect("global path is infallible");
+                AllocBuffer::try_zeroed(8, hook).expect("a small global reservation succeeds");
             assert_eq!(&buf[..], &[0u16; 8][..]);
             drop(buf);
         }
@@ -1071,8 +1286,8 @@ mod tests {
     /// The "no hook at all" path is the historical global-allocator behaviour.
     #[test]
     fn inactive_none_hook_uses_owned_storage() {
-        let buf: AllocBuffer<u8> =
-            AllocBuffer::try_zeroed(32, AllocHook::none()).expect("global path is infallible");
+        let buf: AllocBuffer<u8> = AllocBuffer::try_zeroed(32, AllocHook::none())
+            .expect("a small global reservation succeeds");
         assert!(!buf.is_foreign());
         assert_eq!(&buf[..], &[0u8; 32][..]);
     }
@@ -1277,14 +1492,20 @@ mod tests {
         assert_eq!(stats.live_bytes(), 0);
     }
 
-    /// An owned (global-allocator) buffer clones infallibly and independently,
-    /// so the fallible signature costs the default path nothing.
+    /// An owned (global-allocator) buffer clones into a fully **independent**
+    /// region, so mutating the copy leaves the original untouched.
+    ///
+    /// The clone is still *fallible*: the owned arm goes through
+    /// [`Vec::try_reserve_exact`], so global-heap exhaustion is reported as
+    /// [`None`] rather than aborting, and the C copy entry points turn that into
+    /// `Z_MEM_ERROR` (AAP §0.6.5). This four-byte reservation cannot realistically
+    /// fail, which is why the test unwraps it.
     #[test]
     fn owned_try_clone_is_independent() {
         let mut original: AllocBuffer<u8> =
-            AllocBuffer::try_zeroed(4, AllocHook::none()).expect("global path");
+            AllocBuffer::try_zeroed(4, AllocHook::none()).expect("a 4-byte reservation succeeds");
         original[0] = 1;
-        let mut copy = original.try_clone().expect("owned clone is infallible");
+        let mut copy = original.try_clone().expect("a 4-byte owned clone succeeds");
         assert!(!copy.is_foreign());
         copy[0] = 2;
         assert_eq!(original[0], 1);
@@ -1294,7 +1515,10 @@ mod tests {
 
 #[cfg(test)]
 mod foreign_alloc_tests {
-    use super::{AllocHook, ForeignBuffer, fill_default, hook_request, try_alloc_foreign};
+    use super::{
+        AllocHook, ForeignBuffer, default_zalloc, default_zfree, fill_default, hook_request,
+        try_alloc_foreign,
+    };
     use crate::stream::AllocBuffer;
     use alloc::boxed::Box;
     use alloc::vec::Vec;
@@ -1720,5 +1944,103 @@ mod foreign_alloc_tests {
             0,
             "an unrepresentable size must be rejected before the hook"
         );
+    }
+
+    /// [`default_zalloc`] / [`default_zfree`] — the crate's `zcalloc`/`zcfree`
+    /// counterparts that [`crate::ffi::types::init_allocator_prologue`]
+    /// substitutes for a caller's missing allocator half.
+    ///
+    /// The round trip pins the three properties every consumer relies on: the
+    /// returned region really is `items * size` writable bytes, `opaque` is
+    /// ignored (C's `zcalloc` never reads it, `zutil.c` L299-L302), and the
+    /// matching `default_zfree` releases it.
+    #[test]
+    fn builtin_hooks_round_trip_a_region() {
+        const ITEMS: c_uint = 64;
+        const SIZE: c_uint = 4;
+
+        // A deliberately non-null `opaque`: neither built-in may dereference it.
+        let cookie = core::ptr::without_provenance_mut::<c_void>(0xDEAD_BEEF);
+
+        // SAFETY: `default_zalloc` ignores `opaque` and imposes no obligation on
+        // its arguments beyond the ordinary zlib `zalloc` contract.
+        let raw = unsafe { default_zalloc(cookie, ITEMS, SIZE) };
+        assert!(!raw.is_null(), "malloc must serve a 256-byte request");
+
+        let bytes = (ITEMS as usize) * (SIZE as usize);
+        // SAFETY: `raw` is non-null and, per the `zalloc` contract, addresses at
+        // least `bytes` writable bytes that nothing else aliases. `u8` needs no
+        // alignment beyond 1, which `malloc` always satisfies.
+        let region = unsafe { core::slice::from_raw_parts_mut(raw.cast::<u8>(), bytes) };
+        region.fill(0xA5);
+        assert!(region.iter().all(|&b| b == 0xA5), "the region is writable");
+
+        // SAFETY: `raw` came from `default_zalloc` (i.e. `malloc`) and has not
+        // been released; this is its single, matching deallocation.
+        unsafe { default_zfree(cookie, raw) };
+    }
+
+    /// A request whose `items * size` product cannot be represented is reported
+    /// as an allocation failure (null), never as a wrapped — and therefore
+    /// undersized — region. This is the one deliberate refinement over C's
+    /// `unsigned` multiplication in `zcalloc`.
+    ///
+    /// `default_zfree(_, NULL)` is a no-op, exactly as C's `zcfree` is over
+    /// `free(NULL)`.
+    #[test]
+    fn builtin_zalloc_reports_an_overflowing_product_as_failure() {
+        // `0xFFFF_FFFF * 0xFFFF_FFFF` overflows `u32` (C would wrap to 1) and, on
+        // a 64-bit host, is a `usize` product `malloc` can never serve; the
+        // `checked_mul` guard is what makes the 32-bit host answer identically.
+        // SAFETY: as in `builtin_hooks_round_trip_a_region`.
+        let raw = unsafe { default_zalloc(core::ptr::null_mut(), c_uint::MAX, c_uint::MAX) };
+        assert!(
+            raw.is_null(),
+            "an unrepresentable request must fail, not wrap to a tiny region"
+        );
+
+        // SAFETY: a null address is explicitly permitted and is a no-op.
+        unsafe { default_zfree(core::ptr::null_mut(), core::ptr::null_mut()) };
+    }
+
+    /// The built-in-backed counting hooks used by the substituted-half tests in
+    /// `crate::ffi::deflate` and `crate::ffi::inflate` must themselves be
+    /// balanced and interchangeable with the built-ins: a region from
+    /// `BuiltinHookStats::zalloc_fn` is releasable by [`default_zfree`], and a
+    /// region from [`default_zalloc`] is releasable by
+    /// `BuiltinHookStats::zfree_fn`. That cross-compatibility is exactly what
+    /// makes C's per-half substitution sound.
+    ///
+    /// A **null** `opaque` is used throughout, because that is what C's prologue
+    /// leaves behind whenever it substitutes `zcalloc`, and therefore what a
+    /// caller's surviving `zfree` is actually invoked with.
+    #[test]
+    fn builtin_backed_counting_hooks_compose_with_the_built_ins() {
+        use super::test_hook::BuiltinHookStats;
+
+        let stats = BuiltinHookStats::new();
+        let (zalloc, zfree) = (stats.zalloc_fn(), stats.zfree_fn());
+        let no_cookie = core::ptr::null_mut::<c_void>();
+
+        // Counting `zalloc` -> built-in `zfree` (the "caller supplied only
+        // `zalloc`" pairing).
+        let a = zalloc(no_cookie, 32, 2);
+        assert!(!a.is_null());
+        assert_eq!(stats.allocs(), 1);
+        // SAFETY: `a` came from the counting hook, which forwards to
+        // `default_zalloc`/`malloc`; this is its single deallocation.
+        unsafe { default_zfree(no_cookie, a) };
+
+        // Built-in `zalloc` -> counting `zfree` (the "caller supplied only
+        // `zfree`" pairing).
+        // SAFETY: `opaque` is ignored by `default_zalloc`.
+        let b = unsafe { default_zalloc(no_cookie, 32, 2) };
+        assert!(!b.is_null());
+        zfree(no_cookie, b);
+        assert_eq!(stats.frees(), 1);
+
+        // A null address is a no-op and is not counted.
+        zfree(no_cookie, core::ptr::null_mut());
+        assert_eq!(stats.frees(), 1, "a null free must not be counted");
     }
 }

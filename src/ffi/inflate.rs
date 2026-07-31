@@ -23,12 +23,31 @@
 //!
 //! # State-handle model
 //!
-//! * Regular inflate path: the boxed `InflateHandle` (an idiomatic
-//!   [`ZStream`] plus a raw pointer to the caller's registered `gz_header`) is
-//!   stored in `z_stream.state`; [`inflateEnd`] reclaims and drops it (RAII
-//!   replaces the manual `inflateEnd` free).
-//! * `inflateBack` path: a `Box<InflateState>` is stored directly, matching the
-//!   [`crate::inflate::back`] engine which allocates and owns the decode window.
+//! Both paths store a **type-tagged** handle in `z_stream.state`: a
+//! `#[repr(C)]` struct whose first field is a [`HandleKind`] discriminant at
+//! offset 0. Each accessor reads that tag through the shared header prefix and
+//! confirms it before reinterpreting the opaque pointer, so a stream initialized
+//! by one engine can never be reconstituted — or dropped — as another engine's
+//! box.
+//!
+//! * Regular inflate path: `inflateInit_`/`inflateInit2_` install a
+//!   `Box<InflateHandle>` tagged `HandleKind::INFLATE`, holding an idiomatic
+//!   [`ZStream`] plus the raw pointer to the caller's registered `gz_header`.
+//!   `inflate_handle` reborrows it and `inflate_take` reclaims it, each
+//!   validating the tag first; [`inflateEnd`] drops the reclaimed box, so RAII
+//!   replaces the manual `inflateEnd` free.
+//! * `inflateBack` path: [`inflateBackInit_`] installs a
+//!   `Box<InflateBackHandle>` tagged `HandleKind::INFLATE_BACK`, whose `inner`
+//!   field owns the `Box<InflateState>` that the
+//!   [`crate::inflate::back`] engine drives (its owned window doubles as the
+//!   output buffer). `inflate_back_handle` reborrows it and `inflate_back_take`
+//!   reclaims it, again tag-first.
+//!
+//! Ownership is exactly-once in both directions: installation transfers the box
+//! into `state`, and the `take` helpers null `state` as they reclaim it, so a
+//! second `End` call finds nothing to free. A tag mismatch leaves `state`
+//! untouched and yields `Z_STREAM_ERROR` rather than performing a
+//! layout-mismatched deallocation.
 //!
 //! # `inflateBack` callback bridge
 //!
@@ -54,9 +73,9 @@ use crate::error::ReturnCode;
 use crate::ffi::alloc::try_box;
 use crate::ffi::types::{
     Bytef, CAllocator, HandleKind, advance_input, advance_output, guard_int, guard_ulong,
-    gz_headerp, in_func, input_ptr_valid, input_slice, out_func, output_slice, peek_handle_kind,
-    set_adler, set_data_type, set_msg, state_ptr_from_box, stream_buffers_valid, uInt, z_stream,
-    z_streamp, zstream_with_caller_alloc,
+    gz_headerp, in_func, init_allocator_prologue, input_ptr_valid, input_slice, out_func,
+    output_slice, peek_handle_kind, set_adler, set_data_type, set_msg, state_ptr_from_box,
+    stream_buffers_valid, uInt, z_stream, z_streamp,
 };
 use crate::inflate::back::{InFunc, OutFunc};
 use crate::inflate::state::InflateState;
@@ -259,7 +278,7 @@ fn msg_to_cstr(msg: Option<&str>) -> *const c_char {
 /// The leading [`HandleKind`] tag ([`HandleKind::INFLATE`]) lets the `End`/
 /// accessor shims verify the handle *kind* before reinterpreting the opaque
 /// `state` pointer, preventing the layout-mismatched deallocation that a blind
-/// `Box::from_raw` cast would cause on cross-type misuse (FINDING-6). `#[repr(C)]`
+/// `Box::from_raw` cast would cause on cross-type misuse. `#[repr(C)]`
 /// guarantees `kind` sits at offset 0, matching [`DeflateHandle`].
 #[repr(C)]
 struct InflateHandle {
@@ -313,7 +332,7 @@ unsafe fn inflate_handle(strm: &mut z_stream) -> Option<&mut InflateHandle> {
 /// Reclaims the boxed [`InflateHandle`] from `state`, validating the
 /// [`HandleKind`] tag first and nulling `state` on success. Returns [`None`] —
 /// leaving `state` untouched — when the handle is absent or not an inflate
-/// handle, so [`inflateEnd`] never drops a wrong-type box (FINDING-6).
+/// handle, so [`inflateEnd`] never drops a wrong-type box.
 ///
 /// # Safety
 ///
@@ -342,7 +361,7 @@ unsafe fn inflate_take(strm: &mut z_stream) -> Option<Box<InflateHandle>> {
 /// this handle owns the `Box<InflateState>` outright rather than an idiomatic
 /// [`ZStream`]. The leading [`HandleKind`] tag ([`HandleKind::INFLATE_BACK`])
 /// lets [`inflateBack`] and [`inflateBackEnd`] verify the handle *kind* before
-/// reinterpreting the opaque `state` pointer, closing the C4 UB where an
+/// reinterpreting the opaque `state` pointer, closing the undefined behavior where an
 /// untagged `Box<InflateState>` could be blindly reconstituted — or, worse, a
 /// tagged deflate/inflate handle freed through the wrong layout. `#[repr(C)]`
 /// guarantees `kind` sits at offset 0, matching every other tagged handle.
@@ -392,7 +411,7 @@ unsafe fn inflate_back_handle(strm: &mut z_stream) -> Option<&mut InflateBackHan
 /// Reclaims the boxed [`InflateBackHandle`] from `state`, validating the
 /// [`HandleKind`] tag first and nulling `state` on success. Returns [`None`] —
 /// leaving `state` untouched — when the handle is absent or not an `inflateBack`
-/// handle, so [`inflateBackEnd`] never drops a wrong-type box (C4).
+/// handle, so [`inflateBackEnd`] never drops a wrong-type box.
 ///
 /// # Safety
 ///
@@ -429,7 +448,7 @@ unsafe fn inflate_back_take(strm: &mut z_stream) -> Option<Box<InflateBackHandle
 /// (`handed_out`), whether the most recent pull ran dry (`dry`), and the
 /// engine-reported unconsumed tail (`unconsumed`). After [`inflate_back`]
 /// returns, the shim uses these to restore the C `z_stream`'s `next_in`/
-/// `avail_in` exactly like C `infback.c`'s `inf_leave` (C3).
+/// `avail_in` exactly like C `infback.c`'s `inf_leave`.
 struct CInFunc<'a> {
     in_fn: unsafe extern "C" fn(*mut c_void, *mut *const c_uchar) -> c_uint,
     in_desc: *mut c_void,
@@ -553,9 +572,19 @@ unsafe fn version_check(version: *const c_char, stream_size: c_int) -> bool {
 /// `windowBits`.
 ///
 /// `windowBits` retains zlib's full overloading, forwarded unchanged to the
-/// engine: `8..=15` selects a zlib (RFC 1950) wrapper, `-8..=-15` raw DEFLATE
-/// (no wrapper), `24..=31` (i.e. `16 + 8..=15`) a gzip (RFC 1952) wrapper, and
-/// `40..=47` (`32 + 8..=15`) zlib/gzip auto-detection.
+/// engine (`inflate.c` L136-L161):
+///
+/// * `8..=15` — zlib (RFC 1950) wrapper;
+/// * `-15..=-8` — raw DEFLATE, no wrapper. Unlike the deflate side, which
+///   rejects raw `-8` via its `windowBits == 8 && wrap != 1` guard, inflate
+///   accepts the full `-15..=-8` span;
+/// * `0` — zlib wrapper, with the window size taken from the header's CINFO
+///   field instead of the argument (C: `wrap = 5`, `wbits = 0`);
+/// * `24..=31` (`16 + 8..=15`) — gzip (RFC 1952) wrapper;
+/// * `40..=47` (`32 + 8..=15`) — zlib/gzip auto-detection.
+///
+/// The two gzip-bearing forms require the `gzip` cargo feature; without it they
+/// are rejected with `Z_STREAM_ERROR`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn inflateInit2_(
     strm: z_streamp,
@@ -575,24 +604,22 @@ pub unsafe extern "C" fn inflateInit2_(
         // SAFETY: `strm` is non-null and, per the FFI contract, points to a valid
         // caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
-        // Reject a half-present allocator pair before anything is allocated,
-        // mirroring where C tests it: after the version and null-stream guards
-        // and before the state `ZALLOC` (`inflate.c` L183-L199). C substitutes the
-        // missing half in place; this crate cannot (`zcalloc`/`zcfree` are
-        // unexported, and mixing a caller hook with the global allocator is UB),
-        // and ignoring the supplied half would silently swallow the caller's
-        // out-of-memory signal (AAP §0.6.3). `Z_STREAM_ERROR` is the code C's own
-        // `inflateStateCheck` produces for such a stream (`inflate.c` L90-L91)
-        // and the code its `Z_SOLO` init returns (`inflate.c` L184-L186). See
-        // `CAllocator::is_half_present` for the documented divergence.
-        // SAFETY: `sref` is a valid `&z_stream`; only its `Copy` allocator fields
-        // are read, and the hook pointers are never dereferenced.
-        if unsafe { CAllocator::from_stream(sref) }.is_half_present() {
-            return Z_STREAM_ERROR;
-        }
-        // SAFETY: `sref` is a valid `z_stream`; this copies its `zalloc`/`zfree`/
-        // `opaque` fields into an allocator wrapper (it does not read `state`).
-        let mut zs = unsafe { zstream_with_caller_alloc(sref) };
+        // Run C's allocator prologue here, in exactly the position C runs it:
+        // after the version and null-stream guards and *before* the state
+        // `ZALLOC` (`inflate.c` L182-L199). It clears `strm->msg` unconditionally
+        // and substitutes the crate's built-in for a missing half of the
+        // `zalloc`/`zfree` pair, clearing `opaque` only when it is `zalloc` that
+        // was defaulted. The caller's own half is kept, so a deliberately failing
+        // `zalloc` still reports `Z_MEM_ERROR` rather than being bypassed.
+        // SAFETY: `sref` is a valid, exclusively-owned `&mut z_stream`; only its
+        // plain `Copy` `msg`/allocator fields are read and written, and no hook
+        // pointer is dereferenced.
+        let allocator = unsafe { init_allocator_prologue(sref) };
+        // Build the idiomatic stream on the post-prologue allocator triple: the
+        // caller's `zalloc`/`zfree`/`opaque` where supplied, the crate's built-in
+        // where substituted, and the global allocator when the caller supplied
+        // neither half (AAP §0.6.3).
+        let mut zs = ZStream::with_allocator(allocator);
         match crate::inflate::inflate_init2(&mut zs, window_bits) {
             Ok(_) => {
                 let adler = zs.adler;
@@ -687,23 +714,22 @@ pub unsafe extern "C" fn inflateBackInit_(
         }
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
-        // Capture any caller-supplied zalloc/zfree/opaque so the *state* footprint
-        // is charged to the caller's allocator, matching the single
-        // `ZALLOC(strm, 1, sizeof(struct inflate_state))` C makes (`infback.c`
-        // L51). Null hooks leave the reservation unmade, exactly as a C caller with
-        // `zalloc == Z_NULL` gets the built-in allocator.
-        // SAFETY: `sref` is a valid `&z_stream`; `from_stream` only copies the
-        // plain `Copy` allocator fields and never dereferences the hooks.
-        let allocator = unsafe { CAllocator::from_stream(sref) };
-        // A half-present pair is rejected here, in the same position C tests it —
+        // Run C's allocator prologue here, in exactly the position C runs it:
         // after the version, null-stream, null-window and `windowBits` guards and
-        // before the state `ZALLOC` (`infback.c` L30-L53). C substitutes the
-        // missing half; this crate cannot, and ignoring the supplied half would
-        // discard the caller's out-of-memory signal (AAP §0.6.3). See
-        // `CAllocator::is_half_present` for the documented divergence.
-        if allocator.is_half_present() {
-            return Z_STREAM_ERROR;
-        }
+        // *before* the state `ZALLOC` (`infback.c` L36-L53). It clears
+        // `strm->msg` unconditionally and substitutes the crate's built-in for a
+        // missing half of the `zalloc`/`zfree` pair, clearing `opaque` only when
+        // it is `zalloc` that was defaulted.
+        //
+        // The resulting triple charges the *state* footprint to the caller's
+        // allocator, matching the single
+        // `ZALLOC(strm, 1, sizeof(struct inflate_state))` C makes (`infback.c`
+        // L51). A wholly absent pair leaves the reservation unmade, exactly as a
+        // C caller with both hooks null gets the built-in allocator.
+        // SAFETY: `sref` is a valid, exclusively-owned `&mut z_stream`; only its
+        // plain `Copy` `msg`/allocator fields are read and written, and no hook
+        // pointer is dereferenced.
+        let allocator = unsafe { init_allocator_prologue(sref) };
 
         // Lend the caller's buffer to the engine rather than allocating a
         // replacement: C adopts the pointer with `state->window = window;`
@@ -726,8 +752,8 @@ pub unsafe extern "C" fn inflateBackInit_(
             Ok(state) => {
                 // Tag the state as an `inflateBack` handle before installing it,
                 // so `inflateBack`/`inflateBackEnd` can validate the kind and the
-                // regular `inflateEnd` rejects it (C4: no more blind casts of an
-                // untagged `Box<InflateState>`).
+                // regular `inflateEnd` rejects it — no blind cast of an untagged
+                // `Box<InflateState>` is ever performed.
                 // Fallible boxing: an exhausted Rust heap must surface as
                 // `Z_MEM_ERROR`, which is what C's failed state `ZALLOC` returns
                 // (`infback.c` L52-L53), not as an abort (AAP §0.6.5). The
@@ -748,8 +774,8 @@ pub unsafe extern "C" fn inflateBackInit_(
                 // lifetime (`inflateBackInit_`, `inflateBack`, `inflateBackEnd`),
                 // because an `inflateBack` caller owns the check value itself.
                 // C's `inflateBackInit_` writes only `strm->msg` (L36) and the
-                // `state` slot, so publishing a `0` here — as this shim used to —
-                // clobbered a field C leaves entirely alone.
+                // `state` slot, so publishing a `0` here would clobber a field C
+                // leaves entirely alone.
                 Z_OK
             }
             Err(rc) => rc.as_c_int(),
@@ -890,7 +916,7 @@ pub unsafe extern "C" fn inflateEnd(strm: z_streamp) -> c_int {
         // (nulling `state` for exactly-once reclaim) and `None` for a cross-type
         // stream (e.g. one from `deflateInit*` or `inflateBackInit_`) — yielding
         // `Z_STREAM_ERROR` WITHOUT a layout-mismatched free, and matching C,
-        // which returns `Z_STREAM_ERROR` for a non-inflate stream (FINDING-6).
+        // which returns `Z_STREAM_ERROR` for a non-inflate stream.
         match unsafe { inflate_take(sref) } {
             Some(boxed) => {
                 drop(boxed);
@@ -1027,6 +1053,15 @@ pub unsafe extern "C" fn inflateResetKeep(strm: z_streamp) -> c_int {
 /// C `inflateSetDictionary` — supply a preset dictionary for decompression
 /// (used after `inflate` reports `Z_NEED_DICT`). Returns `Z_DATA_ERROR` if the
 /// dictionary's Adler-32 does not match the value the stream expects.
+///
+/// C reads `dictLength` bytes from `dictionary` unconditionally, so a null
+/// pointer or a bogus length is undefined behavior on the caller. This shim
+/// instead maps a null `dictionary` **or** a zero `dict_length` to an empty
+/// slice, which the engine treats as an empty dictionary. That is strictly more
+/// defensive than C: it turns one class of caller UB into a well-defined
+/// `Z_DATA_ERROR` (the Adler-32 of an empty dictionary will not match a stream
+/// that asked for one) while behaving identically for every well-formed call.
+/// Non-null pointers with a positive length are read exactly as C reads them.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn inflateSetDictionary(
     strm: z_streamp,
@@ -1407,6 +1442,13 @@ pub unsafe extern "C" fn inflateCodesUsed(strm: z_streamp) -> c_ulong {
 /// non-null buffers, register it with the engine, and remember the raw pointer
 /// so [`inflate`] can mirror the captured fields back after each call.
 ///
+/// Registration has one caller-visible side effect, reproduced from
+/// `inflate.c` L1228-L1229 (`state->head = head; head->done = 0;`): on success
+/// the caller's `head->done` is cleared to `0`, so a `gz_header` reused across
+/// streams cannot report a stale completion. C performs that store
+/// unconditionally and therefore requires a non-null `head`; this shim skips it
+/// for a null `head`, which is the only difference.
+///
 /// Returns `Z_STREAM_ERROR` if the stream is not decoding gzip framing.
 #[cfg(feature = "gzip")]
 #[unsafe(no_mangle)]
@@ -1469,6 +1511,33 @@ pub unsafe extern "C" fn inflateGetHeader(strm: z_streamp, head: gz_headerp) -> 
         match crate::inflate::inflate_get_header(&mut handle.zs, gh) {
             Ok(_) => {
                 handle.head = head;
+                // Clear `head->done` at *registration*, synchronously, exactly as
+                // C does: `state->head = head; head->done = 0;`
+                // (`inflate.c` L1228-L1229). This is observable and load-bearing —
+                // `done` is the caller's "the header is fully decoded" flag, which
+                // `zlib.h` L1076-L1085 documents as "zero until the header is
+                // completed, at which time head->done is set to one", and which a
+                // caller polls between `inflate` calls. Re-registering a
+                // `gz_header` that a previous stream had already completed would
+                // otherwise leave a stale `done == 1` visible from the instant of
+                // registration until the new stream's header actually finished, so
+                // a polling caller could read the *old* stream's fields and
+                // believe they described the new one.
+                //
+                // C dereferences `head` unconditionally here, so a null `head` is
+                // a caller error it does not survive; this shim already tolerates
+                // one (capturing into a default `GzHeader` above), so the write is
+                // guarded to keep that tolerance rather than reintroducing the
+                // crash.
+                if !head.is_null() {
+                    // SAFETY: `head` is non-null and, per this entry point's FFI
+                    // contract, points at a valid caller-owned `gz_header` that
+                    // stays valid until the decode completes. `done` is a plain
+                    // `c_int` field, so this is an ordinary aligned scalar write
+                    // to a field the caller has explicitly handed over for the
+                    // library to publish into.
+                    unsafe { (*head).done = 0 };
+                }
                 Z_OK
             }
             Err(e) => ReturnCode::from(e).as_c_int(),
@@ -1502,9 +1571,19 @@ pub unsafe extern "C" fn inflateGetHeader(strm: z_streamp, head: gz_headerp) -> 
 /// safe engine. Any already-buffered input in the stream (`next_in`/`avail_in`)
 /// is presented to the engine first, then the `in` callback is invoked for more.
 ///
-/// Returns `Z_STREAM_END` on success, `Z_DATA_ERROR`/`Z_BUF_ERROR`/
-/// `Z_MEM_ERROR` on decode failures, or `Z_STREAM_ERROR` for invalid arguments
-/// (including a null `in`/`out` callback).
+/// Returns exactly the four codes `zlib.h` L1194-L1199 documents for
+/// `inflateBack` — `Z_MEM_ERROR` is **not** among them, because the window and
+/// state were already allocated by [`inflateBackInit_`] and this call allocates
+/// nothing:
+///
+/// * `Z_STREAM_END` — the raw DEFLATE stream completed successfully;
+/// * `Z_DATA_ERROR` — the stream was malformed, with `strm->msg` set to the
+///   reason;
+/// * `Z_BUF_ERROR` — the `in` callback reported no input available, or the `out`
+///   callback reported a write failure;
+/// * `Z_STREAM_ERROR` — the stream was not properly initialized, i.e. a null
+///   `strm`, a `state` that is not an `inflateBackInit_` handle, or a null
+///   `in`/`out` callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn inflateBack(
     strm: z_streamp,
@@ -1534,7 +1613,7 @@ pub unsafe extern "C" fn inflateBack(
         // re-borrow of the stream for cursor restoration.
         let initial: &[u8] = unsafe { input_slice(sref) };
 
-        // C4: fetch the tagged `inflateBack` handle, validating the kind before
+        // Fetch the tagged `inflateBack` handle, validating the kind before
         // touching the engine state. A missing handle, or one owned by the
         // deflate/inflate engines, is rejected with `Z_STREAM_ERROR`.
         // SAFETY: `state`, if non-null, is a live tagged handle from an init shim.
@@ -1561,7 +1640,7 @@ pub unsafe extern "C" fn inflateBack(
         // `state`/`handle` borrows of `sref` end here; `src` is a local that only
         // borrows the detached-lifetime `initial`, so it stays readable below.
 
-        // C3: restore `next_in`/`avail_in` exactly like C `infback.c`'s `inf_leave`
+        // Restore `next_in`/`avail_in` exactly like C `infback.c`'s `inf_leave`
         // (L561-L569 sets `strm->next_in = next; strm->avail_in = have;`), which
         // does NOT touch `total_in`/`total_out`. `next`/`have` track the LAST
         // buffer the engine pulled from — the initial stream buffer or a callback
@@ -1600,7 +1679,7 @@ pub unsafe extern "C" fn inflateBackEnd(strm: z_streamp) -> c_int {
         }
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
-        // C4: validate the `INFLATE_BACK` tag before reclaiming. `inflate_back_take`
+        // Validate the `INFLATE_BACK` tag before reclaiming. `inflate_back_take`
         // reconstitutes the `Box<InflateBackHandle>` ONLY when the leading tag
         // matches, so a stream owned by the other engines — a tagged
         // `DeflateHandle`/`InflateHandle` — or an already-freed handle is rejected
@@ -1625,6 +1704,7 @@ pub unsafe extern "C" fn inflateBackEnd(strm: z_streamp) -> c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ffi::alloc::test_hook::BuiltinHookStats;
     use alloc::vec;
     use alloc::vec::Vec;
     use core::ffi::CStr;
@@ -1888,9 +1968,14 @@ mod tests {
 
     // -- inflateGetHeader ---------------------------------------------------
 
-    #[cfg(feature = "gzip")]
-    fn zeroed_gz_header() -> gz_header {
-        gz_header {
+    /// An all-zero `gz_header`, the state a caller's fresh struct is in.
+    ///
+    /// Deliberately **not** feature-gated: the `#[cfg(not(feature = "gzip"))]`
+    /// rejection test needs it too, and `gz_header` is an unconditional
+    /// `#[repr(C)]` ABI mirror (`src/ffi/types.rs`), so it is nameable in every
+    /// configuration.
+    fn zeroed_gz_header() -> crate::ffi::types::gz_header {
+        crate::ffi::types::gz_header {
             text: 0,
             time: 0,
             xflags: 0,
@@ -1905,6 +1990,203 @@ mod tests {
             hcrc: 0,
             done: 0,
         }
+    }
+
+    /// CQ-2 regression — `inflateGetHeader` must clear `head->done`
+    /// **synchronously, at registration**, exactly as C's
+    /// `state->head = head; head->done = 0;` does (`inflate.c` L1228-L1229).
+    ///
+    /// The failure mode this pins is precise: `zlib.h` L1076-L1085 specifies
+    /// `done` as zero until the header completes and one afterwards, and a caller
+    /// polls it between `inflate` calls. A `gz_header` reused from a previous,
+    /// completed decode still carries `done == 1`; if registration does not clear
+    /// it, the flag reads "complete" from the instant of registration, so a
+    /// polling caller would accept the *previous* stream's fields as the new
+    /// stream's. The assertion is therefore made before any `inflate` call, with a
+    /// deliberately non-zero pre-seeded sentinel — a check made only after a
+    /// successful decode would pass even with the write missing.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn get_header_clears_done_at_registration() {
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    15 + 16,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+
+        // Pre-seed `done` the way a reused header arrives: C's tri-state uses `1`
+        // for "complete" and `-1` for "was a raw zlib stream", so try both, plus
+        // an arbitrary non-zero value no caller would produce.
+        for seeded in [1, -1, 0x7F] {
+            let mut head = zeroed_gz_header();
+            head.done = seeded;
+            assert_eq!(unsafe { inflateGetHeader(&mut strm, &mut head) }, Z_OK);
+            assert_eq!(
+                head.done, 0,
+                "registration must clear `done` immediately (seeded {seeded}), before \
+                 any inflate call — `inflate.c` L1228-L1229"
+            );
+        }
+
+        // The same must hold for a header that also requests field capture, and
+        // `done` must still be `0` after a *partial* decode that has not yet
+        // finished the header.
+        let mut namebuf = [0u8; 64];
+        let mut head = zeroed_gz_header();
+        head.done = 1;
+        head.name = namebuf.as_mut_ptr();
+        head.name_max = namebuf.len() as c_uint;
+        assert_eq!(unsafe { inflateGetHeader(&mut strm, &mut head) }, Z_OK);
+        assert_eq!(head.done, 0, "a capturing header is cleared too");
+
+        // Feed only the first two bytes (the `1f 8b` magic): the header cannot be
+        // complete yet, so `done` must still read zero.
+        let mut out = vec![0u8; 256];
+        strm.next_in = GZIP_NAMED.as_ptr();
+        strm.avail_in = 2;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+        assert_eq!(unsafe { inflate(&mut strm, Z_NO_FLUSH) }, Z_OK);
+        assert_eq!(head.done, 0, "an incomplete header must not report done");
+
+        // Finishing the stream sets it to one, which is the other half of the
+        // contract and proves the clear did not break completion reporting.
+        strm.next_in = GZIP_NAMED[2..].as_ptr();
+        strm.avail_in = (GZIP_NAMED.len() - 2) as c_uint;
+        assert_eq!(unsafe { inflate(&mut strm, Z_NO_FLUSH) }, Z_STREAM_END);
+        assert_eq!(
+            head.done, 1,
+            "a completed gzip header must report done == 1"
+        );
+
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+    }
+
+    /// The other side of the `done` contract, asserted with gzip framing compiled
+    /// **in**: a registration C refuses must leave the caller's header completely
+    /// alone, `done` included.
+    ///
+    /// C reaches `state->head = head; head->done = 0;` only after
+    /// `(state->wrap & 2) == 0` has been ruled out (`inflate.c` L1225-L1229), so a
+    /// *raw* stream — `windowBits = -15`, which carries no gzip header at all —
+    /// returns `Z_STREAM_ERROR` before the store. This is the case
+    /// [`get_header_without_gzip_rejects_and_leaves_done_untouched`] cannot cover,
+    /// because that test only exists when the `gzip` feature is off; without this
+    /// one the default build would have no guard at all against the `done` write
+    /// escaping onto the rejection path.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn get_header_rejection_leaves_the_callers_done_flag_untouched() {
+        let mut head = zeroed_gz_header();
+        head.done = 1; // as if left over from a previous, completed stream
+
+        let mut raw = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut raw,
+                    -15,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        assert_eq!(
+            unsafe { inflateGetHeader(&mut raw, &mut head) },
+            Z_STREAM_ERROR,
+            "a raw stream carries no gzip header, so registration is refused"
+        );
+        assert_eq!(
+            head.done, 1,
+            "a rejected registration must not touch the caller's header"
+        );
+        assert_eq!(unsafe { inflateEnd(&mut raw) }, Z_OK);
+
+        // A zlib-wrapped stream is refused for the same reason (`wrap == 1`), and
+        // must likewise leave the header untouched.
+        let mut zlib = zeroed_stream();
+        assert_eq!(
+            unsafe { inflateInit_(&mut zlib, VERSION.as_ptr(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+        assert_eq!(
+            unsafe { inflateGetHeader(&mut zlib, &mut head) },
+            Z_STREAM_ERROR,
+            "a zlib-wrapped stream carries no gzip header either"
+        );
+        assert_eq!(
+            head.done, 1,
+            "a rejected registration must not touch the caller's header"
+        );
+        assert_eq!(unsafe { inflateEnd(&mut zlib) }, Z_OK);
+    }
+
+    /// A null `head` is tolerated rather than dereferenced. C would crash here
+    /// (`head->done = 0` is unconditional in `inflate.c` L1229), so this shim is
+    /// strictly more forgiving; the point of the case is that adding the `done`
+    /// write did not reintroduce the crash.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn get_header_tolerates_a_null_header_pointer() {
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    15 + 16,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        assert_eq!(
+            unsafe { inflateGetHeader(&mut strm, ptr::null_mut()) },
+            Z_OK,
+            "a null gz_header must be accepted, not dereferenced"
+        );
+
+        // The stream still decodes correctly with nothing captured.
+        let mut out = vec![0u8; 256];
+        strm.next_in = GZIP_NAMED.as_ptr();
+        strm.avail_in = GZIP_NAMED.len() as c_uint;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+        assert_eq!(unsafe { inflate(&mut strm, Z_NO_FLUSH) }, Z_STREAM_END);
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+    }
+
+    /// With gzip framing compiled out, `inflateGetHeader` rejects every request
+    /// with `Z_STREAM_ERROR` and therefore must not touch the caller's header at
+    /// all — including `done`, since C reaches its `head->done = 0` only after the
+    /// `(state->wrap & 2)` test passes (`inflate.c` L1225-L1229).
+    #[test]
+    #[cfg(not(feature = "gzip"))]
+    fn get_header_without_gzip_rejects_and_leaves_done_untouched() {
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe { inflateInit_(&mut strm, VERSION.as_ptr(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+        let mut head = zeroed_gz_header();
+        head.done = 1;
+        assert_eq!(
+            unsafe { inflateGetHeader(&mut strm, &mut head) },
+            Z_STREAM_ERROR
+        );
+        assert_eq!(
+            head.done, 1,
+            "a rejected registration must leave the caller's header untouched"
+        );
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
     }
 
     #[test]
@@ -1992,7 +2274,7 @@ mod tests {
         out
     }
 
-    /// QA-04 regression — the extra field's **declared** length must survive a
+    /// Regression guard — the extra field's **declared** length must survive a
     /// truncating copy.
     ///
     /// `zlib.h` specifies that once `done` is true, `extra_len` holds the *actual*
@@ -2053,10 +2335,12 @@ mod tests {
         assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
     }
 
-    /// The documented length-query pattern: leave `extra` null purely to learn the
-    /// extra field's length. C writes `head->extra_len` in the `EXLEN` state
+    /// The null-buffer length query: leave `extra` null purely to learn the extra
+    /// field's length. C writes `head->extra_len` in the `EXLEN` state
     /// (`inflate.c` L599-L600) gated on neither `extra`'s nullity nor `extra_max`,
-    /// so a null buffer must still yield the real length.
+    /// so a null buffer still yields the real length. `zlib.h` documents only the
+    /// `extra_len > extra_max` truncation signal, making this a de-facto behavior
+    /// that the port must nonetheless match.
     #[test]
     #[cfg(feature = "gzip")]
     fn get_header_reports_extra_len_for_a_null_extra_length_query() {
@@ -2250,7 +2534,7 @@ mod tests {
         assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
     }
 
-    /// C3: `inflateBack` must restore `next_in`/`avail_in` to the unconsumed
+    /// `inflateBack` must restore `next_in`/`avail_in` to the unconsumed
     /// tail of the input (C `infback.c` `inf_leave`), leaving trailing bytes that
     /// are not part of the DEFLATE stream visible to the caller — and it must NOT
     /// touch `total_in`/`total_out`.
@@ -2345,7 +2629,7 @@ mod tests {
         assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
     }
 
-    /// C3: when the `in` callback runs dry, `inflateBack` must null `next_in` and
+    /// When the `in` callback runs dry, `inflateBack` must null `next_in` and
     /// zero `avail_in` (C `PULL` returning 0 sets `next = Z_NULL`, `have = 0`),
     /// even though input was initially buffered.
     #[test]
@@ -2401,7 +2685,7 @@ mod tests {
         assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
     }
 
-    /// F2 (inflate): `inflateBackInit_` must **use the caller's window**, not
+    /// `inflateBackInit_` must **use the caller's window**, not
     /// allocate a replacement.
     ///
     /// Reference zlib adopts the pointer verbatim (`state->window = window;`,
@@ -2983,7 +3267,7 @@ mod tests {
         assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_STREAM_ERROR);
     }
 
-    /// F-03 regression: when the caller's `zalloc` cannot satisfy the copy,
+    /// Regression guard: when the caller's `zalloc` cannot satisfy the copy,
     /// `inflateCopy` must report `Z_MEM_ERROR` — matching C's
     /// `ZFREE(copy); return Z_MEM_ERROR` (`inflate.c` L1343-L1349) — rather than
     /// reporting success with a destination backed by the Rust global allocator
@@ -3056,7 +3340,7 @@ mod tests {
         assert_eq!(unsafe { inflateEnd(&mut src) }, Z_OK);
     }
 
-    /// C4: `inflateBackEnd` must reject a stream whose handle is NOT an
+    /// `inflateBackEnd` must reject a stream whose handle is NOT an
     /// `inflateBack` handle (here a regular `inflate` handle) with
     /// `Z_STREAM_ERROR`, WITHOUT freeing it (no layout-mismatched free); the
     /// correct terminator then still succeeds.
@@ -3077,7 +3361,7 @@ mod tests {
         assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
     }
 
-    /// C4: `inflateEnd` must reject an `inflateBack` handle (tag INFLATE_BACK, not
+    /// `inflateEnd` must reject an `inflateBack` handle (tag INFLATE_BACK, not
     /// INFLATE) with `Z_STREAM_ERROR`, WITHOUT freeing it; `inflateBackEnd` then
     /// reclaims it correctly.
     #[test]
@@ -3106,7 +3390,7 @@ mod tests {
         assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
     }
 
-    /// F6 / M7 end-to-end: with the caller's arena exhausted part-way through
+    /// End-to-end out-of-memory propagation: with the caller's arena exhausted part-way through
     /// `inflateCopy`, the C entry point reports `Z_MEM_ERROR`, leaves `dest`
     /// untouched, releases whatever it did allocate, and leaves `source` able to
     /// finish decoding — never completing the copy on the global allocator.
@@ -3281,59 +3565,194 @@ mod tests {
         ptr::null_mut()
     }
 
-    /// A `zfree` that must never be reached in the half-present tests.
-    unsafe extern "C" fn never_called_zfree(_opaque: *mut c_void, _address: *mut c_void) {
-        panic!("zfree must not be called: init rejected the half-present hook pair");
+    /// A non-null sentinel cookie, used to prove exactly which prologue branch
+    /// clears `z_stream.opaque`. Never dereferenced.
+    fn opaque_sentinel() -> *mut c_void {
+        core::ptr::without_provenance_mut::<c_void>(0x5EED_C0DE)
     }
 
-    /// QA-03 regression — `inflateInit2_` must reject a caller who supplied
-    /// exactly one half of the `zalloc`/`zfree` pair.
+    /// CQ-1 regression — `inflateInit2_` must *complete* a half-present
+    /// `zalloc`/`zfree` pair exactly as C does, not reject it.
     ///
-    /// C substitutes only the *missing* half (`inflate.c` L183-L196) and keeps the
-    /// one the caller gave, so a supplied-but-failing `zalloc` is still called and
-    /// still yields `Z_MEM_ERROR`. This crate cannot substitute per half
-    /// (`zcalloc`/`zcfree` are unexported `local:` symbols, and pairing a caller
-    /// hook with the global allocator is undefined behavior), and silently
-    /// ignoring the supplied half would discard the caller's OOM signal — which
-    /// AAP §0.6.3 forbids. `Z_STREAM_ERROR` is the code C's own
-    /// `inflateStateCheck` yields for such a stream (`inflate.c` L90-L91) and the
-    /// code its `Z_SOLO` init returns, so it is the faithful answer here
-    /// (documented divergence, AAP §0.8.2).
+    /// C's prologue substitutes only the **missing** half — `zcalloc` for a null
+    /// `zalloc` (also clearing `opaque`), `zcfree` for a null `zfree` (which
+    /// leaves `opaque` alone) — and then proceeds (`inflate.c` L182-L199):
+    ///
+    /// * `zalloc` only, deliberately failing: the caller's hook **is** consulted,
+    ///   so the observable code is `Z_MEM_ERROR`, the missing `zfree` was filled
+    ///   in, and `opaque` survived untouched.
+    /// * `zfree` only: the built-in `zalloc` was filled in so initialization
+    ///   **succeeds**, `opaque` was cleared (that is C's `zalloc` branch), and the
+    ///   caller's `zfree` really does release the state at `inflateEnd`.
     #[test]
-    fn init_rejects_a_half_present_allocator_pair() {
-        // zalloc only.
+    fn init_completes_a_half_present_allocator_pair_exactly_as_c_does() {
+        // --- zalloc only, and it refuses ------------------------------------
+        let mut strm = zeroed_stream();
+        strm.zalloc = Some(always_fail_zalloc);
+        strm.opaque = opaque_sentinel();
+        strm.msg = c"stale".as_ptr().cast_mut();
+        assert_eq!(
+            unsafe { inflateInit_(&mut strm, VERSION.as_ptr(), size_of::<z_stream>() as c_int) },
+            Z_MEM_ERROR,
+            "the caller's zalloc must be consulted, so their out-of-memory signal \
+             surfaces as Z_MEM_ERROR exactly as it does in C"
+        );
+        assert!(
+            strm.zfree.is_some(),
+            "the missing zfree half must be substituted in place (`inflate.c` L191-L196)"
+        );
+        assert!(strm.zalloc.is_some(), "the caller's own half must be kept");
+        assert_eq!(
+            strm.opaque,
+            opaque_sentinel(),
+            "C clears `opaque` only on the zalloc branch (`inflate.c` L186-L189)"
+        );
+        assert!(strm.state.is_null(), "a failed init must install no state");
+
+        // --- zfree only: initialization succeeds ----------------------------
+        let stats = BuiltinHookStats::new();
+        let mut strm = zeroed_stream();
+        strm.zfree = Some(stats.zfree_fn());
+        strm.opaque = opaque_sentinel();
+        strm.msg = c"stale".as_ptr().cast_mut();
+        assert_eq!(
+            unsafe { inflateInit_(&mut strm, VERSION.as_ptr(), size_of::<z_stream>() as c_int) },
+            Z_OK,
+            "a caller who supplied only zfree gets the built-in zalloc and a \
+             working stream, exactly as in C"
+        );
+        assert!(
+            strm.zalloc.is_some(),
+            "the missing zalloc half must be substituted in place (`inflate.c` L183-L190)"
+        );
+        assert!(strm.msg.is_null(), "`strm->msg` is cleared unconditionally");
+        assert!(
+            strm.opaque.is_null(),
+            "C clears `opaque` on the zalloc branch, because the cookie belonged \
+             to the allocator being replaced (`inflate.c` L186-L189)"
+        );
+        assert!(!strm.state.is_null());
+
+        // The caller's own `zfree` — invoked with the cleared, null `opaque`, just
+        // as C invokes it — is what releases the state reservation. C's
+        // `inflateInit2_` makes exactly one allocation (`inflate.c` L197-L199);
+        // the window is deferred to the first `inflate` call.
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+        assert_eq!(
+            stats.allocs(),
+            0,
+            "the caller supplied no zalloc, so none of their allocations ran"
+        );
+        assert_eq!(
+            stats.frees(),
+            1,
+            "the caller's zfree releases C's single `inflateInit2_` allocation, \
+             the state reservation (`inflate.c` L197-L199)"
+        );
+    }
+
+    /// The prologue runs in exactly C's position: after the version and
+    /// null-stream guards, and before the state allocation and the `windowBits`
+    /// validation (`inflate.c` L173-L214).
+    #[test]
+    fn the_allocator_prologue_is_ordered_exactly_as_c_orders_it() {
+        // A bad version *and* a half hook: the version guard precedes the
+        // prologue, so neither the hooks nor `msg` may be touched at all.
+        let stale = c"stale".as_ptr().cast_mut();
+        let mut strm = zeroed_stream();
+        strm.zalloc = Some(always_fail_zalloc);
+        strm.msg = stale;
+        assert_eq!(
+            unsafe { inflateInit_(&mut strm, ptr::null(), size_of::<z_stream>() as c_int) },
+            Z_VERSION_ERROR,
+            "the version guard must still outrank the allocator prologue"
+        );
+        assert!(strm.state.is_null());
+        assert!(
+            strm.zfree.is_none(),
+            "C returns Z_VERSION_ERROR before the prologue, so no substitution occurs"
+        );
+        assert_eq!(
+            strm.msg, stale,
+            "C returns Z_VERSION_ERROR before `strm->msg = Z_NULL`"
+        );
+
+        // An out-of-range `windowBits` with a *working* half hook: the prologue
+        // completes the pair, the state reservation is served through the caller's
+        // `zalloc`, and only then is the parameter rejected — because C validates
+        // `windowBits` inside `inflateReset2`, *after* its state `ZALLOC`
+        // (`inflate.c` L197-L213). The substituted half then releases the state,
+        // so the counting `zalloc` sees one call and the counting side sees no
+        // free at all.
+        let stats = BuiltinHookStats::new();
+        let mut strm = zeroed_stream();
+        strm.zalloc = Some(stats.zalloc_fn());
+        strm.msg = stale;
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    99,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_STREAM_ERROR
+        );
+        assert!(strm.state.is_null());
+        assert!(
+            strm.zfree.is_some(),
+            "the prologue precedes the state allocation, so the pair was completed \
+             even though the init then failed"
+        );
+        assert!(
+            strm.msg.is_null(),
+            "`strm->msg = Z_NULL` is unconditional and precedes every later return"
+        );
+        assert_eq!(
+            stats.allocs(),
+            1,
+            "C reserves the state through the caller's zalloc before validating \
+             `windowBits` (`inflate.c` L197-L213)"
+        );
+        assert_eq!(
+            stats.frees(),
+            0,
+            "the substituted built-in zfree released the state, not the caller's \
+             counting half"
+        );
+
+        // An out-of-range `windowBits` *and* a refusing `zalloc`: because C's
+        // state `ZALLOC` precedes the `windowBits` check, the allocator's verdict
+        // is what the caller observes — `Z_MEM_ERROR`, not `Z_STREAM_ERROR`.
         let mut strm = zeroed_stream();
         strm.zalloc = Some(always_fail_zalloc);
         assert_eq!(
-            unsafe { inflateInit_(&mut strm, VERSION.as_ptr(), size_of::<z_stream>() as c_int) },
-            Z_STREAM_ERROR,
-            "a zalloc supplied without a zfree must be rejected, not silently \
-             replaced by the global allocator"
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    99,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_MEM_ERROR,
+            "C's `ZALLOC` precedes `inflateReset2`'s windowBits validation \
+             (`inflate.c` L197-L213), so out-of-memory outranks the bad parameter"
         );
-        assert!(
-            strm.state.is_null(),
-            "a rejected init must install no state"
-        );
-
-        // zfree only. `never_called_zfree` panics if it is ever invoked, proving
-        // the rejection happens before any allocation is made or released.
-        let mut strm = zeroed_stream();
-        strm.zfree = Some(never_called_zfree);
-        assert_eq!(
-            unsafe { inflateInit_(&mut strm, VERSION.as_ptr(), size_of::<z_stream>() as c_int) },
-            Z_STREAM_ERROR,
-            "a zfree supplied without a zalloc must be rejected"
-        );
-        assert!(
-            strm.state.is_null(),
-            "a rejected init must install no state"
-        );
+        assert!(strm.state.is_null());
     }
 
-    /// The other half of the matrix: the two *valid* hook configurations must be
-    /// unaffected. Neither half supplied is the overwhelmingly common case (a
-    /// zeroed `z_stream`) and matches C's substitution of both built-ins; both
-    /// halves supplied routes through the caller's allocator.
+    /// The other half of the matrix: the two *complete* hook configurations must
+    /// be unaffected. Neither half supplied is the overwhelmingly common case (a
+    /// zeroed `z_stream`); both halves supplied routes through the caller's
+    /// allocator.
+    ///
+    /// A wholly absent pair is deliberately left absent — see
+    /// [`crate::ffi::types::init_allocator_prologue`], whose doc records why: the
+    /// substitution is confined to the *half*-present case so a hookless caller's
+    /// allocation count and engine-state footprint stay byte-for-byte what they
+    /// have always been (AAP §0.6.5).
     #[test]
     fn init_accepts_both_hooks_and_neither_hook() {
         // Neither: global allocator, exactly as before.
@@ -3344,6 +3763,12 @@ mod tests {
             "a zeroed z_stream must still initialize"
         );
         assert!(!strm.state.is_null());
+        assert!(
+            strm.zalloc.is_none() && strm.zfree.is_none(),
+            "a wholly absent pair is left absent, which selects the global \
+             allocator and keeps a hookless caller's footprint unchanged"
+        );
+        assert!(strm.opaque.is_null(), "a zeroed cookie stays zeroed");
         assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
 
         // Both: the caller's allocator backs the state.
@@ -3352,47 +3777,108 @@ mod tests {
         };
         let mut strm = zeroed_stream();
         attach_budget(&mut strm, &budget);
+        let cookie = strm.opaque;
         assert_eq!(
             unsafe { inflateInit_(&mut strm, VERSION.as_ptr(), size_of::<z_stream>() as c_int) },
             Z_OK,
             "a complete hook pair with budget must initialize"
         );
         assert!(!strm.state.is_null());
+        assert!(
+            core::ptr::eq(strm.opaque, cookie),
+            "a complete pair is left exactly as the caller supplied it"
+        );
         assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+        assert!(
+            budget.remaining.load(core::sync::atomic::Ordering::SeqCst) < 64,
+            "a complete pair must actually route the working buffers through the \
+             caller's zalloc, not through the built-in"
+        );
     }
 
     /// The `inflateBack` twin: `infback.c` carries the identical prologue
-    /// (L37-L50), so it must reach the identical verdict.
+    /// (L36-L50), so it must reach the identical verdict — completion, not
+    /// rejection.
     #[test]
-    fn back_init_rejects_a_half_present_allocator_pair() {
+    fn back_init_completes_a_half_present_allocator_pair_exactly_as_c_does() {
         let mut window = vec![0u8; 1 << 15];
 
-        let cases: [(&str, crate::ffi::alloc_func, crate::ffi::free_func); 2] = [
-            ("zalloc only", Some(always_fail_zalloc), None),
-            ("zfree only", None, Some(never_called_zfree)),
-        ];
-        for (label, zalloc, zfree) in cases {
-            let mut strm = zeroed_stream();
-            strm.zalloc = zalloc;
-            strm.zfree = zfree;
-            assert_eq!(
-                unsafe {
-                    inflateBackInit_(
-                        &mut strm,
-                        15,
-                        window.as_mut_ptr(),
-                        VERSION.as_ptr(),
-                        size_of::<z_stream>() as c_int,
-                    )
-                },
-                Z_STREAM_ERROR,
-                "inflateBackInit_ must reject a half-present hook pair ({label})"
-            );
-            assert!(
-                strm.state.is_null(),
-                "a rejected inflateBackInit_ must install no state ({label})"
-            );
-        }
+        // --- zalloc only, and it refuses ------------------------------------
+        let mut strm = zeroed_stream();
+        strm.zalloc = Some(always_fail_zalloc);
+        strm.opaque = opaque_sentinel();
+        assert_eq!(
+            unsafe {
+                inflateBackInit_(
+                    &mut strm,
+                    15,
+                    window.as_mut_ptr(),
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_MEM_ERROR,
+            "the caller's zalloc must be consulted, so their out-of-memory signal \
+             surfaces as Z_MEM_ERROR exactly as it does in C"
+        );
+        assert!(
+            strm.zfree.is_some(),
+            "the missing zfree half must be substituted in place (`infback.c` L45-L50)"
+        );
+        assert_eq!(
+            strm.opaque,
+            opaque_sentinel(),
+            "C clears `opaque` only on the zalloc branch (`infback.c` L40-L43)"
+        );
+        assert!(
+            strm.state.is_null(),
+            "a failed inflateBackInit_ must install no state"
+        );
+
+        // --- zfree only: initialization succeeds ----------------------------
+        let stats = BuiltinHookStats::new();
+        let mut strm = zeroed_stream();
+        strm.zfree = Some(stats.zfree_fn());
+        strm.opaque = opaque_sentinel();
+        assert_eq!(
+            unsafe {
+                inflateBackInit_(
+                    &mut strm,
+                    15,
+                    window.as_mut_ptr(),
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK,
+            "a caller who supplied only zfree gets the built-in zalloc and a \
+             working inflateBack state, exactly as in C"
+        );
+        assert!(
+            strm.zalloc.is_some(),
+            "the missing zalloc half must be substituted in place (`infback.c` L37-L44)"
+        );
+        assert!(
+            strm.opaque.is_null(),
+            "C clears `opaque` on the zalloc branch (`infback.c` L40-L43)"
+        );
+        assert!(!strm.state.is_null());
+
+        // C's `inflateBackInit_` makes exactly one allocation — the state
+        // (`infback.c` L51) — because the window belongs to the caller and is
+        // adopted, never allocated or freed.
+        assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
+        assert_eq!(
+            stats.allocs(),
+            0,
+            "the caller supplied no zalloc, so none of their allocations ran"
+        );
+        assert_eq!(
+            stats.frees(),
+            1,
+            "the caller's zfree releases the single state reservation and nothing \
+             else: the lent window is never freed (`infback.c` L572-L577)"
+        );
 
         // Control: neither half still initializes, as it always has.
         let mut strm = zeroed_stream();
@@ -3411,9 +3897,88 @@ mod tests {
         assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
     }
 
+    /// `inflateCopy` reads the *source's* raw allocator fields, exactly as C does
+    /// through `inflateStateCheck(source)` (`inflate.c` L90-L91) followed by
+    /// `ZALLOC(source, …)` (L1310-L1329), and then hands the destination the
+    /// source's whole allocator triple through
+    /// `zmemcpy(dest, source, sizeof(z_stream))` (L1355). Both of the *valid*
+    /// hook configurations are asserted:
+    ///
+    /// * a source initialized with **no** hooks at all: the prologue leaves a
+    ///   wholly absent pair absent (see
+    ///   [`crate::ffi::types::init_allocator_prologue`]), the source is still a
+    ///   valid stream, the copy succeeds, and the destination inherits the same
+    ///   absent triple — which is what selects the global allocator for it too;
+    /// * a source with a **complete** caller-supplied pair: the copy succeeds and
+    ///   the destination inherits both halves *and* the cookie verbatim, so its
+    ///   buffers are charged to the caller's arena rather than the global heap.
+    ///
+    /// The invalid configuration — a half-present pair — is the subject of
+    /// [`copy_rejects_a_half_present_source_allocator`].
+    #[test]
+    fn copy_honors_the_source_allocator_fields_exactly_as_c_does() {
+        // --- a wholly unhooked source ---------------------------------------
+        let mut src = zeroed_stream();
+        assert_eq!(
+            unsafe { inflateInit_(&mut src, VERSION.as_ptr(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+        assert!(
+            src.zalloc.is_none() && src.zfree.is_none(),
+            "a wholly absent pair is left absent, so a hookless caller's \
+             footprint is unchanged (AAP §0.6.5)"
+        );
+
+        let mut dst = zeroed_stream();
+        assert_eq!(
+            unsafe { inflateCopy(&mut dst, &mut src) },
+            Z_OK,
+            "a stream this crate initialized always passes inflateStateCheck's \
+             hook clause"
+        );
+        assert!(!dst.state.is_null());
+        assert!(
+            dst.zalloc.is_none() && dst.zfree.is_none() && dst.opaque.is_null(),
+            "C's zmemcpy hands the destination the source's allocator triple \
+             verbatim, absent halves included"
+        );
+        assert_eq!(unsafe { inflateEnd(&mut dst) }, Z_OK);
+        assert_eq!(unsafe { inflateEnd(&mut src) }, Z_OK);
+
+        // --- a source with a complete caller-supplied pair -------------------
+        let budget = Budget {
+            remaining: core::sync::atomic::AtomicUsize::new(256),
+        };
+        let mut src = zeroed_stream();
+        attach_budget(&mut src, &budget);
+        let cookie = src.opaque;
+        assert_eq!(
+            unsafe { inflateInit_(&mut src, VERSION.as_ptr(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+
+        let mut dst = zeroed_stream();
+        assert_eq!(unsafe { inflateCopy(&mut dst, &mut src) }, Z_OK);
+        assert!(!dst.state.is_null());
+        assert!(
+            dst.zalloc.is_some() && dst.zfree.is_some(),
+            "a complete pair is inherited by the destination"
+        );
+        assert!(
+            core::ptr::eq(dst.opaque, cookie),
+            "the cookie travels with the hooks, so the destination's regions are \
+             charged to the same arena"
+        );
+        assert_eq!(unsafe { inflateEnd(&mut dst) }, Z_OK);
+        assert_eq!(unsafe { inflateEnd(&mut src) }, Z_OK);
+    }
+
     /// `inflateCopy` reads the *source's* raw allocator fields, so it carries the
-    /// same exposure. C rejects it through `inflateStateCheck(source)`
-    /// (`inflate.c` L90-L91) before its `ZALLOC(source, …)`.
+    /// same exposure as the `*Init*_` shims. C rejects a half-present pair through
+    /// `inflateStateCheck(source)` (`inflate.c` L90-L91) before its
+    /// `ZALLOC(source, …)`, and so must this shim — otherwise the destination
+    /// would be backed by the global heap while the caller believes their hook
+    /// owns it.
     #[test]
     fn copy_rejects_a_half_present_source_allocator() {
         let mut src = zeroed_stream();

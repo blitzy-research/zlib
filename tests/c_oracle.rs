@@ -50,10 +50,33 @@
 //!
 //! It is never `#[ignore]`d: plan-adopted standard **S10** (AAP §0.7.2) fixes
 //! the suite's ignored-test count at zero, so a run-time capability probe is the
-//! only admissible mechanism. The line is drawn deliberately: a compiler that is
-//! *absent* is an environmental fact and skips, whereas a compiler that is
-//! *present but cannot build the in-tree C sources* is a genuine defect and
-//! **fails**, with the captured `stderr` attached.
+//! only admissible mechanism.
+//!
+//! # Skip versus fail — the line, and why it is drawn where it is
+//!
+//! A skip and a failure make opposite claims. A skip says *nothing here could be
+//! checked*; a failure says *something here is wrong*. Reporting the second as
+//! the first is how a byte-identity gate comes to report success without having
+//! compared a single byte, so the two are separated mechanically rather than by
+//! good intentions:
+//!
+//! * **Skip** is reachable from exactly two conditions, both established before
+//!   anything is created: no C compiler is installed under any candidate name,
+//!   and the retained C baseline is absent. `skip_notice` documents that closed
+//!   list, and nothing else in this file is permitted to call it.
+//! * **Fail** covers everything after those two checks pass — creating the work
+//!   directory, copying each baseline file, writing the driver, compiling,
+//!   archiving, linking, writing each corpus, running the driver, and parsing its
+//!   result blob. Each panics with the path, or with the captured `stderr`, that
+//!   makes it diagnosable.
+//!
+//! The distinction is enforced one level down as well, where a tool is first
+//! looked for. "No such command" and "not executable" mean *absent* and lead to
+//! the next candidate; every other spawn error, and any non-zero `--version`,
+//! mean the tool exists and something went wrong, and those can never produce a
+//! skip. So a machine with a broken `cc` alongside a working `gcc` proceeds
+//! normally, while a machine whose only compiler is broken **fails and says so**,
+//! rather than claiming no compiler was found — which would not be true.
 //!
 //! # How to run it
 //!
@@ -118,6 +141,21 @@
 //!   directory as its working directory, so no object file, archive, binary,
 //!   corpus or result blob can land in the repository tree. The directory is
 //!   removed by a [`Drop`] guard when the test finishes.
+//! * **That temporary directory is created, never adopted — and proved fresh and
+//!   private before anything is built or run inside it.** It holds C sources that
+//!   get compiled and a binary that gets *executed*, and it is finally deleted
+//!   recursively, so using a directory this harness did not itself create would be
+//!   indefensible. The system temporary directory is moreover frequently shared
+//!   and world-writable, often without even the sticky bit that would stop one
+//!   user removing another's entries, so the directory is a trust boundary rather
+//!   than a convenience. [`WorkDir::new`] therefore anchors itself to an absolute,
+//!   already-resolved temporary base, creates the directory with a single
+//!   non-recursive — hence atomic — `mkdir` that *fails* rather than adopts when
+//!   anything already occupies the path, requests owner-only permissions at
+//!   creation time on Unix, steps to a fresh name when one is taken, and
+//!   re-verifies both properties before handing the directory out — see that type
+//!   for how this closes the insecure-temporary-directory, link-following and
+//!   time-of-check/time-of-use exposures (CWE-377, CWE-59, CWE-367).
 //! * **Never adjust an expectation to make a comparison pass.** Preservation
 //!   directive **D-2** (AAP §0.8.1) forbids altering a constant, and a mismatch
 //!   here is a real byte-identity defect in the encoder that must be reported,
@@ -465,7 +503,168 @@ fn smoke_corpus() -> Vec<(&'static str, Vec<u8>)> {
 // The private work directory (std only — there is no `tempfile` dependency)
 // ===========================================================================
 
-/// A uniquely named work directory, removed when the guard drops.
+/// How many distinct directory names [`WorkDir::new`] will try before giving up.
+///
+/// Every attempt draws a fresh nonce, so an honest collision between two parallel
+/// test threads is resolved on the next iteration. The bound exists for the
+/// dishonest case — a directory being pre-created faster than the loop advances —
+/// and for a filesystem that refuses every name: either must make the harness
+/// stop with a diagnostic rather than spin forever or, far worse, fall back to
+/// reusing a path it did not create.
+const MAX_WORK_DIR_ATTEMPTS: u32 = 64;
+
+/// Permission bits the work directory is created with on Unix: `rwx` for the
+/// owner and nothing whatsoever for group or other.
+///
+/// Named rather than inlined so the creation path, the post-creation
+/// verification in [`WorkDir::assert_fresh_and_private`] and the harness's own
+/// self-checks can never drift apart.
+#[cfg(unix)]
+const WORKDIR_MODE: u32 = 0o700;
+
+/// The system temporary directory, having first proved it really is one.
+///
+/// Everything this harness creates, and every process it spawns, is anchored
+/// here — so this one assumption underpins both the work directory and the
+/// `--version` probes, and leaving it unchecked would quietly reintroduce the
+/// very confusion the skip/fail split exists to remove. If `TMPDIR` (or its
+/// platform equivalent) names something that is not a directory, then
+/// [`Command::current_dir`] fails with [`NotFound`] — the *same* `io::Error` kind
+/// as "no such command" — and every compiler probe would be misfiled as absent.
+/// The harness would then print "no working C compiler found" and pass, on a
+/// machine that has a perfectly good compiler.
+///
+/// Checking here makes that impossible and costs one `stat` per call. It also
+/// buys the classification in [`Probe::Absent`] its precision: with the working
+/// directory proven to exist, a [`NotFound`] from a spawn can only mean the
+/// command itself is missing.
+///
+/// # Why the value is resolved rather than taken as returned
+///
+/// [`std::env::temp_dir`] is deliberately not trusted verbatim. On Unix it echoes
+/// `$TMPDIR` when that is set, which may be *relative* — and every command this
+/// harness spawns sets [`Command::current_dir`], so a relative base resolved
+/// against a changing working directory is not a location anybody can reason
+/// about — and which may itself be a symbolic link. Canonicalising resolves every
+/// component once, up front, so the base cannot be redirected afterwards by
+/// swapping an intermediate symlink, and it yields an absolute path by
+/// construction.
+///
+/// The canonicalisation is Unix-only on purpose. On Windows [`fs::canonicalize`]
+/// returns a `\\?\`-prefixed verbatim path and `CreateProcess` does not accept
+/// one of those as a child process's working directory — which is precisely what
+/// this path is used for. There the raw value is kept and only checked, which
+/// loses nothing: the shared, world-writable temporary directory that motivates
+/// the canonicalisation is a Unix phenomenon, whereas `%TEMP%` is per-user.
+///
+/// # Panics
+///
+/// Panics when the temporary directory cannot be resolved, does not exist, is not
+/// a directory, or is not absolute. Every supported platform provides a usable
+/// one, so each of those is a misconfigured environment — a condition to report,
+/// not a capability to skip.
+///
+/// [`NotFound`]: std::io::ErrorKind::NotFound
+fn temp_root() -> PathBuf {
+    let raw = std::env::temp_dir();
+
+    #[cfg(unix)]
+    let base = fs::canonicalize(&raw).unwrap_or_else(|err| {
+        panic!(
+            "the system temporary directory {} could not be resolved: {err}. Every command this \
+             harness spawns is anchored there, so an unresolvable base is reported rather than \
+             skipped — skipping would be indistinguishable from `no C compiler found`.",
+            raw.display()
+        )
+    });
+    #[cfg(not(unix))]
+    let base = raw.clone();
+
+    assert!(
+        base.is_dir(),
+        "the system temporary directory {} (from {}) does not exist or is not a directory, so \
+         this harness can neither create its work directory nor anchor its process spawns \
+         there. Check TMPDIR (or the platform equivalent). This is reported rather than skipped \
+         because it would otherwise be indistinguishable from `no C compiler found`.",
+        base.display(),
+        raw.display()
+    );
+    assert!(
+        base.is_absolute(),
+        "the system temporary directory {} (from {}) resolved to a relative path; the C-oracle \
+         work directory is only ever created under an absolute base, because every spawned \
+         command sets its own working directory and a relative base would then mean something \
+         different for each one.",
+        base.display(),
+        raw.display()
+    );
+    base
+}
+
+/// Reduce an arbitrary string to a single safe path component.
+///
+/// Only ASCII alphanumerics, `_`, and `-` survive. That drops every character
+/// which could end the component or refer to a parent — `/`, `\`, `.` (so `..`
+/// collapses away entirely), `:`, NUL, and every non-ASCII byte — so the result
+/// can only ever name a *child* of the directory it is joined onto, never a
+/// sibling or an ancestor (CWE-22). The output is truncated so an absurdly long
+/// value cannot push the path past a filesystem limit, and an input that filters
+/// down to nothing becomes `x`, so the caller always receives a usable
+/// component.
+///
+/// Applied to the work-directory tag. Today every tag is an in-file literal, so
+/// this is defence in depth rather than a live exploit path — but it makes the
+/// containment structural instead of a property one has to re-derive by
+/// inspecting call sites, which is the only form of it that survives a future
+/// caller passing something less trustworthy.
+fn safe_component(raw: &str) -> String {
+    let filtered: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(32)
+        .collect();
+    if filtered.is_empty() {
+        "x".to_owned()
+    } else {
+        filtered
+    }
+}
+
+/// Create `path` as a new, owner-private directory, failing if anything is
+/// already there.
+///
+/// Non-recursive on purpose. `create_dir_all` *succeeds* when the name is
+/// already taken by a directory — or by a symbolic link pointing at one — which
+/// would let this harness adopt a path it did not create and then compile, link,
+/// **execute** a binary inside it and finally remove it recursively. Refusing
+/// with [`AlreadyExists`] instead is what lets [`WorkDir::new`] step to the next
+/// candidate rather than follow the link (CWE-59), and it means the directory
+/// handed back provably did not exist a moment ago, which is in turn what makes
+/// the recursive delete in [`Drop`] safe (CWE-367).
+///
+/// On Unix the `0o700` mode is passed to `mkdir(2)` itself, so the directory is
+/// never even momentarily group- or world-accessible; there is no
+/// `set_permissions` window for another process to race (CWE-377). Elsewhere the
+/// platform default applies, which on Windows already excludes other users from
+/// a per-user temporary directory.
+///
+/// [`AlreadyExists`]: std::io::ErrorKind::AlreadyExists
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    // Explicit even though it is the default: this single flag is what makes the
+    // call one `mkdir(2)` — an atomic create-or-fail — and it must never be
+    // relaxed to `recursive(true)`.
+    builder.recursive(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(WORKDIR_MODE);
+    }
+    builder.create(path)
+}
+
+/// A freshly created, owner-private work directory, removed when the guard
+/// drops.
 ///
 /// Everything the reference build produces — copied sources, object files, the
 /// archive, the driver binary, the corpora and the result blob — lives here and
@@ -478,18 +677,85 @@ fn smoke_corpus() -> Vec<(&'static str, Vec<u8>)> {
 /// error, so the gzip layer must not attempt one — but failing to delete a
 /// temporary directory is not an error anybody needs to hear about, so
 /// best-effort removal in a destructor is precisely the correct design.
+///
+/// # Why the creation path is create-new rather than create-if-absent
+///
+/// This directory is not merely a scratch pad. Fifteen C translation units and a
+/// generated driver are written into it, compiled, archived and linked there, and
+/// then the resulting **binary is executed** from it — after which the whole tree
+/// is removed recursively. A directory that this harness did not itself create is
+/// therefore not safe to use for any of those steps, so it never adopts one:
+/// [`create_private_dir`] is non-recursive and owner-private, and [`WorkDir::new`]
+/// treats an occupied name purely as a reason to try the next one. Concretely
+/// that closes three distinct exposures in the system temporary directory, which
+/// on a shared machine is world-writable:
+///
+/// * **CWE-377, insecure temporary file.** The name is unpredictable *and* the
+///   directory is `0o700` from `mkdir(2)` onwards, so another user can neither
+///   guess it nor read the sources, objects and corpora inside it.
+/// * **CWE-59, link following.** A symlink planted at a candidate name is not
+///   followed: `create_dir_all` would have succeeded through it and written the C
+///   sources, the archive and the driver binary wherever it pointed, whereas
+///   create-new semantics report [`AlreadyExists`] and the candidate is skipped.
+/// * **CWE-367, time-of-check/time-of-use.** There is no check-then-use window at
+///   all, because there is no check: the single `mkdir(2)` both proves the name
+///   was free and takes it. That is also what makes the recursive delete in
+///   [`Drop`] sound — the path provably did not exist an instant earlier, so it
+///   cannot be a pre-existing directory or a link into one.
+///
+/// This is the same pattern the build script's schema-test helpers already use,
+/// deliberately so: one hardened idiom, applied identically wherever this
+/// repository creates a temporary directory.
+///
+/// [`AlreadyExists`]: std::io::ErrorKind::AlreadyExists
 struct WorkDir {
     /// Absolute path of the directory.
     path: PathBuf,
 }
 
 impl WorkDir {
-    /// Creates a fresh directory tagged with `tag`.
+    /// Creates a fresh, owner-private directory tagged with `tag`.
     ///
-    /// Uniqueness comes from the process id, a per-process monotonic counter and
-    /// a nanosecond timestamp together, because Cargo runs the test functions of
-    /// one binary on parallel threads and each builds its own oracle.
-    fn new(tag: &str) -> std::io::Result<Self> {
+    /// Uniqueness comes from the process id, a per-process monotonic counter, a
+    /// nanosecond timestamp and the attempt index together, because Cargo runs
+    /// the test functions of one binary on parallel threads and each builds its
+    /// own oracle, while sibling clones of this repository run in separate
+    /// processes. The tag passes through [`safe_component`] so the name is a
+    /// single component by construction.
+    ///
+    /// That makes collisions vanishingly unlikely — but *unlikely* is not the
+    /// property this function needs, because the name is derived from public
+    /// values and is therefore guessable, and the system temporary directory is
+    /// routinely shared between users and world-writable. Three mechanisms turn
+    /// the name into a guarantee:
+    ///
+    /// * **The base is resolved and validated first** by [`temp_root`], so the
+    ///   path is anchored to an absolute, already-resolved directory.
+    /// * **The directory itself is created atomically and privately** by
+    ///   [`create_private_dir`], which fails rather than adopting anything that
+    ///   already occupies the path. A collision — honest or hostile — is retried
+    ///   under a brand-new name instead of being reused.
+    /// * **The result is re-verified** by [`WorkDir::assert_fresh_and_private`]
+    ///   before the directory is handed out.
+    ///
+    /// Note the ordering in the success arm: the guard is constructed *before* it
+    /// is verified, so a failed verification drops it and its [`Drop`] removes the
+    /// directory — there is no separate cleanup path to get wrong.
+    ///
+    /// # Panics
+    ///
+    /// Panics — rather than degrading to a skip — when no work directory can be
+    /// created. By the time this is called a C compiler has already answered
+    /// `--version` and the retained C baseline has already been found, so the
+    /// prerequisites for a real sweep are established and an inability to make a
+    /// directory is a genuine failure of the machine, not an environmental fact
+    /// about it. Reporting it as "skipped" would turn a broken run into a green
+    /// one, which is precisely the false-green this harness exists to prevent.
+    ///
+    /// An occupied candidate name is *not* a failure: it is retried under the
+    /// next name, up to [`MAX_WORK_DIR_ATTEMPTS`] times. Nothing pre-existing is
+    /// ever adopted, moved or deleted.
+    fn new(tag: &str) -> Self {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
 
         let nanos = SystemTime::now()
@@ -497,18 +763,146 @@ impl WorkDir {
             .map(|d| d.as_nanos())
             .unwrap_or_default();
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "zlib_rs_c_oracle_{tag}_{}_{nanos}_{seq}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path)?;
-        Ok(Self { path })
+        let tag = safe_component(tag);
+        let pid = std::process::id();
+        let base = temp_root();
+
+        // The loop only ever advances the candidate name. It never inspects,
+        // adopts, unlinks or replaces whatever occupies a taken one.
+        for attempt in 0..MAX_WORK_DIR_ATTEMPTS {
+            let candidate = base.join(format!(
+                "zlib_rs_c_oracle_{tag}_{pid}_{nanos}_{seq}_{attempt}"
+            ));
+            match create_private_dir(&candidate) {
+                Ok(()) => {
+                    // Construct first, verify second: on a verification failure the
+                    // guard is dropped here and its `Drop` removes the directory.
+                    let work = Self { path: candidate };
+                    if let Err(err) = work.assert_fresh_and_private() {
+                        panic!(
+                            "the C-oracle work directory {} was created but failed its own \
+                             verification: {err}. This harness compiles C sources in that \
+                             directory and then executes the binary it produced, so the \
+                             freshness and privacy of the directory are load-bearing and a \
+                             failure here is reported, never worked around.",
+                            work.path.display()
+                        );
+                    }
+                    return work;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => panic!(
+                    "could not create the C-oracle work directory {}: {err}. A C compiler and \
+                     the retained C baseline were both found, so the live sweep was supposed to \
+                     run; this is a failure to report, not a capability to skip.",
+                    candidate.display()
+                ),
+            }
+        }
+        panic!(
+            "could not find an unused C-oracle work directory name under {} after \
+             {MAX_WORK_DIR_ATTEMPTS} attempts. Every candidate was already occupied, which is \
+             not a condition this harness can work around by itself.",
+            base.display()
+        );
+    }
+
+    /// Re-reads the directory this guard owns and proves it is the one that was
+    /// just created: a plain directory, not a symlink, and — on Unix — private to
+    /// its owner.
+    ///
+    /// Strictly this is defence in depth: [`create_private_dir`] is
+    /// non-recursive, so it already fails on anything pre-existing, and
+    /// `mkdir(2)` already applied [`WORKDIR_MODE`]. It is kept because it costs
+    /// one `lstat`, because it states the invariant in executable form rather
+    /// than in a comment, and because the consequence of the invariant not
+    /// holding is arbitrary code execution — the harness is about to compile and
+    /// run a binary from here.
+    fn assert_fresh_and_private(&self) -> std::io::Result<()> {
+        // `symlink_metadata` deliberately does *not* follow the final component,
+        // so a symlink is reported as a symlink instead of as whatever it aims
+        // at. `metadata` would defeat the entire check.
+        let meta = fs::symlink_metadata(&self.path)?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the work directory {} is not a plain directory ({:?}); refusing to build or \
+                     run anything inside it",
+                    self.path.display(),
+                    meta.file_type()
+                ),
+            ));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            // `mkdir(2)` masks the requested mode with the process umask, so the
+            // effective bits can only be a subset of what was asked for. Both
+            // halves are therefore checked: no group or other access at all (the
+            // security property), and full owner access (the functional one,
+            // without which the harness could not write here anyway).
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 || mode & WORKDIR_MODE != WORKDIR_MODE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "the work directory {} came out as mode {mode:04o} rather than \
+                         {WORKDIR_MODE:04o}; it must grant its owner full access and no other \
+                         user any",
+                        self.path.display()
+                    ),
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     /// Returns the path of `name` inside this directory.
     fn join<P: AsRef<Path>>(&self, name: P) -> PathBuf {
         self.path.join(name)
     }
+
+    /// Creates `name` inside this directory and writes `bytes` to it, failing
+    /// with [`AlreadyExists`] if the name is taken.
+    ///
+    /// Every artifact this harness materialises goes through this helper or
+    /// [`copy_new`](Self::copy_new), so no file it later compiles, links, runs
+    /// or parses can ever be one it silently replaced.
+    ///
+    /// [`AlreadyExists`]: std::io::ErrorKind::AlreadyExists
+    fn write_new<P: AsRef<Path>>(&self, name: P, bytes: &[u8]) -> std::io::Result<PathBuf> {
+        use std::io::Write as _;
+
+        let path = self.join(name);
+        create_new_file(&path)?.write_all(bytes)?;
+        Ok(path)
+    }
+
+    /// Copies `from` to `name` inside this directory, failing with
+    /// `AlreadyExists` if the name is taken.
+    ///
+    /// `fs::copy` is deliberately not used: it opens the destination with
+    /// truncate-or-create semantics and would overwrite whatever it found.
+    fn copy_new<P: AsRef<Path>>(&self, from: &Path, name: P) -> std::io::Result<PathBuf> {
+        let path = self.join(name);
+        let mut src = fs::File::open(from)?;
+        let mut dst = create_new_file(&path)?;
+        std::io::copy(&mut src, &mut dst)?;
+        Ok(path)
+    }
+}
+
+/// Opens `path` for writing with create-new semantics: never truncating an
+/// existing file and never following a symlink planted at that name.
+fn create_new_file(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 impl Drop for WorkDir {
@@ -516,12 +910,26 @@ impl Drop for WorkDir {
         // Best-effort: a cleanup failure must never mask a test result, and
         // leaving a few hundred KiB behind is not worth failing a conformance
         // gate over.
+        //
+        // Safe to recurse, on two independent grounds. First, `WorkDir::new`
+        // created this path with create-new semantics, so it was not a
+        // pre-existing directory and not a symlink into one — nothing
+        // pre-existing is ever in the removal set. Second, the directory is
+        // `0o700` from `mkdir(2)` onward, so no other user could have planted a
+        // symlink inside it for the traversal to follow; `std`'s own
+        // `remove_dir_all` is additionally implemented with `openat`/`unlinkat`
+        // on Unix and so does not re-resolve paths as it descends (CWE-367).
+        // Without those guarantees this call would be the payload of the CWE-59
+        // exposure described on the type, not a tidy-up. It is therefore safe to
+        // run unconditionally, including on the path where `WorkDir::new` rejects
+        // a directory it has just created, because the directory is only ever one
+        // this guard owns.
         let _ = fs::remove_dir_all(&self.path);
     }
 }
 
 // ===========================================================================
-// Capability probing — skip on an absent tool, fail on a broken build
+// Capability probing — skip only on an absent compiler; fail on a broken one
 // ===========================================================================
 
 /// A usable C toolchain: the compiler, its version banner, and the archiver when
@@ -531,8 +939,10 @@ struct Toolchain {
     cc: String,
     /// First line of its `--version` output, printed as evidence.
     version: String,
-    /// The archiver, when `ar` answered `--version`; [`None`] selects the
-    /// direct-object-link fallback.
+    /// The archiver, when `ar` answered `--version`. [`None`] selects the
+    /// direct-object-link fallback and means `ar` was either absent (expected on
+    /// an MSVC toolchain) or present but unable to answer `--version`, in which
+    /// case [`probe_toolchain`] has already said so out loud.
     ar: Option<String>,
 }
 
@@ -555,50 +965,185 @@ fn compiler_candidates() -> Vec<String> {
     candidates
 }
 
-/// Returns the first line of `name --version`, or [`None`] when the tool cannot
-/// be spawned or reports failure.
+/// The outcome of probing one candidate tool with `--version`.
+///
+/// Three outcomes rather than the two a plain `Option` offers, because the two
+/// an `Option` is forced to collapse together are not the same kind of thing at
+/// all. *"There is no such command"* is a fact about the machine, and it is the
+/// only fact that may ever lead to a skip. *"The command is there and something
+/// went wrong"* is a failure, and a failure has to be reported however it
+/// happens to be spelled — otherwise a resource limit, an unreadable interpreter
+/// line or a mis-installed compiler wrapper all launder themselves into
+/// "no C compiler found" and the conformance gate reports green without having
+/// compared a single byte.
+///
+/// `Debug` is derived so the harness's own self-tests can name the outcome they
+/// actually observed when an assertion about the classification fails.
+#[derive(Debug)]
+enum Probe {
+    /// Nothing usable is installed under this name. The spawn failed with
+    /// [`NotFound`] — no such command anywhere on `PATH` — or with
+    /// [`PermissionDenied`], meaning a matching file exists but cannot be
+    /// executed, so there is still no command to run. Both say "try the next
+    /// candidate", and if every candidate answers this way then there genuinely
+    /// is no C compiler and a skip is the truthful outcome.
+    ///
+    /// [`NotFound`] is unambiguous here only because [`temp_root`] has already
+    /// proved the spawn's working directory exists; otherwise a bad `TMPDIR`
+    /// would produce the identical error kind and be misread as an absent tool.
+    ///
+    /// [`NotFound`]: std::io::ErrorKind::NotFound
+    /// [`PermissionDenied`]: std::io::ErrorKind::PermissionDenied
+    Absent,
+    /// Something *is* installed under this name but could not be used: it
+    /// spawned and exited non-zero, or the spawn failed for a reason that is not
+    /// "no such command" — a resource limit, an I/O error, a broken wrapper. The
+    /// payload records which, so the eventual message is diagnosable. This
+    /// outcome can never produce a skip.
+    Unusable(String),
+    /// The tool answered `--version` successfully. Carries the first line of its
+    /// banner, printed later as evidence of which toolchain produced the oracle.
+    Usable(String),
+}
+
+/// First non-empty line of `stream`, trimmed — used both for the version banner
+/// and for the one line of `stderr` that makes a probe failure diagnosable.
+fn first_line(stream: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stream);
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
+}
+
+/// Classifies `name` by running `name --version`.
 ///
 /// The banner is captured rather than inherited so it never pollutes the test
-/// log; only the one line this returns is printed, and only as evidence of which
-/// toolchain produced the oracle.
+/// log; only the one line [`Probe::Usable`] carries is printed.
 ///
 /// This probe runs *before* the work directory exists — it is what decides
-/// whether there is anything to build at all — so it anchors itself to the
-/// system temporary directory instead. The rule that no spawn in this file ever
-/// inherits the repository as its working directory therefore holds without
-/// exception, which is what preservation directive **D-7** (AAP §0.8.1)
-/// requires: even a compiler wrapper that wrote a stray log file on `--version`
-/// could not touch the tree.
-fn probe_tool(name: &str) -> Option<String> {
-    let out = Command::new(name)
-        .current_dir(std::env::temp_dir())
+/// whether there is anything to build at all — so it anchors itself to
+/// [`temp_root`] instead. The rule that no spawn in this file ever inherits the
+/// repository as its working directory therefore holds without exception, which
+/// is what preservation directive **D-7** (AAP §0.8.1) requires: even a compiler
+/// wrapper that wrote a stray log file on `--version` could not touch the tree.
+///
+/// # Panics
+///
+/// Panics when the temporary directory is unusable — see [`temp_root`] for why
+/// that must be reported here rather than misfiled as [`Probe::Absent`].
+fn probe_tool(name: &str) -> Probe {
+    let out = match Command::new(name)
+        .current_dir(temp_root())
         .arg("--version")
         .output()
-        .ok()?;
+    {
+        Ok(out) => out,
+        // The one classification that matters: only "no such command" and "not
+        // executable" mean absent. Every other `io::Error` describes a machine
+        // that tried to run the tool and failed, which is a defect to report.
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Probe::Absent;
+        }
+        Err(err) => {
+            return Probe::Unusable(format!(
+                "`{name} --version` could not be spawned: {err} (io kind {:?}). That is not a \
+                 'no such command' condition, so it is a broken tool rather than an absent one.",
+                err.kind()
+            ));
+        }
+    };
+
     if !out.status.success() {
-        return None;
+        let detail = first_line(&out.stderr)
+            .or_else(|| first_line(&out.stdout))
+            .map_or_else(String::new, |line| format!(" — {line}"));
+        return Probe::Unusable(format!(
+            "`{name} --version` ran and reported {}{detail}",
+            out.status
+        ));
     }
-    let banner = String::from_utf8_lossy(&out.stdout);
-    Some(
-        banner
-            .lines()
-            .next()
-            .unwrap_or("(no version banner)")
-            .trim()
-            .to_owned(),
-    )
+
+    Probe::Usable(first_line(&out.stdout).unwrap_or_else(|| "(no version banner)".to_owned()))
 }
 
 /// Probes for a compiler and, independently, for `ar`.
 ///
-/// A missing `ar` is not a reason to skip: the archive step exists to mirror the
-/// recipe AAP §0.6.4 measured, and linking the objects straight into the driver
-/// is equivalent for this sweep. A missing *compiler* is a reason to skip.
+/// Returns [`None`] for exactly one condition: **no C compiler is installed
+/// under any candidate name**. That is the environmental fact the module header
+/// promises will skip.
+///
+/// A missing `ar` is not a reason to skip either: the archive step exists to
+/// mirror the recipe AAP §0.6.4 measured, and linking the objects straight into
+/// the driver is equivalent for this sweep.
+///
+/// # Panics
+///
+/// Panics when a compiler *is* installed but no candidate could be used. Saying
+/// "no working C compiler found" in that situation would be false, and passing
+/// the test on the strength of a false statement is the exact false-green this
+/// harness exists to prevent. Every unusable candidate is listed with the reason
+/// it failed, so the report is actionable rather than merely loud.
 fn probe_toolchain() -> Option<Toolchain> {
-    let (cc, version) = compiler_candidates()
-        .into_iter()
-        .find_map(|candidate| probe_tool(&candidate).map(|version| (candidate, version)))?;
-    let ar = probe_tool("ar").map(|_| "ar".to_owned());
+    let mut unusable: Vec<String> = Vec::new();
+    let mut chosen: Option<(String, String)> = None;
+
+    for candidate in compiler_candidates() {
+        match probe_tool(&candidate) {
+            Probe::Usable(version) => {
+                chosen = Some((candidate, version));
+                break;
+            }
+            // Recorded, not fatal on the spot: a broken `cc` wrapper alongside a
+            // working `gcc` is a real and benign configuration, so the search
+            // continues. What must not happen is the search *ending* in a skip
+            // while this list is non-empty.
+            Probe::Unusable(why) => unusable.push(why),
+            Probe::Absent => {}
+        }
+    }
+
+    let Some((cc, version)) = chosen else {
+        if !unusable.is_empty() {
+            panic!(
+                "a C compiler is installed but no candidate could be used, so the live C-oracle \
+                 sweep cannot run — and must not be reported as skipped:\n  - {}\n\
+                 Point CC at a working compiler, or repair the tools listed above.",
+                unusable.join("\n  - ")
+            );
+        }
+        return None;
+    };
+
+    let ar = match probe_tool("ar") {
+        Probe::Usable(_) => Some("ar".to_owned()),
+        // Absent is expected on an MSVC toolchain, where the archiver is
+        // `lib.exe` rather than `ar`.
+        Probe::Absent => None,
+        // Unusable is not expected — but the archive step is provably equivalent
+        // to linking the objects straight into the driver, so it cannot change a
+        // single compared byte. The honest response is therefore the documented
+        // fallback plus a notice that says out loud why it was taken: neither a
+        // skip (nothing about the sweep is impaired) nor a hard failure (nothing
+        // that affects the result has gone wrong). Note that this branch is
+        // reached only when `ar` never answered `--version`; an `ar` that
+        // answered and *then* failed to build the archive is a different
+        // condition entirely and is surfaced by `run_required`.
+        Probe::Unusable(why) => {
+            println!(
+                "c_oracle: note — `ar` is present but unusable, so the archive step is bypassed \
+                 and the reference objects are linked straight into the driver, which is \
+                 equivalent for this sweep: {why}"
+            );
+            None
+        }
+    };
+
     Some(Toolchain { cc, version, ar })
 }
 
@@ -608,6 +1153,20 @@ fn probe_toolchain() -> Option<Toolchain> {
 /// run-time notice is the mechanism precisely because plan-adopted standard
 /// **S10** (AAP §0.7.2) keeps the suite's ignored-test count at zero, so
 /// `#[ignore]` is not available.
+///
+/// # Where this may be called from — the whole list
+///
+/// Exactly two places, both in [`build_oracle`] and both *before* anything has
+/// been created: no C compiler is installed, and the retained C baseline is
+/// absent. Nothing else in this file may call it. In particular a failure to
+/// create a directory, copy a source, write a file, compile, archive, link, run
+/// the driver or parse its blob is **not** a capability condition — those all
+/// mean the sweep was possible and something broke, so they panic.
+///
+/// Keeping this list closed is what makes a printed `SKIPPED` trustworthy. If a
+/// genuine failure could also print it, then reading the notice would tell you
+/// nothing about whether the gate had actually been evaluated, and the gate would
+/// be worth nothing.
 fn skip_notice(reason: &str) {
     println!(
         "\nc_oracle: SKIPPED — {reason}.\n\
@@ -1185,10 +1744,31 @@ fn repo_root() -> PathBuf {
 /// Builds a reference oracle over `shapes`, or returns [`None`] after printing a
 /// capability notice when this machine cannot produce one.
 ///
-/// [`None`] means an *environmental* condition: no C compiler, or no retained C
-/// baseline (which is the legitimate state inside a packaged `.crate`, since the
-/// C sources are excluded from the published crate). A compiler that is present
-/// but fails to build the baseline panics instead — see [`run_required`].
+/// # The two — and only two — conditions that return [`None`]
+///
+/// 1. **No C compiler is installed** under any candidate name.
+/// 2. **The retained C baseline is absent**, which is the legitimate state inside
+///    a packaged `.crate` because the C sources are deliberately excluded from
+///    the published crate (AAP §0.8.2, third divergence).
+///
+/// Both are facts about the environment rather than defects, and both are checked
+/// *first*, before anything is created or written. Once past them the harness has
+/// established that a real sweep is possible, and from that point on **every**
+/// failure is reported rather than skipped: the work directory
+/// ([`WorkDir::new`]), each baseline copy, the driver write, the compile, the
+/// archive, the link, each corpus write, the sweep run and the blob parse all
+/// panic with the path or captured process output that makes them diagnosable.
+///
+/// That line is the whole point. A skip is a claim that nothing could be checked
+/// here; a failure is a claim that something is wrong. Reporting the second as
+/// the first is how a byte-identity gate comes to pass without having compared a
+/// single byte, and it is the specific defect this function is written to make
+/// impossible — see [`probe_toolchain`] for the same distinction applied one
+/// level down, at the point where "absent" and "broken" are told apart.
+///
+/// # Panics
+///
+/// On any post-prerequisite failure, as enumerated above.
 fn build_oracle(tag: &str, shapes: Vec<(&'static str, Vec<u8>)>) -> Option<Oracle> {
     let Some(toolchain) = probe_toolchain() else {
         skip_notice("no working C compiler found (tried $CC, cc, gcc, clang)");
@@ -1218,32 +1798,39 @@ fn build_oracle(tag: &str, shapes: Vec<(&'static str, Vec<u8>)>) -> Option<Oracl
         return None;
     }
 
-    let work = match WorkDir::new(tag) {
-        Ok(work) => work,
-        Err(err) => {
-            skip_notice(&format!(
-                "could not create a temporary work directory: {err}"
-            ));
-            return None;
-        }
-    };
+    // ---------------------------------------------------------------------
+    // Past this point both prerequisites are established: a compiler answered
+    // `--version` and every retained C baseline file was found. Everything that
+    // follows is therefore work the harness is *supposed* to be able to do, so
+    // every failure below is reported — never converted into a skip. See the
+    // "explicit failure" contract on `skip_notice` and `run_required`.
+    // ---------------------------------------------------------------------
+
+    let work = WorkDir::new(tag);
 
     // Copy the baseline out of the tree. The originals are only ever *read*:
     // preservation directive D-7 keeps them byte-identical, and copying is how
     // that is guaranteed mechanically rather than by discipline.
     for name in REFERENCE_SOURCES.iter().chain(REFERENCE_HEADERS.iter()) {
-        if let Err(err) = fs::copy(root.join(name), work.join(name)) {
-            skip_notice(&format!(
-                "could not copy the retained C baseline file {name} into {}: {err}",
+        let from = root.join(name);
+        work.copy_new(&from, name).unwrap_or_else(|err| {
+            panic!(
+                "could not copy the retained C baseline file {} into {}: {err}. The file was \
+                 present a moment ago, so the sweep was supposed to run and this is a failure \
+                 to report rather than a capability to skip.",
+                from.display(),
                 work.path.display()
-            ));
-            return None;
-        }
+            )
+        });
     }
-    if let Err(err) = fs::write(work.join("oracle_driver.c"), DRIVER_SOURCE) {
-        skip_notice(&format!("could not write the reference driver: {err}"));
-        return None;
-    }
+
+    work.write_new("oracle_driver.c", DRIVER_SOURCE.as_bytes())
+        .unwrap_or_else(|err| {
+            panic!(
+                "could not write the reference oracle driver into {}: {err}",
+                work.path.display()
+            )
+        });
 
     // Compile the fifteen translation units. `.current_dir(&work.path)` is the
     // single most important line for D-7 compliance: without it the compiler
@@ -1282,16 +1869,32 @@ fn build_oracle(tag: &str, shapes: Vec<(&'static str, Vec<u8>)>) -> Option<Oracl
     // unavailable — on an MSVC toolchain the archiver is `lib.exe` — fall back to
     // linking the objects straight into the driver, which is equivalent for this
     // sweep's purposes.
+    //
+    // The archive command itself goes through `run_required`, not through a
+    // success test whose failure branch selects the fallback. `ar` reaching this
+    // point means it already answered `--version`, so it is present and was
+    // expected to work; an `ar` that then cannot write an archive out of fifteen
+    // object files it just watched the compiler produce is a broken machine, and
+    // quietly switching linkage strategy would hide it. Absent-`ar` is handled
+    // once, in `probe_toolchain`, which is the only place entitled to decide that
+    // there is no archiver at all.
     let archive = "libz_ref.a";
-    let archived = toolchain.ar.as_ref().is_some_and(|ar| {
-        let mut command = Command::new(ar);
-        command
-            .current_dir(&work.path)
-            .arg("rcs")
-            .arg(archive)
-            .args(&objects);
-        matches!(command.output(), Ok(out) if out.status.success())
-    });
+    let archived = match toolchain.ar.as_ref() {
+        Some(ar) => {
+            let mut command = Command::new(ar);
+            command
+                .current_dir(&work.path)
+                .arg("rcs")
+                .arg(archive)
+                .args(&objects);
+            run_required(
+                &mut command,
+                "archiving the retained C baseline into libz_ref.a",
+            );
+            true
+        }
+        None => false,
+    };
 
     let mut link = Command::new(&toolchain.cc);
     link.current_dir(&work.path)
@@ -1307,18 +1910,25 @@ fn build_oracle(tag: &str, shapes: Vec<(&'static str, Vec<u8>)>) -> Option<Oracl
     // provably compress the very same bytes.
     let mut corpora = Vec::with_capacity(shapes.len());
     for (name, data) in shapes {
-        let path = work.join(format!("corpus_{name}.bin"));
-        if let Err(err) = fs::write(&path, &data) {
-            skip_notice(&format!("could not write the {name} corpus: {err}"));
-            return None;
-        }
+        let path = work
+            .write_new(format!("corpus_{name}.bin"), &data)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "could not write the {name} corpus ({} bytes) into {}: {err}",
+                    data.len(),
+                    work.path.display()
+                )
+            });
         corpora.push(Corpus { name, data, path });
     }
 
     let linkage = if archived {
         match fs::metadata(work.join(archive)) {
             Ok(meta) => format!("{archive} = {} bytes", meta.len()),
-            Err(_) => archive.to_owned(),
+            // Purely cosmetic — the size is evidence, not a result — but the
+            // reason is still stated rather than swallowed, so a log line never
+            // implies everything was fine when something was not.
+            Err(err) => format!("{archive} (size unreadable: {err})"),
         }
     } else {
         "direct object link (no usable `ar`)".to_owned()
@@ -1660,7 +2270,7 @@ impl Oracle {
     /// the largest artifact the harness produces, and nothing needs it again.
     fn sweep(&self, tag: &str, axes: &Axes) -> Vec<Record> {
         let blob_path = self.work.join(format!("results_{tag}.bin"));
-        let params_path = self.work.join(format!("sweep_{tag}.params"));
+        let params_name = format!("sweep_{tag}.params");
 
         // The parameter file is the single source of truth for the grid: writing
         // the axes once and letting the driver read them removes any possibility
@@ -1680,12 +2290,15 @@ impl Oracle {
         for corpus in &self.corpora {
             let _ = writeln!(params, "corpus={}", corpus.path.display());
         }
-        fs::write(&params_path, &params).unwrap_or_else(|err| {
-            panic!(
-                "could not write the sweep parameter file {}: {err}",
-                params_path.display()
-            )
-        });
+        let params_path = self
+            .work
+            .write_new(&params_name, params.as_bytes())
+            .unwrap_or_else(|err| {
+                panic!(
+                    "could not write the sweep parameter file {params_name} into {}: {err}",
+                    self.work.path.display()
+                )
+            });
 
         let mut sweep = Command::new(&self.driver);
         sweep
@@ -1757,7 +2370,8 @@ const DECISION_POINTS: &str = "\
     (c) the chain insertion order   — state.rs `insert_string`; `head[]` must be
                                       written only AFTER `prev[]`
     (d) the `longest_match` thresholds and both early exits — `max_chain_length`,
-        `nice_match`, the `good_match` chain halving, the lookahead clamp
+        `nice_match`, the `good_match` chain quartering (`chain_length >>= 2`),
+        the lookahead clamp
     (e) the lazy-match filter       — slow.rs `TOO_FAR` (4096) and the
                                       `prev_length -= 2` pre-decrement
     (f) block-type selection        — trees.rs stored/static/dynamic formulas
@@ -2118,4 +2732,521 @@ fn c_oracle_full_grid_matches_reference_zlib() {
              excluded and the grid is {expected} rather than the 3750 of the default feature set"
         );
     }
+}
+
+// ===========================================================================
+// Self-tests of the harness itself
+// ===========================================================================
+//
+// The two gates above are only as trustworthy as the machinery that decides
+// whether to run them and where to run them. These tests pin that machinery
+// directly, and they need no C toolchain at all, so they execute on every
+// machine that compiles this target — including the ones where the sweeps
+// themselves legitimately skip. Both properties they cover are ones that fail
+// *silently* when broken: a skip that should have been a failure still prints a
+// reassuring notice, and an adopted temporary directory still compiles and runs
+// perfectly well.
+
+/// `safe_component` must collapse every traversal and separator form into a
+/// single harmless component.
+///
+/// This is the containment that keeps a work-directory tag inside the temporary
+/// directory no matter what it says. Each case below is a way of naming somewhere
+/// else; none of them may survive.
+#[test]
+fn safe_component_neutralizes_traversal_and_separators() {
+    for raw in [
+        "smoke/../../security_target",
+        "../../../etc/passwd",
+        "..",
+        ".",
+        "/absolute",
+        "a/b\\c:d",
+        "back\\slash",
+        "c:\\windows\\system32",
+        "grid\0suffix",
+        "with space",
+        "semi;colon",
+        "new\nline",
+        "tilde~",
+        "dollar$sign",
+        "héllo",
+        "\u{4f60}\u{597d}",
+    ] {
+        let safe = safe_component(raw);
+        assert_eq!(
+            Path::new(&safe).components().count(),
+            1,
+            "{raw:?} sanitized to {safe:?}, which is not a single path component"
+        );
+        for bad in ['/', '\\', '.', ':', '\0'] {
+            assert!(
+                !safe.contains(bad),
+                "{raw:?} sanitized to {safe:?}, which still contains {bad:?}"
+            );
+        }
+        assert!(
+            safe.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "{raw:?} sanitized to {safe:?}, which still contains a character outside the \
+             allow-list — every shell metacharacter and every non-ASCII byte must be dropped"
+        );
+        assert!(
+            !safe.is_empty(),
+            "{raw:?} sanitized to an empty component, which cannot be joined onto a path"
+        );
+
+        // The property that actually matters: joined onto a base, the result can
+        // only ever name a *child* of that base — never a sibling, an ancestor or
+        // an absolute path of its own (CWE-22).
+        let joined = Path::new("/tmp").join(&safe);
+        assert_eq!(
+            joined.parent(),
+            Some(Path::new("/tmp")),
+            "{raw:?} sanitized to {safe:?}, which does not stay one level below the base"
+        );
+    }
+
+    // A value that filters down to nothing still yields something usable, and an
+    // over-long one is truncated rather than pushed past a filesystem limit.
+    assert_eq!(safe_component("////"), "x");
+    assert_eq!(safe_component(""), "x");
+    assert_eq!(safe_component(&"z".repeat(500)).len(), 32);
+
+    // Ordinary tags — the ones actually used — must pass through untouched, so
+    // the sanitizer costs nothing in readability of a real work-directory name.
+    assert_eq!(safe_component("smoke"), "smoke");
+    assert_eq!(safe_component("grid"), "grid");
+}
+
+/// `create_private_dir` must refuse an occupied name instead of adopting it, and
+/// must never follow a symbolic link planted at that name.
+///
+/// The contrast with `create_dir_all` is asserted explicitly, because that is the
+/// whole substance of the fix: `create_dir_all` reports *success* for both of
+/// these inputs, which is how a directory nobody in this file created comes to
+/// hold C sources, an archive, an executed binary — and then a recursive delete.
+#[test]
+fn create_private_dir_refuses_an_occupied_name_and_never_follows_a_symlink() {
+    let work = WorkDir::new("selftest_private");
+
+    // Case 1: a plain directory already there.
+    let occupied = work.join("occupied");
+    create_private_dir(&occupied).expect("first creation must succeed");
+    let err = create_private_dir(&occupied)
+        .expect_err("a second creation at the same name must be refused");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::AlreadyExists,
+        "an occupied name must report AlreadyExists so the caller can pick another, got {err}"
+    );
+    assert!(
+        fs::create_dir_all(&occupied).is_ok(),
+        "create_dir_all is expected to succeed here — that permissiveness is exactly why it is \
+         not used to create the work directory"
+    );
+
+    // Case 2: a symbolic link pointing at a directory holding a sentinel file.
+    #[cfg(unix)]
+    {
+        let target = work.join("link_target");
+        create_private_dir(&target).expect("link target must be creatable");
+        let sentinel = target.join("sentinel.txt");
+        fs::write(&sentinel, b"must survive").expect("sentinel must be writable");
+
+        let link = work.join("planted_link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink must be creatable");
+
+        let err =
+            create_private_dir(&link).expect_err("a planted symlink must not be created through");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "a symlinked name must report AlreadyExists rather than resolve, got {err}"
+        );
+        assert_eq!(
+            fs::read(&sentinel).expect("sentinel must still be readable"),
+            b"must survive",
+            "refusing the name must leave the link's target completely untouched"
+        );
+        assert!(
+            fs::create_dir_all(&link).is_ok(),
+            "create_dir_all follows the link and succeeds — the behaviour that made the planted \
+             symlink exploitable"
+        );
+    }
+}
+
+/// A `WorkDir` must be a freshly created, owner-private child of the system
+/// temporary directory, and must be gone once the guard drops.
+#[test]
+fn work_dir_is_a_fresh_private_child_of_the_temp_dir_and_is_removed_on_drop() {
+    let base = temp_root();
+    let path = {
+        let work = WorkDir::new("selftest_layout");
+        let path = work.path.clone();
+
+        assert!(
+            path.is_dir(),
+            "{} must exist as a directory",
+            path.display()
+        );
+        assert_eq!(
+            path.parent(),
+            Some(base.as_path()),
+            "{} must be a direct child of the temporary directory {}",
+            path.display(),
+            base.display()
+        );
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("the directory name must be valid UTF-8 by construction");
+        assert!(
+            name.starts_with("zlib_rs_c_oracle_selftest_layout_"),
+            "unexpected work-directory name {name:?}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(&path)
+                .expect("metadata must be readable")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, WORKDIR_MODE,
+                "the work directory must be owner-private from mkdir(2) onwards, got {mode:#o}"
+            );
+        }
+
+        // Successive directories never collide, which is what lets Cargo run the
+        // gates on parallel threads while each builds its own oracle.
+        let other = WorkDir::new("selftest_layout");
+        assert_ne!(
+            path, other.path,
+            "two work directories must never share a name"
+        );
+
+        path
+    };
+
+    assert!(
+        !path.exists(),
+        "{} must be removed when its guard drops",
+        path.display()
+    );
+}
+
+/// A tag that tries to escape must land inside the temporary directory anyway.
+///
+/// Every tag in this file is a literal today, so this is the property that keeps
+/// it that way structurally rather than by review.
+#[test]
+fn work_dir_contains_a_hostile_tag_inside_the_temp_dir() {
+    let base = temp_root();
+    let work = WorkDir::new("../../escape/attempt");
+
+    assert_eq!(
+        work.path.parent(),
+        Some(base.as_path()),
+        "a traversing tag must not move the work directory out of {}",
+        base.display()
+    );
+    let name = work
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("the directory name must be valid UTF-8 by construction");
+    assert!(
+        name.starts_with("zlib_rs_c_oracle_escapeattempt_"),
+        "the tag must be sanitized into the name, got {name:?}"
+    );
+    assert!(work.path.is_dir(), "the directory must still be created");
+}
+
+/// The file helpers must refuse to overwrite, so no artifact the harness later
+/// compiles, links, runs or parses can ever be one it silently replaced — by a
+/// second sweep reusing a tag or by anything else.
+#[test]
+fn work_dir_file_helpers_refuse_to_overwrite() {
+    let work = WorkDir::new("filehygiene");
+
+    // First write succeeds and lands inside the work directory.
+    let written = work
+        .write_new("payload.bin", b"first")
+        .expect("the first write_new must succeed");
+    assert_eq!(written.parent(), Some(work.path.as_path()));
+    assert_eq!(fs::read(&written).expect("read back"), b"first");
+
+    // Second write to the same name is refused, and the original is intact.
+    let err = work
+        .write_new("payload.bin", b"second")
+        .expect_err("write_new must not overwrite");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(
+        fs::read(&written).expect("read back"),
+        b"first",
+        "a refused write must leave the original bytes untouched"
+    );
+
+    // `copy_new` obeys the same rule, and copies content faithfully.
+    let copied = work
+        .copy_new(&written, "payload_copy.bin")
+        .expect("the first copy_new must succeed");
+    assert_eq!(fs::read(&copied).expect("read back"), b"first");
+    let err = work
+        .copy_new(&written, "payload_copy.bin")
+        .expect_err("copy_new must not overwrite");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+
+    let path = work.path.clone();
+    drop(work);
+    assert!(
+        !path.exists(),
+        "Drop must remove the work directory and everything written into it"
+    );
+}
+
+/// A command that does not exist must classify as [`Probe::Absent`] — the one
+/// outcome that is allowed to end in a skip.
+#[test]
+fn probe_classifies_a_missing_command_as_absent() {
+    let probe = probe_tool("zlib_rs_c_oracle_no_such_tool_4f2b9e");
+    assert!(
+        matches!(probe, Probe::Absent),
+        "a command that is not installed must be Absent, got {probe:?}"
+    );
+}
+
+/// A command that exists and fails must classify as [`Probe::Unusable`], never as
+/// absent.
+///
+/// This is the crux of the skip/fail separation. Before the fix, both of the
+/// cases below arrived as a bare `None` indistinguishable from "nothing is
+/// installed", so a machine whose only compiler was broken reported
+/// "no working C compiler found" and **passed**.
+#[cfg(unix)]
+#[test]
+fn probe_classifies_a_present_but_failing_command_as_unusable() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let work = WorkDir::new("selftest_probe");
+
+    // Case 1: executable, spawns, exits non-zero. The reported detail must carry
+    // the tool's own diagnostic so the eventual panic is actionable.
+    let failing = work.join("failing_tool.sh");
+    fs::write(
+        &failing,
+        "#!/bin/sh\necho 'deliberate probe failure' >&2\nexit 3\n",
+    )
+    .expect("script must be writable");
+    fs::set_permissions(&failing, fs::Permissions::from_mode(0o755))
+        .expect("script must be made executable");
+
+    let probe = probe_tool(failing.to_str().expect("path must be UTF-8"));
+    match &probe {
+        Probe::Unusable(why) => {
+            assert!(
+                why.contains("deliberate probe failure"),
+                "the tool's own stderr must reach the report, got {why:?}"
+            );
+            assert!(
+                why.contains("3"),
+                "the exit status must reach the report, got {why:?}"
+            );
+        }
+        other => panic!("a present-but-failing tool must be Unusable, got {other:?}"),
+    }
+
+    // Case 2: present but not executable. There is still no command to run, so
+    // this is genuinely absent rather than broken — the second half of the
+    // classification, and the reason PermissionDenied is grouped with NotFound.
+    let not_executable = work.join("not_executable");
+    fs::write(&not_executable, "#!/bin/sh\nexit 0\n").expect("file must be writable");
+    fs::set_permissions(&not_executable, fs::Permissions::from_mode(0o644))
+        .expect("permissions must be settable");
+
+    let probe = probe_tool(not_executable.to_str().expect("path must be UTF-8"));
+    assert!(
+        matches!(probe, Probe::Absent),
+        "a non-executable file provides no command to run, so it must be Absent, got {probe:?}"
+    );
+}
+
+/// The work directory this harness builds and runs C code in must be created
+/// fresh and private, every time — and must live under the resolved absolute
+/// temporary base.
+///
+/// This needs no C compiler: it inspects the properties of [`WorkDir::new`]
+/// itself, which are the precondition for everything the sweeps later do inside
+/// that directory — write C sources, compile them, and execute the resulting
+/// binary. A shared, frequently world-writable temporary directory is what makes
+/// those properties load-bearing rather than cosmetic, so they are asserted
+/// rather than assumed.
+///
+/// There is no skip path. [`temp_root`] reports an unusable temporary base by
+/// panicking, deliberately: a base that cannot be resolved is indistinguishable
+/// at spawn time from "no such command", so degrading to a skip here would turn
+/// a broken machine into a green run — exactly the false-green this harness
+/// exists to prevent.
+#[test]
+fn c_oracle_work_directory_is_absolute_fresh_and_private() {
+    let base = temp_root();
+    assert!(
+        base.is_absolute(),
+        "the resolved temporary base {} must be absolute",
+        base.display()
+    );
+
+    let mut created: Vec<WorkDir> = (0..2).map(|_| WorkDir::new("selftest")).collect();
+
+    // Two guards taken in the same process must never name the same directory:
+    // Cargo runs this binary's tests on parallel threads and each sweep builds
+    // its own oracle in its own directory.
+    assert_ne!(
+        created[0].path, created[1].path,
+        "two work directories must not share a path"
+    );
+
+    for work in &created {
+        assert!(
+            work.path.starts_with(&base),
+            "the work directory {} must live under the resolved temporary base {}",
+            work.path.display(),
+            base.display()
+        );
+
+        // `symlink_metadata` does not follow the final component, so this is the
+        // check that a symlink cannot pass.
+        let meta = fs::symlink_metadata(&work.path)
+            .expect("a work directory that was just created must be inspectable");
+        assert!(
+            !meta.file_type().is_symlink(),
+            "the work directory {} must be a real directory, never a symlink",
+            work.path.display()
+        );
+        assert!(
+            meta.is_dir(),
+            "the work directory {} must be a directory",
+            work.path.display()
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                WORKDIR_MODE,
+                "the work directory {} must be created with mode {WORKDIR_MODE:04o} so no other \
+                 user on a shared host can read, traverse or write the C sources that are about \
+                 to be compiled and run; it came out as {mode:04o}",
+                work.path.display()
+            );
+        }
+
+        // The guard's own verification must agree, since that is what
+        // `WorkDir::new` relies on.
+        work.assert_fresh_and_private()
+            .expect("a freshly created work directory must pass its own verification");
+
+        // The directory really is new: driving the production creation path at
+        // the very same location must be refused rather than adopting it. This
+        // is the atomic freshness proof `WorkDir::new` relies on, asserted
+        // against the real function.
+        let err = create_private_dir(&work.path)
+            .expect_err("creating an existing directory must fail, never adopt it");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "creating over an existing path must report AlreadyExists, not {err}"
+        );
+    }
+
+    // And the guard cleans up after itself, so a run leaves nothing behind in a
+    // directory other users can see.
+    let last = created.pop().expect("two guards were created");
+    let path = last.path.clone();
+    assert!(
+        fs::symlink_metadata(&path).is_ok(),
+        "the work directory {} must still exist while its guard is alive",
+        path.display()
+    );
+    drop(last);
+    assert!(
+        fs::symlink_metadata(&path).is_err(),
+        "dropping the guard must remove the work directory {}",
+        path.display()
+    );
+}
+
+/// A pre-placed symlink must never be adopted as the work directory, and the
+/// guard's own verification must reject one outright.
+///
+/// This is the regression guard for the exact hazard the atomic create closes,
+/// and it is written as a contrast so the reason is impossible to miss:
+/// [`fs::create_dir_all`] reports **success** for a symlink that points at an
+/// existing directory, silently redirecting everything subsequently written
+/// there, whereas the non-recursive [`fs::DirBuilder`] this harness uses reports
+/// [`std::io::ErrorKind::AlreadyExists`] and refuses. On a world-writable
+/// temporary directory that difference is the difference between a conformance
+/// harness and an arbitrary-code-execution vector, since the harness compiles
+/// and then runs what it finds in that directory.
+///
+/// The second half is the one [`create_private_dir_refuses_an_occupied_name_and_never_follows_a_symlink`]
+/// does not cover: even if such a path were somehow reached,
+/// [`WorkDir::assert_fresh_and_private`] refuses it with
+/// [`std::io::ErrorKind::InvalidData`].
+///
+/// Unix-only because it needs `symlink(2)`; creating a symlink on Windows
+/// requires a privilege that a test process cannot assume.
+#[cfg(unix)]
+#[test]
+fn c_oracle_work_directory_creation_refuses_a_pre_placed_symlink() {
+    let work = WorkDir::new("symlink-selftest");
+
+    // Stand up the attacker's arrangement inside our own private directory: a
+    // real directory, and a symlink aimed at it under the name the harness would
+    // like to create.
+    let victim = work.join("victim");
+    let planted = work.join("planted");
+    fs::create_dir(&victim).expect("the decoy target directory must be creatable");
+    std::os::unix::fs::symlink(&victim, &planted).expect("the decoy symlink must be creatable");
+
+    let err = create_private_dir(&planted)
+        .expect_err("the production creation path must refuse a pre-placed symlink");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::AlreadyExists,
+        "a pre-placed symlink must be reported as AlreadyExists, not {err}"
+    );
+
+    // The contrast that documents why the non-recursive form is mandatory: the
+    // recursive helper is perfectly happy to follow the symlink.
+    assert!(
+        fs::create_dir_all(&planted).is_ok(),
+        "create_dir_all is expected to follow a symlink to an existing directory and report \
+         success — that is precisely why WorkDir::new must not use it"
+    );
+
+    // And the guard's own verification would reject such a path outright. Giving
+    // the symlink a real guard is safe: its `Drop` can only reach inside `work`,
+    // which is this test's own private directory and is removed wholesale
+    // afterwards either way.
+    let planted_guard = WorkDir { path: planted };
+    let rejected = planted_guard
+        .assert_fresh_and_private()
+        .expect_err("a symlinked work directory must be rejected");
+    assert_eq!(
+        rejected.kind(),
+        std::io::ErrorKind::InvalidData,
+        "a symlinked work directory must be rejected as InvalidData, not {rejected}"
+    );
+
+    println!(
+        "c_oracle: work-directory self-check passed — a pre-placed symlink is refused with \
+         AlreadyExists and rejected by verification, while create_dir_all would have followed it"
+    );
 }

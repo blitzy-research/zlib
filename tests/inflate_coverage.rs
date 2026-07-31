@@ -1490,8 +1490,8 @@ unsafe extern "C" fn cap_free(opaque: *mut c_void, address: *mut c_void) {
 /// 1. **State allocation fails at init.** With a budget below the state size,
 ///    `inflateInit2_` cannot obtain the state reservation and returns
 ///    `Z_MEM_ERROR` — matching C, and validating that the inflate *state*
-///    allocation is routed through the caller's hook (previously it bypassed
-///    the hook and wrongly succeeded).
+///    allocation is routed through the caller's hook. A state allocation that
+///    bypassed the hook would wrongly succeed here.
 /// 2. **Window allocation fails after init.** With a budget large enough for the
 ///    state but below the state + window size, `inflateInit2_` succeeds and the
 ///    subsequent `inflate` fails when it tries to grow the lazily-allocated
@@ -1874,7 +1874,7 @@ fn external_allocator_observes_every_deflate_request() {
     // Exactly five requests, matching C `deflateInit2_` — the state plus
     // `window`, `prev`, `head` and the *single* `pending_buf` that carries the
     // overlaid symbol region (`deflate.c` L440-L520). A sixth request would mean
-    // the symbol buffer had been split out again.
+    // the symbol buffer was split out into an allocation of its own.
     assert_eq!(
         requests,
         vec![
@@ -2175,11 +2175,12 @@ fn compress_at(payload: &[u8], window_bits: i32) -> Vec<u8> {
 /// `out_chunk` is the ordinary `zpipe.c` shape.
 ///
 /// The assertion is byte-exact recovery plus `Z_STREAM_END`, across raw, zlib,
-/// gzip and auto-detect framings. Before the fast loop's entry invariant was
-/// corrected this aborted the process on the majority of these combinations: a
-/// `debug_assert!` failure under `panic = "abort"` (set for **both** profiles,
-/// `Cargo.toml` L173-L205), which across the C ABI is an unrecoverable
-/// `SIGABRT` rather than an error return.
+/// gzip and auto-detect framings. The stakes on these combinations are high: a
+/// fast loop that asserted C's prose-only `bits < 8` entry claim, or that handed
+/// back bytes it never pulled, would fail a `debug_assert!` under
+/// `panic = "abort"` (set for **both** profiles, `Cargo.toml` L173-L205), and
+/// across the C ABI that is an unrecoverable `SIGABRT` rather than an error
+/// return.
 #[test]
 fn incrementally_delivered_input_decodes_byte_exactly() {
     // Mixed entropy: repeated phrases give the encoder long back-references while
@@ -2402,10 +2403,11 @@ fn stream_inflate_tolerant(
 ///   zlib built without `INFLATE_STRICT` accepts this stream and a default build
 ///   must accept exactly what reference zlib accepts.
 ///
-/// Before the slow-path guard was ported, a strict build accepted the stream at
-/// every `out_chunk <= 259` and at `out_chunk == 4096` for every small
-/// `in_chunk` — rejecting it only when the fast loop happened to decode the
-/// offending symbol.
+/// Both verdicts must hold at every buffer granularity. Without the slow-path
+/// `dmax` guard a strict build would accept the stream at every
+/// `out_chunk <= 259` and at `out_chunk == 4096` for every small `in_chunk`,
+/// rejecting it only when the fast loop happened to decode the offending
+/// symbol — which is exactly the buffer-size dependence this test forbids.
 #[test]
 fn strict_dmax_verdict_is_independent_of_buffer_sizes() {
     // CINFO = 0 declares a 256-byte window; the body carries a distance of 556.

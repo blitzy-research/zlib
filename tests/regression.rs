@@ -1,8 +1,12 @@
 //! Canonical zlib regression driver — a faithful Rust port of `test/example.c`,
 //! the reference zlib exerciser shipped with the C library.
 //!
-//! This integration test operationalizes the "official zlib test vectors"
-//! conformance requirement (AAP §0.6.7 / §0.7.2). It reproduces the ten
+//! This integration test operationalizes user **constraint 4** — "must pass the
+//! official zlib test vectors" — whose technical content is spelled out in **AAP
+//! §0.6.7**, where `test/example.c` is named as this file's oracle. Keeping it
+//! green and un-`#[ignore]`d is required by **§0.7.2 plan-adopted standard S10**
+//! ("quality gates stay green and blocking") and by **§0.8.1 directive D-5**
+//! (test coverage is preserved and only ever increased). It reproduces the ten
 //! `example.c` helper functions as independent `#[test]`s driving the public
 //! [`zlib_rs`] API:
 //!

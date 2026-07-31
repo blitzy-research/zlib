@@ -187,9 +187,10 @@ pub struct GzHeader {
     ///   the extra field was truncated, exactly as `zlib.h` specifies for
     ///   `inflateGetHeader`: once `done` is true, `extra_len` contains the actual
     ///   extra field length, and `extra` contains that field *or that field
-    ///   truncated if `extra_max` is less than `extra_len`*. It is also written
-    ///   for the documented length-query pattern, where the caller leaves
-    ///   `extra` as [`None`] (C `Z_NULL`) purely to learn the length.
+    ///   truncated if `extra_max` is less than `extra_len`*. Because that write is
+    ///   unconditional, a caller may also leave `extra` as [`None`] (C `Z_NULL`)
+    ///   purely to learn the length. `zlib.h` does not spell that query out; it is
+    ///   de-facto reference-zlib behavior, and this port reproduces it.
     ///
     ///   Because C writes it only when the header actually carries an `FEXTRA`
     ///   field, a stream **without** one leaves whatever value the caller had

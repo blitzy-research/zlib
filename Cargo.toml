@@ -69,8 +69,14 @@ build = "build.rs"
 #
 # NEVER add to this list — these ARE the crate: `src/**`, `tests/**`,
 # `benches/**`, `build.rs`, `Cargo.toml`, `Cargo.lock`, `README.md`, `LICENSE`,
-# `CHANGELOG.md`, `SECURITY.md`, `CONTRIBUTING.md`, `deny.toml`, `clippy.toml`,
-# `rustfmt.toml`, `rust-toolchain.toml`. Note especially that the `test/**`
+# `deny.toml`, `rustfmt.toml`, `rust-toolchain.toml`.
+#
+# The same prohibition applies in advance to four artifacts the migration plan
+# calls for that DO NOT EXIST in this tree yet: `CHANGELOG.md` (AAP gap D5),
+# `SECURITY.md` and `CONTRIBUTING.md` (gap D6), and `clippy.toml` (gap D11, the
+# companion to `rustfmt.toml`). They are named here so that whoever writes them
+# does not have to rediscover the rule: each belongs in the published crate, so
+# none of them may ever be added below. Note especially that the `test/**`
 # entry below is the *C driver* directory (`test/example.c`, `test/infcover.c`,
 # `test/minigzip.c`) and is a DIFFERENT path from the Rust integration suite
 # `tests/**`, which must remain packaged. Do not conflate the two.
@@ -102,10 +108,12 @@ exclude = [
     "MODULE.bazel",
     # CMake's own formatter config — tooling for the retained C build only.
     ".cmake-format.yaml",
-    # Upstream C documentation. `README.md` (this crate's `readme = ` target)
-    # and the Rust `CHANGELOG.md` are deliberately NOT in this group: the bare
-    # `README` and `ChangeLog` names below are the *upstream C* files, which the
-    # Rust-facing documents supersede for crate consumers.
+    # Upstream C documentation. `README.md` — this crate's `readme = ` target —
+    # is deliberately NOT in this group: the bare `README` and `ChangeLog` names
+    # below are the *upstream C* files, and a bare name matches a path component
+    # without matching a `.md` suffix. The Rust-facing `CHANGELOG.md` that would
+    # supersede `ChangeLog` for crate consumers does not exist yet (AAP gap D5);
+    # when it is written it must stay out of this group as well.
     "ChangeLog",
     "FAQ",
     "INDEX",

@@ -123,13 +123,17 @@ pub use state::{GzMode, GzState};
 // it is not part of the public API. The `pub(crate)` re-export matches the
 // type's own `pub(crate)` visibility (a `pub use` of it would fail to compile).
 //
-// `#[allow(unused_imports)]`: this re-export exists so the forthcoming
-// `src/ffi/gz.rs` can reach the look-ahead mode via `crate::gz::How` — the
-// `state` submodule is private, so the FFI shim layer has no other path to it.
-// Until that shim lands, the library-only target has no in-crate consumer of the
-// re-exported name (the module's own `#[cfg(test)]` block references it, but
-// that is a separate compilation target), so the unused-import lint would
-// otherwise fire here. The re-export is mandated by the layer contract.
+// `#[allow(unused_imports)]`: the re-export exists so that a consumer OUTSIDE
+// this module — `src/ffi/gz.rs` is the intended one — can name the look-ahead
+// mode as `crate::gz::How`, because the `state` submodule is private and offers
+// no other path from the FFI layer. As it stands the shim has no need for it:
+// `src/ffi/gz.rs` never mentions `How`, and this module's sibling `close.rs`
+// reaches the type by its in-layer path `crate::gz::state::How` instead. The
+// only reference to the re-exported name is in this module's own
+// `#[cfg(test)]` block, which is a separate compilation target, so the
+// library-only target sees no consumer at all and the unused-import lint would
+// fire without the allow. The re-export is kept because the layer contract
+// specifies it as the single sanctioned cross-layer path to `How`.
 #[allow(unused_imports)]
 pub(crate) use state::How;
 

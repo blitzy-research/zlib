@@ -76,11 +76,13 @@ use crate::gz::write::{gz_comp, gz_zero};
 ///   (a later error in this sequence overrides an earlier one, matching C).
 ///
 /// Note: reference zlib additionally reports [`Z_ERRNO`](ReturnCode::ErrNo)
-/// when `close(fd)` itself fails. In this safe layer the descriptor is closed
-/// by [`File`](std::fs::File)'s [`Drop`], which cannot surface a `close(2)`
-/// error, so the exact `Z_ERRNO`-on-close path is deferred to the raw-descriptor
-/// FFI boundary (`src/ffi/gz.rs`). This function therefore returns the
-/// accumulated flush status, matching the C non-error close path.
+/// when `close(fd)` itself fails (C L695-L696). The descriptor here is owned by
+/// a [`File`](std::fs::File) and closed by its [`Drop`], which discards the
+/// `close(2)` result, so that code is never produced — by this function or by
+/// the `gzclose`/`gzclose_w` C-ABI shims, which simply delegate here. The
+/// returned value is therefore always the accumulated stream status, which
+/// equals the C result whenever `close(fd)` succeeds. This is a documented
+/// consequence of RAII descriptor ownership, not a deferral.
 pub fn gzclose_w(mut file: Box<GzState>) -> i32 {
     // C L676-L677: reject a handle that is not open for writing.
     if file.mode != GzMode::Write {
@@ -107,11 +109,12 @@ pub fn gzclose_w(mut file: Box<GzState>) -> i32 {
 
     // C L695-L698: `if (close(fd) == -1) ret = Z_ERRNO; ... free(state);`.
     // Dropping the box frees the I/O buffers, ends the deflate stream, and
-    // closes the descriptor via RAII. `File`'s `Drop` cannot surface a
-    // `close(2)` error to safe Rust, so we do not fabricate one here — the exact
-    // `Z_ERRNO`-on-close reporting is deferred to the raw-descriptor FFI
-    // boundary (`src/ffi/gz.rs`). We return the accumulated flush status, which
-    // matches the C result whenever `close(fd)` succeeds.
+    // closes the descriptor via RAII. `File`'s `Drop` discards the `close(2)`
+    // result, so a close failure is unobservable and `Z_ERRNO` is never returned
+    // from this path — nor from the `gzclose_w` C-ABI shim, which delegates
+    // straight here rather than handling a raw descriptor of its own. We return
+    // the accumulated flush status, which matches the C result whenever
+    // `close(fd)` succeeds.
     drop(file);
 
     ret.as_c_int()
@@ -136,11 +139,13 @@ pub fn gzclose_w(mut file: Box<GzState>) -> i32 {
 ///   [`Z_OK`](ReturnCode::Ok).
 ///
 /// Note: reference zlib additionally reports [`Z_ERRNO`](ReturnCode::ErrNo)
-/// when `close(fd)` fails (C `return ret ? Z_ERRNO : err;`). In this safe layer
-/// the descriptor is closed by [`File`](std::fs::File)'s [`Drop`], which cannot
-/// surface a `close(2)` error, so the exact `Z_ERRNO`-on-close path is deferred
-/// to the raw-descriptor FFI boundary (`src/ffi/gz.rs`). This function returns
-/// the accumulated read status, matching the C non-error close path.
+/// when `close(fd)` fails (C `return ret ? Z_ERRNO : err;`). The descriptor here
+/// is owned by a [`File`](std::fs::File) and closed by its [`Drop`], which
+/// discards the `close(2)` result, so that code is never produced — by this
+/// function or by the `gzclose`/`gzclose_r` C-ABI shims, which simply delegate
+/// here. The returned value is therefore always the accumulated read status,
+/// which equals the C result whenever `close(fd)` succeeds. This is a documented
+/// consequence of RAII descriptor ownership, not a deferral.
 pub fn gzclose_r(file: Box<GzState>) -> i32 {
     // C L650-L651: reject a handle that is not open for reading.
     if file.mode != GzMode::Read {
@@ -155,11 +160,12 @@ pub fn gzclose_r(file: Box<GzState>) -> i32 {
 
     // C L665-L667: `ret = close(state->fd); free(state); return ret ? Z_ERRNO
     // : err;`. Dropping the box ends the inflate stream, frees buffers, and
-    // closes the descriptor via RAII. `File`'s `Drop` cannot surface a
-    // `close(2)` error to safe Rust, so we do not fabricate one here — the exact
-    // `Z_ERRNO`-on-close reporting is deferred to the raw-descriptor FFI
-    // boundary (`src/ffi/gz.rs`). We return the accumulated read status, which
-    // matches the C result whenever `close(fd)` succeeds.
+    // closes the descriptor via RAII. `File`'s `Drop` discards the `close(2)`
+    // result, so a close failure is unobservable and `Z_ERRNO` is never returned
+    // from this path — nor from the `gzclose_r` C-ABI shim, which delegates
+    // straight here rather than handling a raw descriptor of its own. We return
+    // the accumulated read status, which matches the C result whenever
+    // `close(fd)` succeeds.
     drop(file);
 
     status.as_c_int()

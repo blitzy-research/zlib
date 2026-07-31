@@ -1,10 +1,21 @@
 //! Byte-identity and wire-format cross-validation for `zlib-rs`.
 //!
 //! This integration test is the authoritative **byte-identity and wire-format
-//! compatibility** gate for `zlib-rs` (AAP §0.6.4 / §0.6.7 / §0.7.2; user
-//! constraint 1, "output must be binary-compatible with zlib-produced
-//! streams"; plan-adopted standard S3, "bit-exactness is a release gate, not an
-//! aspiration"). It proves two distinct, complementary properties, in two tiers:
+//! compatibility** gate for `zlib-rs`. Its mandate comes from four specific
+//! places:
+//!
+//! * user **constraint 1** — "output must be binary-compatible with
+//!   zlib-produced streams";
+//! * **AAP §0.8.1 directive D-1** — compressed output must remain byte-for-byte
+//!   identical to reference zlib, read in its strong form;
+//! * **AAP §0.7.2 plan-adopted standard S3** — "bit-exactness is a release gate,
+//!   not an aspiration", which is what makes tier 1 below always-on and
+//!   C-toolchain-free;
+//! * **AAP §0.6.4** (the eight decision points that determine the emitted bytes)
+//!   and **§0.6.7** (official test-vector conformance), which supply the
+//!   technical content the two tiers assert.
+//!
+//! It proves two distinct, complementary properties, in two tiers:
 //!
 //! # Testing strategy
 //!

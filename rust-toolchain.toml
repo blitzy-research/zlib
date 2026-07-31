@@ -29,20 +29,19 @@
 #
 # THIS FILE IS NOT A STRAITJACKET
 # ==============================
-# `rustup` gives a `+toolchain` shorthand, the `RUSTUP_TOOLCHAIN` environment
-# variable, and a directory override all HIGHER precedence than this file, so any
-# single command, shell, or CI step can opt out without editing anything here:
+# `rustup` resolves a toolchain by precedence, highest first: (1) a `+toolchain`
+# shorthand on the command line, (2) the `RUSTUP_TOOLCHAIN` environment
+# variable, (3) a `rustup override` set for the directory, (4) THIS FILE, and
+# (5) `rustup default`. Ranks 1-3 all beat it, so any single command, shell, or
+# CI step can opt out without editing anything here:
 #
 #     cargo +stable test                 # one command, current stable
 #     RUSTUP_TOOLCHAIN=stable cargo test # one shell / one CI step
 #
 # Two consequences follow, and both matter:
 #
-# (a) This file is NOT a straitjacket. Ranks 1-3 all beat it, so any single
-#     command, shell, or CI step can opt out without editing anything here:
-#
-#         cargo +stable test                 # one command, current stable
-#         RUSTUP_TOOLCHAIN=stable cargo test # one shell / one CI step
+# (a) Ranks 1-3 beating rank 4 is what the two commands above rely on, so the
+#     pin costs a contributor nothing when they need another channel.
 #
 #     Verified in this working tree: with this file present,
 #     `rustup show active-toolchain` reports
@@ -160,19 +159,21 @@
 #
 # Measured on the current tree, it is clean on BOTH ends — `clippy 0.1.97` and
 # the `clippy 0.1.85` that ships with the pinned floor — with and without
-# `--all-features`, zero warnings in all four combinations. An earlier revision
-# of this file recorded two 0.1.85 failures in `src/ffi/gz.rs`
-# (`clippy::duplicated_attributes` for an inner `#![cfg(feature = "gz-io")]`
-# restating the `#[cfg(…)]` on `pub mod gz;`, and `undocumented_unsafe_blocks`
-# for a block whose `// SAFETY:` comment `rustfmt` had separated from the
-# `unsafe` token). Both have since been resolved in the source — the inner
-# `cfg` attribute is gone, and every `unsafe` block in the crate AND in the
-# integration tests now carries a `// SAFETY:` comment adjacent to the `unsafe`
-# token, verified with an explicit `-W clippy::undocumented_unsafe_blocks`
-# sweep over `--all-targets` on both toolchains (zero findings).
+# `--all-features`, zero warnings in all four combinations. Two 0.1.85-specific
+# diagnostics are worth naming, because staying clean on the floor means
+# continuing to avoid the constructs that trigger them:
+# `clippy::duplicated_attributes`, which fires on an inner
+# `#![cfg(feature = "gz-io")]` restating the `#[cfg(…)]` on `pub mod gz;` (see the
+# note in `src/ffi/gz.rs`), and `undocumented_unsafe_blocks`, which fires when
+# `rustfmt` separates a `// SAFETY:` comment from its `unsafe` token. Neither
+# construct is present: there is no inner `cfg` attribute, and every `unsafe`
+# block in the crate AND in the integration tests carries a `// SAFETY:` comment
+# adjacent to the `unsafe` token, verified with an explicit
+# `-W clippy::undocumented_unsafe_blocks` sweep over `--all-targets` on both
+# toolchains (zero findings).
 #
 # The gate nevertheless stays on stable, and that is a durable decision rather
-# than a reaction to those two diagnostics: clippy's lint SET is not stable
+# than a reaction to any particular diagnostic: clippy's lint SET is not stable
 # across releases, so `-D warnings` on an old clippy can reintroduce
 # diagnostics upstream has already withdrawn, and pinning the linter to the
 # MSRV would eventually mean editing correct, test-covered code to satisfy an
@@ -187,28 +188,29 @@
 # failed stable's.
 #
 # The direction of that asymmetry is why the CI `lint` job must state its
-# toolchain rather than inherit it. Before this was made explicit, the job was
-# LABELLED `dtolnay/rust-toolchain@stable` but actually executed the pinned
+# toolchain rather than inherit it. Without an explicit override the job is
+# LABELLED `dtolnay/rust-toolchain@stable` while actually executing the pinned
 # floor's clippy — the action sets `rustup default`, which this file outranks —
-# so the "current stable lint" gate was in fact an MSRV lint gate, and a
-# stable-only diagnostic could reach the default branch unnoticed. Every job in
-# `.github/workflows/ci.yml` and `.github/workflows/fuzz.yml` now sets
+# so the "current stable lint" gate becomes an MSRV lint gate, and a stable-only
+# diagnostic reaches the default branch unnoticed. Every job in
+# `.github/workflows/ci.yml` and `.github/workflows/fuzz.yml` therefore sets
 # `RUSTUP_TOOLCHAIN` at job level (rank 2), so the label and the compiler agree.
 #
 # Re-verify BOTH ends whenever a dependency or a language feature is added — the
-# floor for the MSRV contract, stable for the lint contract:#
+# floor for the MSRV contract, stable for the lint contract:
+#
 #     cargo check --all-targets                          # the pinned floor
 #     cargo clippy --all-targets -- -D warnings          # the floor's linter
 #     cargo +stable clippy --all-targets -- -D warnings  # the lint gate
 #
 # MEASURED STATUS — the lint gate passes on BOTH ends of the supported range,
-# with and without `--all-features`. An earlier revision of this file was wrong
-# to claim otherwise, so the measurement is recorded rather than the claim:
+# with and without `--all-features`. The measurement is recorded here instead of
+# a bare assertion, so it can be re-run rather than trusted:
 #
 #     clippy 0.1.97 (8bab26f4f6 2026-07-14)  — exit 0, zero diagnostics
 #     clippy 0.1.85 (4d91de4e48 2025-02-17)  — exit 0, zero diagnostics
 #
-# Do NOT reinstate a claim that the floor's clippy fails, and do not add an
+# Do NOT introduce a claim that the floor's clippy fails, and do not add an
 # `#[allow(…)]` or any other suppression for a failure that does not exist.
 #
 #

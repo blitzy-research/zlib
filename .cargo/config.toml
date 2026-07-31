@@ -74,10 +74,12 @@
 #     drop `-D warnings` or `--all-targets` and make a gate look green.
 #  7. No `[env]` table at all. `[env]` applies to build scripts as well as to
 #     compilation, here and in `fuzz/`, so a key here can change what a build
-#     script sees without appearing on any command line. `build.rs` reads
-#     exactly one variable today -- the `OUT_DIR` Cargo sets for it -- and it
-#     must stay that way: an environment-gated build-script behaviour is
-#     untestable by CI and was already removed once (see SYMBOL VERSIONING).
+#     script sees without appearing on any command line. That matters concretely
+#     now that `build.rs` carries the `ZLIB_RS_VERSION_SCRIPT` opt-in described
+#     under SYMBOL VERSIONING: setting it from `[env]` would turn an explicit,
+#     per-invocation choice into an ambient default for this whole directory tree
+#     -- including the detached `fuzz/` workspace -- with nothing on any command
+#     line to show for it. Pass it on the invocation that wants it instead.
 #  8. No `[source]`, `[patch]`, `[registries]`, or `[net] offline`. Resolution
 #     must not move and `Cargo.lock` must stay byte-identical; `deny.toml`
 #     allows only the crates.io index.
@@ -114,14 +116,8 @@
 
 
 # ---------------------------------------------------------------------------
-# SYMBOL VERSIONING (gap D8) IS NOT WIRED UP -- NOT HERE, AND NOT IN `build.rs`
+# SYMBOL VERSIONING (gap D8) LIVES IN `build.rs`, NOT HERE
 # ---------------------------------------------------------------------------
-# The retained C baseline links `libz.so` through `zlib.map`, a GNU-ld version
-# script. Only GNU `ld` and `lld` understand `--version-script`; Mach-O's
-# `ld64` wants `-exported_symbols_list` and MSVC's `link.exe` wants a `.def`
-# file -- which is why the upstream C build applies `zlib.map` only on Unix
-# that is not Apple, AIX, or SunOS.
-#
 # The retained C baseline links `libz.so` through `zlib.map`, a genuine GNU-ld
 # version script: 16 version nodes from `ZLIB_1.2.0` to `ZLIB_1.3.2`, 54
 # `global:` names, and 10 named `local:` names plus a `_*` wildcard. Only GNU
@@ -130,35 +126,46 @@
 # wants a `.def` file. The upstream C build draws the same boundary, applying
 # `zlib.map` only on Unix that is not Apple, AIX, or SunOS.
 #
-# The Rust build reproduces none of it, deliberately. `build.rs` emits no link
-# argument of any kind and reads no environment variable other than `OUT_DIR`;
-# the emitted `cdylib` therefore carries an unversioned symbol table. That is
-# AAP 0.8.2 Divergence 4, which ranks D8 LOW, notes it "carries
+# The Rust build can reproduce it, and by DEFAULT does not. With
+# `ZLIB_RS_VERSION_SCRIPT` unset -- which is what every CI job and every
+# ordinary `cargo build` sees -- `build.rs` emits only its two `rerun-if-*`
+# declarations, and the emitted `cdylib` carries an unversioned symbol table.
+# That default is AAP 0.8.2 Divergence 4, which ranks D8 LOW, notes it "carries
 # linker-portability risk", states it is "deliberately deferred behind D3" --
 # the cross-platform CI matrix that would be needed to test it -- and instructs
 # that the divergence be KEPT rather than "fixed". The symbol SET is already
-# exactly right: 95 exported symbols on Linux, all 54 `zlib.map` globals
-# present, none of the 10 locals leaked. Only the version tags are absent, and
-# a drop-in replacement links, resolves through `pkg-config`, and `LD_PRELOAD`s
-# without them.
+# exactly right without it: 95 exported symbols on Linux, all 54 `zlib.map`
+# globals present, none of the 10 locals leaked; a drop-in replacement links,
+# resolves through `pkg-config`, and `LD_PRELOAD`s without version tags.
 #
-# An environment-gated opt-in for this once existed in `build.rs` and was
-# removed after measurement, because it was fatal on one supported toolchain
-# and ineffective on the other: on the pinned MSRV (1.85.0, GNU `ld`) the link
-# FAILED outright -- "anonymous version tag cannot be combined with other
-# version tags", since `rustc` already passes an anonymous-node version script
-# of its own -- while on current stable (1.97.1, `rust-lld`) it linked but
-# produced ZERO per-symbol tags (`nm -D --defined-only | grep -c @` = 0) and one
-# `linker_messages` warning per listed symbol, which fails a `-D warnings` gate.
-# The full measurements live in the "No cdylib symbol versioning" section of
-# `build.rs`; do not re-add the option from either file (see DO NOT ADD item 7).
+# Setting `ZLIB_RS_VERSION_SCRIPT=1` on a native `*-linux-gnu` build applies the
+# script and yields the same 95 symbols with all 16 version nodes and exactly 54
+# `@@ZLIB_x.y.z` tags. The mechanism is a substituting linker shim written into
+# `OUT_DIR`, because ADDING a second version script provably cannot work:
+# `rustc` already passes one that uses an ANONYMOUS version node, GNU `ld`
+# refuses to combine an anonymous node with named ones ("anonymous version tag
+# cannot be combined with other version tags", fatal on the pinned MSRV), and
+# build-script link arguments land AFTER `rustc`'s own so they could never win on
+# ordering anyway (on stable the naive form links and produces ZERO tags). The
+# full measurements and the shim's shape live in the "Optional cdylib symbol
+# versioning" section of `build.rs`.
 #
-# If a maintainer ever does re-open D8 -- behind D3, with `.symver` directives,
-# because link arguments alone provably do not produce per-symbol tags -- and
-# needs an LLD-flavoured linker on a toolchain whose default `ld` refuses the
-# combination, the per-triple anchors below are the right home for that one
-# link argument: one explicit, reviewed entry for one platform, never a global
-# default.
+# Why the wiring belongs THERE and not here, in three parts. It must be
+# conditional on a runtime probe -- a readable `zlib.map`, an `ld.bfd` actually
+# present on PATH -- and a config file cannot probe. It must generate two files
+# into `OUT_DIR` and reference them by absolute path, which only a build script
+# knows. And it must be scoped to the `cdylib` alone: `build.rs` emits
+# `cargo:rustc-cdylib-link-arg`, whereas any `rustflags`/`linker` entry here
+# would apply to every unit in the graph and would push a linker prefix and a
+# linker flavour onto all 8 test binaries and 3 bench binaries as well. One
+# tested place, with a hard-error on a misspelled value and a `cargo:warning`
+# plus an unversioned artifact on every unsupported target, beats ambient flags
+# split across two files. See DO NOT ADD item 7 for why it must not be turned on
+# from an `[env]` table either.
+#
+# The per-triple anchors below remain the right home for a genuinely
+# platform-specific LINKER choice, if a cross row ever needs one: one explicit,
+# reviewed entry for one platform, never a global default.
 
 
 # ---------------------------------------------------------------------------
@@ -204,8 +211,10 @@
 # instead of `3`, and that is CORRECT rather than a byte-identity problem: C's
 # `zutil.h` selects the same platform value, so parity with a Windows-built
 # reference `libz` requires it. Hard-coding `3` on every target is the thing that
-# would break parity, and an earlier revision of the encoder did exactly that
-# with a private `const OS_CODE: u8 = 3` shadowing the real constant. Byte
+# would break parity, which is why `src/util/mod.rs` holds the only declaration
+# of `OS_CODE` and `src/lib.rs`'s `os_code_is_declared_in_exactly_one_module`
+# counts declarations to keep it that way: a private
+# `const OS_CODE: u8 = 3` anywhere else would shadow the cascade. Byte
 # identity (AAP 0.8.1 D-1) is defined against the reference C library built for
 # the SAME target, never across targets. `zlib.map` is meaningless here anyway:
 # `link.exe` uses `.def` files.
@@ -237,9 +246,18 @@
 # BIG-ENDIAN: no big-endian triple appears above or in the platform set
 # `deny.toml` names. If one is ever added -- `s390x-unknown-linux-gnu`,
 # `powerpc64-unknown-linux-gnu` -- add it HERE as a sixth anchor and keep
-# `deny.toml` in step. Be precise about what is known: `build.rs` performs no
-# host or target detection and emits the same tables everywhere, so its OUTPUT
-# is byte-identical on every platform, and the checksum runtime consumes only
-# the endian-independent byte-wise table. No big-endian target has ever been
-# built or tested here; treat any endianness claim about the runtime as
-# unverified until such a row actually runs.
+# `deny.toml` in step.
+#
+# Be precise about what is known, because the two halves differ. `build.rs`
+# performs no host or target detection: it emits BOTH braid table families
+# unconditionally -- `CRC_TABLE` and `CRC_BRAID_TABLE` for little-endian, plus
+# `CRC_BIG_TABLE` and `CRC_BRAID_BIG_TABLE` for big-endian -- so its OUTPUT is
+# byte-identical on every platform. The RUNTIME is not endian-independent: it
+# picks between those families with `cfg!(target_endian)` in
+# `src/checksum/crc32.rs`, so a big-endian target selects code paths and tables
+# that a little-endian target never touches. Nothing here has ever been built or
+# tested on a big-endian target, which means `CRC_BIG_TABLE` and
+# `CRC_BRAID_BIG_TABLE` have never been exercised at all. That is the concrete
+# residual risk AAP 0.6.6 records and the technical justification for gap D3
+# (see also standard S8: platform claims require platform coverage). Treat every
+# big-endian claim as unverified until such a row actually runs.

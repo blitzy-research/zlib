@@ -3407,7 +3407,7 @@ mod tests {
     }
 
     // =======================================================================
-    // C layout-mirror pinning (F2, AAP §0.6.3, §0.6.5)
+    // C layout-mirror pinning (AAP §0.6.3, §0.6.5)
     // =======================================================================
 
     /// `DeflateState::C_LAYOUT_SIZE` must equal C's `sizeof(deflate_state)`.
@@ -3440,7 +3440,7 @@ mod tests {
             "_Alignof(deflate_state) on LP64"
         );
         // The mirror must not accidentally become the Rust type: the whole point
-        // of F2 is that the two sizes differ and the *C* one is what is charged.
+        // of the mirror is that the two sizes differ and the *C* one is charged.
         assert_ne!(
             DeflateState::C_LAYOUT_SIZE,
             size_of::<DeflateState>(),
@@ -3528,7 +3528,7 @@ mod tests {
     }
 
     // =======================================================================
-    // Overlaid symbol region (F2b, AAP §0.3.2 rule T3)
+    // Overlaid symbol region (AAP §0.3.2 rule T3)
     // =======================================================================
 
     /// The symbol region must sit exactly where C puts it, be exactly as large as

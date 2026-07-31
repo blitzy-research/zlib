@@ -354,18 +354,28 @@ fn stream_round_trip(
 /// Design note (decode granularity vs. the inflate fast path): a *multi-call*
 /// inflate that offers a large (`>= 258`-byte) output window on a resumed call
 /// re-enters the fast decode loop (`src/inflate/fast.rs`) carrying the bit
-/// accumulator saved from the previous call. Reference zlib keeps that loop's
-/// entry invariant `state.bits < 8` by having `inflate_fast` push whole unused
-/// bytes back to the input on exit; this port instead retains them in the bit
-/// buffer — byte-for-byte correct (verified: release round-trips are exact) but
-/// it trips a debug-only `debug_assert!(state.bits < 8)` on cross-call fast-path
-/// re-entry. That engine-side invariant is owned by the inflate workstream and
-/// is out of scope for this test. Faithful to `example.c` — whose streaming
-/// tests use one-byte buffers (never the fast path) and whose bulk tests decode
-/// in one shot — the granularity stress here keeps output windows small
-/// (see [`stream_round_trip`] callers), while strategy/framing coverage decodes
-/// whole via this helper. The fast path itself is still exercised on first
-/// entry by both this helper and the one-call [`uncompress`] tests.
+/// accumulator saved from the previous call, so `state.bits` may be 8 or more on
+/// entry. That is ordinary rather than exceptional, and it is handled: C's
+/// `inffast.c` header lists `state->bits < 8` among its entry assumptions, but
+/// nothing in C enforces it and the C driver does not provide it — the slow
+/// path's code lookups pull whole speculative bytes and then drop only the width
+/// of the code actually decoded (`inflate.c` L924-L928, L940). This port's fast
+/// loop therefore asserts the invariant it genuinely depends on, `bits <= 32`,
+/// and clamps its byte-give-back epilogue to the bytes that call itself pulled,
+/// so a resumed entry decodes byte-exactly whatever `bits` carries in.
+///
+/// Cross-call fast-path re-entry is covered where the invariant lives rather
+/// than through this helper: `src/inflate/fast.rs`'s
+/// `decodes_identically_when_entered_with_whole_buffered_bytes` and
+/// `never_returns_input_bytes_it_did_not_pull` pin the carried-in bits and the
+/// give-back clamp, and `inflate_coverage.rs`'s
+/// `incrementally_delivered_input_decodes_byte_exactly` drives the 6-byte and
+/// 258-byte entry-contract boundaries across raw, zlib, gzip and auto-detect
+/// framing. Faithful to `example.c` — whose streaming tests use one-byte buffers
+/// and whose bulk tests decode in one shot — the granularity stress here stays
+/// in the small-window [`stream_round_trip`] callers, while strategy and framing
+/// coverage decodes whole via this helper. The fast path is still exercised on
+/// first entry by both this helper and the one-call [`uncompress`] tests.
 fn round_trip_whole(data: &[u8], level: i32, strategy: Strategy, window_bits: i32) -> Vec<u8> {
     round_trip_whole_with_mem_level(data, level, strategy, window_bits, DEF_MEM_LEVEL)
 }

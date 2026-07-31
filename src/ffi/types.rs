@@ -117,11 +117,17 @@ pub type z_off64_t = i64;
 /// type of the [`z_stream::state`] field.
 ///
 /// C never constructs or inspects this type — it only ever holds a pointer to
-/// it. The Rust FFI stores `Box::into_raw(state) as *mut internal_state` here
-/// (see [`state_ptr_from_box`]) and reclaims it with [`state_take`]. The empty,
-/// private field makes the type both zero-sized and impossible to construct
-/// outside this module, exactly matching the "not visible by applications"
-/// contract in `zlib.h`.
+/// it. The Rust FFI stores `Box::into_raw(handle) as *mut internal_state` here
+/// (see [`state_ptr_from_box`]), where `handle` is always one of the three
+/// **type-tagged** engine handles — [`DeflateHandle`], the `inflate*`-owned
+/// inflate handle, or the `inflateBack*`-owned handle — each of which carries a
+/// [`HandleKind`] discriminant at offset 0. Reclamation therefore goes through a
+/// tag-validating helper such as [`deflate_take`] rather than a blind
+/// `Box::from_raw`, which is what makes a cross-engine `End` call return
+/// `Z_STREAM_ERROR` instead of deallocating with a mismatched `Layout`. The
+/// empty, private field makes the type both zero-sized and impossible to
+/// construct outside this module, exactly matching the "not visible by
+/// applications" contract in `zlib.h`.
 #[repr(C)]
 pub struct internal_state {
     /// Zero-sized private marker: `internal_state` is opaque and never built in
@@ -275,7 +281,7 @@ pub type gz_headerp = *mut gz_header;
 /// zlib exposes just this abbreviated prefix so the C `gzgetc(g)` *macro* can
 /// read `have`/`next`/`pos` directly through the [`gzFile`] pointer.
 ///
-/// # Live prefix (C2)
+/// # Live prefix
 ///
 /// The crate's idiomatic gz state (`crate::gz::GzState`) is **not** `#[repr(C)]`,
 /// so `gz.rs` boxes its opaque handle as a `#[repr(C)]` `GzHandle` whose FIRST
@@ -327,9 +333,10 @@ pub type gzFile = *mut gzFile_s;
 /// [`AllocHook`] via [`Allocator::hook`], and its
 /// [`allocate_zeroed`](Allocator::allocate_zeroed) routes every working buffer
 /// (window, `pending_buf`, hash tables) through the caller's `zalloc` when
-/// **both** `zalloc` and `zfree` are supplied. When they are null (or `zalloc`
-/// reports OOM) it falls back to the global allocator, exactly matching AAP
-/// §0.6.3's "otherwise `std::alloc` is used" clause. The **ABI guarantee** is
+/// **both** `zalloc` and `zfree` are supplied. When both are null it uses the
+/// global allocator, exactly matching AAP §0.6.3's "otherwise `std::alloc` is
+/// used" clause; an *active* hook that reports out-of-memory is reported as an
+/// allocation failure and never falls back. The **ABI guarantee** is
 /// unconditional: supplying `zalloc`/`zfree` routes allocation through them and
 /// never breaks the stream, and leaving them null works identically to before.
 ///
@@ -367,43 +374,135 @@ impl CAllocator {
         }
     }
 
-    /// Whether exactly one half of the `zalloc`/`zfree` pair was supplied.
+    /// Whether exactly one half of the `zalloc`/`zfree` pair is present.
     ///
     /// Such a pair is unusable, and the C library agrees: `inflateStateCheck`
     /// (`inflate.c` L90-L91) and `deflateStateCheck` (`deflate.c` L540-L541)
     /// both classify a stream whose `zalloc` **or** `zfree` is null as invalid,
-    /// so every entry point after initialization answers `Z_STREAM_ERROR`. C's
-    /// three `*Init*_` prologues only avoid tripping that check by substituting
-    /// the *missing half* in place — `zcalloc` for a null `zalloc`, `zcfree` for
-    /// a null `zfree` (`inflate.c` L183-L196, `deflate.c` L400-L414,
-    /// `infback.c` L37-L50) — and under `Z_SOLO`, where those built-ins do not
-    /// exist, they return `Z_STREAM_ERROR` outright.
+    /// so every entry point after initialization answers `Z_STREAM_ERROR`.
     ///
-    /// This crate cannot perform C's in-place substitution. `zcalloc`/`zcfree`
-    /// are `local:` symbols in `zlib.map` and are deliberately not exported, and
-    /// pairing a caller's `zalloc` with the Rust global deallocator (or vice
-    /// versa) would free a region through an allocator that never owned it —
-    /// undefined behavior, which the crate's containment rules forbid. Silently
-    /// ignoring the half the caller *did* supply is equally wrong: it discards
-    /// their out-of-memory signal, so a deliberately failing `zalloc` would be
-    /// bypassed and the call would report success where C reports
-    /// `Z_MEM_ERROR`. AAP §0.6.3 states the required semantics directly — "a
-    /// null `zalloc` propagates as an allocation failure rather than silently
-    /// falling back".
+    /// C's three `*Init*_` prologues avoid ever tripping that check by
+    /// substituting the *missing half* in place — `zcalloc` for a null `zalloc`,
+    /// `zcfree` for a null `zfree` (`inflate.c` L183-L196, `deflate.c`
+    /// L400-L414, `infback.c` L37-L50). [`init_allocator_prologue`] reproduces
+    /// that substitution byte-for-byte, so a stream this crate initialized
+    /// **always** carries a complete pair and this predicate is `false` for it.
     ///
-    /// The initialization entry points therefore reject a half-present pair with
-    /// `Z_STREAM_ERROR`, which is both the code C's own state checks produce for
-    /// such a stream and the code C's `Z_SOLO` build returns from init. This is a
-    /// deliberate, documented divergence (AAP §0.8.2): a caller who supplies
-    /// exactly one hook *and* whose supplied `zalloc` would have succeeded gets
-    /// `Z_STREAM_ERROR` here where a non-`Z_SOLO` C build would have completed
-    /// using the substituted half. Supplying both hooks, or neither, behaves
-    /// identically to C.
+    /// The predicate therefore has exactly one job: detecting a stream whose
+    /// allocator fields were mutated *after* initialization, which is the same
+    /// condition C's `*StateCheck` functions reject. `inflateCopy` uses it for
+    /// that purpose, because C reaches its own `Z_STREAM_ERROR` there through
+    /// `inflateStateCheck(source)` before its `ZALLOC(source, …)`. Rejecting
+    /// keeps the copy from silently allocating out of the global heap while the
+    /// caller believes their hook owns the memory — the "caller buffers are used
+    /// only when both halves are supplied" half of AAP §0.6.3's has-hook clause.
     #[inline]
     #[must_use]
     pub(crate) const fn is_half_present(&self) -> bool {
         self.zalloc.is_some() != self.zfree.is_some()
     }
+}
+
+/// Reproduces C's `*Init*_` allocator prologue on a caller's [`z_stream`] and
+/// returns the resulting [`CAllocator`].
+///
+/// All three C initializers — `deflateInit2_` (`deflate.c` L399-L414),
+/// `inflateInit2_` (`inflate.c` L182-L196) and `inflateBackInit_`
+/// (`infback.c` L36-L50) — carry the identical prologue, and they run it *after*
+/// the version/`stream_size` guard and the null-argument guards but *before* any
+/// parameter validation and before the state `ZALLOC`. This function is that
+/// prologue, in that order:
+///
+/// 1. `strm->msg = Z_NULL` — cleared unconditionally, "in case we return an
+///    error", so a stale diagnostic from a previous call cannot survive into a
+///    failed initialization. This happens **before** the allocator is inspected.
+/// 2. If `strm->zalloc` is null, install `crate::ffi::alloc::default_zalloc` and
+///    clear `strm->opaque`. C clears `opaque` on exactly this branch and nowhere
+///    else (`deflate.c` L405-L406), because the cookie belonged to the allocator
+///    that is being replaced; a caller who supplied only `zfree` keeps *their*
+///    `zfree` but must not have a stale cookie handed to the built-in `zalloc`.
+/// 3. If `strm->zfree` is null, install `crate::ffi::alloc::default_zfree`.
+///    `opaque` is **not** touched on this branch — again exactly as C does it
+///    (`deflate.c` L408-L413).
+///
+/// The two built-ins are the crate's counterparts of C's `zcalloc`/`zcfree`, are
+/// `malloc`/`free`-backed just as C's are, and — like the `zlib.map` `local:`
+/// entries they mirror — are never exported. Substituting per half is what makes
+/// a partially-supplied pair behave exactly as it does in C: the caller's own
+/// half is honored (so a deliberately failing `zalloc` still produces
+/// `Z_MEM_ERROR` rather than being bypassed), the missing half is filled in, and
+/// initialization proceeds.
+///
+/// # A wholly absent pair is left absent
+///
+/// The substitution is confined to the *half*-present case. When the caller
+/// supplied **neither** half, both fields are left null, which selects the
+/// crate's global-allocator path — the built-in allocator for this port, exactly
+/// as `zcalloc`/`zcfree` are for C. That is required by AAP §0.6.5: charging the
+/// engine-state footprint to the caller happens only when they actually installed
+/// a hook, so that a hookless C caller's footprint stays byte-for-byte what it
+/// has always been. See [`Allocator::reserves_state_footprint`], whose entire
+/// purpose is that requirement. Substituting the built-ins here would make every
+/// hookless stream pay a real `sizeof(deflate_state)` reservation it does not pay
+/// today, purely for accounting symmetry with a hook the caller never supplied.
+///
+/// One consequence is observable and is recorded here rather than glossed over:
+/// after a *hookless* initialization, reference C leaves `strm->zalloc` and
+/// `strm->zfree` holding its own built-ins, whereas this crate leaves both null.
+/// It affects nothing else — every return code, every `msg`/`opaque` mutation,
+/// every allocation count and every byte of output is identical, and the null
+/// fields are internally consistent (nothing in this crate rejects a stream for
+/// carrying them, so `deflateCopy`/`inflateCopy` and every other entry point
+/// behave the same). `zlib.h` documents these three fields as *inputs* the
+/// application initializes before the call (L140, L235, L385, L551, L863, L1117)
+/// and never as outputs the library publishes, so no documented contract depends
+/// on the difference. This is a consequence of the AAP §0.6.5 footprint
+/// requirement, not an independently authorized divergence.
+///
+/// # Safety
+///
+/// `strm` must reference a validly-initialized [`z_stream`] that the caller owns
+/// exclusively for the duration of the call. Only plain `Copy` fields are read
+/// and written (`msg`, `zalloc`, `zfree`, `opaque`); no hook pointer is
+/// dereferenced here.
+#[inline]
+pub unsafe fn init_allocator_prologue(strm: &mut z_stream) -> CAllocator {
+    // Step 1 — `strm->msg = Z_NULL;` (deflate.c L399, inflate.c L182,
+    // infback.c L36). Unconditional, and ahead of the allocator inspection, so
+    // every subsequent `return` in the initializer reports a clean `msg`.
+    strm.msg = core::ptr::null_mut();
+
+    // Whether the caller supplied exactly one half. Captured *before* either
+    // branch runs, so step 3 cannot observe the pointer step 2 just installed.
+    let complete_the_pair = strm.zalloc.is_some() != strm.zfree.is_some();
+
+    // Step 2 — `if (strm->zalloc == 0) { strm->zalloc = zcalloc; strm->opaque = 0; }`
+    // (deflate.c L400-L407, inflate.c L183-L190, infback.c L37-L44).
+    //
+    // The `complete_the_pair` conjunct is the one place this differs from C's
+    // literal text, and it is deliberate: it confines the substitution to the
+    // half-present case and leaves a WHOLLY absent pair absent, which selects
+    // this crate's global-allocator path — the built-in allocator here, exactly
+    // as `zcalloc`/`zcfree` are C's, and the case AAP §0.6.3 and §0.6.5 govern
+    // (see this function's doc comment). The behavior a C caller can observe for
+    // a half-present pair is identical either way; for a wholly absent pair the
+    // conjunct is what keeps a hookless caller's allocation count and footprint
+    // unchanged.
+    if complete_the_pair && strm.zalloc.is_none() {
+        strm.zalloc = Some(crate::ffi::alloc::default_zalloc);
+        strm.opaque = core::ptr::null_mut();
+    }
+
+    // Step 3 — `if (strm->zfree == 0) strm->zfree = zcfree;` (deflate.c
+    // L408-L413, inflate.c L191-L196, infback.c L45-L50). Note that C does NOT
+    // touch `opaque` on this branch.
+    if complete_the_pair && strm.zfree.is_none() {
+        strm.zfree = Some(crate::ffi::alloc::default_zfree);
+    }
+
+    // SAFETY: `strm` is a valid `&z_stream`; `from_stream` only copies the plain
+    // `Copy` allocator fields out and never dereferences a hook pointer.
+    unsafe { CAllocator::from_stream(strm) }
 }
 
 impl Allocator for CAllocator {
@@ -419,12 +518,13 @@ impl Allocator for CAllocator {
     /// AAP §0.6.3's "otherwise `std::alloc` is used" clause and C's substitution
     /// of `zcalloc`/`zcfree` for a wholly absent pair (`deflate.c` L400-L414).
     ///
-    /// A *half*-present pair never reaches this method from a C entry point: the
-    /// `*Init*_` shims reject it with `Z_STREAM_ERROR` before constructing any
-    /// buffer, because C's per-half substitution is unavailable here and ignoring
-    /// the supplied half would discard the caller's out-of-memory signal. See
-    /// `CAllocator::is_half_present` for the full rationale, the C citations,
-    /// and the documented divergence. Soundness is preserved because
+    /// A *half*-present pair never reaches this method from a C entry point:
+    /// [`init_allocator_prologue`] has already completed it by substituting the
+    /// crate's built-in for the missing half, exactly as C's `*Init*_` prologues
+    /// substitute `zcalloc`/`zcfree` (`deflate.c` L400-L414, `inflate.c`
+    /// L183-L196, `infback.c` L37-L50). The caller's own half is therefore
+    /// honored — a deliberately failing `zalloc` still surfaces as `Z_MEM_ERROR`
+    /// rather than being bypassed. Soundness is preserved because
     /// the returned buffer knows its own backing store and frees it the matching
     /// way on [`Drop`] — the historical unsoundness of dropping a foreign-backed
     /// `Vec` through the global allocator cannot occur.
@@ -432,7 +532,7 @@ impl Allocator for CAllocator {
     /// When an **active** hook's `zalloc` reports out-of-memory (or the request is
     /// unrepresentable, or the returned region is unusably aligned) this returns
     /// [`None`] and the caller surfaces `Z_MEM_ERROR`. There is deliberately no
-    /// global-allocator fallback on that path (M7).
+    /// global-allocator fallback on that path.
     #[inline]
     fn allocate_zeroed<T>(&self, count: usize) -> Option<AllocBuffer<T>>
     where
@@ -549,10 +649,19 @@ pub const unsafe fn alloc_hook_from_parts(
 /// Builds an idiomatic [`ZStream<CAllocator>`](crate::stream::ZStream) whose
 /// allocator carries the caller's `zalloc`/`zfree`/`opaque` triple.
 ///
-/// This is the single constructor the deflate/inflate init shims use to obtain
-/// the one monomorphized handle type they box into [`z_stream::state`]. It
-/// honors caller hooks where the design permits and global-allocates otherwise
-/// (see [`CAllocator`]).
+/// It produces the one monomorphized handle type the boundary boxes into
+/// [`z_stream::state`], honoring caller hooks when the pair is complete and
+/// global-allocating when neither half is present (see [`CAllocator`]).
+///
+/// # Use [`init_allocator_prologue`] in an `*Init*_` shim
+///
+/// This constructor reads the triple exactly as it finds it, so it is the right
+/// tool only where that triple is already known-complete — for example when it
+/// has been cloned out of an initialized handle. The `deflateInit2_`,
+/// `inflateInit2_`, and `inflateBackInit_` shims must additionally reproduce C's
+/// initialization prologue (clear `msg`, substitute a missing half of the pair),
+/// so they call [`init_allocator_prologue`] and hand its result to
+/// [`ZStream::with_allocator`] instead.
 ///
 /// # Safety
 ///
@@ -581,15 +690,24 @@ pub unsafe fn zstream_with_caller_alloc(strm: &z_stream) -> ZStream<CAllocator> 
 /// Consumes a boxed engine handle and returns it as the opaque
 /// [`z_stream::state`] pointer.
 ///
-/// The typical `T` is [`ZStream<CAllocator>`](crate::stream::ZStream). Ownership
-/// is transferred to the C `state` field; the box must later be reclaimed with
-/// [`state_take`] (during `deflateEnd`/`inflateEnd`) to avoid a leak.
+/// In production `T` is always one of the three **type-tagged** engine handles —
+/// [`DeflateHandle`] (installed by the `deflate*` shims), the inflate handle
+/// (installed by `inflateInit*`), or the `inflateBack` handle (installed by
+/// `inflateBackInit_`) — each a `#[repr(C)]` struct carrying a [`HandleKind`] at
+/// offset 0. Ownership is transferred to the C `state` field; the box must later
+/// be reclaimed exactly once to avoid a leak, and that reclamation goes through
+/// the matching tag-validating helper ([`deflate_take`] for a deflate stream,
+/// its inflate counterparts for the two decode paths) rather than a blind
+/// `Box::from_raw`.
 ///
 /// # Safety
 ///
 /// The returned pointer must be treated as owning: it must be reclaimed exactly
-/// once via [`state_take`] (or an equivalent `Box::from_raw`), and must not be
-/// aliased by another owner.
+/// once — via the tag-validating `*_take` helper for its handle kind, or an
+/// equivalent [`state_take`]/`Box::from_raw` **with the same `T`** — and must not
+/// be aliased by another owner. Reconstituting it as a different `T` would
+/// deallocate with a `Layout` that does not match the allocation, which is why
+/// the tag check exists.
 #[inline]
 #[must_use]
 pub unsafe fn state_ptr_from_box<T>(b: Box<T>) -> *mut internal_state {
@@ -600,6 +718,12 @@ pub unsafe fn state_ptr_from_box<T>(b: Box<T>) -> *mut internal_state {
 
 /// Borrows the boxed engine handle stored in [`z_stream::state`], or [`None`]
 /// if no engine is installed.
+///
+/// This is the raw, **untagged** primitive: it performs no [`HandleKind`] check.
+/// The exported shims never call it directly on a caller-supplied stream — they
+/// go through the tag-validating accessors ([`deflate_state`] and its inflate
+/// counterparts), which read the tag through the shared C-layout header prefix
+/// before reinterpreting the pointer.
 ///
 /// # Safety
 ///
@@ -624,6 +748,12 @@ pub unsafe fn state_ref<T>(strm: &mut z_stream) -> Option<&mut T> {
 /// Dropping the returned box runs the engine's RAII teardown — the replacement
 /// for the C `deflateEnd`/`inflateEnd` free path.
 ///
+/// This is the raw, **untagged** primitive: it performs no [`HandleKind`] check,
+/// so the exported `End` shims use the tag-validating helpers ([`deflate_take`]
+/// and its inflate counterparts) instead. Those confirm the tag *before*
+/// reconstituting the box, which is what turns a cross-engine `End` call into a
+/// `Z_STREAM_ERROR` rather than a layout-mismatched deallocation.
+///
 /// # Safety
 ///
 /// If [`z_stream::state`] is non-null it must point at a live `Box<T>` (same
@@ -643,7 +773,7 @@ pub unsafe fn state_take<T>(strm: &mut z_stream) -> Option<Box<T>> {
     }
 }
 
-// --- Type-tagged state handles (FINDING-6) ---------------------------------
+// --- Type-tagged state handles ---------------------------------------------
 //
 // The C `deflateEnd`/`inflateEnd` contract lets a caller (incorrectly) pass a
 // stream that was initialized by the *other* engine. The deflate and inflate
@@ -651,9 +781,11 @@ pub unsafe fn state_take<T>(strm: &mut z_stream) -> Option<Box<T>> {
 // blind `Box::from_raw(state as *mut T)` inside the wrong `End` shim would
 // reconstitute (and drop) a `Box<T>` whose `Layout` does not match the original
 // allocation. That violates the `GlobalAlloc::dealloc` contract (the dealloc
-// `Layout` must equal the alloc `Layout`): undefined behavior, benign on glibc's
-// size-agnostic `free` but heap-corrupting under sized-dealloc allocators such
-// as jemalloc/mimalloc. Tagging each handle with a discriminant at offset 0 and
+// `Layout` must equal the alloc `Layout`). This is undefined behavior. It may
+// appear to work against glibc's size-agnostic `free`, but it can corrupt an
+// allocator that relies on the size passed to deallocation (jemalloc, mimalloc,
+// and Rust's own sized-dealloc path) — and, being UB, it carries no guarantee on
+// any allocator. Tagging each handle with a discriminant at offset 0 and
 // validating it BEFORE reconstituting the box makes the mismatch detectable, so
 // the shim returns `Z_STREAM_ERROR` without ever dropping a wrong-type box.
 
@@ -679,7 +811,8 @@ impl HandleKind {
     /// stream). Distinct from [`INFLATE`](Self::INFLATE) so the regular
     /// `inflateEnd`/`inflateBackEnd` terminators can reject cross-type misuse
     /// (freeing an `inflateBack` state as a plain inflate handle, or vice
-    /// versa, would be a layout-mismatched free — the same UB class as C4).
+    /// versa, would be a layout-mismatched free — the same undefined behavior a
+    /// blind cast of the opaque `state` pointer would cause).
     pub const INFLATE_BACK: HandleKind = HandleKind(0x14F1_A7E5_BAC6_0003);
 }
 
@@ -698,7 +831,7 @@ struct HandleHeader {
 /// [`HandleKind`] tag lets [`deflate_take`]/[`deflate_state`] confirm the handle
 /// really is a deflate handle before reinterpreting the opaque pointer,
 /// preventing the layout-mismatched deallocation that a blind cast would cause
-/// on cross-type `End` misuse (FINDING-6). `#[repr(C)]` guarantees `kind` is at
+/// on cross-type `End` misuse. `#[repr(C)]` guarantees `kind` is at
 /// offset 0.
 #[repr(C)]
 pub struct DeflateHandle {
@@ -1054,9 +1187,12 @@ pub unsafe fn gz_header_to_idiomatic(head: *const gz_header) -> Option<GzHeader>
 /// Scalar fields (`text`, `time`, `xflags`, `os`, `hcrc`, `done`) are always
 /// written, as is `extra_len`, which receives the extra field's **declared**
 /// length even when the copy into `extra` is truncated to `extra_max` — and even
-/// when `extra` is null, which is the documented length-query pattern. This
-/// matches C, where `inflate` writes `head->extra_len` from the header's `XLEN`
-/// independently of the clamped copy (`inflate.c` L599-L600 vs L614-L621).
+/// when `extra` is null. This matches C, where `inflate` writes `head->extra_len`
+/// from the header's `XLEN` independently of the clamped copy (`inflate.c`
+/// L599-L600 vs L614-L621). `zlib.h` specifies the truncation signal
+/// (`extra_len > extra_max`); the null-`extra` length query is not spelled out
+/// there but falls out of that same unconditional write, so reference zlib
+/// permits it de facto and this port must too.
 ///
 /// # Safety
 ///
@@ -1086,8 +1222,9 @@ pub unsafe fn write_gz_header_from_idiomatic(head: *mut gz_header, src: &GzHeade
     // neither `extra`'s nullity nor `extra_max`'s size, and separately clamps the
     // copy (`inflate.c` L614-L621). Reproducing both halves is what makes
     // `extra_len > extra_max` a usable truncation signal per `zlib.h`, and what
-    // makes the documented length-query pattern — a null `extra` purely to learn
-    // the length — return the real length instead of zero. When the stream
+    // lets a caller pass a null `extra` purely to learn the length and get the
+    // real value instead of zero — de-facto reference-zlib behavior that falls
+    // out of the same unconditional write. When the stream
     // carried no `FEXTRA` field the engine left this at whatever the caller
     // supplied, so writing it back is then a no-op.
     h.extra_len = src.extra_len as c_uint;
@@ -1229,6 +1366,47 @@ pub(crate) fn guard_off(
     f()
 }
 
+// --- Shared test utility for the panic guards ------------------------------
+//
+// Declared at module scope (not inside `mod tests`) and `pub(crate)` so the
+// sibling shim files' test modules — `src/ffi/gz.rs` has two guards of its own
+// for the `z_size_t` / `*const T` widths this module does not cover — reach the
+// same serialization primitive. Without a single shared lock, two test modules
+// swapping the process-global panic hook concurrently can interleave.
+
+/// Serializes every test that installs a scoped panic hook.
+///
+/// `std::panic::take_hook` / `set_hook` mutate **process-global** state and the
+/// test harness runs unit tests on several threads, so two tests swapping the
+/// hook concurrently can interleave — leaving the noisy default hook installed
+/// for a deliberate panic, or restoring a hook the other test had taken. This
+/// lock makes each take/run/restore sequence atomic with respect to the others.
+#[cfg(all(test, feature = "std"))]
+static PANIC_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Runs `f` with the default panic hook silenced and the previous hook restored
+/// afterwards, serialized through `PANIC_HOOK_LOCK`.
+///
+/// Every panic-guard test provokes a real panic inside a guard; without this the
+/// default hook would print a backtrace per deliberate panic and make a passing
+/// run read like a failing one. Poisoning is tolerated
+/// ([`std::sync::PoisonError::into_inner`]) because these tests exist to provoke
+/// panics: a poisoned lock must not cascade into unrelated failures. `f` itself
+/// is not expected to unwind — the guard under test catches the panic and
+/// returns its default — so the restore is a plain sequential statement rather
+/// than a drop guard.
+#[cfg(all(test, feature = "std"))]
+pub(crate) fn with_silenced_panic_hook<R>(f: impl FnOnce() -> R) -> R {
+    let _lock = PANIC_HOOK_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let out = f();
+    std::panic::set_hook(prev);
+    out
+}
+
 // ===========================================================================
 // Phase 10 — Compile-time ABI layout guards
 // ===========================================================================
@@ -1259,7 +1437,7 @@ const _: () = {
 // 64-bit **LP64** (Linux/macOS on `x86_64`/`aarch64`), where `c_ulong` (C
 // `uLong`) is 8 bytes. On this ABI the mirror structs must match `libz`'s
 // `z_stream`/`gz_header`/`gzFile_s` byte for byte, so every field offset and the
-// total size is pinned below; any drift fails the build (Min1 hardening).
+// total size is pinned below; any drift fails the build.
 //
 // Windows x64 (LLP64, `c_ulong` = 4) and 32-bit targets carry a different
 // `uLong` width and therefore different offsets, so they are intentionally
@@ -1303,7 +1481,7 @@ const _: () = {
     assert!(size_of::<gz_header>() == 80);
 
     // `gzFile_s` — `{ have, next, pos }`, 24 bytes total on LP64. This is the
-    // live prefix the C `gzgetc(g)` macro dereferences (C2), so its exact shape
+    // live prefix the C `gzgetc(g)` macro dereferences, so its exact shape
     // matters for drop-in macro consumers.
     assert!(offset_of!(gzFile_s, have) == 0);
     assert!(offset_of!(gzFile_s, next) == 8);
@@ -1402,7 +1580,7 @@ mod tests {
         assert!(size_of::<gzFile_s>() >= size_of::<*mut c_uchar>() + 8);
     }
 
-    /// Min1: **exact** numeric field offsets and total sizes on the supported
+    /// **Exact** numeric field offsets and total sizes on the supported
     /// 64-bit LP64 ABI (Linux/macOS on `x86_64`/`aarch64`), pinning the mirror
     /// structs to `libz`'s byte-for-byte layout. The compile-time `const _`
     /// guard in the module enforces the identical values at build time; this
@@ -1444,7 +1622,7 @@ mod tests {
         assert_eq!(offset_of!(gz_header, done), 72);
         assert_eq!(size_of::<gz_header>(), 80);
 
-        // gzFile_s — 24 bytes; the live `gzgetc` macro prefix (C2).
+        // gzFile_s — 24 bytes; the live `gzgetc` macro prefix.
         assert_eq!(offset_of!(gzFile_s, have), 0);
         assert_eq!(offset_of!(gzFile_s, next), 8);
         assert_eq!(offset_of!(gzFile_s, pos), 16);
@@ -1609,7 +1787,7 @@ mod tests {
     /// With active hooks, `CAllocator::allocate_zeroed` routes through the
     /// caller's `zalloc` (a `Foreign` buffer, zero-filled and usable as a
     /// slice) and releases it through the caller's `zfree` on drop — the
-    /// FINDING-3 has-hook clause. Invocation counts are recorded via a global
+    /// has-hook clause (AAP §0.6.3). Invocation counts are recorded via a global
     /// (`static`) counter because the C hooks receive only the `opaque` cookie.
     #[test]
     fn callocator_active_hooks_are_invoked_and_balanced() {
@@ -1661,7 +1839,7 @@ mod tests {
         assert_eq!(FREES.load(Ordering::SeqCst), 1, "zfree must balance zalloc");
     }
 
-    /// M7 regression: an **active** allocator hook whose `zalloc` reports
+    /// Regression guard: an **active** allocator hook whose `zalloc` reports
     /// out-of-memory (returns `NULL`) must make `allocate_zeroed` yield
     /// [`None`] — surfaced as `Z_MEM_ERROR` at the engine init paths — rather
     /// than silently falling back to the Rust global allocator. A zero-count
@@ -1687,11 +1865,11 @@ mod tests {
         assert!(alloc.hook().is_active());
 
         // A non-empty request through the OOM hook must fail with `None`; there
-        // is deliberately NO global-allocator fallback (M7).
+        // is deliberately NO global-allocator fallback.
         let buf: Option<AllocBuffer<u8>> = alloc.allocate_zeroed(64);
         assert!(
             buf.is_none(),
-            "active-hook OOM must yield None (M7), not a global-allocator Vec"
+            "active-hook OOM must yield None, not a global-allocator Vec"
         );
 
         // The zero-count fast path never consults the hook and still succeeds.
@@ -1701,7 +1879,7 @@ mod tests {
         assert!(empty.is_empty());
     }
 
-    /// M7 propagation: a real engine init (`DeflateState::new_in`) driven by an
+    /// Out-of-memory propagation: a real engine init (`DeflateState::new_in`) driven by an
     /// active OOM hook surfaces [`ZlibError::MemError`] (→ `Z_MEM_ERROR`) instead
     /// of panicking or silently succeeding on the global allocator. This proves
     /// the `AllocBuffer::try_zeroed(..).ok_or(ZlibError::MemError)?` chain in
@@ -1726,11 +1904,11 @@ mod tests {
 
         // Valid parameters (level 6, deflate method, 15-bit window, mem level 8,
         // default strategy, zlib wrap): the ONLY reason this can fail is the OOM
-        // hook, so a `MemError` proves the M7 propagation path.
+        // hook, so a `MemError` proves the out-of-memory propagation path.
         let result = DeflateState::new_in(hook, 6, Z_DEFLATED, 15, 8, Strategy::Default, 1);
         assert!(
             matches!(result, Err(ZlibError::MemError)),
-            "active-hook OOM at init must surface Z_MEM_ERROR (M7), got {:?}",
+            "active-hook OOM at init must surface Z_MEM_ERROR, got {:?}",
             result.as_ref().map(|_| "Ok(state)")
         );
     }
@@ -1785,7 +1963,7 @@ mod tests {
         unsafe { alloc::alloc::dealloc(raw, layout) };
     }
 
-    /// F1 soundness regression: a foreign region must be initialized with
+    /// Soundness regression: a foreign region must be initialized with
     /// `T::default()` for **every** element, not with a raw zero fill.
     ///
     /// `Copy + Default` does **not** promise that an all-zero bit pattern is an
@@ -1879,7 +2057,7 @@ mod tests {
         assert!(longs.iter().all(|&l| l == 0));
     }
 
-    /// F2 geometry regression: `DeflateState::new_in` must present the caller's
+    /// Geometry regression: `DeflateState::new_in` must present the caller's
     /// `zalloc` with the same `(items, size)` argument pairs — in the same order,
     /// and the same number of times — that C `deflateInit2_` passes.
     ///
@@ -1990,7 +2168,7 @@ mod tests {
         assert_eq!(state.head.len(), hash_size);
     }
 
-    /// F2 regression: `deflateCopy` must present the caller's `zalloc` with C's
+    /// Regression guard: `deflateCopy` must present the caller's `zalloc` with C's
     /// **copy** schedule — the destination state, then `window`, `prev`, `head`
     /// and `pending_buf` (`deflate.c` L1335-L1345) — with the same `(items, size)`
     /// pairs `deflateInit2_` used, and with no request for the overlaid symbol
@@ -2083,7 +2261,7 @@ mod tests {
         assert!(copy.pending_buf.is_foreign() && copy.state_alloc.is_foreign());
     }
 
-    /// F2 regression: the engines must release their buffers in the **reverse of
+    /// Regression guard: the engines must release their buffers in the **reverse of
     /// C's allocation order**, which is the order C's own teardown uses.
     ///
     /// `deflateEnd` is explicit about it — the source carries the comment
@@ -2201,7 +2379,7 @@ mod tests {
         );
     }
 
-    /// F2 regression: `deflateCopy` must duplicate the state through the *same*
+    /// Regression guard: `deflateCopy` must duplicate the state through the *same*
     /// allocator and report an out-of-memory refusal, never silently relocate the
     /// copy into the Rust global heap.
     ///
@@ -2501,6 +2679,27 @@ mod tests {
         assert_eq!(out.extra_len, 10);
     }
 
+    // -- panic-guard tests --------------------------------------------------
+    //
+    // Every fallible shim body in `src/ffi/**` runs inside one of the four
+    // guards above, because a Rust panic unwinding across the C ABI is
+    // undefined behavior. The guards are four *separate* implementations, one
+    // per C return width, and each is the last line of defense for the shims
+    // that use it, so each is exercised directly rather than by analogy:
+    //
+    // | Guard         | C return type          | Representative shims                       |
+    // |---------------|------------------------|--------------------------------------------|
+    // | `guard_int`   | `int`                  | `deflate`, `inflate`, `gzread`, `gzclose`   |
+    // | `guard_ulong` | `uLong`                | `adler32`, `crc32`, `compressBound`         |
+    // | `guard_ptr`   | `T *`                  | `gzgets`, `gzopen`                          |
+    // | `guard_off`   | `z_off_t`/`z_off64_t`  | `gzseek`, `gztell`, `gzoffset`              |
+    //
+    // Two properties matter for every one of them: the success value must pass
+    // through *bit-exactly* (a guard that clamped or re-derived it would corrupt
+    // an ordinary result), and a panic must yield *the caller's* default, since
+    // that substituted value is precisely what the C caller observes as the
+    // function's error sentinel.
+
     /// The panic guard substitutes the default value when the body panics and
     /// passes the value through otherwise.
     #[cfg(feature = "std")]
@@ -2508,12 +2707,140 @@ mod tests {
     fn guard_int_catches_panic_and_passes_value() {
         assert_eq!(guard_int(-2, || 7), 7);
 
-        // Suppress the default panic hook so the test log stays clean.
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let caught = guard_int(-2, || panic!("boundary panic"));
-        std::panic::set_hook(prev);
+        // The default panic hook is silenced (and the swap serialized against
+        // the sibling guard tests) so the test log stays clean.
+        let caught = with_silenced_panic_hook(|| guard_int(-2, || panic!("boundary panic")));
         assert_eq!(caught, -2);
+    }
+
+    /// [`guard_ulong`] passes a `c_ulong` through unchanged and substitutes its
+    /// exact default when the body panics.
+    ///
+    /// This guard backs the shims whose C contract has **no error sentinel** —
+    /// `adler32`, `crc32`, `compressBound`, `deflateBound` all return a plain
+    /// `uLong` — so the substituted default *is* the value a C caller observes
+    /// and it must be reproduced bit-exactly rather than coerced to zero.
+    #[cfg(feature = "std")]
+    #[test]
+    fn guard_ulong_catches_panic_and_passes_value() {
+        // Pass-through, including both extremes of the platform width.
+        assert_eq!(guard_ulong(0, || 0), 0);
+        assert_eq!(guard_ulong(0, || 1), 1);
+        assert_eq!(guard_ulong(1, || c_ulong::MAX), c_ulong::MAX);
+
+        // A panic substitutes the caller's default exactly — not zero, and not
+        // the closure's would-be value.
+        let caught =
+            with_silenced_panic_hook(|| guard_ulong(0xDEAD_BEEF, || panic!("boundary panic")));
+        assert_eq!(caught, 0xDEAD_BEEF);
+
+        // A zero default is substituted just as faithfully (the `adler32` /
+        // `crc32` shims pass `0`).
+        let zeroed = with_silenced_panic_hook(|| guard_ulong(0, || panic!("boundary panic")));
+        assert_eq!(zeroed, 0);
+    }
+
+    /// [`guard_ptr`] passes a pointer through by **identity** and substitutes
+    /// its default when the body panics.
+    ///
+    /// The generic parameter is exercised at two distinct pointee types so the
+    /// guard is proven generic rather than accidentally monomorphic, and both
+    /// the C `NULL` sentinel (used by `gzgets` / `gzopen`) and a non-null
+    /// default are checked — the latter proving the guard returns *the caller's*
+    /// default rather than hard-coding `NULL`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn guard_ptr_catches_panic_and_passes_value() {
+        let mut value: c_int = 42;
+        let live: *mut c_int = &raw mut value;
+
+        // Pass-through preserves pointer identity, not merely non-nullness.
+        assert_eq!(guard_ptr(ptr::null_mut(), || live), live);
+
+        // A panic yields the NULL sentinel the pointer-returning shims use.
+        let nulled =
+            with_silenced_panic_hook(|| guard_ptr(ptr::null_mut::<c_int>(), || panic!("boundary")));
+        assert!(nulled.is_null());
+
+        // ... and a non-null default is substituted just as faithfully.
+        let fallback = with_silenced_panic_hook(|| guard_ptr(live, || panic!("boundary")));
+        assert_eq!(fallback, live);
+
+        // The pointee is untouched throughout: the guard moves pointers, never
+        // the memory behind them.
+        assert_eq!(value, 42);
+
+        // A second pointee type proves the generic parameter is live. `Bytef`
+        // is the element type of every zlib buffer, so it is the one that
+        // matters for the byte-pointer shims.
+        let mut bytes: [Bytef; 2] = [7, 8];
+        let byte_ptr: *mut Bytef = bytes.as_mut_ptr();
+        assert_eq!(guard_ptr(ptr::null_mut(), || byte_ptr), byte_ptr);
+        let byte_nulled =
+            with_silenced_panic_hook(|| guard_ptr(ptr::null_mut::<Bytef>(), || panic!("boundary")));
+        assert!(byte_nulled.is_null());
+        assert_eq!(bytes, [7, 8]);
+    }
+
+    /// [`guard_off`] passes a [`z_off64_t`] through unchanged — including the
+    /// negative `-1` sentinel of the `gzseek` / `gztell` / `gzoffset` family and
+    /// both signed 64-bit extremes — and substitutes its exact default when the
+    /// body panics.
+    ///
+    /// The signedness is the point: a guard that widened or saturated through an
+    /// unsigned type would turn a legitimate `-1` result into a huge positive
+    /// offset, so `-1` is asserted as a *pass-through* value as well as a
+    /// default.
+    #[cfg(feature = "std")]
+    #[test]
+    fn guard_off_catches_panic_and_passes_value() {
+        // Pass-through, including the C error sentinel and both extremes.
+        assert_eq!(guard_off(-1, || 0), 0);
+        assert_eq!(guard_off(-1, || -1), -1);
+        // A value beyond 32-bit range: `z_off64_t` is 64-bit on every target,
+        // so this must survive unnarrowed.
+        assert_eq!(guard_off(-1, || 2_147_483_648), 2_147_483_648);
+        assert_eq!(guard_off(0, || z_off64_t::MAX), z_off64_t::MAX);
+        assert_eq!(guard_off(0, || z_off64_t::MIN), z_off64_t::MIN);
+
+        // A panic substitutes the `-1` sentinel the gz position family uses.
+        let caught = with_silenced_panic_hook(|| guard_off(-1, || panic!("boundary panic")));
+        assert_eq!(caught, -1);
+
+        // ... and any other caller-chosen default, bit-exactly.
+        let extreme =
+            with_silenced_panic_hook(|| guard_off(z_off64_t::MIN, || panic!("boundary panic")));
+        assert_eq!(extreme, z_off64_t::MIN);
+    }
+
+    /// Pass-through holds for **both** implementations of every guard.
+    ///
+    /// Each guard exists twice: a `catch_unwind` form under `std` and a
+    /// direct-call form under `no_std`, where there is no unwinding to catch.
+    /// The panic-substitution tests can only run against the `std` form, so this
+    /// deliberately **ungated** test pins the property the two forms share — a
+    /// non-panicking body's value reaches the caller bit-exactly and the
+    /// `default` argument is ignored on the success path — and is therefore the
+    /// only *runtime* coverage the `no_std` forms receive (in the
+    /// `--no-default-features` rows, where `std` is off).
+    ///
+    /// Every `default` below is deliberately distinct from the value returned,
+    /// so a guard that substituted its default unconditionally would be caught.
+    #[test]
+    fn guards_pass_non_panicking_values_through_in_every_feature_row() {
+        assert_eq!(guard_int(-2, || 7), 7);
+        assert_eq!(guard_int(0, || c_int::MIN), c_int::MIN);
+
+        assert_eq!(guard_ulong(0, || 0xFEED), 0xFEED);
+        assert_eq!(guard_ulong(1, || c_ulong::MAX), c_ulong::MAX);
+
+        assert_eq!(guard_off(-1, || 2_147_483_648), 2_147_483_648);
+        assert_eq!(guard_off(0, || z_off64_t::MIN), z_off64_t::MIN);
+
+        let mut value: c_int = 42;
+        let live: *mut c_int = &raw mut value;
+        assert_eq!(guard_ptr(ptr::null_mut(), || live), live);
+        assert_eq!(value, 42, "the guard moves pointers, never the pointee");
     }
 
     // -- test helpers -------------------------------------------------------

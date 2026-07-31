@@ -776,10 +776,25 @@ pub fn gzgetc_(state: &mut GzState) -> i32 {
 /// Pushes one byte back so the next read returns it — the Rust port of C
 /// `gzungetc` (`gzread.c` L505-563).
 ///
-/// Returns the byte pushed, or `-1` on error. At most one push is guaranteed
-/// after a fresh open (the double-sized output buffer reserves room); further
-/// pushes succeed only while buffer space remains. `c` must be a valid byte
-/// (`>= 0`); pushing EOF is rejected.
+/// Returns the byte pushed, or `-1` on error.
+///
+/// Capacity follows the guarantees `zlib.h` L1631-L1642 states. **At least one**
+/// character of push-back is always allowed, in any state — when the output
+/// buffer is empty the byte is placed at its very *end* (C L533-540) so later
+/// pushes still have room in front of it. Immediately after `gzopen`/`gzdopen`,
+/// before anything has been read, at least the full output-buffer size may be
+/// pushed; beyond that a push succeeds only while space remains in the
+/// double-sized buffer, and an exhausted buffer records `Z_DATA_ERROR`
+/// ("out of room to push characters", C L543-546).
+///
+/// `c` must be a valid byte. Passing a negative value cannot push EOF and
+/// returns `-1` — but note the C ordering, reproduced exactly here: a pending
+/// forward seek is honored *first* (C L525-526), and only then is the negative
+/// value rejected (C L529-530). `gzungetc(-1, file)` is therefore zlib's
+/// documented idiom for forcing a pending seek so that `gztell` reports the true
+/// position, and its `-1` return is expected rather than a failure signal.
+///
+/// Pushed characters are discarded by a subsequent `gzseek` or `gzrewind`.
 pub fn gzungetc(c: i32, state: &mut GzState) -> i32 {
     // The handle must be open for reading (C L512-513).
     if state.mode != GzMode::Read {

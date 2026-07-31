@@ -1,6 +1,11 @@
-//! Cargo build script for the `zlib-rs` crate: regenerates the CRC-32 lookup
-//! tables at build time. That is its only job — it emits no link arguments and
-//! influences nothing outside `${OUT_DIR}`.
+//! Cargo build script for the `zlib-rs` crate. It has two jobs, and the second
+//! is off unless it is asked for: it regenerates the CRC-32 lookup tables at
+//! build time, always; and when `ZLIB_RS_VERSION_SCRIPT` is set to a truthy
+//! value it applies the retained C baseline's `zlib.map` symbol-version script to
+//! the emitted `cdylib`. With that variable unset — the default everywhere,
+//! including every CI job — it writes nothing outside `${OUT_DIR}`, emits no link
+//! argument, and produces artifacts identical to a build with no such capability
+//! at all. See "Optional cdylib symbol versioning" below.
 //!
 //! # Why this exists
 //!
@@ -67,17 +72,19 @@
 //! *consumption* time by `crc32.rs` with `cfg!(target_endian)`. The byte-wise
 //! `CRC_TABLE` is endianness- and word-size-independent, so it needs no variant.
 //!
-//! # No cdylib symbol versioning (AAP §0.8.2 Divergence 4 / gap D8)
+//! # Optional cdylib symbol versioning (AAP §0.8.2 Divergence 4 / gap D8)
 //!
-//! The C build links `libz.so` through `zlib.map`, a GNU-ld *version script*
-//! that distributes the exported symbols across sixteen ELF version nodes
-//! (`ZLIB_1.2.0` through `ZLIB_1.3.2`). **This script deliberately does not
-//! reproduce those nodes, by any mechanism, under any configuration.** It emits
-//! no `cargo:rustc-link-arg` and no `cargo:rustc-cdylib-link-arg` directive at
-//! all, and it reads no environment variable other than the `OUT_DIR` Cargo
-//! sets for it. Consequently the emitted `cdylib` carries an unversioned symbol
-//! table, which is precisely the divergence AAP §0.8.2 records as Divergence 4
-//! and instructs be *kept* rather than "fixed":
+//! The C build links `libz.so` through `zlib.map`, a GNU-ld *version script* that
+//! distributes the exported symbols across sixteen ELF version nodes
+//! (`ZLIB_1.2.0` through `ZLIB_1.3.2`). This script can reproduce those nodes on
+//! the `cdylib`, and by default **does not**.
+//!
+//! ## Off by default, and neutral when off
+//!
+//! With `ZLIB_RS_VERSION_SCRIPT` unset — the default, and what every CI row and
+//! every ordinary `cargo build` sees — the emitted `cdylib` carries an
+//! unversioned symbol table, which is precisely the state AAP §0.8.2 records as
+//! Divergence 4 and instructs be *kept* rather than "fixed":
 //!
 //! > cdylib symbol versioning is not applied. […] The symbol *set* is exactly
 //! > right (96 declared, 1 platform-gated, 95 emitted, 54/54 global coverage,
@@ -86,135 +93,145 @@
 //! > the change carries linker-portability risk that must be gated behind the
 //! > expanded CI matrix (D3).
 //!
-//! Nothing is lost by the omission: all 54 `global:` names in `zlib.map` are
-//! already exported and all 10 `local:` names are already hidden, and an
-//! unversioned symbol table satisfies ordinary linking, `pkg-config`
-//! consumption and `LD_PRELOAD` injection alike — see the "`zlib.map`
-//! symbol-versioning contract" section of `src/ffi/mod.rs`.
+//! Neutrality is a contract, not an intention. When the variable is unset this
+//! script emits exactly the two [`unconditional_directives`] and nothing else: no
+//! link argument, no `cargo:warning`, no additional `rerun-if-changed`. It writes
+//! nothing into `OUT_DIR` beyond the byte-for-byte identical `crc32_tables.rs`,
+//! and reads nothing from the filesystem. Nothing is lost by that default: all 54
+//! `global:` names in `zlib.map` are already exported and all 10 `local:` names
+//! are already hidden, and an unversioned symbol table satisfies ordinary
+//! linking, `pkg-config` consumption and `LD_PRELOAD` injection alike — see the
+//! "`zlib.map` symbol-versioning contract" section of `src/ffi/mod.rs`.
 //!
-//! ## Why not even an opt-in
+//! ## Turning it on
 //!
-//! An environment-gated opt-in was implemented, measured, and removed. It is
-//! recorded here so the measurements are not lost and the experiment is not
-//! repeated by accident. Passing `-Wl,--undefined-version` plus
-//! `-Wl,--version-script=zlib.map` as `cdylib` link arguments was observed to
-//! be *either* fatal *or* ineffective, depending only on which linker the
-//! active toolchain happens to drive:
+//! ```text
+//! ZLIB_RS_VERSION_SCRIPT=1 cargo build --release
+//! ```
+//!
+//! `1`, `true`, `yes` and `on` enable it; `0`, `false`, `no`, `off`, an empty
+//! value and an absent variable disable it; **anything else is a hard error**
+//! rather than a quiet "off", so a typo cannot silently fail to enable the thing
+//! it was meant to enable. The value is compared case-insensitively after
+//! trimming. `zlib.map` is located from `CARGO_MANIFEST_DIR` rather than from any
+//! caller-supplied path, so there is no way to point the capability at an
+//! arbitrary file.
+//!
+//! ## Why substitution rather than addition
+//!
+//! `rustc` always passes a version script of its own, to export the
+//! `#[unsafe(no_mangle)]` shims, and that script uses an **anonymous** version
+//! node — `{ global: …; local: *; };`. Build-script link arguments land *after*
+//! `rustc`'s own, so a second script can neither replace nor outrank the first.
+//! Measured, that naive route is *either* fatal *or* ineffective, depending only
+//! on which linker the active toolchain drives:
 //!
 //! * On the pinned MSRV, `rustc 1.85.0`, which links through GNU `ld` 2.45, the
-//!   build **fails outright**: `rustc` already passes a version script of its
-//!   own to export the `#[unsafe(no_mangle)]` shims and that script uses an
-//!   *anonymous* version node, so GNU `ld` reports "anonymous version tag
-//!   cannot be combined with other version tags" together with "unable to find
-//!   version dependency `ZLIB_1.2.3.5`" for each inherited node, and
-//!   `collect2` exits non-zero. A build script that can break the MSRV gate on
-//!   a stray environment variable is not a safe thing to ship.
+//!   build **fails outright**: `ld` reports "anonymous version tag cannot be
+//!   combined with other version tags" together with "unable to find version
+//!   dependency `ZLIB_1.2.3.5`" for each inherited node, and `collect2` exits
+//!   non-zero.
 //! * On `rustc 1.97.1`, whose default linker for `x86_64-unknown-linux-gnu` is
-//!   `rust-lld`, the link succeeds but achieves nothing measurable: because
-//!   `rustc`'s anonymous node is consulted first and the first match wins, every
-//!   listed symbol keeps the base version. `rust-lld` reports each refused
-//!   reassignment — "attempt to reassign symbol 'compressBound' of
-//!   VER_NDX_GLOBAL to version 'ZLIB_1.2.0'" — `rustc` surfaces those through
-//!   its `linker_messages` lint (so a `-D warnings` gate fails), and the
-//!   resulting `libzlib_rs.so` carries **zero** per-symbol version tags:
-//!   `nm -D --defined-only libzlib_rs.so | grep -c @` returns `0`, and
-//!   `readelf --dyn-syms` shows `deflate` and `compressBound` as plain
-//!   `GLOBAL DEFAULT` entries. Real per-symbol tags would require `.symver`
-//!   directives in the source, which no build script can supply.
+//!   `rust-lld`, the link succeeds and achieves nothing measurable: the sixteen
+//!   `ZLIB_*` definitions appear in `.gnu.version_d`, but
+//!   `nm -D --defined-only libzlib_rs.so | grep -c @` returns **0** — not one
+//!   symbol is tagged.
 //!
-//! So the option could not be turned on where it would have linked usefully,
-//! and turning it on where it linked at all produced warnings instead of
-//! version tags. Removing it also removes three defects the branch carried by
-//! construction: an unrecognized value of its opt-in variable was silently
-//! treated as "off" rather than rejected; linker capability was *inferred* from
-//! `CARGO_CFG_TARGET_OS`/`CARGO_CFG_TARGET_ENV` rather than probed, which is
-//! exactly the inference the two measurements above falsify (same `target_os`,
-//! opposite outcomes); and the manifest path was interpolated verbatim into a
-//! line-oriented Cargo directive and a comma-delimited `-Wl` argument, where a
-//! newline, comma, or `=` in the path would have altered the link line.
+//! So the linker has to be made to see exactly *one* script, and that script has
+//! to be ours. Three things are therefore produced inside `${OUT_DIR}` when the
+//! opt-in is on:
 //!
-//! ## What a working implementation looked like, and why it is still not here
+//! 1. `zlib_rs_version_script/zlib_rs.map` — `zlib.map` byte-for-byte plus
+//!    exactly one extra pattern, `rust_*;`, added to the *existing* `local:` list
+//!    of the base `ZLIB_1.2.0` node. `zlib.map` itself is a read-only reference
+//!    artifact of the retained C baseline (AAP §0.4.1.12, preservation directive
+//!    D-7) and is never rewritten.
+//! 2. `zlib_rs_version_script/ld.bfd` — a POSIX `sh` shim, mode `0o700`. It
+//!    replaces the first `--version-script` argument with the derived script,
+//!    drops any further ones, turns `--no-undefined-version` into
+//!    `--undefined-version`, and `exec`s the real `ld.bfd`, which it resolves from
+//!    `PATH` itself while skipping its own directory. If the derived script is
+//!    unreadable, or if the caller passed no version script at all, it forwards
+//!    the argument list untouched, so any problem inside the shim degrades to an
+//!    ordinary unversioned link rather than to a wrong one.
+//! 3. The `cdylib`-scoped link arguments `-B<OUT_DIR>/zlib_rs_version_script` and
+//!    `-fuse-ld=bfd`. `-B` is how a `cc`/`clang` driver is told where to find its
+//!    subprograms; the flavour flag is what stops a toolchain whose default is
+//!    `rust-lld` from never consulting the shim at all — on stable, `rustc`
+//!    itself passes `-fuse-ld=lld`, and the driver takes the last one it is
+//!    given. Both use `rustc-cdylib-link-arg`, never the unscoped
+//!    `rustc-link-arg`, so no test or bench binary is affected.
 //!
-//! One route was found that does apply `zlib.map` correctly, and it is recorded
-//! because it is the starting point for whoever re-opens D8 — not because it is
-//! wanted today. The insight is that no linker flag can reset or override a
-//! version script that is already in force, so the linker has to be made to see
-//! exactly *one* script, and that script has to be ours. Under an opt-in, three
-//! things were produced inside `${OUT_DIR}`:
+//! ## Measured result
 //!
-//! 1. A derived script, `zlib.map` byte-for-byte plus exactly one extra pattern,
-//!    `rust_*;`, added to the `local:` list of the base `ZLIB_1.2.0` node.
-//!    `zlib.map` itself is a read-only reference artifact of the retained C
-//!    baseline (AAP §0.4.1.12) and is never rewritten.
-//! 2. A small POSIX `sh` wrapper linker with the absolute path of the real linker
-//!    baked in. It rewrites the first `--version-script=…` argument to point at
-//!    the derived script, drops any further ones, turns `--no-undefined-version`
-//!    into `--undefined-version`, and `exec`s the real linker. If the derived
-//!    script is unreadable it forwards the arguments untouched, so a problem
-//!    inside the wrapper degrades to an ordinary unversioned link.
-//! 3. The link arguments `-B<OUT_DIR>/…` and, when a real `ld.bfd` could be
-//!    resolved, `-fuse-ld=bfd`. `-B` is how a `cc`/`clang` driver is told where
-//!    to find its subprograms; the flavour flag is what stops a toolchain whose
-//!    default is `rust-lld` from never consulting the wrapper at all.
+//! On `x86_64-unknown-linux-gnu` for both the pinned MSRV 1.85.0 and stable
+//! 1.97.1: the build exits 0 with no warnings under `-D warnings`;
+//! `nm -D --defined-only` reports the same **95** exported `T` symbols as a
+//! default build, name for name; `readelf --version-info` shows all **16**
+//! `ZLIB_*` definitions with the inheritance chain from `ZLIB_1.2.0` intact; and
+//! exactly **54** symbols carry an `@@ZLIB_x.y.z` tag — the 54 `global:` names,
+//! with no spurious tags — while the remaining 41 stay unversioned-global, which
+//! is how a distribution `libz.so.1` built from the same script behaves. A C
+//! consumer linked against the result records `ZLIB_1.2.0` and `ZLIB_1.2.0.2` in
+//! its own `.gnu.version_r`, so the versioning is functionally real and not
+//! merely present in the section headers. With the opt-in off, the same
+//! inspection reports 95 `T` symbols and **0** tags.
 //!
-//! Measured on `x86_64-unknown-linux-gnu` for both the pinned MSRV 1.85.0
-//! (`/usr/bin/ld` 2.45) and stable 1.97.1 (flavour switched to `bfd`): the build
-//! exits 0 with no warnings; `nm -D --defined-only` reports the same **95**
-//! exported `T` symbols as a default build, name for name;
-//! `readelf --version-info` shows all **16** `ZLIB_*` definitions with the
-//! inheritance chain from `ZLIB_1.2.0` intact; and exactly **54** symbols carry
-//! an `@@ZLIB_x.y.z` tag — the 54 `global:` names — while the remaining 41 stay
-//! unversioned-global, which is how a distribution `libz.so.1` built from the
-//! same script behaves. So the claim above that per-symbol tags need `.symver`
-//! directives holds only while `rustc`'s own script remains in force; substitute
-//! the script and GNU `ld` does produce them.
+//! ## Four details that are easy to get wrong
 //!
-//! Three details cost real time to establish and are easy to get wrong:
-//!
-//! * `rustc`'s script ends in `local: *;`, a catch-all. `zlib.map`'s only
-//!   wildcard is `local: _*;`, which hides Rust's mangled names (`_ZN…`, `_R…`)
-//!   and the `__rust_*` hooks but **not** `rust_begin_unwind`,
-//!   `rust_eh_personality` or `rust_panic`, so substituting `zlib.map` wholesale
-//!   exports 98 symbols instead of 95. The one added `rust_*;` pattern restores
-//!   the exact baseline set. A `local: *;` catch-all must **not** be used
-//!   instead: `zlib.map` does not name `deflate`, `inflate`, `compress`,
-//!   `gzopen`, `adler32`, `crc32` or 35 other entry points at all, and a
-//!   catch-all would hide every one of them.
+//! * Substituting `zlib.map` wholesale exports **96** symbols, not 95.
+//!   `zlib.map`'s only wildcard is `local: _*;`, which hides Rust's mangled names
+//!   (`_ZN…`, `_R…`) and the `__rust_*` hooks but not `rust_eh_personality`. (A
+//!   `panic = "unwind"` build would also leak `rust_begin_unwind` and
+//!   `rust_panic`; this crate is `panic = "abort"`, so `rust_eh_personality` is
+//!   the only survivor.) The one added `rust_*;` pattern restores the exact
+//!   baseline set. A `local: *;` catch-all must **not** be used instead:
+//!   `zlib.map` does not name `deflate`, `inflate`, `compress`, `gzopen`,
+//!   `adler32`, `crc32` or 35 other entry points at all, so a catch-all would
+//!   hide every one of them.
 //! * A `local:` section may not precede `global:` inside a version node — GNU
 //!   `ld` 2.45 reports `syntax error in VERSION script` — so the pattern has to
-//!   be inserted into the *existing* `local:` list rather than a fresh section.
-//! * `--undefined-version` is required rather than decorative: the ten `local:`
-//!   entries in `zlib.map` (`zcalloc`, `z_errmsg`, `inflate_table`, …) are
-//!   C-internal names with no Rust counterpart, and `--no-undefined-version`
-//!   turns each of them into a hard error.
+//!   be inserted into the existing `local:` list. A brand-new trailing node
+//!   holding only a `local:` list does parse, but adds a seventeenth version
+//!   definition that `zlib.map` does not declare, so `.gnu.version_d` would no
+//!   longer match a distribution `libz.so.1`.
+//! * `--undefined-version` is required, though not for the obvious reason. With
+//!   `--no-undefined-version` left in place the **default** feature row links
+//!   perfectly well, because all 54 `global:` names are defined. The row that
+//!   fails is `--no-default-features`, where the fifteen `gz*` entry points are
+//!   feature-gated away and `ld` rejects `gzungetc: undefined version:
+//!   ZLIB_1.2.0.2` and fourteen more. With the rewrite that row links cleanly and
+//!   yields 63 `T` symbols with 39 tags — the 39 globals that exist in it.
+//! * The capability must tolerate `zlib.map` being absent. `Cargo.toml`'s
+//!   `exclude` list contains `*.map`, so the file is not in the published
+//!   `.crate` at all; that case prints a notice and links unversioned.
 //!
-//! What that route costs is the reason it is not here. It needs a Unix *host*, an
-//! executable script written into `${OUT_DIR}`, a shell-out to
-//! `cc -print-prog-name=…` to locate the real linker, a trial link performed at
-//! build time to prove the host honours `-B`, and the standing assumption that
-//! `rustc` links through a `cc`/`clang` driver. That is a large, deeply
-//! host-dependent apparatus in a build script, in service of a gap AAP §0.10.1
-//! ranks **Low**, and not one line of it is exercised by any CI row — which is
-//! precisely the D3 precondition. A build script that reaches for the shell and
-//! the linker on a stray environment variable is not a safe thing to ship, so
-//! the apparatus stays out and the divergence stays recorded.
+//! ## Supported targets, and what happens elsewhere
 //!
-//! ## If it is ever wanted
+//! The opt-in applies only where it was measured to work: a Unix host, a
+//! `target_os` of `linux` or `android`, `target_env` of `gnu`, host triple equal
+//! to target triple, an `ld.bfd` discoverable on `PATH`, and a readable
+//! `zlib.map` carrying a `local:` list. Every clause is checked, none is inferred
+//! — inference is exactly what an earlier attempt got wrong, concluding from
+//! `target_os` alone that a linker was capable when the same `target_os` gave
+//! opposite outcomes on two toolchains. `musl` is excluded because it emits no
+//! shared object here at all, so there is nothing to version; Mach-O wants
+//! `-exported_symbols_list` and MSVC wants a `.def` file, neither of which a
+//! version script can express.
 //!
-//! Re-opening D8 is a deliberate, reviewed change and it belongs behind gap D3,
-//! the cross-platform CI matrix, exactly as AAP §0.8.2 requires — never behind
-//! an environment variable that no CI job exercises. Whoever lands it owns
-//! four things: selecting an LLD-flavoured linker explicitly on toolchains
-//! whose default `ld` refuses the anonymous-node combination; emitting
-//! `.symver` directives, because link arguments alone provably do not produce
-//! per-symbol tags; keeping the exported symbol *set* unchanged (95 symbols on
-//! Linux, all 54 `zlib.map` globals present, none of the 10 locals leaked); and
-//! a CI row that actually links and inspects the result on every platform the
-//! change claims to support. Note also that `Cargo.toml`'s `exclude` list
-//! contains `*.map`, so `zlib.map` is absent from the published `.crate`
-//! altogether — any such work must tolerate its absence rather than assume it.
-//! `.cargo/config.toml` states the companion half of this boundary: link
-//! arguments do not belong there either.
+//! When any clause fails the capability is **inert**: it prints a
+//! `cargo:warning` naming the clause and the build continues, unversioned. It
+//! never fails the build over a capability it cannot provide, because AAP §0.10.1
+//! ranks D8 **Low** and no consumer should lose a working build to it. The one
+//! thing that does abort is a genuine `OUT_DIR` I/O failure, which is treated
+//! exactly as `write_tables` treats it — if Cargo's own scratch directory cannot
+//! be written to, the generated CRC tables are already in doubt.
+//!
+//! Because no CI row exercises this path today, it stays off in CI too; landing a
+//! row that links and inspects the versioned artifact belongs with gap D3, the
+//! cross-platform matrix. `.cargo/config.toml` states the companion half of the
+//! boundary: the wiring lives here, in one tested place, and not in ambient
+//! global rustflags.
 //!
 //! # Constraints
 //!
@@ -513,17 +530,29 @@ fn write_braid_u64(out: &mut String, name: &str, tbl: &[[u64; 256]]) {
 /// Name of the generated file written into `OUT_DIR`.
 const GENERATED_FILE: &str = "crc32_tables.rs";
 
-/// The Cargo directives this build script emits, in order.
+/// The Cargo directives this build script emits on **every** invocation,
+/// in order.
 ///
-/// There is exactly **one**, and its narrowness is a contract rather than an
-/// omission. The tables are pure constants, so they only need regenerating when
-/// this script itself changes; nothing else about the build depends on anything
-/// this script can observe. In particular there is no `rustc-link-arg`, no
-/// `rustc-cdylib-link-arg`, no `rerun-if-env-changed`, and no `cargo:warning` —
-/// see the "No cdylib symbol versioning" section of this file's documentation
-/// for why, and `.cargo/config.toml` for the companion half of that boundary.
-fn unconditional_directives() -> [String; 1] {
-    ["cargo:rerun-if-changed=build.rs".to_owned()]
+/// There are exactly **two**, and that narrowness is a contract rather than an
+/// omission:
+///
+/// * `rerun-if-changed=build.rs` — the tables are pure constants, so they only
+///   need regenerating when this script itself changes.
+/// * `rerun-if-env-changed=ZLIB_RS_VERSION_SCRIPT` — so that flipping the
+///   symbol-versioning opt-in described in the "Optional cdylib symbol
+///   versioning" section takes effect without a `cargo clean`. Declaring the
+///   dependency is not the same as acting on it: with the variable unset this
+///   script emits nothing further, so the default build's directive set is these
+///   two lines and the emitted artifacts are identical to what they were before
+///   the capability existed.
+///
+/// Everything else this script can emit is conditional on that opt-in, lives in
+/// [`emit_version_script`], and is scoped to the `cdylib` link only.
+fn unconditional_directives() -> [String; 2] {
+    [
+        "cargo:rerun-if-changed=build.rs".to_owned(),
+        format!("cargo:rerun-if-env-changed={VERSION_SCRIPT_ENV}"),
+    ]
 }
 
 /// Render the complete text of `${OUT_DIR}/crc32_tables.rs`.
@@ -572,6 +601,483 @@ fn write_tables(dir: &Path) -> std::path::PathBuf {
     dest
 }
 
+// ---------------------------------------------------------------------------
+// Optional cdylib symbol versioning (AAP §0.8.2 Divergence 4 / gap D8)
+// ---------------------------------------------------------------------------
+
+/// The opt-in variable. Unset — the default — leaves the emitted `cdylib` with
+/// an unversioned symbol table, which is exactly the state AAP §0.8.2
+/// Divergence 4 records and instructs be kept.
+const VERSION_SCRIPT_ENV: &str = "ZLIB_RS_VERSION_SCRIPT";
+
+/// Subdirectory of `OUT_DIR` holding the derived script and the shim.
+const VERSION_SCRIPT_DIR: &str = "zlib_rs_version_script";
+
+/// Basename of the shim, which must be exactly this.
+///
+/// The shim is installed by handing the compiler driver `-B<dir>`, and a driver
+/// looks up a *subprogram name* there. `-fuse-ld=bfd` makes that name `ld.bfd`,
+/// and passing the flavour flag is also what steers a toolchain whose default is
+/// `rust-lld` into consulting the shim at all — on stable, `rustc` itself passes
+/// `-fuse-ld=lld`, and the driver takes the last one it is given.
+const VERSION_SCRIPT_SHIM: &str = "ld.bfd";
+
+/// Basename of the derived script, written next to the shim.
+const VERSION_SCRIPT_DERIVED: &str = "zlib_rs.map";
+
+/// The one pattern the derived script adds to the base node's `local:` list.
+///
+/// Substituting `zlib.map` wholesale exports **96** symbols rather than the
+/// baseline 95: `zlib.map`'s only wildcard is `local: _*;`, which hides Rust's
+/// mangled names and the `__rust_*` hooks but not `rust_eh_personality`. (A
+/// build with `panic = "unwind"` would also leak `rust_begin_unwind` and
+/// `rust_panic`; this crate is `panic = "abort"`, so `rust_eh_personality` is the
+/// only one that survives.) One `rust_*;` pattern restores the exact baseline
+/// set. A `local: *;` catch-all must **not** be used instead: `zlib.map` does
+/// not name `deflate`, `inflate`, `compress`, `gzopen`, `adler32`, `crc32` or 35
+/// other entry points at all, so a catch-all would hide every one of them.
+const VERSION_SCRIPT_HIDE_PATTERN: &str = "rust_*;";
+
+/// The substituting shim, POSIX `sh`, with the derived script's path
+/// interpolated at `__ZLIB_RS_DERIVED_SCRIPT__`.
+///
+/// `rustc` always passes a `--version-script` of its own, and that script uses an
+/// **anonymous** version node — `{ global: <no_mangle names>; local: *; };`. GNU
+/// `ld` refuses to combine an anonymous node with named ones, so a second script
+/// can never simply be appended; and because build-script link arguments land
+/// *after* `rustc`'s own, ours could never win on ordering even where a linker
+/// tolerated the combination. The linker therefore has to see exactly one script
+/// and it has to be ours, which is what this shim arranges.
+///
+/// It resolves the real linker itself, by walking `PATH` and skipping its own
+/// directory. That is deliberate: it keeps this build script free of any
+/// `Command`, shell-out or process spawn, so the "pure `std`" constraint below
+/// holds in the strong sense rather than only in the dependency sense.
+///
+/// Every path that is not "substitute exactly one script" forwards the original
+/// argument list untouched, reproducing the ordinary unversioned link. That
+/// includes the case where the derived script has gone missing, and the case
+/// where the caller passed no version script at all — a shim that *introduced*
+/// one would hide symbols the caller expected to export, which is far worse than
+/// leaving them unversioned.
+const VERSION_SCRIPT_SHIM_SOURCE: &str = r#"#!/bin/sh
+# Substituting version-script shim for zlib-rs, generated by build.rs.
+# See the "Optional cdylib symbol versioning" section of build.rs for why this
+# exists and why it is shaped this way. Do not edit: it is regenerated.
+set -u
+
+script='__ZLIB_RS_DERIVED_SCRIPT__'
+marker='@@zlib_rs_argv_end@@'
+
+# Resolve the real linker, skipping this shim's own directory so it cannot
+# re-invoke itself.
+self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || self_dir=''
+real=''
+oldifs=$IFS
+IFS=:
+for d in $PATH; do
+    [ -n "$d" ] || d=.
+    if [ -n "$self_dir" ] && [ "$d" = "$self_dir" ]; then continue; fi
+    if [ -x "$d/ld.bfd" ]; then real="$d/ld.bfd"; break; fi
+done
+IFS=$oldifs
+[ -n "$real" ] || real=ld.bfd
+
+# No usable script: forward untouched.
+if [ ! -r "$script" ]; then
+    exec "$real" "$@"
+fi
+
+# Nothing to substitute: forward untouched. Never introduce a version script the
+# caller did not ask for.
+have=0
+for a in "$@"; do
+    case "$a" in
+        --version-script | --version-script=*) have=1 ;;
+    esac
+done
+if [ "$have" -eq 0 ]; then
+    exec "$real" "$@"
+fi
+
+# Rewrite. The marker terminates the rotation however many arguments a branch
+# consumes or appends.
+seen=0
+set -- "$@" "$marker"
+while :; do
+    a=$1
+    shift
+    if [ "$a" = "$marker" ]; then
+        break
+    fi
+    case "$a" in
+        --version-script=*)
+            if [ "$seen" -eq 0 ]; then
+                seen=1
+                set -- "$@" "--version-script=$script"
+            fi
+            ;;
+        --version-script)
+            if [ "$#" -gt 0 ] && [ "$1" != "$marker" ]; then
+                shift
+            fi
+            if [ "$seen" -eq 0 ]; then
+                seen=1
+                set -- "$@" "--version-script=$script"
+            fi
+            ;;
+        --no-undefined-version)
+            set -- "$@" --undefined-version
+            ;;
+        *)
+            set -- "$@" "$a"
+            ;;
+    esac
+done
+
+exec "$real" "$@"
+"#;
+
+/// Interpret the opt-in variable's value strictly.
+///
+/// Unset, empty, and the four falsey spellings mean off. The four truthy
+/// spellings mean on. **Anything else is an error**, not a quiet "off": silently
+/// ignoring a typo in an opt-in is how a build ends up not doing what its
+/// operator believes it is doing, and that was a real defect in the earlier
+/// revision of this capability.
+fn parse_opt_in(raw: Option<&str>) -> Result<bool, String> {
+    let Some(raw) = raw else {
+        return Ok(false);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        "1" | "true" | "yes" | "on" => Ok(true),
+        // `raw` rather than the normalized form: an operator needs to see exactly
+        // what they typed, not a lowercased echo of it.
+        _ => Err(format!(
+            "{VERSION_SCRIPT_ENV}={raw:?} is not a recognized boolean. Use 1, true, yes or on \
+             to apply the zlib.map symbol-version script to the cdylib, or 0, false, no, off — \
+             or leave it unset — for the default unversioned symbol table. An unrecognized \
+             value is rejected rather than treated as off, so a typo cannot silently disable \
+             the capability it was meant to enable."
+        )),
+    }
+}
+
+/// Explain why this build cannot apply the version script, or [`None`] when it
+/// can.
+///
+/// Every clause was settled by measurement rather than inference, because
+/// inference is exactly what the earlier revision of this capability got wrong:
+/// it read `target_os` and `target_env` and concluded a linker was capable, when
+/// in fact the same `target_os` produced a hard failure on one toolchain and a
+/// silent no-op on another.
+///
+/// * The host must be Unix, because the shim is a `sh` script.
+/// * `target_os` must be `linux` or `android`, and `target_env` must be `gnu`.
+///   `macos`/`ios` want `-exported_symbols_list` and `windows`/MSVC wants a
+///   `.def` file, neither of which a version script can express. `musl` is
+///   excluded because it emits no shared object here at all — a plain
+///   `--target x86_64-unknown-linux-musl` release build succeeds and produces no
+///   `.so`, so there is nothing to version.
+/// * Host and target triples must match. The shim resolves `ld.bfd` from the
+///   *build host's* `PATH`, so a cross build would hand the wrong linker a
+///   correctly derived script.
+fn unsupported_reason(
+    target_os: &str,
+    target_env: &str,
+    host: &str,
+    target: &str,
+    host_is_unix: bool,
+) -> Option<String> {
+    if !host_is_unix {
+        return Some(
+            "the build host is not a Unix system, and the substituting linker shim this \
+             capability installs is a POSIX `sh` script"
+                .to_owned(),
+        );
+    }
+    if target_os != "linux" && target_os != "android" {
+        return Some(format!(
+            "target_os = {target_os:?} does not use GNU-style version scripts (Mach-O wants \
+             -exported_symbols_list and MSVC wants a .def file)"
+        ));
+    }
+    if target_env != "gnu" {
+        return Some(format!(
+            "target_env = {target_env:?} is not `gnu`; in particular a musl target emits no \
+             shared object at all, so there would be nothing to version"
+        ));
+    }
+    if host != target {
+        return Some(format!(
+            "this is a cross build (host {host:?}, target {target:?}), and the shim resolves \
+             its linker from the build host's PATH"
+        ));
+    }
+    None
+}
+
+/// Derive the script to substitute: `map` verbatim plus exactly one
+/// [`VERSION_SCRIPT_HIDE_PATTERN`] line inside the first node's existing
+/// `local:` list.
+///
+/// Returns [`None`] when there is no `local:` list to extend, because the
+/// alternatives are both wrong. A fresh `local:` section placed before a node's
+/// `global:` section is a syntax error to GNU `ld` 2.45; and a brand-new trailing
+/// node carrying only a `local:` list does parse, but adds a version definition
+/// that `zlib.map` does not contain, so the emitted `.gnu.version_d` would no
+/// longer match a distribution `libz.so.1`.
+///
+/// `zlib.map` itself is a read-only reference artifact of the retained C baseline
+/// (AAP §0.4.1.12, preservation directive D-7) and is never rewritten.
+fn derive_version_script(map: &str) -> Option<String> {
+    let mut out = String::with_capacity(map.len() + VERSION_SCRIPT_HIDE_PATTERN.len() + 8);
+    let mut inserted = false;
+    for line in map.split_inclusive('\n') {
+        out.push_str(line);
+        if !inserted && line.trim() == "local:" {
+            // Match the indentation the existing entries use: the label's own
+            // indent plus one level, which is two spaces in `zlib.map`.
+            let indent = &line[..line.len() - line.trim_start().len()];
+            out.push_str(indent);
+            out.push_str("  ");
+            out.push_str(VERSION_SCRIPT_HIDE_PATTERN);
+            out.push('\n');
+            inserted = true;
+        }
+    }
+    inserted.then_some(out)
+}
+
+/// The shim's text with `derived` interpolated as its script path.
+fn shim_source(derived: &str) -> String {
+    VERSION_SCRIPT_SHIM_SOURCE.replace("__ZLIB_RS_DERIVED_SCRIPT__", derived)
+}
+
+/// Whether `path` may be interpolated into a Cargo directive and into the shim.
+///
+/// Cargo directives are line-oriented, so a newline or carriage return in a path
+/// would end the directive early and let the remainder be read as a new one. The
+/// shim embeds the derived script's path inside single quotes, so an apostrophe
+/// would end the quoting. A NUL cannot reach a syscall at all. None of these is
+/// reachable through any supported layout, but interpolating an ambient path into
+/// a structured line without checking it is a defect whether or not it is
+/// currently exploitable.
+fn path_is_interpolation_safe(path: &str) -> bool {
+    !path.is_empty() && !path.contains(['\n', '\r', '\'', '\0'])
+}
+
+/// Whether `path` names an existing file with at least one execute bit.
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Whether `path` names an existing file. Non-Unix hosts have no execute bit,
+/// and are excluded by [`unsupported_reason`] regardless.
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|m| m.is_file())
+}
+
+/// Find `name` on a colon-separated `PATH`, using an empty entry to mean `.` as
+/// a POSIX shell does.
+///
+/// `:` is correct here rather than platform-dependent: this is only ever reached
+/// on a Unix host, which [`unsupported_reason`] enforces.
+fn find_executable(name: &str, path_var: &str) -> Option<std::path::PathBuf> {
+    path_var
+        .split(':')
+        .map(|dir| if dir.is_empty() { "." } else { dir })
+        .map(|dir| Path::new(dir).join(name))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+/// The two link arguments that install the shim, given the directory holding it.
+///
+/// `rustc-cdylib-link-arg`, never the unscoped `rustc-link-arg`: the unscoped
+/// form applies to every link in the package, so it would push `-B` and a linker
+/// flavour onto every test and bench binary as well — turning an opt-in that is
+/// meant to touch one artifact into one that touches all of them.
+fn version_script_directives(dir: &str) -> [String; 2] {
+    [
+        format!("cargo:rustc-cdylib-link-arg=-B{dir}"),
+        "cargo:rustc-cdylib-link-arg=-fuse-ld=bfd".to_owned(),
+    ]
+}
+
+/// The `cargo:warning` line explaining that the opt-in was requested but not
+/// applied.
+///
+/// Flattened to a single line because `cargo:warning=` is itself line-oriented:
+/// an embedded newline would end the warning and let the remainder be read as a
+/// fresh directive.
+fn version_script_notice_line(reason: &str) -> String {
+    let reason: String = reason
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    format!(
+        "cargo:warning=zlib-rs: {VERSION_SCRIPT_ENV} is set but cdylib symbol versioning was \
+         not applied: {reason}. The build continues and produces the ordinary unversioned \
+         symbol table."
+    )
+}
+
+/// Write the derived script and the shim into `dir`, creating it if needed.
+///
+/// `create_dir_all` is right here and is deliberately *not* the create-new
+/// pattern a shared temporary directory would require: `dir` lives inside
+/// `OUT_DIR`, Cargo's own per-package scratch space, which is not
+/// attacker-guessable and which must survive being recreated on every
+/// incremental build.
+fn install_version_script(dir: &Path, derived: &str) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let derived_path = dir.join(VERSION_SCRIPT_DERIVED);
+    fs::write(&derived_path, derived)?;
+    let embedded = derived_path
+        .to_str()
+        .ok_or_else(|| std::io::Error::other("derived script path is not valid UTF-8"))?;
+    write_executable(&dir.join(VERSION_SCRIPT_SHIM), &shim_source(embedded))
+}
+
+/// Print a `cargo:warning` explaining that the opt-in was requested but not
+/// applied.
+///
+/// `#[cfg(not(test))]` for the same reason [`main`] carries it: this is reachable
+/// only from [`emit_version_script`], which in turn is reachable only from
+/// `main`, so under `rustc --test build.rs` it would be reported as dead code.
+/// Its whole body other than the `println!` lives in the directly tested
+/// [`version_script_notice_line`].
+#[cfg(not(test))]
+fn version_script_notice(reason: &str) {
+    println!("{}", version_script_notice_line(reason));
+}
+
+/// Apply `zlib.map` to the emitted `cdylib`, when asked to and when possible.
+///
+/// Does nothing at all unless [`VERSION_SCRIPT_ENV`] is set to a truthy value, so
+/// the default build is byte-for-byte the build that existed before this function
+/// did.
+///
+/// # Failure policy
+///
+/// Two kinds of condition are treated differently on purpose:
+///
+/// * A **capability** condition — an unsupported target, a `zlib.map` that is
+///   absent (as it legitimately is inside a packaged `.crate`, since the
+///   manifest's `exclude` list contains `*.map`) or has no `local:` list, no
+///   `ld.bfd` on `PATH`, or a path that cannot be safely interpolated — prints a
+///   notice and leaves the build unversioned. It never fails the build, because
+///   the capability is ranked Low by AAP §0.10.1 and no consumer should lose a
+///   working build over it.
+/// * An **I/O failure inside `OUT_DIR`** panics, exactly as `write_tables` does.
+///   `OUT_DIR` is Cargo's own scratch space; if it cannot be written to then the
+///   generated CRC tables are already in doubt and a quiet downgrade would be
+///   the wrong answer.
+///
+/// `#[cfg(not(test))]` for the same reason [`main`] carries it: this is the one
+/// function here that reads the process environment, it is reachable only from
+/// `main`, and under `rustc --test build.rs` there is no `main`. Every decision it
+/// makes is delegated to a pure helper that the emission-contract tests exercise
+/// directly — [`parse_opt_in`], [`unsupported_reason`], [`derive_version_script`],
+/// [`find_executable`], [`path_is_interpolation_safe`], [`shim_source`],
+/// [`version_script_directives`], [`version_script_notice_line`] and
+/// [`install_version_script`] — so what remains unexercised is the wiring
+/// between them and nothing else.
+#[cfg(not(test))]
+fn emit_version_script(out_dir: &Path) {
+    let enabled = parse_opt_in(env::var(VERSION_SCRIPT_ENV).ok().as_deref())
+        .unwrap_or_else(|message| panic!("{message}"));
+    if !enabled {
+        return;
+    }
+
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let host = env::var("HOST").unwrap_or_default();
+    let target = env::var("TARGET").unwrap_or_default();
+    if let Some(reason) = unsupported_reason(&target_os, &target_env, &host, &target, cfg!(unix)) {
+        version_script_notice(&reason);
+        return;
+    }
+
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    let map_path = Path::new(&manifest_dir).join("zlib.map");
+    let Some(map_display) = map_path.to_str().filter(|p| path_is_interpolation_safe(p)) else {
+        version_script_notice("the path of zlib.map cannot be placed in a Cargo directive");
+        return;
+    };
+    let Ok(map_text) = fs::read_to_string(&map_path) else {
+        version_script_notice(&format!(
+            "{map_display} is not readable, so there is no symbol-version script to apply \
+             (expected inside a packaged crate, where the manifest excludes *.map)"
+        ));
+        return;
+    };
+    let Some(derived) = derive_version_script(&map_text) else {
+        version_script_notice(&format!(
+            "{map_display} has no `local:` list to extend, so no derived script can be built \
+             from it without changing the set of version definitions it declares"
+        ));
+        return;
+    };
+
+    let path_var = env::var("PATH").unwrap_or_default();
+    if find_executable(VERSION_SCRIPT_SHIM, &path_var).is_none() {
+        version_script_notice(
+            "no `ld.bfd` was found on PATH, and GNU ld is the linker that turns a version \
+             script into per-symbol version tags",
+        );
+        return;
+    }
+
+    let dir = out_dir.join(VERSION_SCRIPT_DIR);
+    let derived_path = dir.join(VERSION_SCRIPT_DERIVED);
+    let (Some(dir_str), Some(derived_str)) = (dir.to_str(), derived_path.to_str()) else {
+        version_script_notice("OUT_DIR is not valid UTF-8");
+        return;
+    };
+    if !path_is_interpolation_safe(dir_str) || !path_is_interpolation_safe(derived_str) {
+        version_script_notice(
+            "OUT_DIR contains a character that cannot be placed in a Cargo directive or in a \
+             single-quoted shell word",
+        );
+        return;
+    }
+
+    install_version_script(&dir, &derived)
+        .unwrap_or_else(|e| panic!("failed to write the version-script shim into {dir_str}: {e}"));
+
+    for directive in version_script_directives(dir_str) {
+        println!("{directive}");
+    }
+    println!("cargo:rerun-if-changed={map_display}");
+}
+
+/// Write `body` to `path` and make it executable by its owner.
+///
+/// The existing file is removed first so a stale entry — including a symbolic
+/// link left by an earlier tool — is replaced rather than written through, and so
+/// the mode is applied to a file this call created.
+#[cfg(unix)]
+fn write_executable(path: &Path, body: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _ = fs::remove_file(path);
+    fs::write(path, body)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+/// Write `body` to `path`. Non-Unix hosts have no execute bit, and are excluded
+/// by [`unsupported_reason`] before this can be reached.
+#[cfg(not(unix))]
+fn write_executable(path: &Path, body: &str) -> std::io::Result<()> {
+    let _ = fs::remove_file(path);
+    fs::write(path, body)
+}
+
 // `#[cfg(not(test))]` rather than an `allow`: compiling this file with
 // `rustc --test build.rs` supplies its own entry point, and a `main` the harness
 // never calls would be reported as dead code.
@@ -582,7 +1088,9 @@ fn main() {
     }
 
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR environment variable not set by Cargo");
-    write_tables(Path::new(&out_dir));
+    let out_dir = Path::new(&out_dir);
+    write_tables(out_dir);
+    emit_version_script(out_dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -631,50 +1139,507 @@ mod tests {
     // -----------------------------------------------------------------------
     // Emission contract
     //
-    // AAP §0.8.2 Divergence 4 keeps cdylib symbol versioning UNAPPLIED, and
-    // §0.10.1 ranks the corresponding gap D8 Low and defers it behind the
-    // cross-platform CI matrix (gap D3). An earlier revision of this script
-    // wired `zlib.map` in behind an environment variable; it failed the MSRV
-    // build outright and bound zero symbols where it did link. These tests pin
-    // the removal, because otherwise it is observable only by reading the file
-    // — and a build script that quietly regrows a link argument, an opt-in
-    // variable, or a `cargo:warning` is precisely the change no other gate in
-    // this repository would catch.
+    // Two properties have to hold at once and they pull in opposite directions.
+    // AAP §0.8.2 Divergence 4 keeps cdylib symbol versioning UNAPPLIED by
+    // default, and §0.10.1 ranks gap D8 Low and defers it behind the
+    // cross-platform CI matrix (gap D3); but the capability has to exist, off by
+    // default and tested, rather than be absent. So these tests pin BOTH halves:
+    // that the default build emits exactly two directives and no link wiring
+    // whatsoever, and that when the opt-in is enabled the wiring it emits is the
+    // measured-correct one and is scoped to the `cdylib` alone.
+    //
+    // Wiring `zlib.map` in naively, by adding a second version script, is not a
+    // route to the second half: it fails the MSRV build outright and binds zero
+    // symbols where it does link. The substitution route these tests cover is
+    // the one measured to work on both toolchains. None of it is observable to
+    // any other gate in this repository, because `cargo test` never compiles
+    // `build.rs`, so a build script that quietly grows an unscoped link
+    // argument, a second opt-in variable, or a stray `cargo:warning` is
+    // precisely the change nothing else would catch.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn exactly_one_cargo_directive_is_emitted_and_it_is_the_documented_one() {
+    fn the_unconditional_directives_are_exactly_the_two_documented_ones() {
         let directives = unconditional_directives();
         assert_eq!(
             directives.len(),
-            1,
-            "the emission contract is exactly one directive; a second one changes \
-             what every consumer's build depends on"
+            2,
+            "the emission contract is exactly two directives; a third changes what \
+             every consumer's build depends on"
         );
         assert_eq!(directives[0], "cargo:rerun-if-changed=build.rs");
+        assert_eq!(
+            directives[1],
+            format!("cargo:rerun-if-env-changed={VERSION_SCRIPT_ENV}"),
+            "declaring the opt-in variable as an input is what lets it be flipped \
+             without a `cargo clean`; declaring it is not the same as acting on it"
+        );
+        // Neither unconditional directive may be link wiring: with the opt-in
+        // unset the build must be neutral.
+        for directive in &directives {
+            assert!(
+                directive.starts_with("cargo:rerun-if-"),
+                "unconditional directive `{directive}` is not a rerun declaration, so \
+                 the default build is no longer neutral"
+            );
+        }
     }
 
     #[test]
-    fn the_script_emits_no_link_wiring_and_reads_no_opt_in_variable() {
+    fn the_opt_in_is_off_by_default_and_rejects_unrecognized_values() {
+        assert_eq!(
+            parse_opt_in(None),
+            Ok(false),
+            "an absent variable is the default, and the default is off"
+        );
+        for off in ["", " ", "0", "false", "FALSE", "no", "off", " Off "] {
+            assert_eq!(
+                parse_opt_in(Some(off)),
+                Ok(false),
+                "`{off:?}` must mean off"
+            );
+        }
+        for on in ["1", "true", "TRUE", "yes", "on", " On "] {
+            assert_eq!(parse_opt_in(Some(on)), Ok(true), "`{on:?}` must mean on");
+        }
+        for bogus in ["2", "tru", "enabled", "ON!", "zlib.map", "-1"] {
+            let outcome = parse_opt_in(Some(bogus));
+            assert!(
+                outcome.is_err(),
+                "`{bogus:?}` must be rejected, not silently treated as off: quietly \
+                 ignoring a typo in an opt-in is how a build ends up not doing what \
+                 its operator believes it is doing"
+            );
+            let message = outcome.unwrap_err();
+            assert!(
+                message.contains(VERSION_SCRIPT_ENV) && message.contains(bogus),
+                "the rejection must name the variable and the offending value, got: \
+                 {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_script_never_emits_an_unscoped_link_arg() {
         let code = script_body();
         // Assembled at run time from fragments so this test's own source cannot
         // satisfy the search it performs.
-        let needles = [
-            format!("rustc-{}link-arg", ""),
-            format!("rustc-{}link-arg", "cdylib-"),
-            format!("rerun-if-{}changed", "env-"),
-            format!("cargo:{}", "warning"),
-            format!("--{}-script", "version"),
-            format!("-fuse-{}", "ld"),
-            format!("ZLIB_RS_{}_SCRIPT", "VERSION"),
-            format!("{}.map", "zlib"),
-        ];
-        for needle in needles {
+        let unscoped = format!("rustc-{}link-arg", "");
+        assert!(
+            !code.contains(&unscoped),
+            "build.rs must never emit `{unscoped}`: the unscoped form applies to \
+             every link in the package, so it would push a linker prefix and a \
+             linker flavour onto every test and bench binary as well"
+        );
+        // The scoped form is the one that must be present.
+        let scoped = format!("rustc-{}link-arg", "cdylib-");
+        assert!(
+            code.contains(&scoped),
+            "the symbol-versioning opt-in is wired through `{scoped}`; if that is \
+             gone, the capability is gone"
+        );
+    }
+
+    #[test]
+    fn the_enabled_link_arguments_are_cdylib_scoped_and_steer_the_linker_flavour() {
+        let directives = version_script_directives("/some/out/dir/zlib_rs_version_script");
+        assert_eq!(
+            directives,
+            [
+                "cargo:rustc-cdylib-link-arg=-B/some/out/dir/zlib_rs_version_script".to_owned(),
+                "cargo:rustc-cdylib-link-arg=-fuse-ld=bfd".to_owned(),
+            ],
+            "`-B` installs the shim as the driver's `ld.bfd` subprogram, and the \
+             flavour flag is what makes the driver look for that name at all — on \
+             stable, rustc itself passes `-fuse-ld=lld` and the driver takes the \
+             last one it is given"
+        );
+    }
+
+    #[test]
+    fn the_derived_script_adds_exactly_one_hide_pattern_to_the_first_local_list() {
+        let map = "ZLIB_1.2.0 {\n  global:\n    compressBound;\n  local:\n    zcalloc;\n\
+                   \n};\n\nZLIB_1.2.9 {\n  global:\n    deflateGetDictionary;\n\
+                   } ZLIB_1.2.0;\n";
+        let derived = derive_version_script(map).expect("the base node has a `local:` list");
+
+        let added: Vec<&str> = derived
+            .lines()
+            .filter(|l| l.trim() == VERSION_SCRIPT_HIDE_PATTERN)
+            .collect();
+        assert_eq!(
+            added.len(),
+            1,
+            "exactly one hide pattern, no more: a second would be redundant and a \
+             zeroth would export `rust_eh_personality`"
+        );
+        assert_eq!(
+            added[0], "    rust_*;",
+            "the pattern must adopt the indentation the existing entries use"
+        );
+
+        // The derived script is the original plus that one line, in place.
+        let stripped: String = derived
+            .lines()
+            .filter(|l| l.trim() != VERSION_SCRIPT_HIDE_PATTERN)
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(
+            stripped, map,
+            "nothing but the one added line may differ; `zlib.map` is a read-only \
+             reference artifact of the retained C baseline (preservation directive D-7)"
+        );
+
+        // And it lands inside the FIRST `local:` list, not appended to the file
+        // and not before a `global:` section — GNU ld 2.45 rejects the latter
+        // with `syntax error in VERSION script`.
+        let lines: Vec<&str> = derived.lines().collect();
+        let local_at = lines
+            .iter()
+            .position(|l| l.trim() == "local:")
+            .expect("a `local:` label survives");
+        assert_eq!(lines[local_at + 1].trim(), VERSION_SCRIPT_HIDE_PATTERN);
+        assert!(
+            lines[..local_at].iter().any(|l| l.trim() == "global:"),
+            "the extended `local:` list must follow a `global:` section in the same node"
+        );
+    }
+
+    #[test]
+    fn the_derived_script_is_refused_when_there_is_no_local_list() {
+        // Refusal is correct rather than conservative: the alternatives are a
+        // fresh `local:` before `global:` (a syntax error) or a brand-new
+        // trailing node (a seventeenth version definition `zlib.map` does not
+        // declare, so `.gnu.version_d` would stop matching a distribution libz).
+        assert_eq!(
+            derive_version_script("ZLIB_1.2.0 {\n  global:\n    compressBound;\n};\n"),
+            None
+        );
+        assert_eq!(derive_version_script(""), None);
+        // A `local:` sharing its line with an entry is not a label this can
+        // safely extend, so it is refused too.
+        assert_eq!(
+            derive_version_script("V { global: a; local: b; };\n"),
+            None,
+            "only a `local:` label on a line of its own is extended"
+        );
+    }
+
+    #[test]
+    fn deriving_from_the_real_zlib_map_keeps_every_declared_name_and_adds_one_line() {
+        let map = include_str!("zlib.map");
+        let derived = derive_version_script(map).expect("the real zlib.map has a `local:` list");
+
+        assert_eq!(
+            derived.lines().count(),
+            map.lines().count() + 1,
+            "exactly one line is added to the real script"
+        );
+        for line in map.lines() {
             assert!(
-                !code.contains(&needle),
-                "build.rs must contain no `{needle}` in executable code: gap D8 is \
-                 deferred behind gap D3 (AAP §0.8.2 Divergence 4), so this script \
-                 emits no link wiring and consults no opt-in"
+                derived.contains(line),
+                "every line of zlib.map must survive verbatim; `{line}` did not"
+            );
+        }
+        // Sanity-check the two ends of the symbol contract this script exists to
+        // preserve: a `global:` name that must stay exported, and a `local:` name
+        // that must stay hidden.
+        assert!(derived.contains("compressBound;"));
+        assert!(derived.contains("inflate_table;"));
+        // And the sixteen version nodes are untouched.
+        let nodes = derived.matches("ZLIB_1.").count();
+        assert_eq!(
+            nodes,
+            map.matches("ZLIB_1.").count(),
+            "no version node may be added or removed"
+        );
+    }
+
+    #[test]
+    fn the_shim_embeds_the_derived_path_and_degrades_to_a_plain_link() {
+        let body = shim_source("/out/zlib_rs_version_script/zlib_rs.map");
+        assert!(
+            body.starts_with("#!/bin/sh\n"),
+            "the shim must be executable as POSIX sh"
+        );
+        assert!(
+            !body.contains("__ZLIB_RS_DERIVED_SCRIPT__"),
+            "the placeholder must be fully substituted"
+        );
+        assert!(
+            body.contains("script='/out/zlib_rs_version_script/zlib_rs.map'"),
+            "the derived path is embedded as a single-quoted shell word"
+        );
+        // The three behaviours the measurements depend on.
+        assert!(
+            body.contains("--version-script=$script"),
+            "the shim substitutes rustc's script rather than adding to it: GNU ld \
+             refuses to combine rustc's anonymous version node with named ones"
+        );
+        assert!(
+            body.contains("--undefined-version"),
+            "`--no-undefined-version` must be rewritten, or a feature row that gates \
+             away the gz* entry points fails to link"
+        );
+        assert!(
+            body.contains("if [ ! -r \"$script\" ]"),
+            "an unreadable derived script must degrade to an ordinary unversioned \
+             link, not to a wrong one"
+        );
+        assert!(
+            body.contains("if [ \"$have\" -eq 0 ]"),
+            "the shim must never introduce a version script the caller did not pass"
+        );
+        // It resolves its own linker, so this build script spawns no process.
+        assert!(
+            !script_body().contains(&format!("{}::Command", "process")),
+            "locating the real linker is the shim's job at link time; this script \
+             must stay free of any process spawn"
+        );
+    }
+
+    #[test]
+    fn paths_that_would_break_a_directive_or_a_shell_word_are_rejected() {
+        assert!(path_is_interpolation_safe(
+            "/tmp/out/zlib_rs_version_script"
+        ));
+        assert!(path_is_interpolation_safe("/tmp/a b/c-d.e_f"));
+        assert!(!path_is_interpolation_safe(""));
+        // Cargo directives are line-oriented, so a newline would end the
+        // directive early and let the remainder be read as a new one.
+        assert!(!path_is_interpolation_safe(
+            "/tmp/x\ncargo:rustc-link-lib=evil"
+        ));
+        assert!(!path_is_interpolation_safe("/tmp/x\r"));
+        // The shim embeds the path inside single quotes.
+        assert!(!path_is_interpolation_safe("/tmp/x'; rm -rf /; '"));
+        assert!(!path_is_interpolation_safe("/tmp/x\0y"));
+    }
+
+    #[test]
+    fn find_executable_honours_the_execute_bit_and_the_posix_empty_entry() {
+        let scratch = Scratch::new("find-exec");
+        let bin = scratch.path.join("zlib-rs-probe-tool");
+        let plain = scratch.path.join("zlib-rs-plain-file");
+        fs::write(&bin, "#!/bin/sh\nexit 0\n").expect("write probe tool");
+        fs::write(&plain, "not a program\n").expect("write plain file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o700))
+                .expect("mark probe tool executable");
+            fs::set_permissions(&plain, fs::Permissions::from_mode(0o600))
+                .expect("mark plain file non-executable");
+        }
+
+        let dir = scratch.path.to_str().expect("scratch path is UTF-8");
+        let path_var = format!("/nonexistent-zlib-rs:{dir}");
+        assert_eq!(
+            find_executable("zlib-rs-probe-tool", &path_var).as_deref(),
+            Some(bin.as_path()),
+            "a later PATH entry must still be searched"
+        );
+        assert_eq!(find_executable("zlib-rs-absent-tool", &path_var), None);
+        #[cfg(unix)]
+        assert_eq!(
+            find_executable("zlib-rs-plain-file", &path_var),
+            None,
+            "a readable but non-executable file is not a linker"
+        );
+        assert_eq!(
+            find_executable("zlib-rs-probe-tool", ""),
+            None,
+            "an entirely empty PATH resolves nothing but `.`"
+        );
+        // A directory is not a program, however it is named.
+        assert_eq!(find_executable(".", &path_var), None);
+    }
+
+    #[test]
+    fn the_generated_artifact_names_are_the_ones_the_driver_and_the_shim_expect() {
+        // `-B<dir>` makes a cc/clang driver look for a *subprogram* in `dir`, and
+        // `-fuse-ld=bfd` is what names that subprogram `ld.bfd`. If the shim were
+        // written under any other name the driver would never find it and the
+        // link would silently fall back to the real linker — a successful build
+        // with no version tags, which is the hardest kind of failure to notice.
+        assert_eq!(VERSION_SCRIPT_SHIM, "ld.bfd");
+        assert!(
+            version_script_directives("/d")
+                .iter()
+                .any(|d| d.ends_with("-fuse-ld=bfd")),
+            "the flavour flag and the shim's name must agree"
+        );
+        // The shim also resolves the *real* linker by that same name while
+        // skipping its own directory, so the two must not drift apart.
+        let body = shim_source("/d/zlib_rs.map");
+        assert!(
+            body.contains(&format!("$d/{VERSION_SCRIPT_SHIM}")),
+            "the shim searches PATH for `{VERSION_SCRIPT_SHIM}`; renaming the constant \
+             without renaming it in the shim would make it exec itself"
+        );
+        assert_eq!(VERSION_SCRIPT_DERIVED, "zlib_rs.map");
+        assert_eq!(VERSION_SCRIPT_DIR, "zlib_rs_version_script");
+    }
+
+    #[test]
+    fn installing_the_version_script_writes_a_readable_map_and_an_executable_shim() {
+        let scratch = Scratch::new("install");
+        let dir = scratch.path.join(VERSION_SCRIPT_DIR);
+        let derived =
+            derive_version_script(include_str!("zlib.map")).expect("the real zlib.map derives");
+
+        // Idempotent: an incremental build re-runs this over an existing
+        // directory and an existing, already-executable shim.
+        for round in 0..2 {
+            install_version_script(&dir, &derived)
+                .unwrap_or_else(|e| panic!("round {round} failed: {e}"));
+
+            let map_path = dir.join(VERSION_SCRIPT_DERIVED);
+            assert_eq!(
+                fs::read_to_string(&map_path).expect("derived script is readable"),
+                derived
+            );
+
+            let shim_path = dir.join(VERSION_SCRIPT_SHIM);
+            let shim = fs::read_to_string(&shim_path).expect("shim is readable");
+            assert!(shim.starts_with("#!/bin/sh\n"));
+            assert!(
+                shim.contains(&format!(
+                    "script='{}'",
+                    map_path.to_str().expect("scratch path is UTF-8")
+                )),
+                "the shim must point at the derived script it was installed beside"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = fs::metadata(&shim_path)
+                    .expect("shim metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(
+                    mode, 0o700,
+                    "round {round}: the shim must be executable by its owner and by \
+                     nobody else — a driver cannot run a non-executable subprogram, \
+                     and nothing outside this build has any business running it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn write_executable_replaces_a_stale_entry_rather_than_writing_through_it() {
+        let scratch = Scratch::new("stale");
+        let target = scratch.path.join("decoy.txt");
+        fs::write(&target, "must not be modified\n").expect("write decoy");
+        let shim = scratch.path.join(VERSION_SCRIPT_SHIM);
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &shim).expect("plant a symlink");
+        #[cfg(not(unix))]
+        fs::write(&shim, "stale\n").expect("plant a stale file");
+
+        write_executable(&shim, "#!/bin/sh\nexit 0\n").expect("write the shim");
+
+        assert_eq!(
+            fs::read_to_string(&target).expect("decoy is readable"),
+            "must not be modified\n",
+            "a planted symlink must be replaced, not followed and written through"
+        );
+        assert_eq!(
+            fs::read_to_string(&shim).expect("shim is readable"),
+            "#!/bin/sh\nexit 0\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let meta = fs::symlink_metadata(&shim).expect("shim metadata");
+            assert!(
+                meta.is_file(),
+                "the shim must be a regular file, not a link"
+            );
+            assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        }
+    }
+
+    #[test]
+    fn the_notice_is_a_single_actionable_cargo_warning_line() {
+        let line = version_script_notice_line("something\nspanning\rlines");
+        assert!(
+            line.starts_with(&format!("cargo:{}=", "warning")),
+            "the notice must be a Cargo warning directive, or nobody sees it"
+        );
+        assert!(
+            !line[..line.len() - 1].contains('\n') && !line.contains('\r'),
+            "`cargo:warning=` is line-oriented: an embedded newline would end the \
+             warning and let the remainder be read as a fresh directive; got {line:?}"
+        );
+        assert!(
+            line.contains("something spanning lines"),
+            "the reason must survive flattening, got {line:?}"
+        );
+        assert!(
+            line.contains(VERSION_SCRIPT_ENV),
+            "the notice must name the variable whose request was refused"
+        );
+        assert!(
+            line.contains("build continues"),
+            "the notice must say the build is not failing, so it is not mistaken for \
+             an error"
+        );
+    }
+
+    #[test]
+    fn the_supported_target_predicate_accepts_only_a_native_linux_gnu_build() {
+        const NATIVE: &str = "x86_64-unknown-linux-gnu";
+        assert_eq!(
+            unsupported_reason("linux", "gnu", NATIVE, NATIVE, true),
+            None,
+            "the one configuration the capability was measured on must be accepted"
+        );
+        assert_eq!(
+            unsupported_reason(
+                "android",
+                "gnu",
+                "aarch64-linux-android",
+                "aarch64-linux-android",
+                true
+            ),
+            None
+        );
+
+        // Every rejection must explain itself, so a `cargo:warning` naming it is
+        // actionable rather than merely present.
+        let rejected = [
+            (
+                "a non-Unix host",
+                unsupported_reason("linux", "gnu", NATIVE, NATIVE, false),
+            ),
+            (
+                "a Mach-O target",
+                unsupported_reason("macos", "", NATIVE, "x86_64-apple-darwin", true),
+            ),
+            (
+                "an MSVC target",
+                unsupported_reason("windows", "msvc", NATIVE, "x86_64-pc-windows-msvc", true),
+            ),
+            (
+                "a musl target, which emits no shared object at all",
+                unsupported_reason("linux", "musl", NATIVE, "x86_64-unknown-linux-musl", true),
+            ),
+            (
+                "a cross build, where the host PATH holds the wrong linker",
+                unsupported_reason("linux", "gnu", NATIVE, "i686-unknown-linux-gnu", true),
+            ),
+        ];
+        for (what, outcome) in rejected {
+            let reason =
+                outcome.unwrap_or_else(|| panic!("{what} must be refused, it was not measured"));
+            assert!(
+                !reason.trim().is_empty() && !reason.contains('\n'),
+                "the reason for refusing {what} must be a non-empty single line, so it \
+                 can be flattened into a `cargo:warning`; got {reason:?}"
             );
         }
     }
@@ -739,21 +1704,62 @@ mod tests {
     }
 
     #[test]
-    fn the_only_environment_variable_this_script_reads_is_out_dir() {
+    fn the_environment_variables_this_script_reads_are_exactly_the_documented_set() {
         let code = script_body();
-        let reads: Vec<&str> = code
+        let reads: BTreeSet<&str> = code
             .match_indices("env::var(")
             .map(|(i, _)| {
                 let rest = &code[i + "env::var(".len()..];
                 rest.split(')').next().unwrap_or_default().trim()
             })
             .collect();
+
+        // Every entry is here for a stated reason. A read that is not on this
+        // list makes the build depend on ambient state no CI row sets and no
+        // other gate observes, which is why the set is pinned rather than
+        // bounded.
+        //
+        //   OUT_DIR              - where the generated tables and, when the
+        //                          opt-in is on, the derived script and shim go.
+        //   VERSION_SCRIPT_ENV   - the opt-in itself.
+        //   CARGO_CFG_TARGET_OS  - version scripts are a GNU-ld concept.
+        //   CARGO_CFG_TARGET_ENV - musl emits no shared object to version.
+        //   HOST / TARGET        - the shim resolves its linker from the host's
+        //                          PATH, so a cross build must be refused.
+        //   CARGO_MANIFEST_DIR   - where zlib.map is, derived internally so no
+        //                          caller-supplied path is ever opened.
+        //   PATH                 - probing for `ld.bfd` rather than assuming it.
+        let expected: BTreeSet<&str> = [
+            "\"OUT_DIR\"",
+            "VERSION_SCRIPT_ENV",
+            "\"CARGO_CFG_TARGET_OS\"",
+            "\"CARGO_CFG_TARGET_ENV\"",
+            "\"HOST\"",
+            "\"TARGET\"",
+            "\"CARGO_MANIFEST_DIR\"",
+            "\"PATH\"",
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(
-            reads,
-            ["\"OUT_DIR\""],
-            "`OUT_DIR` is the one variable Cargo guarantees a build script. Reading \
-             any other makes the generated artifacts depend on ambient state that \
-             no CI row sets and no gate observes"
+            reads, expected,
+            "the set of environment variables this script reads is part of its \
+             contract; every addition needs a `rerun-if-env-changed` and a reason"
+        );
+
+        // The opt-in is read through the constant, so pin the constant too —
+        // otherwise renaming it would silently rename the public opt-in.
+        assert_eq!(VERSION_SCRIPT_ENV, "ZLIB_RS_VERSION_SCRIPT");
+        // Only the opt-in is declared as a rerun trigger, and it is the only one
+        // that can change the emitted artifacts: the other seven are fixed for a
+        // given Cargo invocation and Cargo already reruns the script when they
+        // change.
+        assert!(
+            unconditional_directives()
+                .iter()
+                .any(|d| d == &format!("cargo:rerun-if-env-changed={VERSION_SCRIPT_ENV}")),
+            "reading the opt-in without declaring it would leave a stale artifact \
+             behind when it is flipped"
         );
     }
 

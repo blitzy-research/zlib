@@ -39,8 +39,11 @@
 //!
 //! # Safety and portability
 //!
-//! There is **zero `unsafe`** anywhere in this file (AAP §0.6.2 — `unsafe` in
-//! the inflate layer is confined to `fast.rs`). The module is `no_std` + `alloc`
+//! There is **zero `unsafe`** anywhere in this file, and the same holds for
+//! every other module under `src/inflate/**` — including [`fast`], the hot
+//! decode loop. All raw-pointer and `extern "C"` work lives at the FFI boundary
+//! in `src/ffi/**` (AAP §0.6.2 / §0.7.2 standard S2), so the decoder is written
+//! entirely in safe, bounds-checked Rust. The module is `no_std` + `alloc`
 //! and targets the Rust 2024 edition (MSRV 1.85.0). All gzip-framing code is
 //! gated behind the `gzip` cargo feature; with gzip disabled, [`inflate`]
 //! still fully handles zlib and raw DEFLATE streams.
@@ -366,7 +369,7 @@ fn fixedtables(state: &mut InflateState) {
 /// The window is an owned [`AllocBuffer<u8>`]: when the owning stream carries a
 /// caller-supplied `zalloc`/`zfree` (installed through the FFI `z_stream`), the
 /// window is allocated through those hooks via the state's stored
-/// [`alloc_hook`](InflateState::alloc_hook) (AAP §0.6.3; QA FINDING-3);
+/// [`alloc_hook`](InflateState::alloc_hook) (AAP §0.6.3);
 /// otherwise it uses the Rust global allocator.
 ///
 /// # Errors
@@ -374,7 +377,7 @@ fn fixedtables(state: &mut InflateState) {
 /// Returns [`ZlibError::MemError`] when the lazy window allocation is routed
 /// through an active caller hook whose `zalloc` reports out-of-memory. This is
 /// the faithful port of C `updatewindow` returning `1` on `ZALLOC` failure,
-/// which the callers translate into the `MEM` mode / `Z_MEM_ERROR` (M7). The
+/// which the callers translate into the `MEM` mode / `Z_MEM_ERROR`. The
 /// global-allocator path is infallible (it aborts on OOM per Rust convention),
 /// so this only fails for a caller-installed bounded allocator.
 fn updatewindow<A: Allocator>(
@@ -389,7 +392,7 @@ fn updatewindow<A: Allocator>(
     // caller-installed `zalloc` still backs it. C requests
     // `ZALLOC(strm, 1U << state->wbits, sizeof(unsigned char))` (`inflate.c`
     // L261), which is the element-shaped split, so `allocate_zeroed` forwards the
-    // same argument pair. A refusal propagates as `Z_MEM_ERROR` (M7) rather than
+    // same argument pair. A refusal propagates as `Z_MEM_ERROR` rather than
     // falling back to the global allocator (AAP §0.6.3 has-hook clause).
     if state.window.is_empty() {
         state.window = alloc
@@ -566,7 +569,7 @@ pub fn inflate_reset2<A: Allocator>(strm: &mut ZStream<A>, window_bits: i32) -> 
         // Free the window if the size changed, so it is re-sized on next use.
         // Assigning an empty `AllocBuffer` drops the previous one, which routes
         // through the caller's `zfree` when the window was hook-backed
-        // (AAP §0.6.3; QA FINDING-3). The stored `alloc_hook` is left intact so
+        // (AAP §0.6.3). The stored `alloc_hook` is left intact so
         // the re-allocation on next use goes through the same allocator.
         if !state.window.is_empty() && state.wbits != wb as u32 {
             state.window = AllocBuffer::default();
@@ -612,7 +615,7 @@ pub fn inflate_init2<A: Allocator>(strm: &mut ZStream<A>, window_bits: i32) -> I
     // guard; wrap/wbits are (re)assigned by inflate_reset2 below. The caller's
     // allocator hook (the `zalloc`/`zfree` installed via the FFI `z_stream`, or
     // a no-op under the global allocator) is threaded in so the lazily-allocated
-    // window is later routed through it (AAP §0.6.3; QA FINDING-3).
+    // window is later routed through it (AAP §0.6.3).
     let hook = strm.allocator().hook();
     // `try_new_in` boxes the state through a checked global allocation, so heap
     // exhaustion becomes `Z_MEM_ERROR` rather than an abort.
@@ -950,9 +953,10 @@ pub fn inflate<A: Allocator>(
                     // `inflateGetHeader` — the copy below is clamped to
                     // `extra_max` (`inflate.c` L614-L621) while this field keeps
                     // the true length, so `extra_len > extra_max` is the caller's
-                    // only signal that bytes were dropped. It also serves the
-                    // documented length-query pattern, where the caller supplies
-                    // no `extra` buffer at all purely to learn the length.
+                    // only signal that bytes were dropped. The same unconditional
+                    // write is also what lets a caller supply no `extra` buffer
+                    // at all purely to learn the length — de-facto reference-zlib
+                    // behavior rather than a `zlib.h`-documented pattern.
                     if let Some(head) = state.head.as_mut() {
                         head.extra_len = io.hold;
                     }
@@ -1861,7 +1865,7 @@ pub fn inflate<A: Allocator>(
         // window allocation (routed through the caller's `zalloc`) reported OOM.
         // Enter the permanent `MEM` error state and return `Z_MEM_ERROR` with no
         // committed progress, matching both the C control flow and the
-        // `InflateMode::Mem` arm above (M7).
+        // `InflateMode::Mem` arm above.
         state.mode = InflateMode::Mem;
         strm.set_inflate_state(state);
         return InflateOutcome {
@@ -2010,7 +2014,7 @@ pub fn inflate_set_dictionary<A: Allocator>(
     // Load the dictionary into the window (amending existing history). C treats
     // `updatewindow` failure as `Z_MEM_ERROR` (setting `mode = MEM`); reproduce
     // that when the window allocation is routed through a caller hook that
-    // reports OOM (M7).
+    // reports OOM.
     let dict_len = dictionary.len();
     if updatewindow(state, alloc, dictionary, dict_len, dict_len).is_err() {
         state.mode = InflateMode::Mem;
@@ -2416,7 +2420,7 @@ pub fn inflate_mark<A: Allocator>(strm: &ZStream<A>) -> i64 {
 }
 
 /// Returns the number of decode-table entries used so far — the Rust port of C
-/// `inflateCodesUsed` (`inflate.c` L1408-L1414).
+/// `inflateCodesUsed` (`inflate.c` L1408-L1413).
 ///
 /// This equals [`InflateState::next`] (the C `state->next - state->codes`, since
 /// `next` is already an index into [`InflateState::codes`]). Returns [`None`]

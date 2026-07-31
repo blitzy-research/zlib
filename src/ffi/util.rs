@@ -126,10 +126,22 @@ unsafe fn as_bytes_mut<'a>(ptr: *mut Bytef, len: usize) -> &'a mut [u8] {
 /// Compresses `source` into `dest` at the given `level`, writing the produced
 /// length back through `dest_len`.
 ///
-/// Port of C `compress2` (`compress.c`). Returns `Z_OK` on success,
-/// `Z_STREAM_ERROR` for invalid arguments (null pointers or an invalid level),
-/// `Z_BUF_ERROR` when `dest` is too small, or `Z_MEM_ERROR` on allocation
-/// failure.
+/// Port of C `compress2` / `compress2_z` (`compress.c` L24-L74). Returns `Z_OK`
+/// on success, `Z_STREAM_ERROR` for invalid arguments (null pointers or an
+/// invalid level), `Z_BUF_ERROR` when `dest` is too small, or `Z_MEM_ERROR` on
+/// allocation failure.
+///
+/// `*dest_len` is strictly in/out and follows C's write schedule:
+///
+/// * On the argument-validation failure (`dest_len` itself null, or a null
+///   pointer paired with a non-zero length) `*dest_len` is left **untouched** —
+///   C returns at `compress.c` L33 before assigning anything.
+/// * On every path that gets past validation, `*dest_len` is **overwritten**
+///   with the number of bytes actually written to `dest`. C does this
+///   unconditionally at `compress.c` L63, after the deflate loop and before
+///   `deflateEnd`, so a `Z_BUF_ERROR` reports the bytes that did fit rather than
+///   zero. A failing `deflateInit` reports `0`, because C zeroes the field at
+///   `compress.c` L36 before initializing (`compress.c` L42-L43).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn compress2(
     dest: *mut Bytef,
@@ -156,27 +168,28 @@ pub unsafe extern "C" fn compress2(
         // SAFETY: as established above, the dest pointer/length coupling was
         // validated, so this mutable slice is sound (empty when `cap == 0`).
         let dst = unsafe { as_bytes_mut(dest, cap) };
-        match util::compress2(dst, src, level) {
-            Ok(produced) => {
-                // SAFETY: `dest_len` is non-null (checked above).
-                unsafe { *dest_len = produced as uLongf };
-                Z_OK
-            }
-            Err(rc) => {
-                // The safe `compress2` does not surface the partial output
-                // count on error, so the reported length is reset to zero. This
-                // matches C exactly for the `Z_STREAM_ERROR` (invalid level)
-                // path, whose `*destLen` was set to 0 before the failing
-                // `deflateInit`.
-                // SAFETY: `dest_len` is non-null (checked above).
-                unsafe { *dest_len = 0 };
-                rc.as_c_int()
-            }
+        // `produced` is a pure out-parameter seeded by the engine to zero,
+        // matching C's `*destLen = 0;` (`compress.c` L36), and overwritten with
+        // `next_out - dest` on every path that reaches the deflate loop
+        // (`compress.c` L63). Publishing it on the error arm too is what makes a
+        // `Z_BUF_ERROR` report the bytes that did fit, as C does.
+        let mut produced = 0usize;
+        let result = util::compress2_tracked(dst, src, level, &mut produced);
+        // SAFETY: `dest_len` is non-null (checked above); C writes the reported
+        // length unconditionally after the loop, before returning.
+        unsafe { *dest_len = produced as uLongf };
+        match result {
+            Ok(_) => Z_OK,
+            Err(rc) => rc.as_c_int(),
         }
     })
 }
 
-/// `size_t` variant of [`compress2`] (C `compress2_z`).
+/// `size_t` variant of [`compress2`] (C `compress2_z`, `compress.c` L24-L66).
+///
+/// The `*dest_len` write schedule is identical to [`compress2`]: untouched when
+/// argument validation fails, otherwise overwritten with the produced byte count
+/// on both the success and error paths.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn compress2_z(
     dest: *mut Bytef,
@@ -199,17 +212,15 @@ pub unsafe extern "C" fn compress2_z(
         // SAFETY: as established above, the dest pointer/length coupling was
         // validated, so this mutable slice is sound (empty when `cap == 0`).
         let dst = unsafe { as_bytes_mut(dest, cap) };
-        match util::compress2(dst, src, level) {
-            Ok(produced) => {
-                // SAFETY: `dest_len` is non-null (checked above).
-                unsafe { *dest_len = produced };
-                Z_OK
-            }
-            Err(rc) => {
-                // SAFETY: `dest_len` is non-null (checked above).
-                unsafe { *dest_len = 0 };
-                rc.as_c_int()
-            }
+        // As in [`compress2`]: the count is reported on every path that reaches
+        // the deflate loop, mirroring `compress.c` L63.
+        let mut produced = 0usize;
+        let result = util::compress2_tracked(dst, src, level, &mut produced);
+        // SAFETY: `dest_len` is non-null (checked above).
+        unsafe { *dest_len = produced };
+        match result {
+            Ok(_) => Z_OK,
+            Err(rc) => rc.as_c_int(),
         }
     })
 }
@@ -345,8 +356,8 @@ pub unsafe extern "C" fn uncompress2(
         // C writes back BOTH counts after the decode loop, on success *and* on
         // error (`uncompr.c`: `*sourceLen -= len + stream.avail_in;` and
         // `*destLen = stream.total_out;` both run before the error-mapping
-        // `return`). Publishing the produced count on the error path is the M2
-        // fix: callers relying on the partial output length now observe it.
+        // `return`). Publishing the produced count on the error path is what lets
+        // a caller relying on the partial output length observe it.
         // SAFETY: `source_len` is non-null (checked above).
         unsafe { *source_len = consumed as uLong };
         // SAFETY: `dest_len` is non-null (checked above).
@@ -633,6 +644,7 @@ mod tests {
     // Local integer return codes for assertions (the module keeps only the two
     // it emits; tests need a couple more for clarity).
     const Z_DATA_ERROR: c_int = ReturnCode::DataError.as_c_int();
+    const Z_BUF_ERROR: c_int = ReturnCode::BufError.as_c_int();
 
     /// Read a shim-returned C string back into a Rust byte slice for comparison.
     ///
@@ -817,6 +829,164 @@ mod tests {
     }
 
     #[test]
+    fn compress2_leaves_dest_len_untouched_when_validation_fails() {
+        // C `compress2_z` returns `Z_STREAM_ERROR` at `compress.c` L33 — before
+        // `left = *destLen; *destLen = 0;` at L35-L36 — so the caller's length
+        // is not modified by an argument-validation rejection.
+        let mut dest = [0u8; 64];
+        let src = b"payload";
+
+        // Null source paired with a positive source_len.
+        let mut dest_len: uLongf = 64;
+        let rc = unsafe {
+            compress2(
+                dest.as_mut_ptr(),
+                &mut dest_len,
+                ptr::null(),
+                7,
+                Z_DEFAULT_COMPRESSION,
+            )
+        };
+        assert_eq!(rc, Z_STREAM_ERROR);
+        assert_eq!(dest_len, 64, "the capacity is left exactly as it was found");
+
+        // Null dest paired with a positive *dest_len.
+        let mut dest_len: uLongf = 64;
+        let rc = unsafe {
+            compress2(
+                ptr::null_mut(),
+                &mut dest_len,
+                src.as_ptr(),
+                src.len() as uLong,
+                Z_DEFAULT_COMPRESSION,
+            )
+        };
+        assert_eq!(rc, Z_STREAM_ERROR);
+        assert_eq!(dest_len, 64, "the capacity is left exactly as it was found");
+
+        // The `_z` twin follows the identical schedule.
+        let mut dest_len_z: z_size_t = 64;
+        let rc = unsafe {
+            compress2_z(
+                dest.as_mut_ptr(),
+                &mut dest_len_z,
+                ptr::null(),
+                7,
+                Z_DEFAULT_COMPRESSION,
+            )
+        };
+        assert_eq!(rc, Z_STREAM_ERROR);
+        assert_eq!(dest_len_z, 64);
+    }
+
+    #[test]
+    fn compress2_reports_zero_length_when_the_level_is_invalid() {
+        // C zeroes `*destLen` at `compress.c` L36 and then returns the
+        // `deflateInit` failure at L42-L43, so an invalid level reports a length
+        // of zero — not the caller's original capacity.
+        let src = b"payload";
+        let mut dest = [0u8; 64];
+        let mut dest_len: uLongf = dest.len() as uLongf;
+        let rc = unsafe {
+            compress2(
+                dest.as_mut_ptr(),
+                &mut dest_len,
+                src.as_ptr(),
+                src.len() as uLong,
+                42, // outside `-1 | 0..=9`
+            )
+        };
+        assert_eq!(rc, Z_STREAM_ERROR);
+        assert_eq!(dest_len, 0, "the failed initializer reports zero bytes");
+    }
+
+    #[test]
+    fn compress2_reports_partial_output_on_buf_error() {
+        // C `compress2_z` writes the produced count unconditionally at
+        // `compress.c` L63 — after the loop, before `deflateEnd` — so a
+        // `Z_BUF_ERROR` reports the bytes that *did* fit. Anything else would be
+        // an observable divergence from the reference library.
+        let plain: Vec<u8> = (0..512u32).map(|i| (i * 31 + 7) as u8).collect();
+
+        // Reference: the complete stream at the same level.
+        let bound = unsafe { compressBound(plain.len() as uLong) } as usize;
+        let mut full = vec![0u8; bound];
+        let mut full_len: uLongf = full.len() as uLongf;
+        let rc = unsafe {
+            compress2(
+                full.as_mut_ptr(),
+                &mut full_len,
+                plain.as_ptr(),
+                plain.len() as uLong,
+                Z_DEFAULT_COMPRESSION,
+            )
+        };
+        assert_eq!(rc, Z_OK);
+        let full_len = full_len as usize;
+        assert!(
+            full_len > 16,
+            "the complete stream is larger than the probe"
+        );
+
+        // Now compress the same input into a deliberately short buffer.
+        const PARTIAL: usize = 12;
+        let mut small = [0u8; PARTIAL];
+        let mut small_len: uLongf = PARTIAL as uLongf;
+        let rc = unsafe {
+            compress2(
+                small.as_mut_ptr(),
+                &mut small_len,
+                plain.as_ptr(),
+                plain.len() as uLong,
+                Z_DEFAULT_COMPRESSION,
+            )
+        };
+        assert_eq!(rc, Z_BUF_ERROR, "an undersized dest is a buffer error");
+        assert_eq!(
+            small_len as usize, PARTIAL,
+            "the produced count is reported on the error path, not forced to zero"
+        );
+        // The engine's decisions do not depend on output capacity, so the bytes
+        // that fit must be a byte-exact prefix of the complete stream (AAP
+        // directive D-1).
+        assert_eq!(
+            &small[..],
+            &full[..PARTIAL],
+            "the partial output is a byte-exact prefix of the full stream"
+        );
+
+        // The `_z` twin reports the same count through its `size_t` length.
+        let mut small_z = [0u8; PARTIAL];
+        let mut small_len_z: z_size_t = PARTIAL;
+        let rc = unsafe {
+            compress2_z(
+                small_z.as_mut_ptr(),
+                &mut small_len_z,
+                plain.as_ptr(),
+                plain.len(),
+                Z_DEFAULT_COMPRESSION,
+            )
+        };
+        assert_eq!(rc, Z_BUF_ERROR);
+        assert_eq!(small_len_z, PARTIAL);
+        assert_eq!(&small_z[..], &full[..PARTIAL]);
+
+        // `compress`/`compress_z` forward to the same core, so they inherit it.
+        let mut small_d = [0u8; PARTIAL];
+        let mut small_len_d: uLongf = PARTIAL as uLongf;
+        let rc = unsafe {
+            compress(
+                small_d.as_mut_ptr(),
+                &mut small_len_d,
+                plain.as_ptr(),
+                plain.len() as uLong,
+            )
+        };
+        assert_eq!(rc, Z_BUF_ERROR);
+        assert_eq!(small_len_d as usize, PARTIAL);
+    }
+
+    #[test]
     fn compress2_then_uncompress2_round_trip() {
         let plain = b"the quick brown fox jumps over the lazy dog, repeatedly!";
 
@@ -973,10 +1143,10 @@ mod tests {
 
     #[test]
     fn uncompress2_reports_partial_output_on_error() {
-        // Regression guard for the M2 fix: on an error path that produces
-        // output before failing, `*destLen` must report the produced count
-        // (C `uncompress2_z` writes `*destLen = stream.total_out;` before the
-        // error-mapping `return`), not the old force-to-zero value.
+        // Regression guard: on an error path that produces output before
+        // failing, `*destLen` must report the produced count (C
+        // `uncompress2_z` writes `*destLen = stream.total_out;` before the
+        // error-mapping `return`), never a forced zero.
         //
         // Build a fully valid zlib stream, then truncate its 4-byte Adler-32
         // trailer. All deflate data is present, so inflate decodes the entire
@@ -1021,7 +1191,8 @@ mod tests {
             )
         };
         assert_eq!(rc, Z_DATA_ERROR, "a truncated stream is a data error");
-        // The M2 assertion: the produced count is surfaced on the error path.
+        // The load-bearing assertion: the produced count is surfaced on the
+        // error path.
         assert_eq!(
             out_len as usize,
             plain.len(),

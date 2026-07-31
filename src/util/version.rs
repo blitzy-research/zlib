@@ -156,8 +156,13 @@ fn type_size_bits(uint: usize, ulong: usize, voidpf: usize, z_off_t: usize) -> u
 /// exist as symbols but return `Z_STREAM_ERROR` because no secure `*printf` was
 /// available (`zlib.h`: bit 27 "1 means gzprintf() returns an error"). Rendering
 /// a C `va_list` from Rust requires the unstable (nightly-only) `c_variadic`
-/// feature, so this crate always ships exactly that error-returning stub for
-/// `gzprintf`/`gzvprintf` and therefore always sets this bit.
+/// feature, so the **C-ABI shims** `ffi::gz::gzprintf` and `ffi::gz::gzvprintf`
+/// are exactly that error-returning variant, and this bit is always set to
+/// advertise it. The scope is deliberately narrow: the idiomatic Rust entry
+/// points `gz::gzprintf` and `gz::gzvprintf` take [`core::fmt::Arguments`] and
+/// perform full formatted output, so a Rust caller has no functional gap. Only
+/// the variadic C ABI is affected, and only because no safe stable-Rust
+/// rendering of a `va_list` exists.
 ///
 /// Every other bit the C function can set (9-15, 18-26, and 28-31) is `0` in
 /// this build: there is no assembler variant, no Windows API, no runtime-built
@@ -200,9 +205,11 @@ pub fn zlib_compile_flags() -> u32 {
     // bit 27: gzprintf() returns an error. C sets `1L << 27` for a build with
     // no secure `vsnprintf`/`snprintf` (`NO_vsnprintf && !ZLIB_INSECURE`), i.e.
     // one whose `gzprintf`/`gzvprintf` are present as symbols but return
-    // `Z_STREAM_ERROR`. A functional `gzprintf` in this crate would require
-    // Rust's unstable (nightly-only) C-variadic support, so this crate always
-    // ships the documented error-returning stubs and sets this bit to match C.
+    // `Z_STREAM_ERROR`. Rendering a C `va_list` requires Rust's unstable
+    // (nightly-only) C-variadic support, so the C-ABI shims in `src/ffi/gz.rs`
+    // are that error-returning variant and this bit is set to match C. It says
+    // nothing about the idiomatic `crate::gz::gzprintf`/`gzvprintf`, which take
+    // `core::fmt::Arguments` and are fully functional.
     flags |= 1 << 27;
 
     // Bits 9-15, 18-26, and 28-31 are unconditionally 0 in this build (see the

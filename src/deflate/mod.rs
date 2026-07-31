@@ -144,7 +144,14 @@ pub struct DeflateConfig {
     /// Compression method — must be [`Z_DEFLATED`] (`8`).
     pub method: i32,
     /// The base-2 logarithm of the window size, overloaded to also select the
-    /// wrapper: `8..=15` = zlib, `-8..=-15` = raw, `24..=31` = gzip.
+    /// wrapper: `8..=15` = zlib, `-15..=-9` = raw, `24..=31` = gzip (which
+    /// requires the `gzip` cargo feature).
+    ///
+    /// Raw `-8` is accepted by the shared `windowBits` decoder but then rejected
+    /// by the C-parity guard `windowBits == 8 && wrap != 1` (`deflate.c`
+    /// L434-L436), so the accepted raw range for compression is `-15..=-9` — one
+    /// value narrower than inflate's `-15..=-8`. Auto-detect (`+32`) is
+    /// inflate-only.
     pub window_bits: i32,
     /// The memory level (`1..=9`, default `8`) controlling the hash-table and
     /// symbol-buffer sizes.
@@ -298,12 +305,16 @@ fn hcrc_update(s: &mut DeflateState, io: &mut IoContext, hcrc: bool, beg: usize)
 /// size via [`parse_window_bits`]:
 ///
 /// * `8..=15` → zlib wrapper (`wrap = 1`)
-/// * `-8..=-15` → raw DEFLATE, no wrapper (`wrap = 0`)
-/// * `24..=31` → gzip wrapper (`wrap = 2`, requires the `gzip` feature)
+/// * `-15..=-8` → raw DEFLATE, no wrapper (`wrap = 0`)
+/// * `24..=31` → gzip wrapper (`wrap = 2`, requires the `gzip` cargo feature)
 /// * `40..=47` (auto-detect) is inflate-only and rejected here
 ///
+/// The raw `-8` that the decoder accepts is then rejected downstream by C's
+/// `windowBits == 8 && wrap != 1` guard (`deflate.c` L434-L436), so the range
+/// this function actually accepts for raw DEFLATE is `-15..=-9`.
+///
 /// All remaining parameter validation (memory level, method, window range,
-/// level range, and the `windowBits == 8 && wrap != 1` rejection), the
+/// level range, and that `windowBits == 8 && wrap != 1` rejection), the
 /// `level == -1 → 6` default resolution, and the 8-bit-window bump to 9 are
 /// performed by [`DeflateState::new`]. On success the freshly constructed
 /// state is installed and the stream is reset (mirroring the C

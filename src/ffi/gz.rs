@@ -28,7 +28,7 @@
 //! This guarantees a sound lifecycle: one allocation on open, guarded borrows on
 //! every operation, one deallocation on close — no double-free, no leak.
 //!
-//! # `gzgetc` / `gzgetc_` — live `gzFile_s` prefix (C2)
+//! # `gzgetc` / `gzgetc_` — live `gzFile_s` prefix
 //!
 //! In C, `gzgetc` is a *macro* that peeks the `{have, next, pos}` triple
 //! directly through the handle for a branch-free fast path, falling back to the
@@ -94,11 +94,19 @@
 //! reported as a `clippy::duplicated_attributes` error by the Clippy shipped
 //! with the pinned MSRV toolchain (see `rust-toolchain.toml`).
 //!
-//! This is the crate's `unsafe` boundary: every `unsafe` block
-//! carries a `// SAFETY:` justification, and no shim may unwind across the C
-//! boundary — fallible bodies run inside the `guard_*` helpers so a panic is
-//! caught and converted to the function's C error sentinel.
+//! This module is part of `src/ffi/**`, the crate's designated `unsafe`
+//! boundary: every `unsafe` block carries a `// SAFETY:` justification, and no
+//! shim may unwind across the C boundary — fallible bodies run inside the
+//! `guard_*` helpers so a panic is caught and converted to the function's C
+//! error sentinel.
 
+// Every exported function here shares one uniform safety contract, stated under
+// "Feature gating & safety" above: the caller passes a `gzFile` this module
+// itself produced (or null, which each shim rejects), NUL-terminated C strings
+// for paths and modes, and buffers valid for the lengths given. Documenting that
+// once at the module level is clearer than repeating an identical `# Safety`
+// section on each of the 34 `extern "C"` shims, so the per-item lint is allowed
+// here.
 #![allow(clippy::missing_safety_doc)]
 
 use core::ffi::{CStr, c_char, c_int, c_uint};
@@ -190,7 +198,7 @@ unsafe fn cpath_to_pathbuf(path: *const c_char) -> Option<std::path::PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
-// C2 — live `gzFile_s` prefix for the `gzgetc(g)` macro fast-path
+// Live `gzFile_s` prefix for the `gzgetc(g)` macro fast-path
 // ---------------------------------------------------------------------------
 //
 // zlib's `gzgetc(g)` is a *macro* that reads the `{ have, next, pos }` prefix
@@ -408,12 +416,22 @@ pub unsafe extern "C" fn gzopen64(path: *const c_char, mode: *const c_char) -> g
 /// `gzFile gzdopen(int fd, const char *mode)`  *(Unix)*
 ///
 /// Associates a `gz*` stream with an already-open file descriptor. Ownership of
-/// `fd` is **transferred** to the returned handle (Rust RAII): it is closed by
-/// [`gzclose`], or — should the open fail — closed when the transient [`File`]
-/// is dropped. This is a minor, documented divergence from C (which leaves the
-/// descriptor open on failure) sanctioned by the FFI ownership convention.
+/// `fd` is **transferred**: it is adopted by a [`File`], so it is closed by
+/// [`gzclose`] on success and by that transient [`File`]'s [`Drop`] if the open
+/// fails.
 ///
-/// Returns `NULL` for a null `mode` or a negative `fd`.
+/// This differs from C on the failure path. C `gzdopen` builds its own path
+/// string and calls `gz_open`, which never closes the caller's descriptor, so a
+/// C caller may retry or `close(fd)` itself after a failure. Here the descriptor
+/// is already owned by a [`File`] before the open is attempted, so a failure
+/// closes it. It is an implementation consequence of RAII descriptor ownership,
+/// recorded here so callers do not double-close; it is not one of the deliberate
+/// divergences enumerated in AAP §0.8.2.
+///
+/// Returns `NULL` for a null `mode` or a negative `fd`. Every such early
+/// rejection — negative `fd`, null `mode`, and a non-UTF-8 `mode` — happens
+/// *before* `File::from_raw_fd`, so in those cases the descriptor is never
+/// adopted and never closed.
 ///
 /// [`File`]: std::fs::File
 #[cfg(unix)]
@@ -1268,6 +1286,11 @@ mod tests {
             // Formatted write (the documented `NO_vsnprintf && !ZLIB_INSECURE`
             // zlib variant): both variadic entry points return Z_STREAM_ERROR
             // unconditionally, matching `zlibCompileFlags` bit 27.
+            //
+            // A NULL handle alone cannot distinguish "always fails" from "fails
+            // only on a bad handle", so the *unconditional* half of that
+            // contract is pinned separately, on a live writable handle, by
+            // `variadic_printf_stubs_fail_on_a_valid_write_handle` below.
             assert_eq!(gzprintf(nul, c"%d".as_ptr()), Z_STREAM_ERROR);
             assert_eq!(
                 gzvprintf(nul, c"%d".as_ptr(), ptr::null_mut()),
@@ -1279,6 +1302,199 @@ mod tests {
             // Void: must not panic or crash.
             gzclearerr(nul);
         }
+    }
+
+    /// The `NO_vsnprintf && !ZLIB_INSECURE` variant contract (AAP §0.8.2
+    /// Divergence 1) pinned on a **valid, writable** handle.
+    ///
+    /// [`gzprintf`] / [`gzvprintf`] are ABI-compatible stubs that return
+    /// `Z_STREAM_ERROR` *unconditionally* — never conditionally on the handle —
+    /// and the crate advertises exactly that variant through `zlibCompileFlags`
+    /// bit 27. `null_handle_sentinels` observes them only through a NULL handle,
+    /// which any null check satisfies and which therefore leaves the
+    /// unconditional half of the contract unproven: a hypothetical
+    /// partially-functional implementation would pass that assertion.
+    ///
+    /// This test closes the gap. It drives both raw exports on a live `"wb"`
+    /// handle with a format string containing **no conversion specifier** — the
+    /// easiest possible input, which a functional implementation would copy
+    /// verbatim and report a length for — and pins the whole contract:
+    ///
+    /// * each call returns `Z_STREAM_ERROR` on the valid handle;
+    /// * the advertised flag (bit 27) and the observed behavior agree;
+    /// * the stubs are inert — nothing is staged (`gztell` stays `0`) and the
+    ///   handle's error state is untouched;
+    /// * the handle survives and finalizes cleanly (`gzclose_w == Z_OK`);
+    /// * the finished member independently decodes to an **empty** payload, so
+    ///   no byte reached the file either.
+    ///
+    /// Its companion, [`idiomatic_printf_renders_through_the_same_handle`],
+    /// proves the divergence is confined to the raw C-variadic ABI.
+    #[test]
+    fn variadic_printf_stubs_fail_on_a_valid_write_handle() {
+        let (path, cpath) = unique_path("printfstub");
+
+        // The behavior asserted below is the one the flags word advertises;
+        // assert them together so the pair can never drift apart silently.
+        assert_ne!(
+            crate::util::zlib_compile_flags() & (1 << 27),
+            0,
+            "compile flags must advertise the gzprintf-returns-error variant"
+        );
+
+        unsafe {
+            let wf = gzopen(cpath.as_ptr(), c"wb".as_ptr());
+            assert!(!wf.is_null(), "gzopen for write returned NULL");
+
+            // Conversion-free format: a functional gzprintf would render these
+            // 10 bytes verbatim and return 10.
+            let fmt = c"plain text";
+
+            assert_eq!(
+                gzprintf(wf, fmt.as_ptr()),
+                Z_STREAM_ERROR,
+                "gzprintf must fail on a VALID handle, not only on NULL"
+            );
+            assert_eq!(
+                gzvprintf(wf, fmt.as_ptr(), ptr::null_mut()),
+                Z_STREAM_ERROR,
+                "gzvprintf must fail on a VALID handle, not only on NULL"
+            );
+
+            // Inert: no byte staged, position untouched.
+            assert_eq!(gztell(wf), 0, "the stubs must not stage any byte");
+
+            // Inert: the handle's error state is untouched. The stubs report
+            // through the return value only, so a subsequent `gzerror` must
+            // still read as "no error" — matching a C build whose `gzprintf`
+            // returns the error without recording it on the file.
+            let mut errnum: c_int = Z_STREAM_ERROR;
+            let msg = gzerror(wf, &raw mut errnum);
+            assert_eq!(errnum, Z_OK, "the stubs must not poison the handle");
+            assert!(!msg.is_null(), "gzerror must return a valid C string");
+            assert!(
+                CStr::from_ptr(msg).to_bytes().is_empty(),
+                "no error message may be recorded"
+            );
+
+            // The handle is still fully usable and finalizes normally.
+            assert_eq!(
+                gzclose_w(wf),
+                Z_OK,
+                "the handle must survive the rejected stub calls"
+            );
+
+            // Independent decode: a valid but EMPTY gzip member.
+            let rf = gzopen(cpath.as_ptr(), c"rb".as_ptr());
+            assert!(!rf.is_null(), "the finished member must be readable");
+            let mut buf = [0u8; 32];
+            assert_eq!(
+                gzread(rf, buf.as_mut_ptr() as voidp, buf.len() as c_uint),
+                0,
+                "the decoded payload must be empty — nothing reached the file"
+            );
+            assert_eq!(gzeof(rf), 1);
+            assert_eq!(gzclose_r(rf), Z_OK);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The control for [`variadic_printf_stubs_fail_on_a_valid_write_handle`]:
+    /// the stub contract is confined to the **raw C-variadic ABI** entry points.
+    ///
+    /// Rust callers lose nothing — [`crate::gz::gzprintf`] and
+    /// [`crate::gz::gzvprintf`] render [`core::fmt::Arguments`] in full. Driving
+    /// the idiomatic layer through the *same* `gzFile` the raw export just
+    /// rejected proves the split is a deliberate, ABI-scoped divergence rather
+    /// than "formatted writes do not work in this crate".
+    #[test]
+    fn idiomatic_printf_renders_through_the_same_handle() {
+        let (path, cpath) = unique_path("printfctl");
+        unsafe {
+            let wf = gzopen(cpath.as_ptr(), c"wb".as_ptr());
+            assert!(!wf.is_null(), "gzopen for write returned NULL");
+
+            // Raw C-variadic entry point on this handle: rejected.
+            assert_eq!(gzprintf(wf, c"%d".as_ptr()), Z_STREAM_ERROR);
+
+            // Same handle, idiomatic entry points: both render and report the
+            // formatted byte count.
+            {
+                // SAFETY: `wf` is a live, non-null handle from `gzopen` that has
+                // not been closed, so borrowing its `GzHandle` is valid.
+                let mut guard = GzBorrow::new(gz_handle(wf));
+                assert_eq!(
+                    gz::gzprintf(&mut guard, format_args!("{}+{}={}", 2, 3, 5)),
+                    5,
+                    "the idiomatic gzprintf renders and reports its length"
+                );
+                assert_eq!(
+                    gz::gzvprintf(&mut guard, format_args!(" ok")),
+                    3,
+                    "the idiomatic gzvprintf renders and reports its length"
+                );
+            }
+
+            // The rendered bytes are staged (unlike the stub calls above).
+            assert_eq!(gztell(wf), 8, "8 rendered bytes are staged");
+            assert_eq!(gzclose_w(wf), Z_OK);
+
+            // The member decodes to exactly the idiomatically rendered text.
+            let rf = gzopen(cpath.as_ptr(), c"rb".as_ptr());
+            assert!(!rf.is_null());
+            let mut buf = [0u8; 32];
+            let got = gzread(rf, buf.as_mut_ptr() as voidp, buf.len() as c_uint);
+            assert_eq!(got, 8);
+            assert_eq!(&buf[..8], b"2+3=5 ok");
+            assert_eq!(gzclose_r(rf), Z_OK);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The two `gz`-local panic guards behave exactly like their
+    /// [`crate::ffi::types`] siblings.
+    ///
+    /// [`guard_size`] and [`guard_const_ptr`] exist because the shared guard set
+    /// has no [`z_size_t`] or `*const T` variant, and they are the last line of
+    /// defense for `gzfread` / `gzfwrite` (whose C contract returns a plain
+    /// `z_size_t` with no error sentinel, so the substituted default *is* what
+    /// the C caller observes) and for `gzerror` (whose sentinel is `NULL`).
+    /// Being separate implementations, they are exercised directly rather than
+    /// by analogy with the shared guards.
+    #[test]
+    fn local_panic_guards_pass_values_through_and_substitute_defaults() {
+        // Pass-through, with defaults deliberately different from the results.
+        assert_eq!(guard_size(0, || 41), 41);
+        assert_eq!(guard_size(1, || z_size_t::MAX), z_size_t::MAX);
+
+        let bytes: [u8; 2] = [3, 4];
+        let live: *const u8 = bytes.as_ptr();
+        assert_eq!(guard_const_ptr(ptr::null(), || live), live);
+
+        // Panic substitutes the caller's default. The shared helper silences the
+        // default hook (so the deliberate panics print no backtrace) and
+        // serializes the process-global hook swap against the sibling
+        // `ffi::types` guard tests, which run concurrently in this same binary.
+        let (sized, zeroed, nulled, fallback) = crate::ffi::types::with_silenced_panic_hook(|| {
+            (
+                guard_size(7, || panic!("boundary panic")),
+                guard_size(0, || panic!("boundary panic")),
+                guard_const_ptr(ptr::null::<u8>(), || panic!("boundary panic")),
+                guard_const_ptr(live, || panic!("boundary panic")),
+            )
+        });
+
+        assert_eq!(sized, 7, "gzfread/gzfwrite observe the caller's default");
+        assert_eq!(
+            zeroed, 0,
+            "a zero default is substituted just as faithfully"
+        );
+        assert!(nulled.is_null(), "gzerror's sentinel is NULL");
+        assert_eq!(
+            fallback, live,
+            "the guard returns the caller's default, not a hard-coded NULL"
+        );
+        assert_eq!(bytes, [3, 4], "the pointee is untouched");
     }
 
     #[test]
@@ -1333,7 +1549,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// C2: the live `gzFile_s` prefix lets the C `gzgetc(g)` *macro* consume
+    /// The live `gzFile_s` prefix lets the C `gzgetc(g)` *macro* consume
     /// buffered bytes directly through the handle pointer, and the next real
     /// `gz*` call reconciles that consumption into the idiomatic cursor.
     ///

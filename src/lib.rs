@@ -554,7 +554,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Unsafe-containment boundary (F3 remediation)
+    // Unsafe-containment boundary
     //
     // `#![deny(unsafe_code)]` at the crate root already makes a stray `unsafe` a
     // compile error. The two `#[allow(unsafe_code)]` carve-outs, however, are
@@ -1099,11 +1099,11 @@ mod tests {
 
     #[test]
     fn the_toolchain_pin_documents_no_clippy_failure_that_does_not_exist() {
-        // F2 also covered stale commentary: `rust-toolchain.toml` claimed the
-        // `-D warnings` clippy gate FAILS on the pinned floor's clippy. It was
-        // measured passing (exit 0, zero diagnostics) on clippy 0.1.85 and
-        // 0.1.97 alike, and neither construct the claim named still exists.
-        // Guard against the claim being reinstated.
+        // `rust-toolchain.toml` must not claim that the `-D warnings` clippy
+        // gate fails on the pinned floor's clippy. The gate is measured passing
+        // (exit 0, zero diagnostics) on clippy 0.1.85 and 0.1.97 alike, so such
+        // a claim would be false and would invite someone to "fix" a gate that
+        // works. This guards the file against acquiring it.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let pin = std::fs::read_to_string(root.join("rust-toolchain.toml"))
             .expect("rust-toolchain.toml must be readable");
@@ -1154,11 +1154,28 @@ mod tests {
                     "src/util/mod.rs must hold exactly the three-arm OS_CODE cascade"
                 );
 
-                // Each declaration must carry its own `cfg`. Scanned on the raw
-                // text (the blanked copy erases the `"apple"` literal) by walking
-                // back from every declaration over its doc comment to the
-                // attribute immediately above it.
-                // Capturing the literal alongside the `cfg` is what makes the
+                // The cascade must be spelled with `cfg_if!`, the crate's declared
+                // stand-in for the C `#if`/`#elif`/`#else` nests (AAP §0.5.1,
+                // §0.5.3), and must be backed by the independent `const`
+                // cross-check that a bare `cargo check --target <triple>` proves.
+                assert!(
+                    text.contains("cfg_if::cfg_if! {"),
+                    "the OS_CODE cascade must be written as a cfg_if! chain, whose \
+                     arms are mutually exclusive by construction because the macro \
+                     negates every preceding predicate"
+                );
+                assert!(
+                    text.contains("const _: () = assert!("),
+                    "the cascade must keep its const-evaluated cross-check, which \
+                     is what makes the Windows and Apple values provable from a \
+                     host that cannot execute them"
+                );
+
+                // Each declaration must sit under its own arm of that chain.
+                // Scanned on the raw text (the blanked copy erases the `"apple"`
+                // literal) by walking back from every declaration over its doc
+                // comment to the arm header immediately above it.
+                // Capturing the literal alongside the arm is what makes the
                 // per-platform claims checkable from a single host: a wrong value in
                 // an arm that this target does not compile is otherwise invisible.
                 let lines: alloc::vec::Vec<&str> = text.lines().collect();
@@ -1183,21 +1200,22 @@ mod tests {
                         break;
                     }
                 }
-                arms.sort_unstable();
+                // Deliberately NOT sorted: in a `cfg_if!` chain the first matching
+                // arm wins, so source order is load-bearing and the fallback must
+                // come last. Asserting the sequence therefore checks strictly more
+                // than the previous set of independent attributes did.
                 assert_eq!(
                     arms,
                     alloc::vec![
-                        (
-                            "#[cfg(all(not(windows), not(target_vendor = \"apple\")))]",
-                            "3"
-                        ),
-                        ("#[cfg(all(not(windows), target_vendor = \"apple\"))]", "19"),
-                        ("#[cfg(windows)]", "10"),
+                        ("if #[cfg(windows)] {", "10"),
+                        ("} else if #[cfg(target_vendor = \"apple\")] {", "19"),
+                        ("} else {", "3"),
                     ],
                     "the OS_CODE cascade must be exactly `10` on Windows (zutil.h \
-                     L156-L158), `19` on Apple (L168-L170) and the `3` Unix fallback \
-                     (L187-L189), each guarded by its own mutually exclusive `cfg` so \
-                     that precisely one arm compiles for any target"
+                     L156-L158), then `19` on Apple (L168-L170), then the \
+                     unconditional `3` Unix fallback (L187-L189) — in that order, so \
+                     that precisely one arm compiles for any target and no target is \
+                     left without one"
                 );
             }
 

@@ -302,24 +302,28 @@ pub type ZfreeFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
 /// path is entirely unchanged.
 ///
 /// A hook is *active* only when **both** `zalloc` and `zfree` are present, since
-/// a region obtained from one must be released through the other. Two
-/// configurations reach this type from a C caller, and they are handled
-/// differently:
+/// a region obtained from one must be released through the other. Only two
+/// configurations can reach this type from a C caller, because the C
+/// initialization boundary completes a partial pair before any hook is built:
 ///
 /// * **Neither half supplied** — the hook is inactive and allocation uses the
-///   global allocator. This matches C, whose init prologues substitute *both*
-///   built-ins (`zcalloc`/`zcfree`) for a wholly absent pair.
-/// * **Exactly one half supplied** — rejected at the C initialization boundary
-///   with `Z_STREAM_ERROR` before any buffer is built, so an active-vs-inactive
-///   decision is never made for such a pair. C substitutes only the *missing*
-///   half and keeps the one the caller gave (`inflate.c` L183-L196,
-///   `deflate.c` L400-L414, `infback.c` L37-L50); this crate cannot, because
-///   `zcalloc`/`zcfree` are unexported `local:` symbols and pairing a caller's
-///   `zalloc` with the global deallocator would be undefined behavior. Ignoring
-///   the supplied half instead would silently discard the caller's
-///   out-of-memory signal, which AAP §0.6.3 forbids. See
-///   `CAllocator::is_half_present` in `crate::ffi::types` for the full
-///   rationale and the documented divergence (AAP §0.8.2).
+///   global allocator. That is this port's built-in allocator, exactly as
+///   `zcalloc`/`zcfree` are C's, and it is what AAP §0.6.3's "otherwise
+///   `std::alloc` is used" clause prescribes for a wholly absent pair.
+/// * **Both halves present** — the hook is active and every working buffer is
+///   carved from the caller's `zalloc` and released through their `zfree`. An
+///   active `zalloc` that reports out-of-memory is propagated as an allocation
+///   failure; there is deliberately no global-allocator fallback on that path.
+///
+/// A pair with **exactly one half supplied** never becomes an `AllocHook`: C's
+/// three `*Init*_` prologues substitute the library's own built-in for whichever
+/// half is missing — `zcalloc` for a null `zalloc` (also clearing `opaque`),
+/// `zcfree` for a null `zfree` (`inflate.c` L183-L196, `deflate.c` L400-L414,
+/// `infback.c` L37-L50) — and `crate::ffi::types::init_allocator_prologue`
+/// reproduces that substitution before constructing anything, so the hook this
+/// type sees is already complete. The caller's own half is honored in full,
+/// which is what keeps a deliberately failing `zalloc` observable as
+/// `Z_MEM_ERROR` instead of being silently bypassed.
 ///
 /// # Constructing one
 ///
@@ -698,8 +702,9 @@ impl<T: Copy + Default + ZeroValid> AllocBuffer<T> {
         T: 'static,
     {
         // Fast path / default: an inactive hook (a C caller who supplied neither
-        // half; a half-present pair is rejected at the `*Init*_` boundary and
-        // never arrives here), an empty request, or a zero-sized element type.
+        // half; a half-present pair is *completed* with the crate's built-in at
+        // the `*Init*_` boundary, so it arrives here already active), an empty
+        // request, or a zero-sized element type.
         // `try_owned` matches C `zcalloc`'s zero fill and
         // is the exact historical (global-allocator) behavior, but reserves
         // fallibly so global-heap exhaustion is reported rather than aborting; for
@@ -768,8 +773,8 @@ impl<T: Copy + Default + ZeroValid> AllocBuffer<T> {
         let count = total / elem;
 
         // Fast path / default: an inactive hook (neither half supplied; a
-        // half-present pair is rejected at the `*Init*_` boundary), or an empty
-        // request.
+        // half-present pair is *completed* with the crate's built-in at the
+        // `*Init*_` boundary and so arrives active), or an empty request.
         if !hook.is_active() || count == 0 {
             return Self::try_owned(count);
         }
@@ -1894,7 +1899,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Caller-allocator hook contract (F5 / F1 / F6 remediation)
+    // Caller-allocator hook contract
     //
     // The C `alloc_func`/`free_func` pair is raw-pointer machinery, so the
     // counting backing store lives in the crate's designated unsafe boundary
@@ -1945,22 +1950,23 @@ mod tests {
     /// clause (§0.6.3): [`AllocBuffer::try_zeroed`] must use owned
     /// (global-allocator) storage and must never consult the caller's `zalloc`.
     ///
-    /// This is the AAP's deliberate *both-hook* policy, **not** literal C
-    /// parity. C defaults the two halves **independently** — `deflate.c`
-    /// L401-L407 installs `zcalloc` only when `zalloc` is null (also clearing
-    /// `opaque`), and L408-L413 installs `zcfree` only when `zfree` is null — so
-    /// a C stream carrying only `zalloc` *retains* it and pairs it with the
-    /// built-in `zcfree`. That mismatched pair is exactly what this port refuses
-    /// to reproduce: a region obtained from the caller's `zalloc` would then be
-    /// released through a different deallocator. Requiring both halves before
-    /// any foreign allocation makes that mismatch unrepresentable — allocation
-    /// and release always come from the *same* allocator, which is what the
-    /// `frees() == 0` assertion below pins.
+    /// This pins the *type-level* contract, which is what makes the buffer's
+    /// backing store and its deallocator provably the same: allocation and
+    /// release always come from one allocator, which is exactly what the
+    /// `frees() == 0` assertion below observes.
     ///
-    /// The divergence is therefore narrow and deliberate: a C caller who
-    /// installs only one half sees their hook go unconsulted rather than
-    /// half-honored. Every stream still succeeds, no byte of output changes, and
-    /// a complete hook is honored in full.
+    /// It is **not** the behavior a C caller who supplies one half gets. C
+    /// defaults the two halves **independently** — `deflate.c` L400-L407 installs
+    /// `zcalloc` only when `zalloc` is null (also clearing `opaque`), and
+    /// L408-L413 installs `zcfree` only when `zfree` is null — and
+    /// `crate::ffi::types::init_allocator_prologue` reproduces that substitution
+    /// at the C boundary. Such a caller therefore arrives here with a *complete*
+    /// pair whose missing half is the crate's own `malloc`/`free`-backed built-in,
+    /// and their supplied half is honored in full. A half-present hook is
+    /// reachable only from within the crate — as here — or from a stream whose
+    /// allocator fields were mutated after initialization, which
+    /// `CAllocator::is_half_present` rejects exactly as C's `*StateCheck`
+    /// functions do.
     #[test]
     fn zalloc_only_is_inactive_and_uses_owned() {
         let stats = crate::ffi::alloc::test_hook::HookStats::new();
@@ -1988,7 +1994,10 @@ mod tests {
     }
 
     /// A hook carrying only `zfree` is likewise inactive, so nothing is routed
-    /// through the caller and the buffer is released by ordinary drop glue.
+    /// through the caller and the buffer is released by ordinary drop glue. As
+    /// above this pins the type-level contract; a C caller who supplies only
+    /// `zfree` has the missing `zalloc` substituted at the initialization
+    /// boundary and reaches this type with a complete, active pair.
     #[test]
     fn zfree_only_is_inactive_and_uses_owned() {
         let stats = crate::ffi::alloc::test_hook::HookStats::new();
@@ -2204,7 +2213,7 @@ mod tests {
         alloc.deallocate(buf);
     }
 
-    /// F3 regression: the global-allocator path must be **fallible**.
+    /// Regression guard: the global-allocator path must be **fallible**.
     ///
     /// `vec![T::default(); count]` aborts the process when the request cannot be
     /// satisfied, whereas zlib reports a failed working-buffer allocation as
@@ -2234,7 +2243,7 @@ mod tests {
         assert!(ok.iter().all(|&w| w == 0));
     }
 
-    /// F4 regression: `try_zeroed_items` computes the element count from the
+    /// Regression guard: `try_zeroed_items` computes the element count from the
     /// `items * item_size` byte total and rejects geometries it cannot represent.
     ///
     /// The pair is forwarded to an active `zalloc` verbatim so a bounded caller
@@ -2270,7 +2279,7 @@ mod tests {
         assert!(empty.is_empty());
     }
 
-    /// F2 regression: `try_clone` copies an owned buffer's contents exactly and
+    /// Regression guard: `try_clone` copies an owned buffer's contents exactly and
     /// keeps it owned, so the fallible copy path is a drop-in for `Clone` on the
     /// global-allocator path.
     ///

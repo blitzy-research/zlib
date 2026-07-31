@@ -348,8 +348,8 @@ pub fn inflate_back_init(window_bits: i32) -> Result<Box<InflateState>, ReturnCo
 
 /// Same as [`inflate_back_init`] but threads an explicit [`AllocHook`] so the
 /// owned back-inflate window is allocated through the caller's `zalloc`/`zfree`
-/// when one was installed via the FFI `z_stream` (AAP §0.6.3 has-hook clause;
-/// QA FINDING-3). In back-inflate the window *is* the output buffer, so unlike
+/// when one was installed via the FFI `z_stream` (AAP §0.6.3 has-hook clause).
+/// In back-inflate the window *is* the output buffer, so unlike
 /// the streaming `inflate` path this allocation is eager (performed here rather
 /// than lazily in `updatewindow`); routing it through the hook means the
 /// output buffer honors a caller-supplied allocator exactly as reference zlib's
@@ -1308,7 +1308,7 @@ mod tests {
         assert_eq!(inflate_back_end(state), ReturnCode::Ok);
     }
 
-    /// F2 (inflate): `inflate_back_init_borrowed_window` charges C's *single*
+    /// `inflate_back_init_borrowed_window` charges C's *single*
     /// state allocation and adopts the supplied window without requesting one.
     ///
     /// This is the property that makes the FFI `inflateBackInit_` shim match
