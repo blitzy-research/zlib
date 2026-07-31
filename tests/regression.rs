@@ -119,9 +119,17 @@ fn deflate_hello() -> Vec<u8> {
 /// by C `test_large_deflate`. It compresses a 20000-byte zero-filled buffer,
 /// switches to `Z_NO_COMPRESSION` and feeds back `uncomprLen/2` bytes of
 /// already-compressed data, switches to `Z_BEST_COMPRESSION` + `Z_FILTERED` and
-/// feeds the full plaintext again, then finishes. The greedy-consumption check
-/// from C is asserted inline. The returned stream decompresses to exactly
+/// feeds the full plaintext again, then finishes in a single `Z_FINISH` call.
+/// Both of C's inline checks are asserted here: the greedy-consumption check
+/// after the first `Z_NO_FLUSH`, and `Z_STREAM_END` from that one `Z_FINISH`.
+/// The returned stream decompresses to exactly
 /// `2 * UNCOMPR_LEN + UNCOMPR_LEN / 2 == 50000` bytes.
+///
+/// Both mid-stream `deflateParams` switches are load-bearing: they exercise the
+/// re-dispatch path that reassigns the per-level tuning row (`good_length`,
+/// `max_lazy`, `nice_length`, `max_chain`) and, on the way out of level 0,
+/// slides or clears the hash table. Neither the level/strategy pairs nor their
+/// order may be simplified.
 fn large_deflate_stream() -> Vec<u8> {
     let uncompr = vec![0u8; UNCOMPR_LEN];
     let mut compr = vec![0u8; COMPR_LEN];
@@ -174,15 +182,21 @@ fn large_deflate_stream() -> Vec<u8> {
     assert_eq!(o3.consumed, UNCOMPR_LEN, "third input not fully consumed");
     out_off += o3.produced;
 
-    // Step 4: finish the stream.
-    loop {
-        let outcome = deflate(&mut strm, &[], &mut compr[out_off..], Z_FINISH);
-        out_off += outcome.produced;
-        if outcome.code == ReturnCode::StreamEnd {
-            break;
-        }
-        assert_eq!(outcome.code, ReturnCode::Ok, "large deflate finish");
-    }
+    // Step 4: finish the stream. C makes exactly ONE `deflate(Z_FINISH)` call
+    // here and treats anything other than `Z_STREAM_END` as fatal ("deflate
+    // should report Z_STREAM_END"), because `avail_out` still holds most of the
+    // 60000-byte buffer — the encoder has ample room to emit the last block and
+    // the Adler-32 trailer in a single call. Asserting the single call, rather
+    // than looping until the stream happens to end, is what preserves that
+    // check: a port that needed a second `Z_FINISH` call with tens of thousands
+    // of output bytes to spare would be a behavioral divergence C would catch.
+    let finish = deflate(&mut strm, &[], &mut compr[out_off..], Z_FINISH);
+    assert_eq!(
+        finish.code,
+        ReturnCode::StreamEnd,
+        "deflate should report Z_STREAM_END"
+    );
+    out_off += finish.produced;
 
     deflate_end(&mut strm).expect("deflateEnd");
     compr.truncate(out_off);
@@ -273,8 +287,11 @@ fn deflate_with_dict() -> (Vec<u8>, u32) {
 /// Port of the version guard in `example.c`'s `main`: the linked
 /// `zlibVersion()` must share its first character with the compile-time
 /// `ZLIB_VERSION`, and here (single crate, no dynamic linking) must equal it
-/// exactly. Also pins the `ZLIB_VERSION` / `ZLIB_VERNUM` constants and confirms
-/// `zlibCompileFlags()` returns without panicking.
+/// exactly. Also pins the `ZLIB_VERSION` / `ZLIB_VERNUM` constants, and checks
+/// the one bit of `zlibCompileFlags()` that is a contract rather than a
+/// build-configuration detail — bit 27, which advertises the documented
+/// `gzprintf`-returns-an-error variant. The rest of the flags word is
+/// deliberately left unpinned; see the inline comments for why.
 #[test]
 fn version_check() {
     let linked = zlibVersion();
@@ -287,9 +304,27 @@ fn version_check() {
     assert_eq!(ZLIB_VERSION, "1.3.2.1-motley");
     assert_eq!(ZLIB_VERNUM, 0x1321);
 
-    // `zlibCompileFlags()` must simply return (its exact value is platform- and
-    // configuration-dependent).
-    let _flags = zlibCompileFlags();
+    // C's `main` prints `compile flags = 0x%lx`, so a reader of its output would
+    // notice a wrong flags word. The exact value is platform- and
+    // configuration-dependent, so it is deliberately NOT pinned here: bits 0-7
+    // encode the host's C-ABI type widths and bit 8 mirrors `debug_assertions`,
+    // which legitimately differs between a debug and a release run.
+    let flags = zlibCompileFlags();
+
+    // Bit 27 is the one bit this build sets unconditionally, and it is a
+    // contract rather than a configuration detail: it advertises the documented
+    // "gzprintf() returns an error" variant, exactly as a C zlib built without a
+    // secure `vsnprintf` does. Rendering a C `va_list` needs the nightly-only
+    // `c_variadic` feature, so the C-ABI `gzprintf`/`gzvprintf` shims are
+    // error-returning stubs and this bit is how a caller detects that
+    // programmatically instead of at runtime. Asserting it here — through the
+    // public `zlib_rs::zlibCompileFlags` re-export the C `main` equivalent calls
+    // — keeps the divergence advertised on the ABI surface it is promised on.
+    assert_eq!(
+        (flags >> 27) & 1,
+        1,
+        "compile flags must advertise the gzprintf-returns-error variant"
+    );
 }
 
 /// Port of C `test_compress`: compress [`HELLO`] with the one-call [`compress`],
@@ -301,6 +336,17 @@ fn test_compress() {
     let bound = compress_bound(source.len());
     let mut compr = vec![0u8; bound];
     let compressed_len = compress(&mut compr, source).expect("compress");
+
+    // C sizes this destination with the generous `comprLen` (60000) and only
+    // checks the return code. Sizing it with `compress_bound` instead makes the
+    // bound itself part of the vector under test, so state the contract the
+    // buffer above already leans on: the bound must cover what `compress`
+    // actually emitted, and `compress` must report the real length rather than
+    // the capacity it was handed.
+    assert!(
+        compressed_len <= bound,
+        "compress produced {compressed_len} bytes, past its {bound}-byte bound"
+    );
     compr.truncate(compressed_len);
 
     let mut uncompr = vec![0u8; UNCOMPR_LEN];

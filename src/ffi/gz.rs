@@ -59,7 +59,7 @@
 //! convenience. Rendering a C `va_list` requires the `c_variadic` language
 //! feature (`core::ffi::VaList`), which is nightly-only, so a true variadic
 //! definition is incompatible with the stable **MSRV 1.85** contract
-//! (AAP §0.7.2); and delegating to a C `vsnprintf` would reintroduce a C
+//! (AAP §0.7.2 standard S7); and delegating to a C `vsnprintf` would reintroduce a C
 //! dependency, violating the **zero-C-dependency** rule (AAP §0.5.2). Emulating
 //! the C ABI's argument promotion by hand cannot recover the caller's original
 //! types, so no safe stable-Rust rendering exists. The documented
@@ -780,7 +780,7 @@ pub unsafe extern "C" fn gzflush(file: gzFile, flush: c_int) -> c_int {
 //
 // Why this variant (and not a functional C-variadic definition): rendering a C
 // `va_list` requires the unstable, nightly-only `c_variadic` feature, which is
-// incompatible with the crate's stable MSRV-1.85 contract (AAP §0.7.2), and
+// incompatible with the crate's stable MSRV-1.85 contract (AAP §0.7.2 standard S7), and
 // delegating to a C `vsnprintf` would reintroduce a C dependency, violating the
 // zero-C-dependency rule (AAP §0.5.2). Rust consumers lose nothing: the
 // idiomatic `crate::gz::gzprintf`/`gzvprintf` render `core::fmt::Arguments`
@@ -800,7 +800,7 @@ pub unsafe extern "C" fn gzflush(file: gzFile, flush: c_int) -> c_int {
 /// Returns `Z_STREAM_ERROR` unconditionally, implementing the documented
 /// `NO_vsnprintf && !ZLIB_INSECURE` zlib variant (its companion flag is
 /// `zlibCompileFlags` bit 27). Rendering a C `va_list` requires the nightly-only
-/// `c_variadic` feature, incompatible with the crate's stable MSRV (AAP §0.7.2);
+/// `c_variadic` feature, incompatible with the crate's stable MSRV (AAP §0.7.2 standard S7);
 /// see the module note above for the ABI rationale and the fully functional
 /// idiomatic [`crate::gz::gzvprintf`].
 #[unsafe(no_mangle)]
@@ -818,7 +818,7 @@ pub extern "C" fn gzvprintf(
 /// See [`gzvprintf`]: returns `Z_STREAM_ERROR`, implementing the documented
 /// `NO_vsnprintf && !ZLIB_INSECURE` zlib variant (advertised via
 /// `zlibCompileFlags` bit 27) because a true C-variadic definition would need
-/// the nightly-only `c_variadic` feature (AAP §0.7.2). Rust callers use the
+/// the nightly-only `c_variadic` feature (AAP §0.7.2 standard S7). Rust callers use the
 /// fully functional idiomatic [`crate::gz::gzprintf`].
 #[unsafe(no_mangle)]
 pub extern "C" fn gzprintf(_file: gzFile, _format: *const c_char) -> c_int {
