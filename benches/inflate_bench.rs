@@ -2,18 +2,36 @@
 //!
 //! Pre-compresses representative inputs with `compress2`, then measures
 //! `uncompress` throughput. Throughput is reported over the *decompressed*
-//! (original) size, matching the decompression throughput goal
-//! (>= C decompression throughput, AAP 0.7.2). Decompression cost can vary with
-//! how the source was compressed, so both the source level (1 / 6 / 9) and the
-//! input profile (text vs. incompressible) are varied. The larger,
-//! match-heavy inputs drive the `inflate_fast` hot path.
+//! (original) size, which is the meaningful denominator for a decoder: the same
+//! corpus compresses to a different length at every level, so normalising by the
+//! compressed size would make two source levels that decode to identical output
+//! incomparable. Decompression cost can vary with how the source was compressed,
+//! so both the source level (1 / 6 / 9) and the input profile (text vs.
+//! incompressible) are varied. The larger, match-heavy inputs drive the
+//! `inflate_fast` hot path.
+//!
+//! Measured position, and the only throughput figures quoted anywhere in this
+//! file: decompression runs at 107%-127% of reference C zlib, so it is at or
+//! above parity, while compression runs at approximately 85% of it (AAP 0.8.3,
+//! "Performance Expectations"). Compression is therefore the interesting side,
+//! and it is measured separately in `benches/deflate_bench.rs`; nothing timed
+//! here is a compression figure.
+//!
+//! This folder MEASURES; it does not AUTHORISE. Performance is a constraint on
+//! the migration, not its objective, so no timing taken here is on its own a
+//! licence to change anything under `src/` (AAP 0.8.3). In particular
+//! `deflate_to_vec` below calls `compress2` purely as benchmark *setup*, to
+//! obtain a stream for the decoder to consume: it is not a byte-identity check,
+//! and byte-identity against reference zlib is owned exclusively by
+//! `tests/interop.rs`.
 //!
 //! Registered in `Cargo.toml` as `[[bench]] name = "inflate_bench"` with
-//! `harness = false`.
+//! `harness = false`. No `[[bench]]` block carries a `path` key, so Cargo
+//! auto-discovers the target by filename: renaming this file breaks the build
+//! outright.
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use zlib_rs::util::compress::compress_bound;
-use zlib_rs::{compress2, uncompress};
+use zlib_rs::{compress_bound, compress2, uncompress};
 
 /// Payload size used by the inflate benchmarks (64 KiB).
 const SIZE: usize = 64 * 1024;
