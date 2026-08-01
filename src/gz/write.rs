@@ -138,10 +138,20 @@ pub(crate) fn gz_init(state: &mut GzState) -> Result<(), ZlibError> {
         }
     }
 
-    // Mark the state as initialized (C L46). The compressed-output window
-    // (C L49-L55) is modelled implicitly: `out_buf[0..size]` is the scratch
-    // area handed to `deflate` on each call, and it is fully drained to the
-    // file within `gz_comp`, so no persistent output cursor is required.
+    // The compressed-output window (C L49-L55, `strm->avail_out = state->size;
+    // strm->next_out = state->out; state->x.next = strm->next_out;`) is modelled
+    // as `out_buf[0..size]` — the scratch area handed to `deflate` on each call —
+    // plus the persistent cursor
+    // [`GzState::out_pending`](crate::gz::state::GzState), which counts the bytes
+    // `deflate` produced that the OS has not accepted yet. C's cursor is a
+    // pointer into `state->out`; the safe-index counterpart starts empty here,
+    // exactly as C's starts equal to `strm->next_out`.
+    state.out_pending = 0;
+
+    // Mark the state as initialized (C L46). This must stay the *last* statement:
+    // a non-zero `size` is the sentinel every caller tests to decide whether the
+    // buffers and engine already exist, so setting it earlier would advertise a
+    // half-built state if any step above failed.
     state.size = state.want;
     Ok(())
 }
@@ -151,21 +161,104 @@ pub(crate) fn gz_init(state: &mut GzState) -> Result<(), ZlibError> {
 /// pathologically large buffer cannot overflow the platform's write count.
 const WRITE_MAX: usize = (u32::MAX >> 2) as usize + 1;
 
-/// Writes `input` straight to the file with no compression — the transparent
-/// (`direct`) branch of C `gz_comp` (`gzwrite.c` L74-L95).
+/// How much input a compress-and-write step ingested, together with the error
+/// (if any) that stopped it.
 ///
-/// Returns the number of bytes written. On a non-blocking stall
-/// ([`io::ErrorKind::WouldBlock`]) it sets [`GzState::again`](crate::gz::state::GzState)
-/// and reports [`ReturnCode::ErrNo`]; on any other write failure it likewise
-/// reports [`ReturnCode::ErrNo`].
-fn write_direct(state: &mut GzState, input: &[u8]) -> Result<usize, ZlibError> {
-    let mut off = 0usize;
-    while off < input.len() {
+/// # Why the count must survive the error
+///
+/// Reference zlib reports partial progress out of a failed `gz_comp` through the
+/// stream itself: after the call, `strm->avail_in` still describes the input the
+/// engine has *not* taken, so `gz_write` recovers the ingested count with
+/// `n -= strm->avail_in` and only then decides what to return
+/// (`gzwrite.c` L239-L244). A plain `Result<usize, ZlibError>` cannot express
+/// that — the `Err` arm carries no count — so a stall would report fewer bytes
+/// accepted than `deflate` actually consumed. A caller obeying the documented
+/// retry contract (resubmit from the returned offset) would then hand the same
+/// bytes to the engine twice and duplicate them in the compressed stream.
+///
+/// Splitting the two answers apart makes the mistake unrepresentable: every
+/// caller must look at `consumed` before it looks at `result`.
+#[must_use]
+struct CompOutcome {
+    /// Number of bytes of the supplied input the engine ingested. Valid whether
+    /// or not `result` is an error.
+    consumed: usize,
+    /// `Ok(())` if the step ran to completion, otherwise the error that stopped
+    /// it (already recorded on the state via
+    /// [`GzState::error`](crate::gz::state::GzState::error)).
+    result: Result<(), ZlibError>,
+}
+
+impl CompOutcome {
+    /// A step that ingested `consumed` bytes and completed successfully.
+    #[inline]
+    fn ok(consumed: usize) -> Self {
+        Self {
+            consumed,
+            result: Ok(()),
+        }
+    }
+
+    /// A step that ingested `consumed` bytes before failing with `err`.
+    #[inline]
+    fn err(consumed: usize, err: ZlibError) -> Self {
+        Self {
+            consumed,
+            result: Err(err),
+        }
+    }
+}
+
+/// Hands `state.out_buf[0..state.out_pending]` to the operating system, keeping
+/// the unwritten remainder addressable — the inner drain loop of C `gz_comp`
+/// (`gzwrite.c` L114-L124).
+///
+/// C advances a cursor that lives on the state
+/// (`while (strm->next_out > state->x.next) { … state->x.next += writ; }`), so a
+/// write that stops early leaves the remainder reachable for the next call. This
+/// keeps the equivalent window front-anchored: each successful partial write
+/// compacts what is left down to `out_buf[0]` and reduces
+/// [`GzState::out_pending`](crate::gz::state::GzState) by the amount accepted, so
+/// on return the invariant `out_buf[0..out_pending]` still names exactly the
+/// bytes the OS has not taken. When the write completes in full — every write to
+/// a regular blocking file — the compaction is a zero-length `copy_within` and
+/// costs nothing.
+///
+/// [`std::io::Write::write_all`] is deliberately not used: it reports only
+/// *whether* it failed, not how far it got, so a partial write followed by a
+/// fault would lose the progress this window exists to preserve.
+///
+/// # Errors
+///
+/// * [`ZlibError::ErrNo`] on a non-blocking stall
+///   ([`io::ErrorKind::WouldBlock`]), which additionally sets
+///   [`GzState::again`](crate::gz::state::GzState) so the caller may retry;
+/// * [`ZlibError::ErrNo`] on any other write failure, and on a writer that
+///   accepts nothing (`Ok(0)`) while bytes remain — per the
+///   [`std::io::Write::write`] contract that means the destination can take no
+///   more, so it is reported rather than silently dropping the remainder. (C has
+///   no such arm: its `write(2)` returning `0` spins the loop forever, which is
+///   strictly worse than a reported error.)
+///
+/// On every error path the pending window is left intact, so a retry resumes at
+/// the exact byte the OS stopped at.
+fn drain_pending(state: &mut GzState) -> Result<(), ZlibError> {
+    while state.out_pending > 0 {
         state.again = false;
-        let end = off + core::cmp::min(WRITE_MAX, input.len() - off);
-        match state.file.write(&input[off..end]) {
-            Ok(0) => break, // no progress possible on a real file with a non-empty slice
-            Ok(written) => off += written,
+        let end = core::cmp::min(WRITE_MAX, state.out_pending);
+        match state.file.write(&state.out_buf[..end]) {
+            Ok(0) => {
+                // The destination accepts nothing while output is still pending.
+                state.error(ReturnCode::ErrNo, Some("write error"));
+                return Err(ZlibError::ErrNo);
+            }
+            Ok(written) => {
+                // Slide the unwritten tail down to the front so the window stays
+                // front-anchored. A complete write makes this a no-op.
+                state.out_buf.copy_within(written..state.out_pending, 0);
+                state.out_pending -= written;
+            }
+            // A signal interrupted the write before any byte moved; retry.
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 state.again = true;
@@ -178,13 +271,54 @@ fn write_direct(state: &mut GzState, input: &[u8]) -> Result<usize, ZlibError> {
             }
         }
     }
-    Ok(off)
+    Ok(())
+}
+
+/// Writes `input` straight to the file with no compression — the transparent
+/// (`direct`) branch of C `gz_comp` (`gzwrite.c` L74-L95).
+///
+/// Reports how many bytes reached the file, **including** on the error paths, so
+/// a stalled transparent write does not under-report its progress and provoke a
+/// duplicating retry (see [`CompOutcome`]). On a non-blocking stall
+/// ([`io::ErrorKind::WouldBlock`]) it sets
+/// [`GzState::again`](crate::gz::state::GzState) and reports
+/// [`ReturnCode::ErrNo`]; any other write failure, and a writer that accepts
+/// nothing while bytes remain, likewise reports [`ReturnCode::ErrNo`].
+///
+/// No pending-output window is needed here: the bytes still live in the caller's
+/// `input` slice, so the accurate `consumed` count is all a retry requires.
+fn write_direct(state: &mut GzState, input: &[u8]) -> CompOutcome {
+    let mut off = 0usize;
+    while off < input.len() {
+        state.again = false;
+        let end = off + core::cmp::min(WRITE_MAX, input.len() - off);
+        match state.file.write(&input[off..end]) {
+            Ok(0) => {
+                // The destination accepts nothing while input remains. Reporting
+                // this (rather than breaking out silently) is what stops the
+                // unwritten tail from vanishing without a trace.
+                state.error(ReturnCode::ErrNo, Some("write error"));
+                return CompOutcome::err(off, ZlibError::ErrNo);
+            }
+            Ok(written) => off += written,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                state.again = true;
+                state.error(ReturnCode::ErrNo, Some("write error"));
+                return CompOutcome::err(off, ZlibError::ErrNo);
+            }
+            Err(_) => {
+                state.error(ReturnCode::ErrNo, Some("write error"));
+                return CompOutcome::err(off, ZlibError::ErrNo);
+            }
+        }
+    }
+    CompOutcome::ok(off)
 }
 
 /// Runs `deflate` over `input`, writing every produced byte to the file, until
 /// the engine has no more work for the requested `flush` — the compress loop of
-/// C `gz_comp` (`gzwrite.c` L109-L142). Returns the number of input bytes
-/// consumed.
+/// C `gz_comp` (`gzwrite.c` L109-L142).
 ///
 /// `input` must **not** alias any field of `state` (it is either an external
 /// caller slice or the `in_buf` moved out with [`core::mem::take`]), which is
@@ -197,25 +331,43 @@ fn write_direct(state: &mut GzState, input: &[u8]) -> Result<usize, ZlibError> {
 /// call. The DEFLATE byte stream is identical either way; only the number of
 /// `write` syscalls differs.
 ///
+/// # Ordering invariant
+///
+/// Any output left over from an earlier stalled call is drained **before**
+/// `deflate` is invoked, and each call's output is drained before the next, so
+/// the engine always receives the whole `out_buf[..size]` scratch area and
+/// compressed bytes are never overwritten while still unwritten. This is the
+/// safe-index equivalent of C never letting `strm->next_out` run past
+/// `state->x.next`.
+///
 /// # Errors
 ///
 /// * [`ZlibError::StreamError`] if `deflate` reports a corrupt stream
 ///   (C L136-L140) — fatal.
 /// * [`ZlibError::ErrNo`] on a file write error (C L119-L124), including a
 ///   non-blocking stall (which also sets [`GzState::again`](crate::gz::state::GzState)).
-fn gz_deflate_loop(
-    state: &mut GzState,
-    input: &[u8],
-    flush: FlushMode,
-) -> Result<usize, ZlibError> {
+///
+/// Either way the returned [`CompOutcome::consumed`] is the true number of input
+/// bytes the engine ingested, and any undelivered output remains pending in
+/// [`GzState::out_pending`](crate::gz::state::GzState) for the next call.
+fn gz_deflate_loop(state: &mut GzState, input: &[u8], flush: FlushMode) -> CompOutcome {
     let size = state.size;
     let flush_i32 = flush.as_c_int();
     let mut consumed = 0usize;
 
+    // Deliver anything a previous stalled call left behind before generating
+    // more. Skipping this would let the `deflate` below overwrite compressed
+    // bytes the file has not received, splicing the DEFLATE stream.
+    if let Err(e) = drain_pending(state) {
+        return CompOutcome::err(consumed, e);
+    }
+
     loop {
         // Compress the still-unconsumed tail of `input` into the full output
         // scratch buffer. `input` is external, and `strm`/`out_buf` are
-        // distinct `state` fields, so these borrows are disjoint.
+        // distinct `state` fields, so these borrows are disjoint. The pending
+        // window is empty here (drained above / at the end of the previous
+        // iteration), so the whole scratch area is available.
         let outcome = deflate::deflate(
             &mut state.strm,
             &input[consumed..],
@@ -229,46 +381,18 @@ fn gz_deflate_loop(
                 ReturnCode::StreamError,
                 Some("internal error: deflate stream corrupt"),
             );
-            return Err(ZlibError::StreamError);
+            return CompOutcome::err(consumed, ZlibError::StreamError);
         }
 
         consumed += outcome.consumed;
 
-        // Flush the freshly produced bytes to the file (C L114-L124). Drain with
-        // an explicit, progress-preserving write loop — the same pattern as the
-        // transparent [`write_direct`] path and the C inner
-        // `while (strm->next_out > state->x.next)` loop (gzwrite.c L114-L124),
-        // which advances the output cursor by each successful `write()`.
-        //
-        // `write_all` is deliberately avoided here: it hides how many bytes were
-        // written before a later error, so a partial write followed by a fault
-        // (or a non-blocking / short-writing descriptor) could lose progress and
-        // corrupt the gzip output — or duplicate bytes on retry. Advancing `off`
-        // by each successful count keeps the exact write progress, retries a
-        // slice interrupted by a signal, and reports a non-blocking stall via
-        // [`GzState::again`](crate::gz::state::GzState), matching zlib.
-        if outcome.produced > 0 {
-            let produced = outcome.produced;
-            let mut off = 0usize;
-            while off < produced {
-                state.again = false;
-                let end = off + core::cmp::min(WRITE_MAX, produced - off);
-                match state.file.write(&state.out_buf[off..end]) {
-                    // No progress possible on a real file with a non-empty slice.
-                    Ok(0) => break,
-                    Ok(written) => off += written,
-                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        state.again = true;
-                        state.error(ReturnCode::ErrNo, Some("write error"));
-                        return Err(ZlibError::ErrNo);
-                    }
-                    Err(_) => {
-                        state.error(ReturnCode::ErrNo, Some("write error"));
-                        return Err(ZlibError::ErrNo);
-                    }
-                }
-            }
+        // Hand the freshly produced bytes to the file (C L114-L124). They occupy
+        // `out_buf[0..produced]`, which is exactly the pending window's shape, so
+        // publishing the count and draining is all that is required; whatever the
+        // OS declines to take stays pending for the next call.
+        state.out_pending = outcome.produced;
+        if let Err(e) = drain_pending(state) {
+            return CompOutcome::err(consumed, e);
         }
 
         let input_left = input.len() - consumed;
@@ -292,7 +416,7 @@ fn gz_deflate_loop(
         }
     }
 
-    Ok(consumed)
+    CompOutcome::ok(consumed)
 }
 
 /// Compress-and-write step over an explicit `input` slice — the body of C
@@ -302,7 +426,10 @@ fn gz_deflate_loop(
 /// Handles the transparent (`direct`) branch, the pending-reset branch, the
 /// compress loop, and the post-`Z_FINISH` reset arm. `input` must not alias any
 /// `state` field (see [`gz_deflate_loop`]).
-fn gz_comp_slice(state: &mut GzState, input: &[u8], flush: FlushMode) -> Result<usize, ZlibError> {
+///
+/// The ingested count is reported on both the success and the error paths (see
+/// [`CompOutcome`]).
+fn gz_comp_slice(state: &mut GzState, input: &[u8], flush: FlushMode) -> CompOutcome {
     // Write directly if requested (C L73-L96).
     if state.direct == 1 {
         return write_direct(state, input);
@@ -313,27 +440,36 @@ fn gz_comp_slice(state: &mut GzState, input: &[u8], flush: FlushMode) -> Result<
     // merely flushing.
     if state.reset {
         if input.is_empty() && flush == FlushMode::NoFlush {
-            return Ok(0);
+            return CompOutcome::ok(0);
+        }
+        // Any output the previous member left stalled must reach the file before
+        // the engine is reset for a new one, or the finished member would be
+        // truncated mid-trailer.
+        if let Err(e) = drain_pending(state) {
+            return CompOutcome::err(0, e);
         }
         if deflate::deflate_reset(&mut state.strm).is_err() {
             state.error(
                 ReturnCode::StreamError,
                 Some("internal error: deflate stream corrupt"),
             );
-            return Err(ZlibError::StreamError);
+            return CompOutcome::err(0, ZlibError::StreamError);
         }
         state.reset = false;
     }
 
     // Run deflate() until it produces no more output (C L110-L142).
-    let consumed = gz_deflate_loop(state, input, flush)?;
+    let outcome = gz_deflate_loop(state, input, flush);
+    if outcome.result.is_err() {
+        return outcome;
+    }
 
     // If that completed a deflate stream, allow another to start (C L144-L146).
     if flush == FlushMode::Finish {
         state.reset = true;
     }
 
-    Ok(consumed)
+    outcome
 }
 
 /// Compress whatever is buffered in `in_buf[0..have]` and write it to the file
@@ -343,9 +479,25 @@ fn gz_comp_slice(state: &mut GzState, input: &[u8], flush: FlushMode) -> Result<
 /// (in `open.rs`), and `gzclose_w` (in `close.rs`), so it is `pub(crate)`. It
 /// lazily allocates the buffers on first use, then delegates to
 /// [`gz_comp_slice`] over the buffered input. The buffered input is moved out
-/// with [`core::mem::take`] so the slice does not alias `state`; on success all
-/// of it is consumed, so [`GzState::have`](crate::gz::state::GzState) is reset
-/// to `0`.
+/// with [`core::mem::take`] so the slice does not alias `state`; whatever the
+/// engine ingested is then removed from the buffer.
+///
+/// # Buffer bookkeeping
+///
+/// [`GzState::have`](crate::gz::state::GzState) is reduced by the number of bytes
+/// the engine actually took, and any remainder is compacted back to
+/// `in_buf[0]`. On the ordinary success path everything is consumed and `have`
+/// becomes `0`; after a non-blocking stall the untouched tail survives so the
+/// retry submits it exactly once. Reference zlib gets this for free — its
+/// `strm->next_in`/`avail_in` keep pointing into `state->in` across the call — so
+/// this compaction is what reproduces C's behaviour with the cursor relocated
+/// onto the state. Leaving `have` unchanged instead would resubmit already
+/// ingested bytes on the retry and duplicate them in the compressed stream.
+///
+/// Compacting (rather than tracking a second offset) also preserves the
+/// `next_in == in` invariant that [`gz_vacate`] and the [`gz_write`] /
+/// [`gzputc`] / [`gzvprintf`] fast paths rely on: buffered input always begins at
+/// `in_buf[0]`.
 ///
 /// # Errors
 ///
@@ -363,15 +515,30 @@ pub(crate) fn gz_comp(state: &mut GzState, flush: FlushMode) -> Result<(), ZlibE
     // cheap empty `Vec` behind, which is swapped back immediately afterwards.
     let buf = core::mem::take(&mut state.in_buf);
     let have = state.have;
-    let result = gz_comp_slice(state, &buf[..have], flush);
+    let outcome = gz_comp_slice(state, &buf[..have], flush);
     state.in_buf = buf;
 
-    // On success every buffered byte was consumed by the engine.
-    if result.is_ok() {
-        state.have = 0;
+    // Drop exactly the bytes the engine ingested, sliding any remainder to the
+    // front so buffered input still starts at `in_buf[0]`.
+    //
+    // The clamp is against the *current* `have`, not the `have` snapshot taken
+    // above, because a fatal (non-retryable) failure inside `gz_comp_slice`
+    // already zeroed it through
+    // [`GzState::error`](crate::gz::state::GzState::error) to mark that there is
+    // nothing left to give back. Reading the live value keeps that decision
+    // intact — computing `have - consumed` from the stale snapshot would
+    // resurrect buffered input on a stream that has just been declared dead.
+    // Where `have` was preserved (success, or a non-blocking stall, where
+    // `again` suppresses the zeroing) the live value equals the snapshot, so the
+    // arithmetic is unchanged.
+    let consumed = core::cmp::min(outcome.consumed, state.have);
+    if consumed > 0 {
+        let end = state.have;
+        state.in_buf.copy_within(consumed..end, 0);
+        state.have = end - consumed;
     }
 
-    result.map(|_| ())
+    outcome.result
 }
 
 /// Compress [`GzState::skip`](crate::gz::state::GzState) zero bytes to the
@@ -481,21 +648,29 @@ pub(crate) fn gz_write(state: &mut GzState, buf: &[u8]) -> usize {
         // Directly compress the user buffer to the file (C L233-L247). The
         // caller's slice is external, so feeding it to the engine involves no
         // extra copy and no aliasing with `state`.
+        //
+        // The ingested count is credited **before** the outcome is inspected,
+        // exactly as C does (`n -= strm->avail_in; state->x.pos += n; len -= n;`
+        // and only then `if (ret == -1) return state->again ? put - len : 0;`,
+        // C L239-L246). Crediting it only on the success arm would under-report a
+        // stalled write, and a caller retrying from the returned offset would
+        // hand the engine bytes it had already compressed — silently duplicating
+        // them in the output stream.
         let mut off = 0usize;
         while off < buf.len() {
             let n = core::cmp::min(u32::MAX as usize, buf.len() - off);
-            match gz_comp_slice(state, &buf[off..off + n], FlushMode::NoFlush) {
-                Ok(consumed) => {
-                    state.pos += consumed as i64;
-                    off += consumed;
-                    if consumed < n {
-                        // A short consume can only mean a non-blocking stall.
-                        return if state.again { off } else { 0 };
-                    }
-                }
-                Err(_) => {
-                    return if state.again { off } else { 0 };
-                }
+            let outcome = gz_comp_slice(state, &buf[off..off + n], FlushMode::NoFlush);
+            state.pos += outcome.consumed as i64;
+            off += outcome.consumed;
+            if outcome.result.is_err() {
+                // Report partial progress only on a non-blocking stall
+                // (C `return state->again ? put - len : 0`).
+                return if state.again { off } else { 0 };
+            }
+            if outcome.consumed < n {
+                // A short consume without an error can only mean a non-blocking
+                // stall that the engine absorbed without failing.
+                return if state.again { off } else { 0 };
             }
         }
     }
@@ -932,6 +1107,7 @@ mod tests {
             level,
             strategy,
             reset: false,
+            out_pending: 0,
             skip: 0,
             err: ReturnCode::Ok,
             msg: None,
@@ -955,6 +1131,195 @@ mod tests {
         let bytes = std::fs::read(path).expect("read compressed output");
         let _ = std::fs::remove_file(path);
         bytes
+    }
+
+    /// Replaces a state's destination with a handle every `write` will reject,
+    /// simulating a destination that stops accepting bytes part-way through a
+    /// drain.
+    ///
+    /// The handle is a **read-only** `File`, so `write(2)` fails with `EBADF`.
+    /// That surfaces as an [`io::Error`] whose kind is neither
+    /// [`io::ErrorKind::Interrupted`] nor [`io::ErrorKind::WouldBlock`], i.e. the
+    /// generic failure arm of [`drain_pending`] / [`write_direct`] — reachable
+    /// with no `unsafe`, no extra dependency, and no platform-specific flags
+    /// (this module is `#![deny(unsafe_code)]`).
+    fn wedge_destination(state: &mut GzState, path: &Path) {
+        File::create(path).expect("create temp file");
+        let ro = File::open(path).expect("reopen read-only");
+        state.file = GzFile::new(ro);
+    }
+
+    /// A deterministic, mildly compressible payload of `n` bytes.
+    fn corpus(n: usize) -> Vec<u8> {
+        let mut s: u32 = 0x1234_5678;
+        (0..n)
+            .map(|i| {
+                s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                // Mix runs with pseudo-random bytes so `deflate` produces real
+                // output rather than one tiny stored block.
+                if i % 7 == 0 { b'A' } else { (s >> 16) as u8 }
+            })
+            .collect()
+    }
+
+    /// QA finding A/F-2, defect 1: output the destination declined must stay
+    /// pending, and a later successful drain must deliver it — losing nothing.
+    ///
+    /// Before the fix, a drain that stopped early returned an error while
+    /// abandoning `out_buf[off..produced]`; the next `deflate` call overwrote
+    /// those bytes, so the destination received a spliced, undecodable DEFLATE
+    /// stream. The check is end-to-end: after the destination recovers, the
+    /// bytes it received must gunzip to exactly the prefix of the input that the
+    /// stream position claims was accepted.
+    #[test]
+    fn output_the_destination_declined_is_retained_and_resumes_without_loss() {
+        let wedged = temp_path("afdefect1_wedged");
+        let good = temp_path("afdefect1_good");
+        let data = corpus(4096);
+
+        // `want = 64` keeps `size` small, so the engine fills the output scratch
+        // area (and therefore has pending output) almost immediately.
+        let mut state = new_write_state(&wedged, 64, 6, 0, 0);
+        wedge_destination(&mut state, &wedged);
+
+        // `data.len() >= size`, so this takes the direct-to-engine large path.
+        let n = gz_write(&mut state, &data);
+        assert_eq!(n, 0, "a non-retryable write failure reports zero written");
+        assert_eq!(state.err, ReturnCode::ErrNo, "the failure is recorded");
+        assert!(!state.again, "EBADF is not a retryable stall");
+        assert!(
+            state.out_pending > 0,
+            "compressed bytes the destination declined must remain pending, \
+             not be silently dropped"
+        );
+
+        // How much input the engine ingested, per the position counter.
+        let accepted = state.pos as usize;
+        assert!(
+            accepted > 0,
+            "the engine ingested input before the destination failed"
+        );
+
+        // The destination becomes writable again; finish the member.
+        state.file = GzFile::new(File::create(&good).expect("create good temp file"));
+        state.clear_error();
+        gz_comp(&mut state, FlushMode::Finish).expect("the resumed flush succeeds");
+        assert_eq!(state.out_pending, 0, "everything pending was delivered");
+
+        let bytes = read_and_remove(&good);
+        let _ = std::fs::remove_file(&wedged);
+        let recovered = gunzip(&bytes);
+        assert_eq!(
+            recovered.len(),
+            accepted,
+            "the delivered stream decodes to exactly the accepted byte count"
+        );
+        assert_eq!(
+            recovered.as_slice(),
+            &data[..accepted],
+            "no compressed byte was lost, duplicated, or reordered"
+        );
+    }
+
+    /// QA finding A/F-2, defect 2: a failed compress-and-write step must still
+    /// report how much input it ingested.
+    ///
+    /// Before the fix the count was discarded with the error, so the stream
+    /// position did not advance at all and a caller retrying from the reported
+    /// offset resubmitted bytes `deflate` had already compressed — duplicating
+    /// them in the output.
+    #[test]
+    fn a_failed_write_still_accounts_for_the_ingested_input() {
+        let wedged = temp_path("afdefect2");
+        let data = corpus(8192);
+
+        let mut state = new_write_state(&wedged, 64, 6, 0, 0);
+        wedge_destination(&mut state, &wedged);
+
+        let n = gz_write(&mut state, &data);
+        assert_eq!(n, 0, "a non-retryable failure reports zero written");
+        assert!(
+            state.pos > 0,
+            "the ingested count must survive the error (C: `n -= strm->avail_in`)"
+        );
+        assert!(
+            (state.pos as usize) <= data.len(),
+            "the accounted count can never exceed the input"
+        );
+        let _ = std::fs::remove_file(&wedged);
+    }
+
+    /// The transparent (`direct`) path must likewise account for the bytes that
+    /// reached the destination before it failed, and must report the failure
+    /// rather than abandoning the tail silently.
+    #[test]
+    fn transparent_writes_report_failure_and_account_for_progress() {
+        let wedged = temp_path("afdefect2_direct");
+        let data = corpus(2048);
+
+        let mut state = new_write_state(&wedged, 64, 6, 0, 1);
+        wedge_destination(&mut state, &wedged);
+
+        let outcome = write_direct(&mut state, &data);
+        assert!(
+            outcome.result.is_err(),
+            "the failure is reported, not hidden"
+        );
+        assert_eq!(state.err, ReturnCode::ErrNo);
+        assert_eq!(
+            outcome.consumed, 0,
+            "nothing reached a destination that rejects every write"
+        );
+        let _ = std::fs::remove_file(&wedged);
+    }
+
+    /// A fatal (non-retryable) failure marks the file as having nothing left to
+    /// give back, and the input-buffer bookkeeping must not undo that.
+    ///
+    /// [`GzState::error`](crate::gz::state::GzState::error) zeroes `have` for a
+    /// fatal error; [`gz_comp`]'s compaction therefore clamps against the live
+    /// value rather than the snapshot it took before the call, so buffered input
+    /// is never resurrected on a stream that has just been declared dead.
+    #[test]
+    fn a_fatal_write_error_does_not_resurrect_buffered_input() {
+        let wedged = temp_path("afdefect2_haveclamp");
+
+        let mut state = new_write_state(&wedged, 128, 6, 0, 0);
+        gz_init(&mut state).expect("gz_init");
+        wedge_destination(&mut state, &wedged);
+
+        // Stage buffered input the way the `gz_write` small path does.
+        let data = corpus(100);
+        state.in_buf[..data.len()].copy_from_slice(&data);
+        state.have = data.len();
+
+        assert!(gz_comp(&mut state, FlushMode::NoFlush).is_err());
+        assert!(!state.again);
+        assert_eq!(
+            state.have, 0,
+            "a fatal error leaves no buffered input to hand back"
+        );
+        let _ = std::fs::remove_file(&wedged);
+    }
+
+    /// Buffered input is fully consumed on the ordinary success path, and the
+    /// pending-output window is left empty.
+    #[test]
+    fn a_successful_comp_consumes_all_buffered_input() {
+        let path = temp_path("afdefect2_success");
+
+        let mut state = new_write_state(&path, 256, 6, 0, 0);
+        gz_init(&mut state).expect("gz_init");
+        let data = corpus(200);
+        state.in_buf[..data.len()].copy_from_slice(&data);
+        state.have = data.len();
+
+        gz_comp(&mut state, FlushMode::Finish).expect("flush succeeds");
+        assert_eq!(state.have, 0, "every buffered byte was ingested");
+        assert_eq!(state.out_pending, 0, "every produced byte was delivered");
+
+        let bytes = read_and_remove(&path);
+        assert_eq!(gunzip(&bytes).as_slice(), data.as_slice());
     }
 
     #[test]

@@ -2847,6 +2847,156 @@ mod tests {
         assert_eq!(&out[..second.produced], MSG);
     }
 
+    /// The gzip rows of the `adler` matrix below, or an empty vector when the
+    /// `gzip` feature is off.
+    ///
+    /// `(windowBits, stream, checksum the decode epilogue must publish)`:
+    /// gzip framing is seeded with `crc32(0, NULL, 0) == 0` and publishes the
+    /// CRC-32, while automatic detection resolves to `wrap = 7`, so `wrap & 1`
+    /// seeds `1` even when the member turns out to be gzip.
+    fn gzip_adler_cases() -> alloc::vec::Vec<(i32, &'static [u8], Option<u32>)> {
+        #[cfg(feature = "gzip")]
+        {
+            alloc::vec![
+                (31, GZIP_STREAM, Some(crc32(0, MSG))),
+                (47, GZIP_STREAM, Some(crc32(0, MSG))),
+                (47, ZLIB_STREAM, Some(adler32(1, MSG))),
+            ]
+        }
+        #[cfg(not(feature = "gzip"))]
+        {
+            alloc::vec::Vec::new()
+        }
+    }
+
+    /// The observable `z_stream.adler` value must match reference zlib at every
+    /// point in a decoder's lifetime, for **every** wrapper — including raw
+    /// framing, where C never assigns the field at all.
+    ///
+    /// C's contract, reproduced here in full:
+    ///
+    /// * The caller arrives with a `memset`-zeroed `z_stream`, so `adler` is `0`
+    ///   before `inflateInit2`. [`ZStream::new`] therefore seeds `0`, not `1`.
+    /// * `inflateResetKeep` publishes the wrapper's initial checksum, but only
+    ///   under `if (state->wrap)` (`inflate.c` L108-L109): `1` for zlib and
+    ///   automatic detection (`wrap & 1 == 1`), `0` for gzip (`wrap == 6`), and
+    ///   **nothing** for raw (`wrap == 0`), which leaves the caller's zero in
+    ///   place forever.
+    /// * The decode epilogue publishes the running check under
+    ///   `if ((state->wrap & 4) && out)` (`inflate.c` L1144-L1146), and raw
+    ///   framing has bit 2 clear as well, so a raw decode never touches it
+    ///   either.
+    ///
+    /// Regression guard: seeding the constructor with `1` made the safe API
+    /// report `1` for raw streams where both [`crate::ffi`] and reference zlib
+    /// report `0` — a silent divergence in an observable public field (AAP S5),
+    /// invisible to every round-trip test because the decoded bytes are correct.
+    #[test]
+    fn adler_mirror_matches_c_for_every_wrapper() {
+        // A stream with no engine installed reports the zeroed C default.
+        assert_eq!(
+            ZStream::new().adler,
+            0,
+            "a fresh stream must match a memset-zeroed C z_stream"
+        );
+
+        // (windowBits, stream, checksum the epilogue must publish once decoded)
+        // `None` means "the field is never written, so it stays at 0".
+        let mut cases: alloc::vec::Vec<(i32, &[u8], Option<u32>)> = alloc::vec![
+            // Raw: no checksum exists, and C assigns nothing on any path.
+            (-15, RAW_STREAM, None),
+            // A smaller raw window still decodes this stream (all distances are
+            // well under 512 bytes) and must behave identically.
+            (-9, RAW_STREAM, None),
+            // zlib: seeded with adler32(0, NULL, 0) == 1, published as the
+            // Adler-32 of the output.
+            (15, ZLIB_STREAM, Some(adler32(1, MSG))),
+        ];
+        // The gzip rows live in a helper so this extension is unconditional —
+        // it yields an empty vector without the `gzip` feature. Pushing them
+        // inside a `#[cfg]` block instead would leave `cases` provably unmutated
+        // on a `--no-default-features` build and trip `unused_mut`.
+        cases.extend(gzip_adler_cases());
+
+        for (window_bits, stream, decoded_check) in cases {
+            // `wrap` is `(windowBits >> 4) + 5` for non-negative windowBits and
+            // `0` for raw, so the seed is exactly `wrap & 1`.
+            let seed = if window_bits < 0 {
+                0
+            } else {
+                ((window_bits >> 4) + 5) as u32 & 1
+            };
+
+            let mut strm = ZStream::new();
+            assert_eq!(inflate_init2(&mut strm, window_bits), Ok(ReturnCode::Ok));
+            assert_eq!(
+                strm.adler, seed,
+                "windowBits {window_bits}: adler after init must be `wrap & 1`"
+            );
+
+            let mut out = alloc::vec![0u8; 256];
+            let outcome = inflate(&mut strm, stream, &mut out, Z_NO_FLUSH);
+            assert_eq!(
+                outcome.code,
+                ReturnCode::StreamEnd,
+                "windowBits {window_bits}: expected Z_STREAM_END"
+            );
+            assert_eq!(&out[..outcome.produced], MSG);
+            assert_eq!(
+                strm.adler,
+                decoded_check.unwrap_or(0),
+                "windowBits {window_bits}: adler after a full decode"
+            );
+
+            // Both resets restore the seed (or, for raw, leave the zero alone).
+            assert_eq!(inflate_reset(&mut strm), Ok(ReturnCode::Ok));
+            assert_eq!(
+                strm.adler, seed,
+                "windowBits {window_bits}: adler after inflate_reset"
+            );
+            assert_eq!(inflate_reset_keep(&mut strm), Ok(ReturnCode::Ok));
+            assert_eq!(
+                strm.adler, seed,
+                "windowBits {window_bits}: adler after inflate_reset_keep"
+            );
+            assert_eq!(inflate_end(&mut strm), Ok(ReturnCode::Ok));
+        }
+    }
+
+    /// A raw decode that errors out, or produces no output at all, must still
+    /// leave `adler` at the caller's zero — the paths where an unguarded
+    /// epilogue write would have leaked an internal `state.check` value.
+    #[test]
+    fn raw_framing_never_publishes_a_check_value() {
+        // Truncated input: the decoder consumes bytes and returns Z_OK without
+        // reaching the end of the block.
+        let mut strm = ZStream::new();
+        assert_eq!(inflate_init2(&mut strm, -15), Ok(ReturnCode::Ok));
+        let mut out = alloc::vec![0u8; 256];
+        let partial = inflate(&mut strm, &RAW_STREAM[..4], &mut out, Z_NO_FLUSH);
+        assert_eq!(partial.code, ReturnCode::Ok, "a truncated raw block stalls");
+        assert_eq!(strm.adler, 0, "a partial raw decode publishes nothing");
+        assert_eq!(inflate_end(&mut strm), Ok(ReturnCode::Ok));
+
+        // A zero-length output buffer produces nothing at all.
+        let mut strm = ZStream::new();
+        assert_eq!(inflate_init2(&mut strm, -15), Ok(ReturnCode::Ok));
+        let mut none: [u8; 0] = [];
+        let _ = inflate(&mut strm, RAW_STREAM, &mut none, Z_NO_FLUSH);
+        assert_eq!(strm.adler, 0, "no output means no check to publish");
+        assert_eq!(inflate_end(&mut strm), Ok(ReturnCode::Ok));
+
+        // Corrupt input: the error path must not leak a partial check either.
+        let mut corrupt = RAW_STREAM.to_vec();
+        corrupt[2] ^= 0xFF;
+        let mut strm = ZStream::new();
+        assert_eq!(inflate_init2(&mut strm, -15), Ok(ReturnCode::Ok));
+        let mut out = alloc::vec![0u8; 256];
+        let _ = inflate(&mut strm, &corrupt, &mut out, Z_NO_FLUSH);
+        assert_eq!(strm.adler, 0, "a failed raw decode publishes nothing");
+        assert_eq!(inflate_end(&mut strm), Ok(ReturnCode::Ok));
+    }
+
     #[test]
     fn mark_is_sentinel_without_state() {
         let strm = ZStream::new();

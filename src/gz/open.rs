@@ -271,8 +271,13 @@ fn gz_reset(state: &mut GzState) {
         state.how = How::Look;
         state.junk = -1;
     } else {
-        // For writing: no `deflateReset` is pending.
+        // For writing: no `deflateReset` is pending, and no compressed output is
+        // waiting to be handed to the OS. C re-seeds the equivalent output cursor
+        // in `gz_init` (`state->x.next = strm->next_out`, `gzwrite.c` L49-L55);
+        // clearing it here keeps the front-anchored `out_buf[0..out_pending]`
+        // window empty for a stream that is starting over.
         state.reset = false;
+        state.out_pending = 0;
     }
 
     // Shared: no non-blocking retry pending, no seek request pending, no error,
@@ -413,6 +418,7 @@ fn gz_open(path: &Path, file: Option<File>, mode: &str) -> Result<Box<GzState>, 
         level: parsed.level,
         strategy: parsed.strategy,
         reset: false,
+        out_pending: 0,
         // shared
         skip: 0,
         err: ReturnCode::Ok,
@@ -585,16 +591,22 @@ pub fn gzbuffer(state: &mut GzState, mut size: u32) -> i32 {
 ///   substituted for the caller's value.
 /// * **After the engine is live** (`size != 0`) the change is applied
 ///   immediately, so an invalid `strategy` is refused here with
-///   [`ReturnCode::StreamError`] rather than deferred.
+///   [`ReturnCode::StreamError`] rather than deferred. Note that C reaches
+///   `Z_OK` on this path even for an out-of-range `strategy`, because it calls
+///   `deflateParams` for its side effect and discards the return value; refusing
+///   the call keeps a value the engine cannot honour from being recorded, and
+///   keeps `gzsetparams` from reporting success for a request it did not apply.
 ///
 /// # Behavioural note (vs. C)
 ///
 /// The reference C `gzsetparams` lets `deflateParams`' internal `Z_BLOCK` flush
 /// emit into the persistent output buffer, to be written by the *next*
-/// `gz_comp`. This port's `gz_comp` fully drains
-/// its output on every call and keeps no persistent output cursor, so — when the
-/// buffers are live — this function performs the block flush itself (via
-/// `gz_comp(Z_BLOCK)`) and drains it to the file *before* calling
+/// `gz_comp`. This port's `gz_comp` instead hands each `deflate` call's output to
+/// the file immediately, retaining across calls only what the destination
+/// declined to accept
+/// ([`GzState::out_pending`](crate::gz::state::GzState)). So — when the buffers
+/// are live — this function performs the block flush itself (via
+/// `gz_comp(Z_BLOCK)`) and delivers it to the file *before* calling
 /// [`deflate_params`](crate::deflate::deflate_params). The stream is then on a
 /// block boundary with nothing pending, so `deflate_params` emits no bytes and
 /// the observable output is byte-identical to C.
@@ -1104,6 +1116,7 @@ mod tests {
             level: Z_DEFAULT_COMPRESSION,
             strategy: Z_DEFAULT_STRATEGY,
             reset: false,
+            out_pending: 0,
             skip: 0,
             err: ReturnCode::Ok,
             msg: None,

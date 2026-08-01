@@ -342,6 +342,48 @@ pub struct GzState {
     /// so the next write reinitialises the deflate stream for a new member.
     pub(crate) reset: bool,
 
+    /// Number of *compressed* bytes already produced by `deflate` but not yet
+    /// handed to the operating system, held at the **front** of
+    /// [`out_buf`](Self::out_buf): the pending window is exactly
+    /// `out_buf[0..out_pending]`.
+    ///
+    /// # Why this field exists
+    ///
+    /// Reference zlib tracks the same thing with the pointer pair
+    /// `state->x.next` (first unwritten byte) and `strm->next_out` (one past the
+    /// last produced byte): `gz_init` seeds `state->x.next = strm->next_out`, and
+    /// `gz_comp`'s drain loop `while (strm->next_out > state->x.next)` advances
+    /// `state->x.next += writ` after every successful `write(2)`
+    /// (`gzwrite.c` L114-L124). Because the cursor lives on the state, a write
+    /// that stops early — a short write, or `EAGAIN`/`EWOULDBLOCK` on a
+    /// non-blocking descriptor — leaves the unwritten remainder addressable, and
+    /// the next `gz*` call resumes exactly where it stopped.
+    ///
+    /// This crate's idiomatic [`ZStream`] deliberately carries no
+    /// `next_out`/`avail_out` fields (output is handed to the engine as a slice
+    /// on every call and progress is reported back explicitly), so the write
+    /// driver must remember the unwritten remainder itself — the output-side
+    /// counterpart of [`in_next`](Self::in_next)/[`in_avail`](Self::in_avail) on
+    /// the read side. Without it a stalled drain would abandon the bytes it had
+    /// not yet written, the following `deflate` call would overwrite them, and
+    /// the file would receive a spliced, undecodable DEFLATE stream.
+    ///
+    /// # Why a single count rather than a cursor pair
+    ///
+    /// The pending window is kept **front-anchored**: a partial write compacts
+    /// the remainder down to `out_buf[0]` (see `write.rs`'s `drain_pending`).
+    /// That keeps one field instead of two and keeps this window independent of
+    /// the read path's [`next`](Self::next)/[`have`](Self::have) pair, at the
+    /// cost of a `copy_within` that is a no-op whenever the write completed in
+    /// full — the overwhelmingly common case, including every write to a regular
+    /// blocking file. Compaction moves bytes between buffer slots only; the byte
+    /// sequence delivered to the file is unchanged, so gzip output stays
+    /// byte-identical to reference zlib.
+    ///
+    /// `deflate` is never invoked while this is non-zero, so the engine always
+    /// receives the whole `out_buf[..size]` scratch area.
+    pub(crate) out_pending: usize,
+
     // -- shared --------------------------------------------------------------
     /// The pending seek amount, in bytes (C `z_off64_t skip`): data to skip on
     /// the next read, or zeros to write on the next write. Already rewound if
@@ -548,6 +590,7 @@ mod tests {
             level: 0,
             strategy: 0,
             reset: false,
+            out_pending: 0,
             skip: 0,
             err: ReturnCode::Ok,
             msg: None,
@@ -1034,6 +1077,7 @@ mod tests {
             level: 6,
             strategy: 0,
             reset: false,
+            out_pending: 0,
             skip: 0,
             err: ReturnCode::Ok,
             msg: None,

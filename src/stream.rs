@@ -1366,6 +1366,30 @@ pub struct ZStream<A: Allocator = DefaultAllocator> {
     ///
     /// Kept as [`u32`] because both checksums are 32-bit; the C field is
     /// `uLong` only because zlib predates fixed-width integer types.
+    ///
+    /// # Initial value
+    ///
+    /// A freshly constructed stream reports `0`, matching the `memset`-zeroed
+    /// (or statically zero-initialised) `z_stream` that every C caller hands to
+    /// `inflateInit`/`deflateInit`. Installing or resetting an *inflate* engine
+    /// then publishes the wrapper's initial checksum — but, exactly as in C,
+    /// **only when the stream is wrapped**:
+    ///
+    /// * zlib framing and automatic detection (`windowBits` `8..=15` and `+32`)
+    ///   publish `1`, the Adler-32 of the empty input.
+    /// * gzip framing (`windowBits` `+16`) publishes `0`, a fresh CRC-32
+    ///   accumulator.
+    /// * raw framing (`windowBits` `-8..=-15`) publishes *nothing*, so the field
+    ///   stays at its constructed `0`. A raw DEFLATE stream carries no checksum,
+    ///   and `inflate.c` L108-L109 guards the assignment with
+    ///   `if (state->wrap)`; that guard is reproduced verbatim by
+    ///   [`inflate_reset_keep`](crate::inflate::inflate_reset_keep), so this
+    ///   port and reference zlib agree on the observed value.
+    ///
+    /// Deflate is unconditional in both C (`deflateResetKeep` always assigns)
+    /// and this port, and its seed is `1` for raw as well as zlib framing
+    /// because `adler32(0, Z_NULL, 0) == 1`. Only the decoder therefore exhibits
+    /// the wrapper-dependent behaviour above.
     pub adler: u32,
 
     /// Last error message, or [`None`] when there is no error (C
@@ -1395,24 +1419,23 @@ pub struct ZStream<A: Allocator = DefaultAllocator> {
     pub(crate) alloc: A,
 }
 
-/// The Adler-32 checksum of the empty input (`adler32(0, Z_NULL, 0) == 1`).
-///
-/// This is the value reference zlib seeds `z_stream.adler` with for the default
-/// (zlib-wrapper) framing. A freshly constructed [`ZStream`] adopts this seed;
-/// installing or resetting an engine then overwrites [`adler`](ZStream::adler)
-/// with the wrapper-appropriate value — this same `1` for Adler-32 / zlib, or
-/// `0` for CRC-32 / gzip.
-const ADLER32_INIT: u32 = 1;
-
 impl ZStream<DefaultAllocator> {
     /// Creates a new stream backed by the [`DefaultAllocator`] (the Rust global
     /// allocator), with no engine installed.
     ///
-    /// All counters start at `0`, [`data_type`](ZStream::data_type) at
-    /// `Z_BINARY`, [`adler`](ZStream::adler) at the Adler-32 seed
-    /// (`ADLER32_INIT`), and [`msg`](ZStream::msg) at [`None`]. This is the
-    /// idiomatic counterpart to a zeroed C `z_stream` prior to
-    /// `deflateInit`/`inflateInit`.
+    /// Every observable field starts at its zero value: both counters at `0`,
+    /// [`data_type`](ZStream::data_type) at `Z_BINARY` (`0`),
+    /// [`adler`](ZStream::adler) at `0`, the internal `reserved` word at `0`,
+    /// and [`msg`](ZStream::msg) at [`None`]. That makes this the exact
+    /// idiomatic counterpart to the `memset`-zeroed C `z_stream` a caller hands
+    /// to `deflateInit`/`inflateInit`, so a stream observed through this API and
+    /// the same stream observed through [`crate::ffi`] report identical values
+    /// at every point in its lifetime.
+    ///
+    /// The checksum seed is deliberately `0` rather than `1`: the wrapper's
+    /// initial checksum is published by the engine, and for raw framing C
+    /// publishes nothing at all. See [`adler`](ZStream::adler) for the full
+    /// per-wrapper contract.
     #[must_use]
     pub fn new() -> Self {
         Self::with_allocator(DefaultAllocator)
@@ -1442,7 +1465,13 @@ impl<A: Allocator> ZStream<A> {
             // `z_stream`; the engine refines it to `Z_BINARY`/`Z_TEXT`
             // (deflate) or the decode state (inflate) as it runs.
             data_type: DataType::Binary.as_c_int(),
-            adler: ADLER32_INIT,
+            // `0`, not the Adler-32 of the empty input: a C caller reaches
+            // `inflateInit`/`deflateInit` with a `memset`-zeroed `z_stream`, and
+            // the engine — not the constructor — publishes the wrapper's
+            // initial checksum. Seeding `1` here would be observable for raw
+            // framing, where C's `if (state->wrap)` guard (`inflate.c`
+            // L108-L109) leaves the field untouched forever. See the field docs.
+            adler: 0,
             msg: None,
             reserved: 0,
             state: StreamState::None,
@@ -1634,9 +1663,10 @@ impl<A: Allocator> ZStream<A> {
     /// [`data_type`](Self::data_type), or [`adler`](Self::adler).
     ///
     /// This is the shared portion of `deflateReset`/`inflateReset`: the engine
-    /// resets its own internal fields (and sets `adler`/`data_type` to their
-    /// wrapper-appropriate values), while these stream-level fields are cleared
-    /// here.
+    /// resets its own internal fields and publishes `data_type` plus — for
+    /// deflate always, and for inflate only when the stream is wrapped — the
+    /// wrapper's initial `adler`, while these stream-level fields are cleared
+    /// here. See [`adler`](Self::adler) for why raw inflate publishes nothing.
     // Reserved internal API: consumed by this module's unit tests and intended
     // as the shared stream-level portion of deflateReset/inflateReset. Retained
     // even in build configurations that wire up no production caller, so the
@@ -1681,8 +1711,10 @@ mod tests {
         assert_eq!(strm.total_out, 0);
         // `Z_BINARY` == 0, the zeroed default.
         assert_eq!(strm.data_type, 0);
-        // Adler-32 of the empty input.
-        assert_eq!(strm.adler, 1);
+        // `0`, matching a `memset`-zeroed C `z_stream`; the engine — not the
+        // constructor — publishes the wrapper's initial checksum, and for raw
+        // framing it publishes nothing at all.
+        assert_eq!(strm.adler, 0);
         assert_eq!(strm.msg, None);
         assert_eq!(strm.reserved, 0);
         // No engine yet, and neither direction reports a live state.
@@ -1698,7 +1730,7 @@ mod tests {
         let strm = ZStream::default();
         assert_eq!(strm.total_in, 0);
         assert_eq!(strm.total_out, 0);
-        assert_eq!(strm.adler, 1);
+        assert_eq!(strm.adler, 0);
         assert!(!strm.has_state());
     }
 

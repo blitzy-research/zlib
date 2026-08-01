@@ -1126,6 +1126,7 @@ mod tests {
             level: 0,
             strategy: 0,
             reset: false,
+            out_pending: 0,
             skip: 0,
             err: ReturnCode::Ok,
             msg: None,
