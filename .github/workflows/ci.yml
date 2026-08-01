@@ -19,11 +19,97 @@
 #   benches       compile-only check of the criterion benchmarks
 #   unsafe-boundary  blocking guard that `unsafe` stays inside src/ffi/** and the
 #                 src/lib.rs no_std runtime block (User Constraint 3)
+#   build-script-tests  build.rs compiled as its own test binary, plus the
+#                 generated-table reproducibility and big-endian checks
+#   c-abi-linkage  the emitted cdylib/staticlib linked, dynamically linked and
+#                 dlopen'd by a C consumer on every std-off feature row
+#   cross-targets  cross TYPE-CHECK ONLY (nothing is executed) on the aarch64,
+#                 32-bit i686 and big-endian s390x Linux triples (gap D3)
+#   bare-metal-no-std  library build for thumbv7em-none-eabihf: the only
+#                 configuration in which `mod no_std_support` compiles (gap D10)
+#   package-verify  `cargo package --list` checked against Cargo.toml's
+#                 `exclude` contract, plus the packaging build (gap D12)
 #
 # Action versions are standardized on @v4 across this repository's Cargo CI.
 # No native toolchain is required: the `flate2` dev-dependency resolves to its
 # pure-Rust miniz_oxide backend, so the interop tests compile without any
 # native library dependency.
+#
+# PLATFORM COVERAGE - WHAT EACH NON-UBUNTU ROW ACTUALLY BUYS
+# ==========================================================
+# Until the rows below were added, every job in this file ran on
+# `ubuntu-latest` / x86_64 / little-endian, so the crate's portability claims
+# rested on code that had never been compiled. These are the platform-divergent
+# sites, each read out of the tree at the line cited, and each is why exactly
+# one row exists:
+#
+#   * `src/ffi/gz.rs` `gzopen_w` - `#[cfg(windows)] #[unsafe(no_mangle)] pub
+#     unsafe extern "C" fn gzopen_w(*const u16, *const c_char) -> gzFile`. The
+#     ONLY platform-gated, ABI-visible exported symbol in the crate, mirroring
+#     C's `#if defined(_WIN32) && !defined(Z_SOLO)` in `zlib.h`. The
+#     `windows-latest` row is the only place it is ever compiled, and keeping
+#     the public surface whole is what the migration's public-interface
+#     preservation directive requires.
+#   * `src/ffi/gz.rs` and `src/gz/**` `#[cfg(not(unix))]` arms - five of them,
+#     one an ABI-visible `gzdopen` that deliberately fails on non-unix and pairs
+#     with the `#[cfg(unix)]` definition of the same symbol. No pre-existing job
+#     compiled any of them.
+#   * `src/gz/open.rs` `O_NONBLOCK` - `#[cfg(unix)] const O_NONBLOCK: i32 = if
+#     cfg!(any(target_os = "linux", target_os = "android")) { 0o4000 } else
+#     { 0o0004 };`. Written as a `cfg!()` EXPRESSION, so both arms type-check on
+#     every unix target, but only a BSD-family host selects `0o0004`. That makes
+#     `macos-latest` value coverage, not merely compile coverage, and it needs
+#     the default feature set because the constant lives behind `gz-io`.
+#   * `src/util/mod.rs` `OS_CODE` - a `cfg_if!` cascade selecting 10 on Windows,
+#     19 on Apple and 3 elsewhere, guarded by a const-evaluated cross-check in
+#     the same module. `src/deflate/mod.rs` imports it and writes it into the
+#     RFC 1952 header, so this is live behaviour on those two runners, not dead
+#     code. See the KNOWN EXPECTED FAILURE note below.
+#   * `src/lib.rs` `MIN_ALIGN` - 16 on 64-bit, 8 on 32-bit, inside
+#     `mod no_std_support`. The 8 arm needs a 32-bit target AND the full no_std
+#     predicate, so the `bare-metal-no-std` job is the only place it compiles.
+#   * `src/checksum/crc32.rs` - selects between the little- and big-endian
+#     generated CRC tables with `cfg!(target_endian = "little")` and consumes
+#     `CRC_BIG_TABLE` / `CRC_BRAID_BIG_TABLE` in the big-endian arm. The
+#     `build-script-tests` job already checks `--lib --profile test` on s390x;
+#     `cross-targets` extends the same triple to `--all-targets`.
+#
+# NATIVE vs CROSS - two different mechanisms, deliberately not conflated:
+#
+#   * A NATIVE row (`windows-latest`, `macos-latest`) needs only its `os:`
+#     value. It builds for the runner's own triple and RUNS the test suite.
+#   * A CROSS row installs the triple through the `targets:` input of
+#     `dtolnay/rust-toolchain` - never `rustup target add`, and never
+#     `rust-toolchain.toml`, which deliberately omits a `targets` key so a
+#     contributor's first build cannot be broken by a target their platform
+#     cannot install. `cargo check` does not link, so no cross linker, emulator
+#     or apt step is required; in exchange a cross row TYPE-CHECKS ONLY and its
+#     name says so. A check row is worth having, but it is not test coverage and
+#     is never labelled as if it were.
+#
+# KNOWN EXPECTED FAILURE ON THE WINDOWS AND macOS ROWS - READ BEFORE "FIXING"
+# ---------------------------------------------------------------------------
+# `tests/interop.rs`'s `BI_VECTORS_GZIP` bakes 75 reference gzip members whose
+# `OS` field (byte 9) is literally `03`, and its consumer compares them with a
+# bare `assert_eq!`, gated only on `feature = "gzip"`. Because `OS_CODE` is 10
+# on Windows and 19 on Apple, that one assertion fails on those two runners.
+# The LIBRARY IS CORRECT: byte-identity is defined against the reference C
+# library built for the SAME target, and C's `zutil.h` selects 10 and 19 there
+# too, so emitting them is parity rather than a regression. The table is a
+# fixture that hard-codes a Unix host, and `tests/interop.rs` says so itself,
+# naming the cross-platform matrix as the thing that would surface it. The fix
+# belongs in that file - normalise byte 9 the way its own `normalise_gzip_os`
+# helper already does for the platform-neutral gzip tables - and it is NOT in
+# this workflow's scope. These rows are therefore deliberately NOT feature-
+# scoped, `if:`-guarded or filtered around the failure: a platform-specific
+# failure is a finding to surface, and papering over it would delete the only
+# signal that the fixture needs fixing. Nothing here claims these rows pass.
+#
+# Also surfaced by the Windows rows and left to their owners: `src/gz/mod.rs`
+# and `src/gz/open.rs` emit three dead-code warnings on the Windows targets
+# (`validate_mode` and `state::GzFile` are unreachable there). They are
+# warnings, not errors, so they do not turn a row red; no job in this file
+# promotes warnings to errors outside `lint`, which is ubuntu-only.
 #
 # TOOLCHAIN SELECTION - EVERY JOB SAYS WHICH COMPILER IT MEANS, TWICE
 # ==================================================================
@@ -92,6 +178,21 @@ jobs:
     # on 1.85.0 regardless of the label above.
     env:
       RUSTUP_TOOLCHAIN: stable
+    # REQUIRED once this matrix stopped being Linux-only. GitHub's default shell
+    # for a `run:` step is `bash` on Linux and macOS but `pwsh` on Windows, and
+    # the toolchain-verification step below is a bash script - `set -euo
+    # pipefail`, `case`/`esac`, `$(...)`. Under `pwsh` it would fail on its first
+    # line, on a row whose whole purpose is to compile `gzopen_w`, and the
+    # failure would look like a platform defect instead of a shell mismatch.
+    # Pinning one shell for the job keeps every row running the SAME script.
+    # `bash` is available on the Windows runners (the Git for Windows build) and
+    # is already the default on the other two, so no step's text changes. The one
+    # nuance: an explicit `shell: bash` adds `-o pipefail`, which is inert for
+    # every step here (each is a single command, and the verification step sets
+    # `pipefail` itself) and strictly safer for any step added later.
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -123,6 +224,51 @@ jobs:
             os: ubuntu-latest
             features: '--no-default-features'
             test: false
+          # ---------------------------------------------------------------
+          # Platform rows (gap D3). These are ADDITIVE to the feature rows
+          # above, not a replacement for them: `runs-on: ${{ matrix.os }}`
+          # already carried the platform axis, so every row above keeps its
+          # exact feature set and only the host changes here. Both rows are
+          # NATIVE - a GitHub-hosted runner building for its own triple - so
+          # they need nothing beyond `os:` and they run the real suite.
+          #
+          # DEFAULT features, deliberately, for two independent reasons.
+          # First, `--all-features` turns on the opt-in `c-oracle` feature,
+          # whose harness shells out to a gcc-flavoured recipe
+          # (`-D_LARGEFILE64_SOURCE=1 -DHAVE_UNISTD_H`, then `ar rcs`); on a
+          # runner that ships MSVC or Apple clang a compiler IS found and the
+          # recipe is the wrong dialect. Second, the platform-divergent code
+          # these rows exist to reach - `gzopen_w`, the `cfg(not(unix))` arms,
+          # `O_NONBLOCK`'s BSD value - all sits behind `gz-io`, which the
+          # default set enables.
+          #
+          # Every row `name:` in this matrix must stay UNIQUE: the failure-only
+          # upload step below names its artifact `${{ matrix.name }} (ci)`, and
+          # `actions/upload-artifact@v4` rejects a duplicate artifact name
+          # within a run. With `fail-fast: false` above, several rows can and do
+          # fail at once, so a collision would mask the real failure with a 409.
+          #
+          # See "KNOWN EXPECTED FAILURE ON THE WINDOWS AND macOS ROWS" in the
+          # header: one `tests/interop.rs` assertion bakes a Unix `OS_CODE` and
+          # fails here by design. It is not scoped around, and these rows are
+          # not claimed to be green.
+          # ---------------------------------------------------------------
+          # Windows/MSVC. The only runner that compiles `gzopen_w` - the sole
+          # platform-gated exported C symbol - and the five `cfg(not(unix))`
+          # arms, one of which is an ABI-visible `gzdopen` with different
+          # behaviour from its unix twin.
+          - name: Windows x86_64 (native, default features)
+            os: windows-latest
+            features: ''
+            test: true
+          # macOS on Apple silicon: `macos-latest` is aarch64, so this single
+          # row is both the macOS and the native aarch64 coverage, and unlike a
+          # cross row it EXECUTES. It is also the only place `O_NONBLOCK` takes
+          # its `0o0004` BSD value and the only place `OS_CODE` is 19.
+          - name: macOS aarch64 (native, default features)
+            os: macos-latest
+            features: ''
+            test: true
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -382,8 +528,8 @@ jobs:
     - name: Compile benchmarks (no run)
       run: cargo +stable bench --no-run
 
-  # Build-script tests — a BLOCKING gate for the generated CRC table contract
-  # and the optional cdylib version-script wiring (AAP §0.3.1 / gap D8).
+  # Build-script tests - a BLOCKING gate for the generated CRC table contract
+  # and the optional cdylib version-script wiring (AAP section 0.3.1 / gap D8).
   #
   # `cargo test` never compiles `build.rs`, so without this job the generator has
   # no test coverage at all and producer/consumer drift can pass every other gate
@@ -467,15 +613,15 @@ jobs:
         fi
         echo "generated tables reproducible: sha256 $first"
 
-  # `unsafe`-containment boundary — a BLOCKING gate for User Constraint 3
-  # ("zero unsafe blocks in core compression logic") and AAP §0.6.2 / §0.7.2
+  # `unsafe`-containment boundary - a BLOCKING gate for User Constraint 3
+  # ("zero unsafe blocks in core compression logic") and AAP section 0.6.2 / section 0.7.2
   # standard S2.
   #
   # Two independent layers, deliberately not merged:
   #
   #   1. The in-crate boundary tests. They re-derive the boundary from the source
-  #      text — blanking comments and literals, classifying every `unsafe` token,
-  #      and treating a bare `unsafe extern "C" fn(..)` *type* as declarative —
+  #      text - blanking comments and literals, classifying every `unsafe` token,
+  #      and treating a bare `unsafe extern "C" fn(..)` *type* as declarative -
   #      then assert that executable `unsafe` appears only under `src/ffi/**` and
   #      inside `mod no_std_support`, and that exactly two narrowly scoped
   #      `#[allow(unsafe_code)]` carve-outs exist. `#![deny(unsafe_code)]` alone
@@ -577,14 +723,14 @@ jobs:
   # and `alloc` rlibs carry `.data.DW.ref.rust_eh_personality` LSDA references that
   # `std` normally satisfies, so with `--no-default-features` the artifacts built
   # clean and then failed at `ld` time with `undefined reference to
-  # rust_eh_personality` — for a static link, for a dynamic link, and for
+  # rust_eh_personality` - for a static link, for a dynamic link, and for
   # `dlopen(RTLD_NOW)` alike. `src/lib.rs`'s freestanding runtime block now supplies
   # the symbol; this job is what keeps it supplied.
   #
   # The three link forms are all tested because they fail independently: a static
   # link resolves against the archive's member objects, a dynamic link against the
   # shared object's dynamic symbol table, and `dlopen(RTLD_NOW)` resolves eagerly at
-  # load time — which is the only one of the three that a lazily-bound program would
+  # load time - which is the only one of the three that a lazily-bound program would
   # not reveal until first call.
   #
   # The personality symbol is asserted on two independent axes, because the two
@@ -592,8 +738,8 @@ jobs:
   #
   #   * EXACTLY ONE DEFINITION must exist in the artifact, on every row. Both
   #     failure directions are caught by `ld` before this job's assertion is even
-  #     reached: zero definitions is the `undefined reference` above, and two — the
-  #     `cfg` gate widened so a `std` build also compiles the freestanding block —
+  #     reached: zero definitions is the `undefined reference` above, and two - the
+  #     `cfg` gate widened so a `std` build also compiles the freestanding block -
   #     is a duplicate-symbol error. Pinning the count to `1` uniformly is what
   #     keeps that guarantee observable, and it is strictly stronger than the
   #     per-row dynamic-table count this job used to compare: because a `std` build
@@ -604,7 +750,7 @@ jobs:
   #     definition default ELF visibility, so a std-off `cdylib` published it as
   #     `FUNC GLOBAL DEFAULT` and measured 96 dynamic `T` symbols where the `std`
   #     build measures 95. That both widened the drop-in `libz` ABI with a symbol
-  #     no `libz` has and exposed an *aborting* routine to ELF interposition — in a
+  #     no `libz` has and exposed an *aborting* routine to ELF interposition - in a
   #     global symbol scope it can win the process-wide lookup for another Rust
   #     shared object's personality references. `src/lib.rs` therefore emits a
   #     `.hidden` directive beside the definition; the reference it exists to
@@ -699,7 +845,7 @@ jobs:
         so=target/release/libzlib_rs.so
         # A version script is a sequence of `NAME { ... } [parent];` nodes. Inside a
         # node the default visibility is `global`, and `global:`/`local:` switch
-        # scope for THAT NODE ONLY — a parser that lets `local:` persist across node
+        # scope for THAT NODE ONLY - a parser that lets `local:` persist across node
         # boundaries mis-sorts most of the file. `_*` is a pattern, not a name.
         python3 - "$so" <<'PY'
         import re, subprocess, sys, pathlib
@@ -719,7 +865,7 @@ jobs:
                         (g if mode == "g" else l).add(tok)
         assert (len(nodes), len(g), len(l)) == (16, 54, 10), \
             f"zlib.map parsed as {len(nodes)} nodes / {len(g)} global / {len(l)} local, " \
-            "expected 16 / 54 / 10 — the version script changed or the parser drifted"
+            "expected 16 / 54 / 10 - the version script changed or the parser drifted"
         out = subprocess.run(["nm", "-D", "--defined-only", so],
                              capture_output=True, text=True, check=True).stdout
         T = {p[2] for p in (line.split() for line in out.splitlines())
@@ -734,7 +880,7 @@ jobs:
         # and anything inside it that needs `std` is gated in the function body.
         if len(T) != 95:
             print(f"::error::expected 95 dynamic T symbols, found {len(T)}. The exported "
-                  "surface must not vary with a Cargo feature — that is an ABI break.")
+                  "surface must not vary with a Cargo feature - that is an ABI break.")
             failed = True
         if missing:
             print(f"::error::zlib.map global: symbols absent from the artifact: {missing}")
@@ -806,3 +952,429 @@ jobs:
         echo "--- dlopen(RTLD_NOW) ---"
         gcc -O2 loader.c -o loader -ldl
         ./loader "$PWD/target/release/libzlib_rs.so"
+
+  # Cross-target type-check (gap D3, the half that cannot be run natively).
+  #
+  # SCOPE, STATED PLAINLY: this job COMPILES the crate and its whole test/bench
+  # surface for three foreign triples and executes NOTHING. `cargo check` does
+  # not link, which is exactly why no cross linker, no emulator and no apt step
+  # is needed - and equally why the result must never be described as those
+  # platforms being "tested". What it does catch is the class of defect a
+  # single-triple pipeline structurally cannot see: pointer-width and integer
+  # assumptions on a 32-bit target, and the big-endian arms of code whose
+  # little-endian twin is the only one a x86_64 runner ever compiles.
+  #
+  # Each triple earns its row, as follows.
+  #
+  #   * aarch64-unknown-linux-gnu - the aarch64 ELF/glibc flavour. `macos-latest`
+  #     covers aarch64 natively and runs the suite, but on Mach-O with Apple's
+  #     `target_vendor`, so it does not stand in for this one.
+  #   * i686-unknown-linux-gnu - 32-bit `usize`/pointer width across the library,
+  #     the integration suite and the benches. `bare-metal-no-std` is also
+  #     32-bit but builds only the library with no default features, so it
+  #     type-checks none of the test surface.
+  #   * s390x-unknown-linux-gnu - big-endian. `build-script-tests` already checks
+  #     `--lib --profile test` here; this row widens the same triple to
+  #     `--all-targets` so the integration tests and benches are compiled
+  #     big-endian too. NOTE for whoever maintains the target lists: s390x is
+  #     absent from BOTH `.cargo/config.toml`'s five `[target.<triple>]` tables
+  #     and `deny.toml`'s `[graph] targets`, so those two files and this matrix
+  #     are not currently aligned on it. Neither file is edited from here; the
+  #     divergence is recorded so it is a decision rather than an accident.
+  #
+  # `--all-targets` on a foreign triple is intentional and is the whole point,
+  # because the library alone would leave `tests/**` and `benches/**` unchecked.
+  #
+  # A NOTE ON THE 2-SPACE COMMENT LINES IN THIS FILE. `src/lib.rs` locates a job
+  # block by scanning for the next line that is indented exactly two spaces and
+  # ends in a colon, so a comment shaped like `  # something:` reads as a job key
+  # and truncates the preceding job's block early. The comments added with these
+  # three jobs deliberately avoid ending a 2-space line with a colon.
+  cross-targets:
+    name: Cross type-check (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    # Rank-2 override: beats the rank-4 `rust-toolchain.toml` repository pin,
+    # which would otherwise force this job onto the MSRV floor. It matters more
+    # here than anywhere else in this file, because the target below is installed
+    # for the toolchain the action selects: if an unqualified `cargo` fell back
+    # to 1.85.0, the requested triple would not be installed for it and the
+    # check would fail for a reason that has nothing to do with the target.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    strategy:
+      # One triple's failure must not hide the other two.
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-gnu
+          - target: i686-unknown-linux-gnu
+          - target: s390x-unknown-linux-gnu
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    # The cross target is installed through this action's `targets:` input. That
+    # is the single sanctioned mechanism: `rust-toolchain.toml` deliberately
+    # carries no `targets` key (it would force every contributor to download a
+    # target before their first build), and a hand-rolled `rustup target add`
+    # step would drift from the toolchain the action actually selected.
+    - name: Install Rust stable toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+    # `rust-toolchain.toml` pins this repository to the MSRV floor, and that
+    # repository pin OUTRANKS the `rustup default` that the toolchain action
+    # above sets. The job-level `RUSTUP_TOOLCHAIN` env var is a higher-priority
+    # override, so it is what actually selects current stable here. This step fails the
+    # job if that override is ever lost, rather than letting the gate silently
+    # run on the wrong compiler.
+    - name: Verify the resolved toolchain is stable
+      run: |
+        set -euo pipefail
+        rustc --version --verbose
+        active="$(rustup show active-toolchain)"
+        echo "active toolchain: $active"
+        case "$active" in
+          stable-*) ;;
+          *) echo "::error::expected the stable toolchain, but resolved '$active'."\
+             " The RUSTUP_TOOLCHAIN override was lost and rust-toolchain.toml won."; exit 1 ;;
+        esac
+    # Report the properties this row exists to exercise, so the log says what was
+    # covered instead of leaving it to be inferred from the triple's name.
+    - name: Report the target's compilation properties
+      run: |
+        set -euo pipefail
+        rustc +stable --print cfg --target '${{ matrix.target }}' \
+          | grep -E 'target_(arch|endian|pointer_width|env|os|vendor)='
+        rustup target list --installed --toolchain stable
+    - name: Cross type-check the library, tests and benches
+      run: cargo +stable check --locked --all-targets --verbose --target '${{ matrix.target }}'
+
+  # Bare-metal no_std library build (gap D10).
+  #
+  # WHY A HOSTED `cargo test --no-default-features` CANNOT CLOSE THIS GAP.
+  # `src/lib.rs` applies `#![no_std]` and declares its freestanding runtime block
+  # under one predicate, spelled identically in both places, namely
+  #
+  #     all(not(feature = "std"), not(test), panic = "abort")
+  #
+  # The `not(test)` term is decisive. `cargo test --no-default-features` sets
+  # `test`, and Cargo additionally forces `panic = "unwind"` for the libtest
+  # harness regardless of the profile setting, so under `cargo test` the
+  # predicate fails on TWO of its three terms and `mod no_std_support` is never
+  # compiled at all. No number of passing hosted tests can reach the libc
+  # `GlobalAlloc`, the `posix_memalign` over-aligned path, the `#[panic_handler]`
+  # or the 32-bit `MIN_ALIGN = 8` arm. `cargo build --target <bare-metal-triple>
+  # --no-default-features` is the only invocation that compiles them: on that
+  # target `not(feature = "std")` holds, `not(test)` holds, and `panic = "abort"`
+  # comes from `[profile.dev]` in `Cargo.toml`.
+  #
+  # `thumbv7em-none-eabihf` is the triple the migration plan names, and
+  # `rustc --print cfg` for it reports `target_os = "none"` and
+  # `target_pointer_width = "32"` - a genuine no-OS target that is also the only
+  # 32-bit configuration in which that `MIN_ALIGN` arm is reachable.
+  #
+  # FOUR THINGS THAT LOOK WRONG HERE AND ARE NOT. Do not "fix" any of them.
+  #
+  #   1. `warning: dropping unsupported crate type `cdylib` for target
+  #      `thumbv7em-none-eabihf`` is EXPECTED. `[lib] crate-type` lists
+  #      `cdylib`, which has no meaning on bare metal, so Cargo drops it and
+  #      keeps `lib` + `staticlib`. Do not suppress or filter the warning, do not
+  #      pass `--crate-type`, and do not edit `Cargo.toml`.
+  #   2. `malloc` / `calloc` / `realloc` / `free` / `posix_memalign` / `abort`
+  #      stay UNDEFINED in the emitted archive. A bare-metal target has no libc,
+  #      but a library build links no final binary, so unresolved references are
+  #      correct - and for four of the six their presence is the positive
+  #      evidence asserted below that the block compiled. No libc shim, no
+  #      `-nostartfiles`, no `-Z build-std`, no linker flags.
+  #   3. The panic strategy is NOT set from here. `panic = "abort"` must keep
+  #      coming from the `Cargo.toml` profiles, because it is the predicate's
+  #      third term: passing `-C panic=...` from CI would either break the
+  #      predicate or mask a genuine misconfiguration.
+  #   4. There is no `cargo test` step, and adding one would be actively wrong,
+  #      not merely impossible: setting `test` flips `not(test)` false and skips
+  #      the very code this job exists to compile.
+  #
+  # This job is ADDITIVE to the host `no-std-tests` job above, which stays a
+  # blocking gate on the hosted std-off test suites. Neither substitutes for the
+  # other: that one runs assertions, this one reaches code that one cannot.
+  bare-metal-no-std:
+    name: Bare-metal no_std (thumbv7em-none-eabihf)
+    runs-on: ubuntu-latest
+    # Rank-2 override: beats the rank-4 `rust-toolchain.toml` repository pin,
+    # which would otherwise force this job onto the MSRV floor - and, as in
+    # `cross-targets`, would look for a target that was installed for a
+    # different toolchain.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    # Installed through the action's `targets:` input, for the same reason as in
+    # `cross-targets`: `rust-toolchain.toml` deliberately has no `targets` key.
+    - name: Install Rust stable toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: thumbv7em-none-eabihf
+    # `rust-toolchain.toml` pins this repository to the MSRV floor, and that
+    # repository pin OUTRANKS the `rustup default` that the toolchain action
+    # above sets. The job-level `RUSTUP_TOOLCHAIN` env var is a higher-priority
+    # override, so it is what actually selects current stable here. This step fails the
+    # job if that override is ever lost, rather than letting the gate silently
+    # run on the wrong compiler.
+    - name: Verify the resolved toolchain is stable
+      run: |
+        set -euo pipefail
+        rustc --version --verbose
+        active="$(rustup show active-toolchain)"
+        echo "active toolchain: $active"
+        case "$active" in
+          stable-*) ;;
+          *) echo "::error::expected the stable toolchain, but resolved '$active'."\
+             " The RUSTUP_TOOLCHAIN override was lost and rust-toolchain.toml won."; exit 1 ;;
+        esac
+    # The gap is "never exercised on no-OS hardware", so the premise has to be
+    # checked rather than assumed: a triple that quietly acquired an OS or a
+    # 64-bit pointer width would still build and would silently stop covering
+    # what this job is here for.
+    - name: Verify the target is genuinely bare metal and 32-bit
+      run: |
+        set -euo pipefail
+        cfg="$(rustc +stable --print cfg --target thumbv7em-none-eabihf)"
+        echo "$cfg"
+        for want in 'target_os="none"' 'target_pointer_width="32"'; do
+          case "$cfg" in
+            *"$want"*) ;;
+            *) echo "::error::thumbv7em-none-eabihf no longer reports $want, so this"\
+               " job would stop covering the bare-metal / 32-bit MIN_ALIGN arms."; exit 1 ;;
+          esac
+        done
+    - name: Build the library for bare metal (no default features)
+      run: cargo +stable build --locked --verbose --target thumbv7em-none-eabihf --no-default-features
+    - name: Build the library for bare metal (no-std feature)
+      run: cargo +stable build --locked --verbose --target thumbv7em-none-eabihf --no-default-features --features no-std
+    # "It compiled" is weaker than this gap deserves: if the predicate ever
+    # stopped holding, both builds above would still succeed and would silently
+    # compile nothing of what D10 is about. The symbol assertions below are the
+    # difference between compiling the crate and compiling the freestanding
+    # runtime block, and each one was picked because it FAILS when run against a
+    # hosted build of this same crate - which is the only property that makes an
+    # assertion evidence rather than decoration.
+    - name: Assert the freestanding runtime block was actually compiled
+      run: |
+        set -euo pipefail
+        lib=target/thumbv7em-none-eabihf/debug/libzlib_rs.a
+        test -f "$lib" || { echo "::error::$lib was not emitted"; exit 1; }
+        status=0
+        # `nm -A` output is written to files rather than piped into `grep -q`:
+        # under `set -o pipefail` an early-exiting `grep -q` SIGPIPEs its
+        # producer, the pipeline then reports 141, and every symbol below would
+        # look absent whether it was there or not.
+        defined="$RUNNER_TEMP/bare-metal-defined.syms"
+        undefined="$RUNNER_TEMP/bare-metal-undefined.syms"
+        nm -A --defined-only "$lib" > "$defined"
+        nm -A --undefined-only "$lib" > "$undefined"
+        # EVERY assertion below was chosen because it FAILS on a hosted build of
+        # this same crate. A check that passes either way proves nothing, and the
+        # obvious candidates really do pass either way: std defines both
+        # `rust_eh_personality` and the panic handler, and `malloc`/`free` are
+        # referenced from a crate object even in a hosted build because
+        # `src/ffi/alloc.rs` declares them for the zcalloc/zcfree bridge. Those
+        # are excluded here for precisely that reason - hence the symbol choices
+        # and the object-file attribution, neither of which is decoration.
+        #
+        # (1) mod no_std_support compiled at all. Both the legacy and the v0
+        #     mangling embed the module path as plain text, so the substring test
+        #     is mangling-agnostic.
+        block="$(grep -c 'no_std_support' "$defined" || true)"
+        echo "symbols defined inside mod no_std_support: $block (want 1 or more)"
+        if [ "$block" -lt 1 ]; then
+          echo "::error::no symbol in $lib names mod no_std_support, so the"\
+               " freestanding allocator and panic handler were not compiled and"\
+               " this job covers nothing the host no-std job does not already."
+          status=1
+        fi
+        # (2) the libc entry points that block calls, attributed to a crate
+        #     object. All four are absent from a hosted build of this crate.
+        for sym in calloc realloc posix_memalign abort; do
+          hits="$(grep -E "[[:space:]]U[[:space:]]+${sym}\$" "$undefined" | grep -c ':zlib_rs' || true)"
+          echo "undefined reference to $sym from a zlib_rs object: $hits (want 1 or more)"
+          if [ "$hits" -lt 1 ]; then
+            echo "::error::no zlib_rs object in $lib references the libc entry"\
+                 " point '$sym', so mod no_std_support was not compiled."
+            status=1
+          fi
+        done
+        # (3) the two symbols that block exists to supply, attributed to a crate
+        #     object rather than to std: `rust_eh_personality` is the unwind
+        #     personality shim a freestanding artifact must provide, and
+        #     `rust_begin_unwind` is the panic handler that terminates through
+        #     abort(). The pattern matches a mangled prefix so it holds under
+        #     either mangling scheme.
+        for sym in rust_eh_personality rust_begin_unwind; do
+          owned="$(grep -E "[[:space:]][tT][[:space:]]+[^[:space:]]*${sym}\$" "$defined" | grep -c ':zlib_rs' || true)"
+          echo "$sym defined by a zlib_rs object: $owned (want 1 or more)"
+          if [ "$owned" -lt 1 ]; then
+            echo "::error::$sym is not defined by any zlib_rs object in $lib. In a"\
+                 " hosted build std supplies it; on bare metal the crate must, and"\
+                 " mod no_std_support is the only thing in this crate that does."
+            status=1
+          fi
+        done
+        if [ "$status" -eq 0 ]; then
+          echo "freestanding runtime block compiled: crate-supplied allocator, panic handler and personality shim all present"
+        fi
+        exit "$status"
+
+  # Packaging verification (gap D12).
+  #
+  # `exclude` in `Cargo.toml` is what keeps the retained C baseline - the
+  # cross-validation oracle and the source of the official test vectors - out of
+  # the published crate while leaving it present in the tree. Those two
+  # requirements only look contradictory: this job is a PACKAGING-time assertion
+  # about what a `.crate` contains, and it neither reads, moves nor rewrites a
+  # single C source. Nothing verified that list before this job existed, and
+  # `Cargo.toml` names `cargo package --list` as its own acceptance gate.
+  #
+  # THE ASSERTIONS ARE PATTERN-BASED, AND THAT IS NOT A SHORTCUT. A fixed file
+  # count, a golden manifest or a diff of the whole listing would all go red the
+  # next time a legitimate file is added to the crate or a newly discovered
+  # stray is excluded - which is to say, they would fail for the one reason that
+  # is not a defect. The absence checks below are monotonic: excluding MORE never
+  # breaks them, and only a regression - a C source, an upstream C document or a
+  # legacy platform directory reappearing in the package - turns this job red.
+  # The presence checks are the other half, because an `exclude` entry broad
+  # enough to swallow `src/` or `tests/` would otherwise look like success.
+  #
+  # `test/**` (the C drivers) is excluded while `tests/**` (the Rust integration
+  # suite) ships. That asymmetry is CORRECT and is asserted in both directions
+  # below; do not "tidy" it into one pattern.
+  #
+  # A PACKAGING CHECK IS NOT A PUBLISH. This job runs `--list` and the local
+  # verification build only. It holds no registry token, reads no secret, cuts no
+  # tag and creates no release, and it must stay that way. It also must not
+  # perturb the workspace: the final step asserts both lockfiles are still
+  # pristine, because a packaging step that quietly re-resolved dependencies
+  # would invalidate every other gate in this file.
+  package-verify:
+    name: Package verification
+    runs-on: ubuntu-latest
+    # Rank-2 override: beats the rank-4 `rust-toolchain.toml` repository pin,
+    # which would otherwise force this job onto the MSRV floor.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Install Rust stable toolchain
+      uses: dtolnay/rust-toolchain@stable
+    # `rust-toolchain.toml` pins this repository to the MSRV floor, and that
+    # repository pin OUTRANKS the `rustup default` that the toolchain action
+    # above sets. The job-level `RUSTUP_TOOLCHAIN` env var is a higher-priority
+    # override, so it is what actually selects current stable here. This step fails the
+    # job if that override is ever lost, rather than letting the gate silently
+    # run on the wrong compiler.
+    - name: Verify the resolved toolchain is stable
+      run: |
+        set -euo pipefail
+        rustc --version --verbose
+        cargo --version
+        active="$(rustup show active-toolchain)"
+        echo "active toolchain: $active"
+        case "$active" in
+          stable-*) ;;
+          *) echo "::error::expected the stable toolchain, but resolved '$active'."\
+             " The RUSTUP_TOOLCHAIN override was lost and rust-toolchain.toml won."; exit 1 ;;
+        esac
+    - name: Check the packaged file list against Cargo.toml's exclude contract
+      run: |
+        set -euo pipefail
+        list="$RUNNER_TEMP/package.list"
+        cargo +stable package --locked --list > "$list"
+        echo "--- cargo package --list ($(wc -l < "$list") entries) ---"
+        cat "$list"
+        status=0
+
+        # MUST NOT SHIP. Each entry is `<extended-regex>::<what it is>`. The
+        # separator is `::` and NOT `|`, because several patterns use regex
+        # alternation and would be split through the middle. Every pattern is
+        # anchored so a legitimate neighbour cannot be caught by accident:
+        # `README` is the upstream C readme and is matched exactly, which is why
+        # `README.md` (the crate's own `readme =` target, asserted present below)
+        # is unaffected, and `^test/` cannot match `tests/`. `cargo` injects
+        # `Cargo.toml.orig` and `.cargo_vcs_info.json` into every listing; both
+        # are expected and are matched by nothing here.
+        forbidden='
+        \.c$::retained C source
+        \.h$::retained C header
+        \.map$::linker version script
+        \.in$::autotools or CMake input template
+        \.cmakein$::CMake input template (NOT caught by *.in)
+        ^zlib\.3::upstream C man page or its PDF
+        ^ChangeLog$::upstream C change log
+        ^FAQ$::upstream C FAQ
+        ^INDEX$::upstream C index
+        ^README$::upstream C readme (distinct from README.md)
+        ^README-cmake\.md$::upstream CMake readme
+        ^\.cmake-format\.yaml$::CMake formatter config for the C build
+        crc-doc\.1\.0\.pdf$::CRC monograph (heavy binary)
+        ^doc/(algorithm|txtvsbin|rfc19(50|51|52))\.txt$::normative reference text
+        ^(contrib|examples|test)/::third-party bindings, C samples or C test drivers
+        ^(amiga|msdos|os400|qnx|watcom|win32)/::legacy platform build tree
+        ^(blitzy|blitzy-deck)/::migration engagement material
+        ^(CMakeLists\.txt|Makefile|configure|make_vms\.com|treebuild\.xml)$::C build descriptor
+        ^(BUILD\.bazel|MODULE\.bazel)$::Bazel build descriptor
+        '
+        while read -r entry; do
+          [ -n "$entry" ] || continue
+          pattern="${entry%%::*}"
+          description="${entry#*::}"
+          if hits="$(grep -E "$pattern" "$list")"; then
+            echo "::error file=Cargo.toml::packaged but must be excluded ($description):"\
+                 "$(printf '%s' "$hits" | tr '\n' ' ')"
+            status=1
+          fi
+        done <<< "$forbidden"
+
+        # MUST SHIP. Deliberately limited to what the crate cannot be published
+        # without, so that adding a new root file never requires editing this
+        # list. Directory entries are prefix-matched because the listing is
+        # per-file.
+        for required in '^src/' '^tests/' '^benches/' '^build\.rs$' '^Cargo\.toml$' \
+                        '^Cargo\.lock$' '^README\.md$' '^LICENSE$'; do
+          if ! grep -qE "$required" "$list"; then
+            echo "::error file=Cargo.toml::nothing matching '$required' is packaged."\
+                 " An exclude entry has become broad enough to remove part of the crate."
+            status=1
+          fi
+        done
+
+        if [ "$status" -eq 0 ]; then
+          echo "package contents match the exclude contract: no C baseline, no upstream C docs,"\
+               "no legacy platform trees, no engagement material; crate sources, tests, benches,"\
+               "build script, manifests, README.md and LICENSE all present"
+        fi
+        exit "$status"
+    # `--list` proves WHAT would ship; this proves the result is BUILDABLE from
+    # only those files. It is the check that catches an `exclude` entry which
+    # removed something the build actually reads - a failure mode the listing
+    # alone cannot see. Deliberately `cargo package` rather than
+    # `cargo publish --dry-run`: `package` performs the same archive-and-verify
+    # work while staying entirely off the publishing path, so the job cannot
+    # acquire a registry interaction, a token requirement or an upload by
+    # accident. Note it is run WITHOUT `--allow-dirty`, which makes it assert a
+    # second property for free: no earlier step left the tree modified.
+    - name: Verify the packaged crate builds from its own contents
+      run: cargo +stable package --locked --verbose
+    # A packaging step that re-resolved dependencies would invalidate every
+    # `--locked` gate in this file, and `fuzz/Cargo.lock` belongs to a detached
+    # workspace that nothing here should be touching at all.
+    - name: Assert both lockfiles are unchanged
+      run: |
+        set -euo pipefail
+        dirty="$(git status --porcelain Cargo.lock fuzz/Cargo.lock)"
+        if [ -n "$dirty" ]; then
+          echo "::error::packaging modified a lockfile, which would silently change what"\
+               " every other job resolves: $dirty"
+          exit 1
+        fi
+        echo "Cargo.lock and fuzz/Cargo.lock are unchanged"
