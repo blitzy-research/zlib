@@ -21,6 +21,13 @@
 //!   *second* operand must always be computed from the canonical identity seed,
 //!   because the C derivation folds that seed back out (`+ BASE - 1` for
 //!   Adler-32). Feeding a varied seed there would be wrong, not stronger.
+//!   The Adler-32 seed is additionally passed through [`adler_normalised`]
+//!   before an agreement property is asserted over it, because a raw 32-bit word
+//!   can encode a `sum1`/`sum2` pair that no sequence of updates can reach, and
+//!   over such a word reference C zlib's own spellings disagree with each other
+//!   too. That reduction is documented in full on [`adler_normalised`]; the raw
+//!   word retains dedicated coverage in [`assert_empty_update`], which exists to
+//!   pin the reduction itself.
 //! * **Known-answer anchors.** A handful of canonical vectors is re-asserted on
 //!   every iteration. They are the cheapest possible tripwire for a regression
 //!   in the build-time CRC table generation or in feature selection between the
@@ -114,7 +121,8 @@ const LONG_TAIL: usize = 16;
 // Helpers
 // ===========================================================================
 
-/// Reduces `seed` exactly the way an empty Adler-32 update does.
+/// Reduces `seed` exactly the way an empty Adler-32 update does, mapping an
+/// arbitrary 32-bit word onto the nearest **reachable** Adler-32 running value.
 ///
 /// Reference zlib routes a non-null zero-length update through its `len < 16`
 /// path, which reduces the low half with a single conditional subtraction and
@@ -122,6 +130,26 @@ const LONG_TAIL: usize = 16;
 /// back. A valid running value (both halves already below `BASE`) therefore
 /// survives untouched, while an arbitrary seed is normalised — `0xFFFF_FFFF`
 /// becomes `0x000E_000E`, and `0xFFF1_FFF1` collapses all the way to `0`.
+///
+/// # Why every varied-seed property must normalise first
+///
+/// An Adler-32 state is a *pair* of sums each kept strictly below `BASE`, packed
+/// as `(sum2 << 16) | sum1`. A fuzzer-chosen word need not respect that
+/// invariant: `0xFFFF_FFDE`, for instance, unpacks to `sum1 = 65502` and
+/// `sum2 = 65535`, and `sum2 >= BASE` is a state **no** sequence of updates can
+/// ever produce. Fed such a word, `adler32` reduces the out-of-range half at
+/// whichever point its accumulation loop happens to reach a modulo step, so the
+/// one-shot, incremental and `*_combine` spellings legitimately disagree —
+/// reference C zlib disagrees in exactly the same way and by exactly the same
+/// amount, which is what makes this a property of the *input*, not a defect in
+/// either implementation.
+///
+/// Normalising therefore does not weaken the varied-seed contract: it is still
+/// re-proved for an arbitrary *starting checksum*, which remains strictly
+/// stronger than the RFC identity-seed form, but it is now asserted over the set
+/// of seeds for which the algebra is actually defined. The *un*-normalised word
+/// keeps its own dedicated coverage in [`assert_empty_update`], which is
+/// deliberately handed the raw seed precisely so this reduction stays observable.
 fn adler_normalised(seed: u32) -> u32 {
     let low = seed & 0xFFFF;
     let high = (seed >> 16) & 0xFFFF;
@@ -209,6 +237,9 @@ fn assert_known_answers() {
 /// seed. The CRC-32 case additionally checks that the precomputed-operator form
 /// agrees with the length form.
 fn assert_three_way(adler_seed: u32, crc_seed: u32, whole: &[u8], split: usize) {
+    // Normalise the Adler-32 seed first: see `adler_normalised` for why an
+    // arbitrary 32-bit word is not a *reachable* Adler-32 running value.
+    let adler_seed = adler_normalised(adler_seed);
     let split = split.min(whole.len());
     let (a, b) = whole.split_at(split);
     let len_b = b.len();
@@ -259,6 +290,9 @@ fn assert_three_way(adler_seed: u32, crc_seed: u32, whole: &[u8], split: usize) 
 /// fed straight back in as a first operand, so any residual seed handling in the
 /// first fold corrupts the second.
 fn assert_chained_combine(adler_seed: u32, crc_seed: u32, whole: &[u8]) {
+    // Normalise the Adler-32 seed first: see `adler_normalised` for why an
+    // arbitrary 32-bit word is not a *reachable* Adler-32 running value.
+    let adler_seed = adler_normalised(adler_seed);
     let (first, rest) = whole.split_at(whole.len() / 3);
     let (second, third) = rest.split_at(rest.len() / 2);
     let len_second = second.len() as i64;
@@ -292,6 +326,9 @@ fn assert_chained_combine(adler_seed: u32, crc_seed: u32, whole: &[u8]) {
 /// symbols; in this slice-based API both collapse onto the same input type, so
 /// any divergence would mean the delegation was broken.
 fn assert_size_variants(adler_seed: u32, crc_seed: u32, buf: &[u8]) {
+    // Normalise the Adler-32 seed first: see `adler_normalised` for why an
+    // arbitrary 32-bit word is not a *reachable* Adler-32 running value.
+    let adler_seed = adler_normalised(adler_seed);
     assert_eq!(
         adler32_z(adler_seed, buf),
         adler32(adler_seed, buf),
@@ -349,6 +386,9 @@ fn assert_empty_update(adler_seed: u32, crc_seed: u32) {
 /// [`ADLER_INVALID`], while CRC-32 produces the rejected operator
 /// [`CRC_INVALID_OP`] and therefore a zero result.
 fn assert_negative_len2(adler1: u32, crc1: u32, len2: i64) {
+    // Normalise the first Adler-32 operand first: see `adler_normalised` for why
+    // an arbitrary 32-bit word is not a *reachable* Adler-32 running value.
+    let adler1 = adler_normalised(adler1);
     assert!(len2 < 0, "harness bug: {len2} is not a negative length");
 
     assert_eq!(
@@ -379,6 +419,9 @@ fn assert_negative_len2(adler1: u32, crc1: u32, len2: i64) {
 /// seed (Adler-32 to `1`, CRC-32 to `0`), not a bare zero — passing a raw `0` as
 /// the second Adler-32 checksum would be incorrect.
 fn assert_zero_len2_identity(adler_seed: u32, crc_seed: u32, buf: &[u8]) {
+    // Normalise the Adler-32 seed first: see `adler_normalised` for why an
+    // arbitrary 32-bit word is not a *reachable* Adler-32 running value.
+    let adler_seed = adler_normalised(adler_seed);
     assert_eq!(
         crc32_combine_gen(0),
         CRC_IDENTITY_OP,
@@ -447,6 +490,13 @@ fuzz_target!(|data: &[u8]| {
     };
     // Two independent seeds from one control word; byte-swapping keeps the two
     // families from being exercised with the same bit pattern every iteration.
+    //
+    // Both are threaded through as the RAW control word. Every helper that
+    // asserts an *algebraic agreement* normalises the Adler-32 half itself (see
+    // `adler_normalised`), so the raw word still reaches `assert_empty_update`,
+    // which is the one helper whose subject IS that reduction. The CRC-32 half
+    // needs no such treatment: every 32-bit value is a reachable CRC state and an
+    // empty CRC update returns its seed untouched.
     let adler_seed = control;
     let crc_seed = control.swap_bytes();
 

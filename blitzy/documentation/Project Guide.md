@@ -38,9 +38,9 @@ _Legend: ■ Completed = `#5B39F3` (dark blue) · □ Remaining = `#FFFFFF` (whi
 - [x] **Verified C-ABI drop-in** — `#[repr(C)]` `z_stream`/`gz_header` + `extern "C"` shims; static **and** dynamic linking pass 17/17 runtime checks; `zlibVersion()` returns `1.3.2.1-motley`.
 - [x] **Byte-exact behavior** — `crc32("123456789")=0xcbf43926`, `adler32=0x091e01de`, exact `compressBound` formula, `ENOUGH=1444` (AAP §0.6.6 correction applied).
 - [x] **Full feature parity** — 10 levels, 5 strategies, 7 flush modes, preset dictionaries, `inflateBack`, zlib/raw/gzip/auto-detect `windowBits`.
-- [x] **100% test pass, 0 ignored** — 487 tests default (399 unit + 68 integration + 20 doctests); 363 in `no-default-features`; suites ported from official C drivers.
-- [x] **Core-compression safety constraint honored** — `src/deflate/**` contains **zero** `unsafe`; `unsafe` confined to `ffi/**` (+ nominal inflate fast path) with `// SAFETY:` justifications.
-- [x] **All 3 AAP-flagged risks resolved** — `no_std` builds and links (previously 129 errors); 5 cargo-fuzz targets (~1.13M execs, 0 crashes); performance validated (~85% compression / 107–127% decompression vs C).
+- [x] **100% test pass, 0 ignored** — 808 tests default (658 unit + 124 integration + 26 doctests); 821 with `--all-features`; 606 in `no-default-features` and in `--features no-std`; suites ported from official C drivers.
+- [x] **Core-compression safety constraint honored** — `src/deflate/**`, `src/inflate/**`, `src/checksum/**`, `src/gz/**` and `src/util/**` each contain **zero** `unsafe` blocks; `unsafe` is confined to `ffi/**` (707 blocks) plus the private no-`std` runtime block in `lib.rs` and two type aliases in `stream.rs`, all carrying `// SAFETY:` justifications (382 in total).
+- [x] **All 3 AAP-flagged risks resolved** — `no_std` builds and links (previously 129 errors); 5 cargo-fuzz targets (783,167 execs, 0 crashes, in a uniform 60 s-per-target campaign matching `fuzz.yml`); performance validated (~85% compression / 107–127% decompression vs C).
 - [x] **Clean quality gates** — clippy `-D warnings` clean; `cargo fmt --check` clean; all 3 crate-types emit.
 
 ### 1.4 Critical Unresolved Issues
@@ -81,7 +81,7 @@ _Legend: ■ Completed = `#5B39F3` (dark blue) · □ Remaining = `#FFFFFF` (whi
 | Gzip file-I/O layer | 50 | 6 modules (mod/state/open/read/write/close) over `std::fs`/`std::io` |
 | One-call wrappers & version | 14 | `util`: `compress`/`compress2`/`compressBound`, `uncompress`/`uncompress2`, `zlibVersion`/`zlibCompileFlags`/`zError` |
 | C-ABI FFI drop-in boundary | 62 | 7 modules; `#[repr(C)]` `z_stream`/`gz_header` mirrors; `extern "C"` shims; full public symbol surface exported |
-| Test suite (ported C drivers) | 44 | 6 files: regression (example.c), inflate_coverage (infcover.c), gzip_compat (minigzip.c), round_trip, interop (flate2 byte-identity), checksum — 487 tests |
+| Test suite (ported C drivers) | 44 | 7 files: regression (example.c), inflate_coverage (infcover.c), gzip_compat (minigzip.c), round_trip, interop (two-tier byte-identity gate), checksum, c_oracle (opt-in live C sweep) — 808 tests default / 821 with `--all-features` |
 | Criterion benchmarks | 8 | deflate/inflate/checksum throughput harnesses |
 | cargo-fuzz targets | 9 | 5 targets (checksum, deflate_roundtrip, ffi_roundtrip, gzip, inflate) + harness/lockfile |
 | Executive summary presentation | 6 | Self-contained reveal.js deck (`blitzy-deck/executive-summary.html`) |
@@ -117,18 +117,18 @@ _All results below originate from Blitzy's autonomous validation logs and were i
 
 | Test Category | Framework | Total Tests | Passed | Failed | Coverage % | Notes |
 |---|---|---:|---:|---:|---|---|
-| Unit (library) | Rust `#[test]` | 399 | 399 | 0 | Parity-based* | Per-module tests across deflate/inflate/checksum/gz/util/ffi |
-| Integration | Rust (`tests/`) | 68 | 68 | 0 | Parity-based* | checksum 18 · gzip_compat 6 · inflate_coverage 7 · interop 14 · regression 11 · round_trip 12 |
-| Doctests | rustdoc | 20 | 20 | 0 | — | Executed API examples (6 promoted from `ignore` during validation) |
-| **Total (default)** | — | **487** | **487** | **0** | — | **0 ignored** |
+| Unit (library) | Rust `#[test]` | 658 | 658 | 0 | Parity-based* | Per-module tests across deflate/inflate/checksum/gz/util/ffi |
+| Integration | Rust (`tests/`) | 124 | 124 | 0 | Parity-based* | checksum 23 · gzip_compat 15 · inflate_coverage 28 · interop 27 · regression 12 · round_trip 19 (c_oracle 13 is `--features c-oracle` only) |
+| Doctests | rustdoc | 26 | 26 | 0 | — | Executed API examples (all promoted from `ignore` during validation) |
+| **Total (default)** | — | **808** | **808** | **0** | — | **0 ignored** |
 
 **Additional configurations & harnesses:**
 
 | Test Category | Framework | Total | Passed | Failed | Notes |
 |---|---|---:|---:|---:|---|
-| `--no-default-features` (no_std/Z_SOLO) | Rust | 363 | 363 | 0 | gz-io/gzip/simd tests correctly compiled out |
-| `--all-features` | Rust | 487 | 487 | 0 | Full feature surface |
-| Fuzzing (smoke) | cargo-fuzz / libFuzzer | 5 targets | 5 | 0 | ~1.13M executions, **0 crashes** (checksum 369k, inflate 303k, gzip 353k, deflate 56k, ffi 52k) |
+| `--no-default-features` (no_std/Z_SOLO) | Rust | 606 | 606 | 0 | gz-io/gzip/simd tests correctly compiled out; `--features no-std` yields the same 606 |
+| `--all-features` | Rust | 821 | 821 | 0 | Full feature surface (adds the 13 `c_oracle` tests) |
+| Fuzzing (smoke) | cargo-fuzz / libFuzzer | 5 targets | 5 | 0 | **783,167 executions, 0 crashes, 0 artifacts** in a uniform 60 s-per-target campaign matching `fuzz.yml` (gzip 334,655 · inflate 288,049 · deflate_roundtrip 100,684 · ffi_roundtrip 34,354 · checksum 25,425) |
 | Benchmarks | criterion | 3 | 3 | 0 | Compile + execute (crc32 ~19 GiB/s, adler32 ~3 GiB/s) |
 
 \* Coverage is validated by **behavioral parity** (byte-identical output vs reference C zlib / flate2 and ported official C test drivers) rather than a line-coverage percentage, which was not emitted by the autonomous test logs.
@@ -144,8 +144,8 @@ _zlib-rs is a headless systems library — there is no product UI. "UI verificat
 - ✅ **Operational — checksums**: `crc32("123456789")=0xcbf43926`, `adler32("123456789")=0x091e01de`.
 - ✅ **Operational — gzip framing**: `deflateInit2` (wbits=31) emits `1f 8b`; `inflateInit2` auto-detect works.
 - ✅ **Operational — FFI symbol surface**: `cdylib` exports the full public zlib API (95 matching symbols via `nm -D`; validator confirmed all 54 documented public entry points from `zlib.map`, zero internal symbols leaked).
-- ✅ **Operational — artifacts**: `libzlib_rs.rlib` (2.3M), `libzlib_rs.so` (594K), `libzlib_rs.a` (22M) all emit under `--release`.
-- ✅ **Operational — fuzz stability**: 5 targets, ~1.13M executions, 0 crashes.
+- ✅ **Operational — artifacts**: `libzlib_rs.rlib` (2.8M), `libzlib_rs.so` (600K), `libzlib_rs.a` (20M) all emit under `--release`.
+- ✅ **Operational — fuzz stability**: 5 targets, 783,167 executions, 0 crashes, 0 artifacts (uniform 60 s per target).
 - ✅ **Operational — executive deck**: self-contained reveal.js HTML renders independently.
 
 ---
@@ -165,7 +165,7 @@ _zlib-rs is a headless systems library — there is no product UI. "UI verificat
 | `unsafe` isolated + `// SAFETY:` documented | ✅ Pass | 100% | Confined to `ffi/**`; 267 `// SAFETY:` comments |
 | Test suite ported from official C drivers | ✅ Pass | 100% | example.c, infcover.c, minigzip.c |
 | Rust 2024 / MSRV 1.85.0 | ✅ Pass | 100% | Builds + `check --all-targets` on MSRV |
-| `no_std` via feature flag | ✅ Pass | 100% | AAP 129-error risk **RESOLVED**; builds & links, 363 tests pass |
+| `no_std` via feature flag | ✅ Pass | 100% | AAP 129-error risk **RESOLVED**; builds & links, 606 tests pass |
 | Zero C dependency in shipped artifact | ✅ Pass | 100% | `crc32fast`/`cfg-if` pure Rust; `flate2` dev-only via `miniz_oxide` |
 | clippy clean / `fmt` clean | ✅ Pass | 100% | `-D warnings` clean |
 | cargo-fuzz targets | ✅ Pass | 100% | AAP "no fuzz targets" risk **RESOLVED** (5 targets) |
@@ -184,8 +184,8 @@ _zlib-rs is a headless systems library — there is no product UI. "UI verificat
 | Worst-case incompressible-input compression below C throughput | Technical | Low | Medium | Tune `longest_match`/hash-chain hot path (≥80% goal already met on level sweep) | Open (tracked) |
 | Byte-identity not exhaustively swept across all levels × strategies vs C | Technical | Medium | Low | Expand interop conformance matrix (identity already asserted on tested cases) | Open |
 | `no_std` validated only in host harness, not real embedded hardware | Technical | Low | Low | Add embedded-target CI (thumbv7em, etc.) | Open |
-| `unsafe` at FFI boundary — UB if C caller passes invalid pointers | Security | Medium | Low | 267 `// SAFETY:` justifications, null/stateless guards tested, `fuzz_ffi` 52k execs 0 crashes | Mitigated (audit pending) |
-| Supply chain — ~105 transitive deps not formally audited | Security | Low | Low | Add `cargo audit`/`cargo deny` to CI | Open |
+| `unsafe` at FFI boundary — UB if C caller passes invalid pointers | Security | Medium | Low | 382 `// SAFETY:` justifications, null/stateless guards tested, `fuzz_ffi_roundtrip` 34,354 execs 0 crashes in a 60 s run — now also covering the full `deflateCopy`/`deflateReset`/`deflateResetKeep`/`inflateCopy`/`inflateReset`/`inflateReset2`/`inflateResetKeep` lifecycle and its misuse paths | Mitigated (audit pending) |
+| Supply chain — 102-package closure (89 root `Cargo.lock` + 13 `fuzz/Cargo.lock`) not formally audited | Security | Low | Low | Add `cargo audit`/`cargo deny` to CI | Open |
 | Allocator-hook path (caller `zalloc`/`zfree`) misuse | Security | Low | Low | Routed through hook; OOM path tested | Mitigated |
 | CI validates only Linux/x86_64 | Operational | Medium | Low | Cross-platform CI matrix | Open |
 | No crates.io release/publish pipeline | Operational | Low | Medium | Release governance + `cargo publish --dry-run` | Open |
@@ -223,7 +223,7 @@ pie showData title Remaining Work by Priority (53h)
 
 ## 8. Summary & Recommendations
 
-**Achievements.** The zlib→Rust migration is functionally complete and validated. Every AAP-specified deliverable — the full source rewrite, DEFLATE/inflate engines (including `inflateBack`), all framing modes, the C-ABI FFI drop-in, all levels/strategies/flush modes, checksums, the ported official test suite, benches, fuzz targets, and the executive deck — is implemented, compiles with zero warnings, and passes 100% of tests (487 default / 363 no-default, 0 ignored). The verified C drop-in (static + dynamic) with byte-exact checksums and `zlibVersion()=1.3.2.1-motley` demonstrates true API/ABI equivalence. All three AAP-flagged risks (`no_std`, fuzzing, performance) are resolved.
+**Achievements.** The zlib→Rust migration is functionally complete and validated. Every AAP-specified deliverable — the full source rewrite, DEFLATE/inflate engines (including `inflateBack`), all framing modes, the C-ABI FFI drop-in, all levels/strategies/flush modes, checksums, the ported official test suite, benches, fuzz targets, and the executive deck — is implemented, compiles with zero warnings, and passes 100% of tests (808 default / 821 all-features / 606 no-default, 0 ignored in every row). The verified C drop-in (static + dynamic) with byte-exact checksums and `zlibVersion()=1.3.2.1-motley` demonstrates true API/ABI equivalence. All three AAP-flagged risks (`no_std`, fuzzing, performance) are resolved.
 
 **Remaining gaps.** The outstanding **53h** is exclusively path-to-production hardening requiring human judgment: formal code review & sign-off, a security/supply-chain audit, cross-platform CI, crates.io release governance, a broader conformance sweep, embedded validation, scheduled fuzzing, perf tuning, and optional symbol-versioning. None block the build or core functionality.
 
@@ -274,9 +274,9 @@ Expected: `Finished ... release [optimized]` and three artifacts (~2.3M rlib, ~5
 ### 9.4 Test & Quality Gates
 
 ```bash
-cargo test                              # 487 pass (399 unit + 68 integration + 20 doctests), 0 ignored
-cargo test --no-default-features        # 363 pass (no_std / Z_SOLO)
-cargo test --all-features               # 487 pass
+cargo test                              # 808 pass (658 unit + 124 integration + 26 doctests), 0 ignored
+cargo test --no-default-features        # 606 pass (no_std / Z_SOLO)
+cargo test --all-features               # 821 pass (adds the 13 c_oracle tests)
 cargo clippy --all-targets -- -D warnings   # clean, exit 0
 cargo fmt --all -- --check                  # clean, exit 0
 cargo bench --no-run                        # compiles 3 criterion benches
@@ -355,8 +355,8 @@ cargo +nightly fuzz run fuzz_inflate -- -runs=100000
 | Command | Purpose |
 |---|---|
 | `cargo build --release` | Optimized build; emits rlib/cdylib/staticlib |
-| `cargo test` | Full default test suite (487) |
-| `cargo test --no-default-features` | no_std/Z_SOLO suite (363) |
+| `cargo test` | Full default test suite (808) |
+| `cargo test --no-default-features` | no_std/Z_SOLO suite (606) |
 | `cargo clippy --all-targets -- -D warnings` | Lint gate |
 | `cargo fmt --all -- --check` | Format gate |
 | `cargo bench --no-run` | Compile benches |

@@ -64,3 +64,21 @@ MODULE.bazel.lock
 /fuzz/corpus
 /fuzz/artifacts
 /fuzz/coverage
+# Reproducers libFuzzer writes when no -artifact_prefix is supplied. `cargo fuzz
+# run` always passes one (pointing into /fuzz/artifacts above), but a target
+# binary invoked DIRECTLY — the normal way to replay a single input, minimise a
+# corpus by hand, or bisect a finding — defaults to `artifact_prefix='./'` and
+# drops the file into whatever the current directory happens to be. Run one from
+# the repository root over a corpus holding a crashing unit and the reproducer
+# lands here as `./crash-<sha1>`, untracked and, without these five patterns,
+# NOT ignored: it then shows up in `git status` and is one `git add -A` away from
+# being committed. The names are libFuzzer's own fixed prefixes for its five
+# finding classes. Anchored with a leading `/` so they match only at the
+# repository root and cannot shadow a legitimately named file in a subdirectory.
+# `fuzz/seeds/**` — the committed, read-only gate-opening seed inputs — is
+# deliberately NOT ignored and is unaffected by these patterns.
+/crash-*
+/oom-*
+/timeout-*
+/leak-*
+/slow-unit-*

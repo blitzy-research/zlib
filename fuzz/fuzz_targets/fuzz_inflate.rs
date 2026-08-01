@@ -68,6 +68,64 @@
 //! make the harness itself the thing that fails, because that would exhaust the
 //! run's memory budget and waste the finding.
 //!
+//! # Committed seed corpus
+//!
+//! Eleven seeds live in `fuzz/seeds/fuzz_inflate/`, and they exist for one
+//! specific reason: the round-trip self-check is the only probe here that is
+//! SAMPLED rather than run on every execution, and its gate — bits `16..=19` of
+//! [`selector`] — is a pure function of the first eight input bytes. An input
+//! therefore either always opens the gate or never does. Gate coverage is thus a
+//! property of the corpus, not of luck, and a small authored corpus can miss it
+//! outright: with a one-in-sixteen hit rate per file, a set of two dozen
+//! hand-written streams has a real chance of containing none, in which case
+//! [`level_from`] and [`probe_round_trip`] measure 0.00 % over a `-runs=0`
+//! replay even though both are perfectly reachable.
+//!
+//! Each seed is named for the level it selects — one per accepted value,
+//! `Z_DEFAULT_COMPRESSION` and `0..=9` — and every one satisfies
+//! `(selector(seed) >> 16) & 0xF == 0`. A zero-mutation replay of the directory
+//! therefore enters the probe eleven times and sweeps all eleven levels, which
+//! is precisely what a coverage measurement over a seed corpus needs and what a
+//! blind campaign cannot promise on its first executions.
+//!
+//! They are not gate tokens with junk attached. Every seed is a real,
+//! decodable, single-member zlib stream emitted by a genuine DEFLATE encoder,
+//! and the set deliberately spans stored blocks, fixed-Huffman blocks, and
+//! dynamic-Huffman blocks with distance matches — so the same bytes are also
+//! productive for [`uncompress`], for all four framing sweeps, and for the
+//! byte-at-a-time drip, instead of failing at the first header check.
+//!
+//! To regenerate or extend the set: reimplement [`selector`] and [`level_from`]
+//! (an xorshift64 over at most the first eight bytes, finished with a multiply
+//! by `0x2545_F491_4F6C_DD1D`), then enumerate candidate encoder outputs and
+//! keep the first whose selector both opens the gate and yields the wanted
+//! level. Only those eight bytes matter, so the search converges in a few
+//! thousand candidates; the trailing bytes stay free for whatever content the
+//! other probes should see.
+//!
+//! `fuzz/seeds/` is a deliberately SEPARATE tree from cargo-fuzz's working
+//! corpus. `fuzz/corpus/<target>/` is writable, is rewritten by
+//! `cargo fuzz cmin`, and is gitignored precisely because libFuzzer fills it
+//! with generated units; committing files there would put tracked data in a
+//! directory that tooling is entitled to prune. `fuzz/seeds/` is read-only
+//! input that nothing writes back to, so it survives minimisation and
+//! `git clean` alike. Pass it explicitly — libFuzzer treats the FIRST corpus
+//! directory as the writable one and the rest as read-only inputs:
+//!
+//! ```text
+//! cargo +nightly fuzz run fuzz_inflate fuzz/corpus/fuzz_inflate fuzz/seeds/fuzz_inflate
+//! cargo +nightly fuzz coverage fuzz_inflate fuzz/seeds/fuzz_inflate
+//! ```
+//!
+//! A bounded campaign reaches the gate by mutation regardless, and that was
+//! measured rather than reasoned: a 45-second run from a completely EMPTY corpus
+//! executed 544,437 inputs and retained a 1,412-unit corpus of which 489 units
+//! (34.6 %, far above the 1-in-16 base rate, because gate-opening inputs reach
+//! extra coverage and are therefore kept) open the gate, spanning all eleven
+//! levels. So these seeds are about DETERMINISM at run zero and about honest
+//! coverage measurement — not about unblocking a path that would otherwise be
+//! dead.
+//!
 //! # C provenance
 //!
 //! The engine under test is the Rust port of `inflate.c`, `inftrees.c`,
@@ -918,6 +976,13 @@ fuzz_target!(|data: &[u8]| {
     // do, and at that rate the check still runs many thousands of times per
     // minute across every compression level. The gate is derived from the input,
     // so a finding still reproduces from the saved input alone.
+    //
+    // Because it is derived from the input — from the first eight bytes only —
+    // an input either always opens this gate or never does, which makes reaching
+    // it a property of the corpus rather than of the run length. That is why
+    // eleven gate-opening seeds, one per accepted level, are committed under
+    // `fuzz/seeds/fuzz_inflate/`; see "Committed seed corpus" in the module
+    // documentation for how they are built and how to pass them.
     if (sel >> 16) & 0xF == 0 {
         probe_round_trip(data, level_from(sel));
     }
