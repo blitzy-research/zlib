@@ -2855,3 +2855,138 @@ fn successful_zlib_decode_publishes_the_payload_adler32() {
     );
     assert_eq!(rc(inflate_end(&mut strm)), ReturnCode::Ok);
 }
+
+/// The gzip metadata parsed by `inflate` must be retrievable by an **external**
+/// safe-Rust consumer, using nothing but the public API.
+///
+/// This is the read-side counterpart of `deflate_set_header`. C's
+/// `inflateGetHeader` (`inflate.c` L1219-L1230) records a *borrowed*
+/// `gz_headerp`, so a C caller simply reads its own struct afterwards; this port
+/// takes ownership of the [`GzHeader`] instead, which is what removes the
+/// dangling-pointer hazard (AAP §0.6.3) but also means a retrieval route must
+/// exist or the parsed fields are unreachable. `inflate_header` (borrow) and
+/// `inflate_take_header` (transfer ownership) are that route.
+///
+/// Because this file is compiled as a separate crate, everything asserted here
+/// is reachable by a real downstream user — a `pub(crate)` accessor would not
+/// compile.
+#[cfg(feature = "gzip")]
+#[test]
+fn gzip_header_metadata_is_retrievable_by_a_safe_rust_consumer() {
+    use zlib_rs::deflate::deflate_set_header;
+    use zlib_rs::inflate::{inflate_header, inflate_take_header};
+
+    let payload: Vec<u8> = (0..5_000u32).map(|i| (i % 251) as u8).collect();
+
+    // --- write side: emit a gzip member carrying every optional field --------
+    let member = {
+        let mut enc = ZStream::new();
+        assert_eq!(
+            rc(deflate_init2(
+                &mut enc,
+                6,
+                Z_DEFLATED,
+                16 + 15,
+                DEF_MEM_LEVEL,
+                Strategy::Default,
+            )),
+            ReturnCode::Ok,
+        );
+        let mut head = GzHeader::new()
+            .with_text(true)
+            .with_time(0x1234_5678)
+            .with_os(3)
+            .with_extra(vec![1u8, 2, 3, 4, 5])
+            .with_name(b"metadata.bin")
+            .with_comment(b"written by the interop test");
+        head.hcrc = true; // emit and verify the optional CRC-16
+        assert_eq!(rc(deflate_set_header(&mut enc, Some(head))), ReturnCode::Ok);
+        let mut out = vec![0u8; payload.len() + payload.len() / 2 + 1_024];
+        let outcome = deflate(&mut enc, &payload, &mut out, Z_FINISH);
+        assert_eq!(outcome.code, ReturnCode::StreamEnd);
+        out.truncate(outcome.produced);
+        assert_eq!(rc(deflate_end(&mut enc)), ReturnCode::Ok);
+        out
+    };
+    assert_eq!(&member[..2], &[0x1f, 0x8b], "a gzip member was produced");
+
+    // --- read side: register capture buffers, decode, then retrieve ----------
+    let mut want = GzHeader::new();
+    want.extra = Some(Vec::new());
+    want.extra_max = 64;
+    want.name = Some(Vec::new());
+    want.name_max = 64;
+    want.comment = Some(Vec::new());
+    want.comm_max = 64;
+
+    let mut dec = ZStream::new();
+    assert_eq!(rc(inflate_init2(&mut dec, 16 + 15)), ReturnCode::Ok);
+    assert_eq!(rc(inflate_get_header(&mut dec, want)), ReturnCode::Ok);
+
+    // Reachable immediately after registration, with `done` cleared.
+    assert!(
+        !inflate_header(&dec)
+            .expect("the registration is visible before decoding")
+            .done,
+        "inflate_get_header clears `done`",
+    );
+
+    let mut out = vec![0u8; payload.len() + 64];
+    let outcome = inflate(&mut dec, &member, &mut out, Z_FINISH);
+    assert_eq!(
+        outcome.code,
+        ReturnCode::StreamEnd,
+        "decode failed: {:?}",
+        dec.msg
+    );
+    assert_eq!(
+        &out[..outcome.produced],
+        &payload[..],
+        "payload round-trips"
+    );
+
+    // Every field is now readable through the borrowing accessor.
+    let head = inflate_header(&dec).expect("the header is reachable after decoding");
+    assert!(head.done, "`done` marks the whole header consumed");
+    assert!(head.text, "the TEXT flag survives the round trip");
+    assert_eq!(head.time, 0x1234_5678, "MTIME survives the round trip");
+    assert_eq!(head.os, 3, "the OS byte survives the round trip");
+    assert_eq!(head.extra.as_deref(), Some(&[1u8, 2, 3, 4, 5][..]));
+    // The declared 16-bit `XLEN` is deliberately absent from `GzHeader`: it is
+    // wire-level decoder metadata published only into a C caller's `gz_header`.
+    // An idiomatic caller reads the number of bytes actually captured, which is
+    // the whole field here because `extra_max` exceeded `XLEN`.
+    assert_eq!(
+        head.extra.as_ref().map_or(0, Vec::len),
+        5,
+        "the whole declared extra field was captured"
+    );
+    assert_eq!(head.name.as_deref(), Some(&b"metadata.bin"[..]));
+    assert_eq!(
+        head.comment.as_deref(),
+        Some(&b"written by the interop test"[..])
+    );
+    assert!(
+        head.hcrc,
+        "FHCRC was set, so the CRC-16 was present and checked"
+    );
+
+    // ...and can be taken out to outlive the stream. Ownership transfer clears
+    // the registration, mirroring C's `state->head = Z_NULL`.
+    let owned = inflate_take_header(&mut dec).expect("ownership is returned");
+    assert!(
+        inflate_header(&dec).is_none(),
+        "the registration is cleared"
+    );
+    assert!(
+        inflate_take_header(&mut dec).is_none(),
+        "a second take yields nothing"
+    );
+    assert_eq!(rc(inflate_end(&mut dec)), ReturnCode::Ok);
+    drop(dec);
+    assert_eq!(
+        owned.name.as_deref(),
+        Some(&b"metadata.bin"[..]),
+        "the retrieved metadata outlives the stream it came from"
+    );
+}

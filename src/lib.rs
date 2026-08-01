@@ -152,7 +152,7 @@
 extern crate alloc;
 
 // ===========================================================================
-// `no_std` runtime support — global allocator + panic handler
+// `no_std` runtime support — global allocator + panic handler + personality
 //
 // A `#![no_std]` crate that still allocates (this one uses `Box`/`Vec`/`String`
 // via `alloc`) and is emitted as a `cdylib`/`staticlib` must SUPPLY its own
@@ -160,6 +160,13 @@ extern crate alloc;
 // provides both, and without `std` the final `cdylib`/`staticlib` link step
 // fails with "no global memory allocator found" and "`#[panic_handler]`
 // function required, but not found" (see QA finding on the `no-std` build).
+//
+// It must also supply `rust_eh_personality`, for the same reason one step later
+// in the pipeline: the two items above satisfy *rustc*, but the pre-compiled
+// sysroot `core`/`alloc` objects still carry LSDA references to the unwinder's
+// personality symbol, so the artifact compiles and yet is unlinkable and
+// unloadable by any C consumer. The rationale is documented in full at that
+// item's definition, at the end of this module.
 //
 // These items are compiled ONLY for a genuine freestanding library build —
 // `#[cfg(all(not(feature = "std"), not(test), panic = "abort"))]`, the SAME
@@ -325,6 +332,45 @@ mod no_std_support {
     fn panic(_info: &core::panic::PanicInfo) -> ! {
         // SAFETY: `abort` is the libc process-termination routine; it never
         // returns and has no preconditions.
+        unsafe { abort() }
+    }
+
+    // The third freestanding runtime item, and the same kind of obligation as the
+    // allocator and panic handler above: a symbol `std` would have supplied.
+    //
+    // The sysroot `core`/`alloc` rlibs this crate links against are distributed
+    // pre-compiled with `panic = "unwind"`, so their objects carry LSDA
+    // (language-specific data area) references to the unwinder's personality
+    // routine — materialized as a `.data.DW.ref.rust_eh_personality` word that
+    // *names* the symbol even in code that can never unwind. `std` defines
+    // `rust_eh_personality`; a freestanding `cdylib`/`staticlib` does not link
+    // `std`, so without this definition nothing resolves it and EVERY std-off
+    // artifact is unlinkable and unloadable:
+    //
+    //   ld: libzlib_rs.a(alloc-*.rcgu.o):(.data.DW.ref.rust_eh_personality+0x0):
+    //       undefined reference to `rust_eh_personality'
+    //   ld: libzlib_rs.so: undefined reference to `rust_eh_personality'
+    //   dlopen: libzlib_rs.so: undefined symbol: rust_eh_personality
+    //
+    // It is therefore gated by the identical predicate, so a `std` build (which
+    // already has the symbol) never sees a duplicate definition.
+    //
+    // The routine is unreachable by construction: this configuration is compiled
+    // `panic = "abort"` (`Cargo.toml` sets it for both profiles, which AAP §0.5.3
+    // records as required for a stable-toolchain `no_std` `cdylib`/`staticlib`),
+    // so no Rust frame ever unwinds and the personality routine is never entered
+    // — the references above are pure link-time data. Only the SYMBOL is needed,
+    // which is why this is a plain `#[unsafe(no_mangle)] extern "C"` function
+    // rather than the nightly-only `#[lang = "eh_personality"]` item: it keeps the
+    // freestanding build on the declared MSRV (stable 1.85.0). The body aborts
+    // rather than returning so that if some future configuration ever did route an
+    // unwind here, the process terminates deterministically instead of resuming
+    // with an unwind context this crate cannot honor — the same "never unwind
+    // across the C ABI" invariant the panic handler upholds.
+    #[unsafe(no_mangle)]
+    extern "C" fn rust_eh_personality() {
+        // SAFETY: `abort` is the libc process-termination routine declared above;
+        // it never returns and has no preconditions.
         unsafe { abort() }
     }
 }
@@ -1021,6 +1067,99 @@ mod tests {
         );
     }
 
+    /// The freestanding runtime block supplies **all three** items a std-off
+    /// `cdylib`/`staticlib` needs — not just the two `rustc` itself demands.
+    ///
+    /// `#[global_allocator]` and `#[panic_handler]` are compiler-enforced: omit
+    /// either and `cargo build --no-default-features` fails outright with "no
+    /// global memory allocator found" / "`#[panic_handler]` function required".
+    /// `rust_eh_personality` is **not**. The pre-compiled sysroot `core`/`alloc`
+    /// objects reference it from their LSDA (a `.data.DW.ref.rust_eh_personality`
+    /// word), so omitting it still compiles, still reports success, and still
+    /// emits `libzlib_rs.{a,so}` — the artifacts are simply unlinkable and
+    /// unloadable:
+    ///
+    /// ```text
+    /// ld: libzlib_rs.a(alloc-*.rcgu.o):(.data.DW.ref.rust_eh_personality+0x0):
+    ///     undefined reference to `rust_eh_personality'
+    /// ld: libzlib_rs.so: undefined reference to `rust_eh_personality'
+    /// dlopen: libzlib_rs.so: undefined symbol: rust_eh_personality
+    /// ```
+    ///
+    /// No `cargo build`, `cargo test`, `cargo clippy`, or `cargo fmt` invocation
+    /// on any feature row can observe that — only a C consumer can — which is
+    /// precisely why the item is pinned here, in the Rust suite that always runs.
+    ///
+    /// Two further properties nothing else observes are pinned with it:
+    ///
+    /// * each item appears exactly **once** in `src/lib.rs` and lies **inside**
+    ///   `mod no_std_support`, so it is compiled only for a genuinely
+    ///   freestanding build and can never collide with the `std`-provided one;
+    /// * the personality routine carries `#[unsafe(no_mangle)]`. It is reached by
+    ///   the *linker*, by name; without that attribute rustc mangles the symbol,
+    ///   the definition silently stops resolving the references it exists to
+    ///   satisfy, and every Rust-side gate stays green.
+    #[test]
+    fn the_freestanding_runtime_block_supplies_every_required_item() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let text =
+            std::fs::read_to_string(root.join("src/lib.rs")).expect("src/lib.rs must be readable");
+        let blanked = blank_comments_and_literals(&text);
+        let runtime = no_std_support_range(&blanked);
+
+        for marker in [
+            "#[global_allocator]",
+            "#[panic_handler]",
+            "fn rust_eh_personality",
+        ] {
+            let hits: alloc::vec::Vec<usize> =
+                blanked.match_indices(marker).map(|(at, _)| at).collect();
+            assert_eq!(
+                hits.len(),
+                1,
+                "`{marker}` must appear exactly once in src/lib.rs, found {}",
+                hits.len()
+            );
+            assert!(
+                runtime.contains(&hits[0]),
+                "`{marker}` must live inside `mod no_std_support` so it is compiled ONLY \
+                 for a freestanding build; outside that gate it collides with the \
+                 std-provided definition"
+            );
+        }
+
+        // The personality routine is resolved by the linker, by name.
+        let lines: alloc::vec::Vec<&str> = text.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| {
+                l.trim_start()
+                    .starts_with("extern \"C\" fn rust_eh_personality()")
+            })
+            .expect(
+                "the personality routine must be a plain `extern \"C\" fn \
+                 rust_eh_personality()` — only the SYMBOL is required, so it must NOT \
+                 depend on the nightly-only `#[lang = \"eh_personality\"]` item",
+            );
+
+        let mut i = at;
+        let attr = loop {
+            assert!(i > 0, "the personality routine must carry an attribute");
+            i -= 1;
+            let above = lines[i].trim();
+            if above.is_empty() || above.starts_with("//") {
+                continue;
+            }
+            break above;
+        };
+        assert_eq!(
+            attr, "#[unsafe(no_mangle)]",
+            "the personality routine must be `#[unsafe(no_mangle)]`; a mangled symbol \
+             does not resolve the sysroot LSDA references, and nothing on the Rust side \
+             would notice"
+        );
+    }
+
     /// Every CI job whose gate is meaningful only on a particular toolchain,
     /// paired with the channel it must resolve to.
     ///
@@ -1030,7 +1169,7 @@ mod tests {
     /// of these jobs silently runs on 1.85.0 instead of its intended channel —
     /// the stable rows would still pass while quietly not covering stable, and
     /// `cargo fuzz build` would fail outright because cargo-fuzz needs nightly.
-    const TOOLCHAIN_JOBS: [(&str, &str, &str); 8] = [
+    const TOOLCHAIN_JOBS: [(&str, &str, &str); 9] = [
         (".github/workflows/ci.yml", "build-test", "stable"),
         (".github/workflows/ci.yml", "no-std-tests", "stable"),
         (".github/workflows/ci.yml", "lint", "stable"),
@@ -1038,6 +1177,7 @@ mod tests {
         (".github/workflows/ci.yml", "benches", "stable"),
         (".github/workflows/ci.yml", "build-script-tests", "stable"),
         (".github/workflows/ci.yml", "unsafe-boundary", "stable"),
+        (".github/workflows/ci.yml", "c-abi-linkage", "stable"),
         (".github/workflows/fuzz.yml", "cargo-fuzz", "nightly"),
     ];
 

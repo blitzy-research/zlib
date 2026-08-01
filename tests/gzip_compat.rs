@@ -801,6 +801,131 @@ fn gzsetparams_midstream_round_trip() {
     );
 }
 
+/// C parity for an out-of-range `gzsetparams` argument recorded *before* any
+/// I/O: the call itself succeeds, and the invalid value is reported later, when
+/// the deferred initialization actually reaches `deflateInit2`.
+///
+/// This is the exact three-stage sequence a C caller observes, and none of the
+/// stages may be short-circuited:
+///
+/// 1. `gzsetparams(out, 6, 5)` returns `Z_OK`. C's `gzsetparams`
+///    (`gzwrite.c` L630-L663) performs **no** range validation at all when the
+///    buffers have not been allocated yet — it stores `state->level` and
+///    `state->strategy` verbatim and returns `Z_OK`.
+/// 2. The first `gzwrite` triggers `gz_init`, whose `deflateInit2` call rejects
+///    `strategy < 0 || strategy > Z_FIXED` (`deflate.c` L436). C's `gz_init`
+///    maps *every* `deflateInit2` failure to
+///    `gz_error(state, Z_MEM_ERROR, "out of memory"); return -1`
+///    (`gzwrite.c` L37-L43), so `gzwrite` returns `0` and `gzerror` reports
+///    `Z_MEM_ERROR` with the message `"out of memory"`.
+/// 3. `gzclose_w` propagates that recorded error rather than `Z_OK`.
+///
+/// The out-of-range *level* case is asserted alongside it because both
+/// parameters travel the identical path: `deflate.c` L436 rejects
+/// `level < 0 || level > 9` in the same guard. The positive control — every
+/// valid strategy still initializing — closes the loop, proving the rejection is
+/// value-driven and not a blanket refusal.
+///
+/// Silently substituting a default for an unrecognized value here would make the
+/// invalid argument invisible to the caller, which is precisely the class of
+/// silent behavior change AAP §0.7.2 standard S5 forbids and which §0.8.2 does
+/// not list among the port's documented divergences.
+#[test]
+fn gzsetparams_out_of_range_argument_fails_at_the_deferred_init() {
+    let scratch = Scratch::new("setparams_range");
+    let payload = repetitive_payload(4000);
+
+    // `Z_FIXED` is the largest valid strategy, so `Z_FIXED + 1` is the first
+    // invalid positive value; `-1` is the first invalid negative one. C's guard
+    // is `strategy < 0 || strategy > Z_FIXED`, so both ends must be rejected.
+    for (tag, level, strategy) in [
+        ("strategy_hi", 6, Z_FIXED + 1),
+        ("strategy_lo", 6, -1),
+        ("level_hi", 10, Z_DEFAULT_STRATEGY),
+        ("level_lo", -2, Z_DEFAULT_STRATEGY),
+    ] {
+        let path = scratch.path(&format!("{tag}{GZ_SUFFIX}"));
+        let mut out = gzopen(&path, "wb").expect("gzopen for writing");
+
+        // Stage 1 — recorded verbatim, no validation, exactly as C does.
+        assert_eq!(
+            gzsetparams(&mut out, level, strategy),
+            Z_OK,
+            "[{tag}] gzsetparams records level={level} strategy={strategy} \
+             without validating it (C gzwrite.c L630-L663)"
+        );
+
+        // Stage 2 — the first write triggers `gz_init`, which fails.
+        assert_eq!(
+            gzwrite(&mut out, &payload),
+            0,
+            "[{tag}] the write must make no progress once the deferred \
+             initialization fails"
+        );
+        let mut errnum = 0i32;
+        let msg = gzerror(&out, Some(&mut errnum));
+        assert_eq!(
+            errnum,
+            ReturnCode::MemError.as_c_int(),
+            "[{tag}] C's gz_init reports every deflateInit2 failure as \
+             Z_MEM_ERROR (gzwrite.c L37-L43), got {errnum} ({msg:?})"
+        );
+        assert_eq!(
+            msg, "out of memory",
+            "[{tag}] gzerror must carry C's exact gz_init message"
+        );
+
+        // Stage 3 — the failure survives to close, so a caller that only checks
+        // `gzclose_w` still learns about it.
+        assert_eq!(
+            gzclose_w(out),
+            ReturnCode::MemError.as_c_int(),
+            "[{tag}] gzclose_w must propagate the recorded failure"
+        );
+    }
+
+    // Positive control: every valid strategy, paired with the extreme valid
+    // levels, still initializes and round-trips. The rejection above is driven
+    // by the value, not by the code path.
+    for strategy in [
+        Z_DEFAULT_STRATEGY,
+        Z_FILTERED,
+        Z_HUFFMAN_ONLY,
+        Z_RLE,
+        Z_FIXED,
+    ] {
+        for level in [Z_BEST_SPEED, Z_BEST_COMPRESSION] {
+            let path = scratch.path(&format!("ok_{level}_{strategy}{GZ_SUFFIX}"));
+            {
+                let mut out = gzopen(&path, "wb").expect("gzopen for writing");
+                assert_eq!(
+                    gzsetparams(&mut out, level, strategy),
+                    Z_OK,
+                    "level={level} strategy={strategy} is a valid configuration"
+                );
+                gz_write_all(&mut out, &payload);
+                let mut errnum = 0i32;
+                let msg = gzerror(&out, Some(&mut errnum));
+                assert_eq!(
+                    errnum, 0,
+                    "a valid configuration records no error, got {errnum} ({msg:?})"
+                );
+                assert_eq!(
+                    gzclose_w(out),
+                    Z_OK,
+                    "a valid configuration finalizes cleanly"
+                );
+            }
+            let (outcome, decoded) = flate2_decode(&fs::read(&path).expect("read the valid `.gz`"));
+            outcome.expect("a valid configuration must produce valid gzip");
+            assert_eq!(
+                decoded, payload,
+                "level={level} strategy={strategy} did not reproduce its payload"
+            );
+        }
+    }
+}
+
 /// Mirrors the `gzflush` usage a streaming client needs: flush part of a member
 /// to disk, keep writing into the *same* member, then finalize.
 ///

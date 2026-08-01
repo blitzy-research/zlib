@@ -564,9 +564,28 @@ pub fn gzbuffer(state: &mut GzState, mut size: u32) -> i32 {
 ///
 /// Returns `0` (`Z_OK`) on success, or a negative C return code on failure
 /// (mirroring zlib): [`ReturnCode::StreamError`] if the file is not a live,
-/// non-transparent writer without a serious error, or if `strategy` is not a
-/// valid strategy value; or the recorded stream error if a pending seek or the
-/// pre-flush fails.
+/// non-transparent writer without a serious error, or if the writer has already
+/// begun compressing and `strategy` is not a valid strategy value; or the
+/// recorded stream error if a pending seek or the pre-flush fails.
+///
+/// # When an out-of-range argument is reported
+///
+/// C performs **no** range validation of its own here (`gzwrite.c` L630-L663):
+/// it records `level` and `strategy` and returns `Z_OK`, leaving `deflateInit2`
+/// / `deflateParams` to reject an out-of-range value later. This port keeps that
+/// timing exactly, so the point at which a bad argument is reported depends on
+/// whether the engine already exists:
+///
+/// * **Before any I/O** (`size == 0`, no engine yet) both arguments are recorded
+///   and `Z_OK` is returned. The value is validated when the deferred
+///   `gz_init` runs on the first write, which reports
+///   `Z_MEM_ERROR` / "out of memory" exactly as C's `gz_init` does for any
+///   `deflateInit2` rejection (C L37-L43); the write then returns `0`, `gzerror`
+///   reports the failure, and `gzclose_w` propagates it. Nothing is silently
+///   substituted for the caller's value.
+/// * **After the engine is live** (`size != 0`) the change is applied
+///   immediately, so an invalid `strategy` is refused here with
+///   [`ReturnCode::StreamError`] rather than deferred.
 ///
 /// # Behavioural note (vs. C)
 ///
@@ -626,7 +645,11 @@ pub fn gzsetparams(state: &mut GzState, level: i32, strategy: i32) -> i32 {
         let _ = deflate::deflate_params(&mut state.strm, &[], &mut state.out_buf, level, strat);
     }
 
-    // Record the new parameters (C L661-662).
+    // Record the new parameters (C L661-662). C stores them unvalidated, and so
+    // does this port: when the engine does not exist yet, the deferred `gz_init`
+    // hands the recorded values to `deflate_init2` and reports any rejection as
+    // `Z_MEM_ERROR` on the first write (see "When an out-of-range argument is
+    // reported" above). No value is ever silently replaced with a default.
     state.level = level;
     state.strategy = strategy;
     ReturnCode::Ok.as_c_int()

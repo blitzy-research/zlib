@@ -84,7 +84,11 @@ fn write_ready(state: &GzState) -> bool {
 /// Returns [`ZlibError::MemError`] if the engine initialization fails (the C
 /// code reports every `gz_init` failure as `Z_MEM_ERROR` / "out of memory",
 /// C L38-L42); the state's error is set via
-/// [`GzState::error`](crate::gz::state::GzState::error) as a side effect.
+/// [`GzState::error`](crate::gz::state::GzState::error) as a side effect. That
+/// includes a recorded `level` or `strategy` outside the range `deflateInit2`
+/// accepts (`deflate.c` L436): C forwards those values unvalidated and reports
+/// the engine's rejection here, and so does this port — the deferred failure is
+/// how a caller's out-of-range `gzsetparams` argument surfaces.
 pub(crate) fn gz_init(state: &mut GzState) -> Result<(), ZlibError> {
     // Allocate the input buffer, double-sized for `gzprintf` (C L14-L19).
     state.in_buf = vec![0u8; state.want << 1];
@@ -99,7 +103,25 @@ pub(crate) fn gz_init(state: &mut GzState) -> Result<(), ZlibError> {
         // header/trailer framing inside the engine (C L34-L36). The gzip
         // CRC-32 and ISIZE trailer are produced internally by the engine, so
         // this layer never touches `crate::checksum` directly.
-        let strategy = Strategy::from_c_int(state.strategy).unwrap_or(Strategy::Default);
+        //
+        // `state.strategy` is the raw C `int` recorded by `gzopen`'s mode
+        // characters or by `gzsetparams`, neither of which range-checks it
+        // (C `gzsetparams`, `gzwrite.c` L630-L663, simply records the value and
+        // returns `Z_OK`). C hands that raw value straight to `deflateInit2`,
+        // which rejects `strategy < 0 || strategy > Z_FIXED` (`deflate.c` L436),
+        // and `gz_init` then reports the rejection as `Z_MEM_ERROR` /
+        // "out of memory" (C L37-L43). The typed `Strategy` cannot represent an
+        // out-of-range value, so the failed conversion *is* that rejection and
+        // must be propagated identically — substituting a default here would
+        // silently compress with a strategy the caller never asked for, making
+        // the caller's mistake invisible in the return code, `gzerror`, and
+        // `gzclose_w` alike. An out-of-range `level` already fails this way
+        // (`deflate_init2` rejects it below), so both parameters of the same
+        // `gzsetparams` call now behave identically.
+        let Some(strategy) = Strategy::from_c_int(state.strategy) else {
+            state.error(ReturnCode::MemError, Some("out of memory"));
+            return Err(ZlibError::MemError);
+        };
         if deflate::deflate_init2(
             &mut state.strm,
             state.level,
@@ -989,6 +1011,120 @@ mod tests {
             !state.strm.is_deflate(),
             "no deflate engine for a transparent stream"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn gz_init_rejects_out_of_range_strategy_like_c() {
+        // C `gzsetparams` records `strategy` unvalidated (`gzwrite.c` L630-L663)
+        // and `gz_init` forwards it to `deflateInit2`, which rejects
+        // `strategy < 0 || strategy > Z_FIXED` (`deflate.c` L436); `gz_init`
+        // reports that as `Z_MEM_ERROR` / "out of memory" (C L37-L43) and
+        // returns -1. The value must never be silently replaced by a default.
+        for bad in [5, 6, -1, i32::MIN, i32::MAX] {
+            let path = temp_path("badstrategy");
+            let mut state = new_write_state(&path, 128, 6, bad, 0);
+
+            assert_eq!(
+                gz_init(&mut state),
+                Err(ZlibError::MemError),
+                "strategy {bad} is out of range and must fail the deferred init"
+            );
+            assert_eq!(
+                state.err,
+                ReturnCode::MemError,
+                "the failure is recorded on the state for gzerror/gzclose_w"
+            );
+            let mut code = 0;
+            assert_eq!(
+                crate::gz::open::gzerror(&state, Some(&mut code)),
+                "out of memory",
+                "C reports every gz_init failure as out of memory"
+            );
+            assert_eq!(
+                code,
+                ReturnCode::MemError.as_c_int(),
+                "gzerror reports the numeric code a C caller sees"
+            );
+            assert_eq!(
+                state.size, 0,
+                "a failed init leaves the buffers unmarked, exactly as C does"
+            );
+            assert!(
+                !state.strm.is_deflate(),
+                "no engine is installed by a failed init"
+            );
+
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn gz_init_accepts_every_valid_strategy() {
+        // The positive control for `gz_init_rejects_out_of_range_strategy_like_c`:
+        // all five valid strategies (`Z_DEFAULT_STRATEGY`..=`Z_FIXED`) still
+        // initialize the engine.
+        for good in 0..=4 {
+            let path = temp_path("goodstrategy");
+            let mut state = new_write_state(&path, 128, 6, good, 0);
+
+            gz_init(&mut state).expect("a valid strategy initializes the engine");
+            assert_eq!(state.size, 128, "initialization completed");
+            assert!(state.strm.is_deflate(), "a deflate engine was installed");
+            assert_eq!(state.err, ReturnCode::Ok, "no error was recorded");
+
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn write_with_out_of_range_strategy_reports_the_deferred_failure() {
+        // The end-to-end shape a caller observes after `gzsetparams(level, 5)`
+        // on a writer that has not performed any I/O yet: the first write fails
+        // (returns 0), and the error is retrievable afterwards. Compare the
+        // out-of-range *level* case below — both parameters behave identically.
+        let path = temp_path("badstrategy_write");
+        let mut state = new_write_state(&path, 128, 6, 5, 0);
+
+        assert_eq!(
+            gz_write(&mut state, b"payload written with an invalid strategy"),
+            0,
+            "the write makes no progress once the deferred init fails"
+        );
+        assert_eq!(state.err, ReturnCode::MemError, "the error is observable");
+        let mut code = 0;
+        assert_eq!(
+            crate::gz::open::gzerror(&state, Some(&mut code)),
+            "out of memory",
+            "the failure is retrievable through gzerror"
+        );
+        assert_eq!(code, ReturnCode::MemError.as_c_int());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_with_out_of_range_level_reports_the_deferred_failure() {
+        // The symmetry proof: an out-of-range level is rejected by
+        // `deflate_init2` itself, and reaches the caller through exactly the
+        // same `gz_init` failure path as an out-of-range strategy.
+        let path = temp_path("badlevel_write");
+        let mut state = new_write_state(&path, 128, 10, 0, 0);
+
+        assert_eq!(
+            gz_write(&mut state, b"payload written with an invalid level"),
+            0,
+            "the write makes no progress once the deferred init fails"
+        );
+        assert_eq!(state.err, ReturnCode::MemError, "the error is observable");
+        let mut code = 0;
+        assert_eq!(
+            crate::gz::open::gzerror(&state, Some(&mut code)),
+            "out of memory",
+            "the failure is retrievable through gzerror"
+        );
+        assert_eq!(code, ReturnCode::MemError.as_c_int());
 
         let _ = std::fs::remove_file(&path);
     }

@@ -2133,6 +2133,14 @@ pub fn inflate_set_dictionary<A: Allocator>(
 /// `src/ffi/inflate.rs` bridges this owned model back to C's borrowed
 /// `gz_headerp`.
 ///
+/// # Retrieving the parsed fields
+///
+/// Because ownership moves in, the caller does **not** retain a handle the way a
+/// C caller does. Read the parsed fields back with [`inflate_header`] (borrow) or
+/// [`inflate_take_header`] (transfer ownership back out). Do so before an
+/// `inflate_reset*`, which clears the registration exactly as C's
+/// `state->head = Z_NULL` does (`inflate.c` L115).
+///
 /// # Errors
 /// Returns [`ZlibError::StreamError`] if `strm` has no inflate state or the
 /// stream is not gzip-capable.
@@ -2146,6 +2154,136 @@ pub fn inflate_get_header<A: Allocator>(strm: &mut ZStream<A>, head: GzHeader) -
     head.done = false;
     state.head = Some(head);
     Ok(ReturnCode::Ok)
+}
+
+/// Borrows the [`GzHeader`] previously registered with [`inflate_get_header`],
+/// or [`None`] if `strm` holds no inflate state or no header was registered.
+///
+/// # Why this exists
+///
+/// C's `inflateGetHeader` (`inflate.c` L1219-L1230) stores a *borrowed*
+/// `gz_headerp`, so a C caller keeps its own handle and simply reads its own
+/// struct once [`inflate`] has run. This port deliberately cannot do that:
+/// ownership of the [`GzHeader`] moves into the decoder so that the parsed
+/// `extra` / `name` / `comment` byte buffers are owned by the same value that
+/// bounds them, which is precisely what removes the dangling-pointer hazard C
+/// carries here (AAP §0.6.3). This accessor is the safe-Rust counterpart of
+/// C's "read the struct you handed in": it hands the borrow back once the
+/// header modes have run, so the parsed metadata is reachable from safe Rust
+/// without exposing the decoder's internals. The C ABI is unaffected — the FFI
+/// shim in `src/ffi/inflate.rs` keeps writing the fields back through the
+/// caller's `gz_headerp` exactly as before.
+///
+/// # Timing
+///
+/// Fields are populated progressively as [`inflate`] walks the gzip header
+/// modes, in the same order and from the same bytes C uses: `text`, `time`,
+/// `xflags` / `os`, `extra_len` and `extra`, `name`, `comment`, then `hcrc`.
+/// [`GzHeader::done`] is set to `true` only after the whole header (including
+/// the optional CRC-16) has been consumed, so `done` is the signal that every
+/// field is final — exactly C's contract. A truncated or rejected header leaves
+/// `done` clear, and a non-gzip stream leaves the registration untouched.
+///
+/// # Lifetime of the registration
+///
+/// The registration does **not** survive a reset: `inflate_reset*` clears it,
+/// mirroring C's `state->head = Z_NULL` (`inflate.c` L115). Because this port
+/// owns the header rather than borrowing it, a reset *drops* the parsed
+/// metadata instead of leaving it in caller-owned storage — so retrieve it (via
+/// this function or [`inflate_take_header`]) before resetting the stream.
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(feature = "gzip")] {
+/// use zlib_rs::constants::{Strategy, Z_DEFLATED, Z_FINISH};
+/// use zlib_rs::deflate::{deflate, deflate_init2, deflate_set_header};
+/// use zlib_rs::inflate::{inflate, inflate_get_header, inflate_header, inflate_init2};
+/// use zlib_rs::stream::ZStream;
+/// use zlib_rs::{GzHeader, ReturnCode};
+///
+/// // Produce a gzip member carrying a file name (windowBits 31 = gzip wrapper).
+/// let mut enc = ZStream::new();
+/// deflate_init2(&mut enc, 6, Z_DEFLATED, 31, 8, Strategy::Default).unwrap();
+/// deflate_set_header(&mut enc, Some(GzHeader::new().with_name(b"a.bin"))).unwrap();
+/// let mut compressed = [0u8; 128];
+/// let out = deflate(&mut enc, b"abc", &mut compressed, Z_FINISH);
+/// assert_eq!(out.code, ReturnCode::StreamEnd);
+/// let compressed = &compressed[..out.produced];
+///
+/// // Register a header to receive the parsed fields: an empty buffer plus the
+/// // capacity that bounds it, exactly as a C caller supplies `name`/`name_max`.
+/// let mut want = GzHeader::new();
+/// want.name = Some(Vec::new());
+/// want.name_max = 64;
+///
+/// let mut dec = ZStream::new();
+/// inflate_init2(&mut dec, 31).unwrap();
+/// inflate_get_header(&mut dec, want).unwrap();
+/// // The registration is reachable even before `inflate` runs.
+/// assert!(inflate_header(&dec).is_some());
+///
+/// let mut plain = [0u8; 16];
+/// let got = inflate(&mut dec, compressed, &mut plain, Z_FINISH);
+/// assert_eq!(got.code, ReturnCode::StreamEnd);
+/// assert_eq!(&plain[..got.produced], b"abc");
+///
+/// // The gzip metadata is now readable from safe Rust.
+/// let head = inflate_header(&dec).expect("the registered header");
+/// assert!(head.done, "the whole gzip header was consumed");
+/// assert_eq!(head.name.as_deref(), Some(&b"a.bin"[..]));
+/// # }
+/// ```
+#[cfg(feature = "gzip")]
+#[must_use]
+pub fn inflate_header<A: Allocator>(strm: &ZStream<A>) -> Option<&GzHeader> {
+    strm.inflate_state()?.head.as_ref()
+}
+
+/// Takes back ownership of the [`GzHeader`] previously registered with
+/// [`inflate_get_header`], leaving the decoder with no header registered — or
+/// [`None`] if `strm` holds no inflate state or no header was registered.
+///
+/// Use this when the parsed metadata must outlive the stream, or must survive an
+/// `inflate_reset*` (which otherwise drops the registration, mirroring C's
+/// `state->head = Z_NULL` at `inflate.c` L115). Use [`inflate_header`] instead
+/// to inspect the fields while leaving the registration in place.
+///
+/// # Effect on subsequent decoding
+///
+/// Afterwards the decoder behaves exactly as if [`inflate_get_header`] had never
+/// been called: the remaining gzip header bytes are still parsed and validated,
+/// and the header CRC-16 is still verified when `FHCRC` is set, but nothing is
+/// recorded — which is precisely what C does for a `Z_NULL` `state->head`.
+/// Decoded output is therefore unchanged, preserving byte-exact fidelity
+/// (AAP §0.8.1 directive D-1).
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(feature = "gzip")] {
+/// use zlib_rs::GzHeader;
+/// use zlib_rs::inflate::{inflate_get_header, inflate_header, inflate_init2, inflate_take_header};
+/// use zlib_rs::stream::ZStream;
+///
+/// let mut strm = ZStream::new();
+/// inflate_init2(&mut strm, 31).unwrap();
+/// assert!(inflate_take_header(&mut strm).is_none(), "nothing registered yet");
+///
+/// inflate_get_header(&mut strm, GzHeader::new().with_name(b"data.bin")).unwrap();
+/// let owned = inflate_take_header(&mut strm).expect("ownership returned");
+/// assert!(!owned.done, "`inflate_get_header` clears `done`");
+/// assert_eq!(owned.name.as_deref(), Some(&b"data.bin"[..]));
+///
+/// // The registration is gone, so the decoder records nothing further.
+/// assert!(inflate_header(&strm).is_none());
+/// assert!(inflate_take_header(&mut strm).is_none());
+/// # }
+/// ```
+#[cfg(feature = "gzip")]
+#[must_use]
+pub fn inflate_take_header<A: Allocator>(strm: &mut ZStream<A>) -> Option<GzHeader> {
+    strm.inflate_state_mut()?.head.take()
 }
 
 /// Scans `input` for the DEFLATE flush marker (`00 00 FF FF`) and, when found,
@@ -3042,5 +3180,229 @@ mod tests {
             inflate_set_dictionary(&mut strm, b"dict"),
             Err(ZlibError::StreamError)
         );
+    }
+
+    /// Compresses `data` as a gzip member carrying every optional header field
+    /// (`FEXTRA`, `FNAME`, `FCOMMENT`, `FHCRC`) using the crate's own encoder,
+    /// whose output is byte-identical to reference zlib. Returns the member.
+    #[cfg(feature = "gzip")]
+    fn gzip_compress_with_full_header(data: &[u8]) -> Vec<u8> {
+        use crate::constants::{Strategy, Z_DEFLATED};
+        let mut strm = ZStream::new();
+        crate::deflate::deflate_init2(&mut strm, 6, Z_DEFLATED, 16 + 15, 8, Strategy::Default)
+            .expect("deflate init");
+        let mut head = GzHeader::new()
+            .with_text(true)
+            .with_time(0x5EED_C0DE)
+            .with_os(3)
+            .with_extra(alloc::vec![0xDE, 0xAD, 0xBE, 0xEF])
+            .with_name(b"payload.bin")
+            .with_comment(b"a comment");
+        // `hcrc` has no builder; setting it makes the encoder emit the optional
+        // CRC-16, which the decoder then verifies.
+        head.hcrc = true;
+        crate::deflate::deflate_set_header(&mut strm, Some(head)).expect("set header");
+        let mut out = alloc::vec![0u8; data.len() * 2 + 256];
+        let r = crate::deflate::deflate(&mut strm, data, &mut out, Z_FINISH);
+        assert_eq!(r.code, ReturnCode::StreamEnd);
+        assert_eq!(r.consumed, data.len());
+        out.truncate(r.produced);
+        crate::deflate::deflate_end(&mut strm).expect("deflate end");
+        out
+    }
+
+    /// Builds the read-side registration a C caller would supply: empty capture
+    /// buffers plus the capacities that bound them.
+    #[cfg(feature = "gzip")]
+    fn capture_header() -> GzHeader {
+        let mut head = GzHeader::new();
+        head.extra = Some(Vec::new());
+        head.extra_max = 64;
+        head.name = Some(Vec::new());
+        head.name_max = 64;
+        head.comment = Some(Vec::new());
+        head.comm_max = 64;
+        head
+    }
+
+    /// Every gzip header field parsed by `inflate` must be reachable from safe
+    /// Rust through [`inflate_header`]. Before this accessor existed the parsed
+    /// metadata was structurally unreachable outside the FFI shim, even though
+    /// the write side round-tripped fully.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn inflate_header_exposes_every_parsed_field() {
+        let member = gzip_compress_with_full_header(MSG);
+
+        let mut strm = ZStream::new();
+        assert_eq!(inflate_init2(&mut strm, 16 + 15), Ok(ReturnCode::Ok));
+        assert_eq!(
+            inflate_get_header(&mut strm, capture_header()),
+            Ok(ReturnCode::Ok)
+        );
+
+        // Registered but not yet decoded: reachable, and `done` is cleared.
+        let pending = inflate_header(&strm).expect("the registration is visible");
+        assert!(!pending.done, "`inflate_get_header` clears `done`");
+
+        let mut out = alloc::vec![0u8; 256];
+        let outcome = inflate(&mut strm, &member, &mut out, Z_NO_FLUSH);
+        assert_eq!(outcome.code, ReturnCode::StreamEnd, "msg {:?}", strm.msg);
+        assert_eq!(&out[..outcome.produced], MSG);
+
+        let head = inflate_header(&strm).expect("the header is reachable after decoding");
+        assert!(head.done, "`done` marks the whole header consumed");
+        assert!(head.text, "the TEXT flag round-trips");
+        assert_eq!(head.time, 0x5EED_C0DE, "MTIME round-trips");
+        assert_eq!(head.os, 3, "the OS byte round-trips");
+        assert_eq!(head.extra.as_deref(), Some(&[0xDEu8, 0xAD, 0xBE, 0xEF][..]));
+        // The stream's declared 16-bit `XLEN` is deliberately not a field of
+        // `GzHeader`: it is wire-level parser metadata carried in the
+        // crate-private `HeaderPublication::extra_len` and published only into a
+        // C caller's `gz_header` (see the module documentation of
+        // `crate::gz_header`). The idiomatic count of captured bytes is
+        // `extra.len()`, and here — with `extra_max` larger than `XLEN` — nothing
+        // was clamped, so the two agree.
+        assert_eq!(
+            head.extra.as_ref().map_or(0, alloc::vec::Vec::len),
+            4,
+            "the whole declared extra field was captured"
+        );
+        assert_eq!(head.name.as_deref(), Some(&b"payload.bin"[..]));
+        assert_eq!(head.comment.as_deref(), Some(&b"a comment"[..]));
+        assert!(
+            head.hcrc,
+            "FHCRC was set, so the CRC-16 was present and checked"
+        );
+
+        assert_eq!(inflate_end(&mut strm), Ok(ReturnCode::Ok));
+    }
+
+    /// [`inflate_take_header`] must transfer ownership out and leave the decoder
+    /// with no registration, matching C's `state->head = Z_NULL` semantics.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn inflate_take_header_transfers_ownership_and_clears_the_registration() {
+        let member = gzip_compress_with_full_header(MSG);
+
+        let mut strm = ZStream::new();
+        assert_eq!(inflate_init2(&mut strm, 16 + 15), Ok(ReturnCode::Ok));
+        assert_eq!(
+            inflate_get_header(&mut strm, capture_header()),
+            Ok(ReturnCode::Ok)
+        );
+        let mut out = alloc::vec![0u8; 256];
+        assert_eq!(
+            inflate(&mut strm, &member, &mut out, Z_NO_FLUSH).code,
+            ReturnCode::StreamEnd
+        );
+
+        let owned = inflate_take_header(&mut strm).expect("ownership is returned");
+        assert!(owned.done);
+        assert_eq!(owned.name.as_deref(), Some(&b"payload.bin"[..]));
+        assert_eq!(owned.comment.as_deref(), Some(&b"a comment"[..]));
+
+        // The registration is gone; both accessors now report nothing.
+        assert!(
+            inflate_header(&strm).is_none(),
+            "the registration is cleared"
+        );
+        assert!(
+            inflate_take_header(&mut strm).is_none(),
+            "a second take yields nothing"
+        );
+
+        // The owned value outlives the stream it came from.
+        assert_eq!(inflate_end(&mut strm), Ok(ReturnCode::Ok));
+        drop(strm);
+        assert_eq!(owned.name.as_deref(), Some(&b"payload.bin"[..]));
+    }
+
+    /// Taking the header must not perturb decoding: the remaining header bytes
+    /// are still parsed and the CRC-16 still verified, they are simply recorded
+    /// nowhere — exactly what C does for a `Z_NULL` `state->head`.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn taking_the_header_midstream_leaves_decoding_byte_exact() {
+        let member = gzip_compress_with_full_header(MSG);
+
+        // Baseline: decode with no registration at all.
+        let mut plain = ZStream::new();
+        assert_eq!(inflate_init2(&mut plain, 16 + 15), Ok(ReturnCode::Ok));
+        let mut expected = alloc::vec![0u8; 256];
+        let base = inflate(&mut plain, &member, &mut expected, Z_NO_FLUSH);
+        assert_eq!(base.code, ReturnCode::StreamEnd);
+        expected.truncate(base.produced);
+
+        // Register, then immediately revoke the registration before decoding.
+        let mut strm = ZStream::new();
+        assert_eq!(inflate_init2(&mut strm, 16 + 15), Ok(ReturnCode::Ok));
+        assert_eq!(
+            inflate_get_header(&mut strm, capture_header()),
+            Ok(ReturnCode::Ok)
+        );
+        assert!(inflate_take_header(&mut strm).is_some());
+        let mut out = alloc::vec![0u8; 256];
+        let outcome = inflate(&mut strm, &member, &mut out, Z_NO_FLUSH);
+        assert_eq!(
+            outcome.code,
+            ReturnCode::StreamEnd,
+            "an FHCRC header still validates with no registration (msg {:?})",
+            strm.msg
+        );
+        assert_eq!(outcome.consumed, base.consumed);
+        assert_eq!(&out[..outcome.produced], expected.as_slice());
+        assert!(inflate_header(&strm).is_none(), "nothing was recorded");
+    }
+
+    /// Both accessors must report [`None`] for every state in which no gzip
+    /// header registration can exist.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn header_accessors_are_none_without_a_registration() {
+        use crate::constants::{Strategy, Z_DEFLATED};
+
+        // (a) No state installed at all.
+        let mut bare = ZStream::new();
+        assert!(inflate_header(&bare).is_none());
+        assert!(inflate_take_header(&mut bare).is_none());
+
+        // (b) A deflate state, not an inflate state.
+        let mut enc = ZStream::new();
+        crate::deflate::deflate_init2(&mut enc, 6, Z_DEFLATED, 16 + 15, 8, Strategy::Default)
+            .expect("deflate init");
+        assert!(inflate_header(&enc).is_none());
+        assert!(inflate_take_header(&mut enc).is_none());
+        crate::deflate::deflate_end(&mut enc).expect("deflate end");
+
+        // (c) An inflate state with nothing registered.
+        let mut dec = ZStream::new();
+        assert_eq!(inflate_init2(&mut dec, 16 + 15), Ok(ReturnCode::Ok));
+        assert!(inflate_header(&dec).is_none());
+        assert!(inflate_take_header(&mut dec).is_none());
+
+        // (d) A registration dropped by a reset, mirroring C's
+        //     `state->head = Z_NULL` in `inflateResetKeep` (`inflate.c` L115).
+        assert_eq!(
+            inflate_get_header(&mut dec, capture_header()),
+            Ok(ReturnCode::Ok)
+        );
+        assert!(inflate_header(&dec).is_some());
+        assert_eq!(inflate_reset(&mut dec), Ok(ReturnCode::Ok));
+        assert!(
+            inflate_header(&dec).is_none(),
+            "a reset clears the registration exactly as C does"
+        );
+        assert_eq!(inflate_end(&mut dec), Ok(ReturnCode::Ok));
+
+        // (e) A raw stream cannot register a header in the first place.
+        let mut raw = ZStream::new();
+        assert_eq!(inflate_init2(&mut raw, -15), Ok(ReturnCode::Ok));
+        assert_eq!(
+            inflate_get_header(&mut raw, capture_header()),
+            Err(ZlibError::StreamError)
+        );
+        assert!(inflate_header(&raw).is_none());
+        assert_eq!(inflate_end(&mut raw), Ok(ReturnCode::Ok));
     }
 }

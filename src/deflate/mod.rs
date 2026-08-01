@@ -1264,6 +1264,86 @@ pub fn deflate<A: Allocator>(
 // deflateParams.
 // ===========================================================================
 
+/// Resolves a caller-supplied compression level the way C's `deflateParams`
+/// does, returning [`None`] when the level is out of range.
+///
+/// Mirrors the non-`FASTEST` branch of `deflate.c`:
+///
+/// ```c
+/// if (level == Z_DEFAULT_COMPRESSION) level = 6;
+/// if (level < 0 || level > 9 || strategy < 0 || strategy > Z_FIXED)
+///     return Z_STREAM_ERROR;
+/// ```
+///
+/// The strategy half of that test is enforced by construction here — a
+/// [`Strategy`] value cannot be out of range — so only the level needs
+/// resolving. Resolution is idempotent for every accepted level, so passing an
+/// already-resolved value through a second time is harmless.
+fn params_resolve_level(level: i32) -> Option<i32> {
+    let level = if level == Z_DEFAULT_COMPRESSION {
+        6
+    } else {
+        level
+    };
+    (0..=9).contains(&level).then_some(level)
+}
+
+/// Reports whether a [`deflate_params`] call with these arguments would perform
+/// C's internal `deflate(strm, Z_BLOCK)` pre-flush.
+///
+/// This is the single source of truth for that condition — [`deflate_params`]
+/// itself calls it — and it exists because the C ABI boundary needs the answer
+/// *before* it bridges the caller's raw `next_in`/`next_out` pointers into
+/// slices. C validates those buffers only where it actually touches them,
+/// namely inside the internal `deflate` call, and that call is made only when
+/// the following all hold (`deflate.c`):
+///
+/// ```c
+/// func = configuration_table[s->level].func;
+/// if ((strategy != s->strategy || func != configuration_table[level].func) &&
+///     s->last_flush != -2) { ... deflate(strm, Z_BLOCK) ... }
+/// ```
+///
+/// So a level/strategy change that keeps the same block producer, or one made
+/// before any `deflate` call has run (`last_flush == -2`, the value
+/// `deflateReset` installs), is a pure bookkeeping update: reference zlib
+/// returns `Z_OK` without reading or writing a single byte, and therefore
+/// without caring whether `next_out` is null. Validating the buffers
+/// unconditionally would reject those calls with `Z_STREAM_ERROR` and silently
+/// drop the parameter change — an ABI-parity break, and a byte-identity break
+/// for any stream whose level was raised mid-flight.
+///
+/// Returns `false` — never panics, never indexes out of bounds — when the level
+/// is out of range or no deflate state is installed. Both cases make
+/// [`deflate_params`] return [`ReturnCode::StreamError`] on its own, which is
+/// exactly what C's `deflateStateCheck`/range test do before the pre-flush is
+/// ever considered, so the buffers are irrelevant there too.
+#[must_use]
+pub fn deflate_params_flushes<A: Allocator>(
+    strm: &ZStream<A>,
+    level: i32,
+    strategy: Strategy,
+) -> bool {
+    let Some(level) = params_resolve_level(level) else {
+        return false;
+    };
+    let Some(s) = strm.deflate_state() else {
+        return false;
+    };
+    // `last_flush == -2` is the sentinel `deflateReset` installs, meaning "no
+    // `deflate` call has happened yet", so there is no block to flush.
+    if s.last_flush == -2 {
+        return false;
+    }
+    // `s.level` is always within `0..=9` for a live state (validated at init and
+    // by this very function on every change), but read it fallibly so a
+    // hypothetically corrupt level can never index out of bounds.
+    let Some(cur) = CONFIGURATION_TABLE.get(s.level as usize) else {
+        return false;
+    };
+    strategy != s.strategy || cur.func != CONFIGURATION_TABLE[level as usize].func
+}
+
 /// Dynamically updates the compression `level` and `strategy` mid-stream.
 ///
 /// Port of C `deflateParams` (`deflate.c` L774-L816). When the change would
@@ -1277,6 +1357,11 @@ pub fn deflate<A: Allocator>(
 ///
 /// The returned [`DeflateOutcome`] carries any I/O performed by the internal
 /// flush (`consumed`/`produced` are `0` when no flush was needed).
+///
+/// Callers that must know *in advance* whether this call will perform that
+/// internal flush — the C ABI shim, which has to decide whether the raw
+/// `next_in`/`next_out` pointers are even relevant — should ask
+/// [`deflate_params_flushes`]; it evaluates the identical condition.
 #[must_use]
 pub fn deflate_params<A: Allocator>(
     strm: &mut ZStream<A>,
@@ -1287,12 +1372,15 @@ pub fn deflate_params<A: Allocator>(
 ) -> DeflateOutcome {
     // Resolve default level and validate the range (strategy is validated by
     // construction of the `Strategy` enum).
-    let level = if level == Z_DEFAULT_COMPRESSION {
-        6
-    } else {
-        level
+    let Some(level) = params_resolve_level(level) else {
+        return DeflateOutcome {
+            code: ReturnCode::StreamError,
+            consumed: 0,
+            produced: 0,
+        };
     };
-    if !(0..=9).contains(&level) {
+
+    if strm.deflate_state().is_none() {
         return DeflateOutcome {
             code: ReturnCode::StreamError,
             consumed: 0,
@@ -1300,23 +1388,12 @@ pub fn deflate_params<A: Allocator>(
         };
     }
 
-    let (cur_level, cur_strategy, last_flush) = match strm.deflate_state() {
-        Some(s) => (s.level, s.strategy, s.last_flush),
-        None => {
-            return DeflateOutcome {
-                code: ReturnCode::StreamError,
-                consumed: 0,
-                produced: 0,
-            };
-        }
-    };
-    let func_cur = CONFIGURATION_TABLE[cur_level as usize].func;
-    let func_new = CONFIGURATION_TABLE[level as usize].func;
-
     let mut consumed = 0usize;
     let mut produced = 0usize;
 
-    if (strategy != cur_strategy || func_cur != func_new) && last_flush != -2 {
+    // The pre-flush condition lives in ONE place (`deflate_params_flushes`) so
+    // this engine path and the C ABI shim's buffer validation can never drift.
+    if deflate_params_flushes(strm, level, strategy) {
         // Flush the current block before switching producers.
         let outcome = deflate(strm, input, output, Z_BLOCK);
         consumed = outcome.consumed;
@@ -1993,5 +2070,123 @@ mod tests {
             table.len(),
             huff.len()
         );
+    }
+    /// The pre-flush predicate reproduces C's condition exactly, and
+    /// [`deflate_params`] agrees with it on every case.
+    ///
+    /// C reaches its internal `deflate(strm, Z_BLOCK)` only when
+    /// `(strategy != s->strategy || configuration_table[s->level].func !=
+    /// configuration_table[level].func) && s->last_flush != -2`. That condition
+    /// is what tells the C ABI boundary whether the caller's raw
+    /// `next_in`/`next_out` pointers are relevant at all, so it is pinned here
+    /// independently of the code that consumes it.
+    ///
+    /// Every expectation below was cross-checked against a reference C zlib
+    /// built from this repository's own `*.c` sources.
+    #[test]
+    fn the_pre_flush_predicate_matches_cs_condition() {
+        // Fresh stream: `last_flush == -2`, so NOTHING ever flushes — not a level
+        // change, not a strategy change, not both.
+        let strm = init(6, MAX_WBITS, DEF_MEM_LEVEL, Strategy::Default);
+        assert_eq!(strm.deflate_state().expect("state").last_flush, -2);
+        for level in [Z_DEFAULT_COMPRESSION, 0, 1, 4, 6, 9] {
+            for strategy in [
+                Strategy::Default,
+                Strategy::Filtered,
+                Strategy::HuffmanOnly,
+                Strategy::Rle,
+                Strategy::Fixed,
+            ] {
+                assert!(
+                    !deflate_params_flushes(&strm, level, strategy),
+                    "a fresh stream (last_flush == -2) never flushes, \
+                     level={level} strategy={strategy:?}"
+                );
+            }
+        }
+
+        // Out-of-range level and a stream with no engine both answer `false`
+        // without panicking or indexing out of bounds; `deflate_params` reports
+        // `StreamError` for them on its own, exactly as C's range test does
+        // before the flush is considered.
+        for bad in [-2, 10, 42, i32::MIN, i32::MAX] {
+            assert!(!deflate_params_flushes(&strm, bad, Strategy::Default));
+        }
+        let bare: ZStream = ZStream::new();
+        assert!(!deflate_params_flushes(&bare, 9, Strategy::Default));
+
+        // Mid-stream (`last_flush != -2`) the producer/strategy comparison
+        // decides. Level 1..=3 select `deflate_fast`, 4..=9 select
+        // `deflate_slow`, and level 0 selects `deflate_stored`, so a change
+        // WITHIN a producer band is pure bookkeeping while a change ACROSS bands
+        // must flush.
+        let corpus: Vec<u8> = (0..4096u32).map(|i| b'a' + (i % 3) as u8).collect();
+        let mut out = vec![0u8; 64 * 1024];
+        let mut strm = init(6, MAX_WBITS, DEF_MEM_LEVEL, Strategy::Default);
+        let outcome = deflate(&mut strm, &corpus, &mut out, Z_NO_FLUSH);
+        assert_eq!(outcome.code, ReturnCode::Ok);
+        assert_ne!(strm.deflate_state().expect("state").last_flush, -2);
+
+        // Same producer band (6 -> 4..=9) and same strategy: no flush.
+        for level in [4, 5, 6, 7, 8, 9, Z_DEFAULT_COMPRESSION] {
+            assert!(
+                !deflate_params_flushes(&strm, level, Strategy::Default),
+                "level {level} keeps `deflate_slow`, so nothing needs flushing"
+            );
+        }
+        // Different band: flush required.
+        for level in [0, 1, 2, 3] {
+            assert!(
+                deflate_params_flushes(&strm, level, Strategy::Default),
+                "level {level} switches the block producer, so a flush is required"
+            );
+        }
+        // Strategy change alone: flush required, whatever the level.
+        for strategy in [
+            Strategy::Filtered,
+            Strategy::HuffmanOnly,
+            Strategy::Rle,
+            Strategy::Fixed,
+        ] {
+            assert!(deflate_params_flushes(&strm, 6, strategy));
+        }
+
+        // And `deflate_params` agrees: a predicate-`false` call performs no I/O
+        // even when the caller passes empty buffers, while a predicate-`true`
+        // call is the one that consumes/produces.
+        let mut empty_out: [u8; 0] = [];
+        let quiet = deflate_params(&mut strm, &[], &mut empty_out, 9, Strategy::Default);
+        assert_eq!(quiet.code, ReturnCode::Ok);
+        assert_eq!((quiet.consumed, quiet.produced), (0, 0));
+        assert_eq!(strm.deflate_state().expect("state").level, 9);
+
+        // Now a real producer switch with room available: accepted, and the
+        // finished stream still decodes to the original bytes.
+        let mut room = vec![0u8; 64 * 1024];
+        let switch = deflate_params(&mut strm, &[], &mut room, 1, Strategy::Default);
+        assert_eq!(switch.code, ReturnCode::Ok);
+        assert_eq!(strm.deflate_state().expect("state").level, 1);
+    }
+
+    /// `params_resolve_level` mirrors C's level resolution and range test, and is
+    /// idempotent for every accepted value (so passing an already-resolved level
+    /// back through it cannot change the answer).
+    #[test]
+    fn params_level_resolution_matches_c() {
+        assert_eq!(params_resolve_level(Z_DEFAULT_COMPRESSION), Some(6));
+        for level in 0..=9 {
+            assert_eq!(params_resolve_level(level), Some(level));
+            assert_eq!(
+                params_resolve_level(level).and_then(params_resolve_level),
+                Some(level)
+            );
+        }
+        for bad in [-2, -3, 10, 11, i32::MIN, i32::MAX] {
+            assert_eq!(
+                params_resolve_level(bad),
+                None,
+                "level {bad} is out of range"
+            );
+        }
     }
 }

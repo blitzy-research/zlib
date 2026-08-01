@@ -505,15 +505,40 @@ pub unsafe extern "C" fn deflateParams(strm: z_streamp, level: c_int, strategy: 
 
         // `deflateParams` may flush pending output through an internal
         // `deflate(strm, Z_BLOCK)` (see `engine::deflate_params`), and that is
-        // precisely where C validates the raw buffers. Because the engine call
-        // receives already-bridged slices — with a null-and-nonempty buffer
-        // masked to empty by `input_slice`/`output_slice` — that masked case
-        // would otherwise degrade to `Z_BUF_ERROR` instead of C's
-        // `Z_STREAM_ERROR`. Surface the same entry check eagerly here (the zlib
-        // manual permits `Z_STREAM_ERROR` for an "inconsistent stream state"):
-        // reject a null `next_out`, or a positive `avail_in` with a null
-        // `next_in`, before any bridging.
-        if !stream_buffers_valid(s) {
+        // precisely — and ONLY — where C validates the raw buffers. Because the
+        // engine call receives already-bridged slices, with a null-and-nonempty
+        // buffer masked to empty by `input_slice`/`output_slice`, that masked
+        // case would otherwise degrade to `Z_BUF_ERROR` instead of C's
+        // `Z_STREAM_ERROR`. So surface the same entry check eagerly — but ONLY
+        // when the pre-flush will actually run.
+        //
+        // C reaches the internal `deflate` call only when the change switches
+        // the block producer (or the strategy) AND the stream has already
+        // started (`s->last_flush != -2`). Otherwise `deflateParams` is pure
+        // bookkeeping: reference zlib returns `Z_OK` without touching a single
+        // byte, and therefore without caring whether `next_out` is null — which
+        // is exactly what a caller does when it raises the level between
+        // `deflateInit2` and the first `deflate` call, with the buffers not yet
+        // wired up. Validating unconditionally rejected those calls with
+        // `Z_STREAM_ERROR` and silently dropped the parameter change, breaking
+        // both ABI parity and byte identity (a stream compressed after a
+        // dropped level change diverges from reference zlib's output).
+        //
+        // `engine::deflate_params_flushes` is the single source of truth for
+        // that condition — `engine::deflate_params` itself calls it — so the
+        // check here cannot drift from the behavior it is guarding. It also
+        // reports `false` when no deflate handle is installed or the level is
+        // out of range, both of which the engine already answers with
+        // `Z_STREAM_ERROR` on its own (mirroring C's `deflateStateCheck` and
+        // range test, which likewise run before the buffers matter).
+        let flushes = {
+            // SAFETY: installed engine state (see `deflate`).
+            let Some(zs) = (unsafe { deflate_state(s) }) else {
+                return Z_STREAM_ERROR;
+            };
+            engine::deflate_params_flushes(zs, level, strategy)
+        };
+        if flushes && !stream_buffers_valid(s) {
             return Z_STREAM_ERROR;
         }
 
@@ -1196,26 +1221,195 @@ mod tests {
         assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
     }
 
+    /// `deflateParams` validates the raw buffers **only when it actually
+    /// flushes** — exactly where reference C does.
+    ///
+    /// C reaches its internal `deflate(strm, Z_BLOCK)` (the only place it looks
+    /// at `next_in`/`next_out`) solely when the requested change switches the
+    /// block producer or the strategy AND the stream has already started
+    /// (`s->last_flush != -2`). Every other `deflateParams` call is pure
+    /// bookkeeping and returns `Z_OK` without reading or writing a byte — so a
+    /// null `next_out` is irrelevant to it. That is precisely what a caller does
+    /// when it raises the level between `deflateInit2` and the first `deflate`,
+    /// with the buffers not yet wired up.
+    ///
+    /// Validating unconditionally rejected those calls with `Z_STREAM_ERROR` and
+    /// silently dropped the parameter change, which is both an ABI-parity break
+    /// and a **byte-identity** break: the stream then compresses at the old
+    /// level and diverges from reference zlib's output. Every expectation below
+    /// was measured against a reference C zlib built from this repository's own
+    /// `*.c` sources.
     #[test]
-    fn deflate_params_rejects_invalid_raw_buffers() {
-        // `deflateParams` surfaces the same entry validation as `deflate` (it may
-        // flush pending output through an internal `deflate(strm, Z_BLOCK)`); a
-        // null `next_out` is rejected with `Z_STREAM_ERROR`.
+    fn deflate_params_validates_raw_buffers_only_when_it_flushes() {
+        let input = b"payload";
+
+        // --- No pre-flush needed: Z_OK even with a null `next_out` -----------
+        // Immediately after `deflateInit_` the stream has `last_flush == -2`, so
+        // C skips the internal flush entirely. Reference C: rc = Z_OK.
         let mut strm = zeroed_stream();
         assert_eq!(
             unsafe { deflateInit_(&mut strm, 6, ver(), size_of::<z_stream>() as c_int) },
             Z_OK
         );
-        let input = b"payload";
         strm.next_in = input.as_ptr();
         strm.avail_in = input.len() as c_uint;
         strm.next_out = ptr::null_mut();
         strm.avail_out = 128;
         assert_eq!(
             unsafe { deflateParams(&mut strm, 9, Z_DEFAULT_STRATEGY) },
+            Z_OK,
+            "a parameter change that needs no flush must succeed, as in C — the \
+             raw buffers are never touched"
+        );
+
+        // ...and the change must have actually been APPLIED. Finish this stream
+        // and compare with one initialized at level 9 from the start: dropping
+        // the change would compress at level 6 and emit different bytes.
+        let corpus: Vec<u8> = (0..20_000u32)
+            .map(|i| b'a' + (i % 3) as u8)
+            .collect::<Vec<u8>>();
+        let mut promoted = std::vec![0u8; 64 * 1024];
+        strm.next_in = corpus.as_ptr();
+        strm.avail_in = corpus.len() as c_uint;
+        strm.next_out = promoted.as_mut_ptr();
+        strm.avail_out = promoted.len() as c_uint;
+        assert_eq!(unsafe { deflate(&mut strm, Z_FINISH) }, Z_STREAM_END);
+        let promoted_len = strm.total_out as usize;
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+
+        let mut native = zeroed_stream();
+        assert_eq!(
+            unsafe { deflateInit_(&mut native, 9, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+        let mut native_out = std::vec![0u8; 64 * 1024];
+        native.next_in = corpus.as_ptr();
+        native.avail_in = corpus.len() as c_uint;
+        native.next_out = native_out.as_mut_ptr();
+        native.avail_out = native_out.len() as c_uint;
+        assert_eq!(unsafe { deflate(&mut native, Z_FINISH) }, Z_STREAM_END);
+        let native_len = native.total_out as usize;
+        assert_eq!(unsafe { deflateEnd(&mut native) }, Z_OK);
+
+        assert_eq!(
+            &promoted[..promoted_len],
+            &native_out[..native_len],
+            "the accepted parameter change must take effect: promoting to level 9 \
+             before the first `deflate` must emit exactly what level 9 emits"
+        );
+        assert_eq!(
+            corpus,
+            zlib_inflate(&promoted[..promoted_len]),
+            "the promoted stream must still decode to the original bytes"
+        );
+
+        // --- Pre-flush required + invalid `next_out`: Z_STREAM_ERROR ---------
+        // Level 1 uses `deflate_fast` and level 9 uses `deflate_slow`, so this is
+        // a producer switch; one real `deflate` call first makes
+        // `last_flush != -2`. C's internal `deflate(strm, Z_BLOCK)` then rejects
+        // the null output pointer and `deflateParams` propagates it.
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe { deflateInit_(&mut strm, 1, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+        let mut output = std::vec![0u8; 64 * 1024];
+        strm.next_in = corpus.as_ptr();
+        strm.avail_in = 4096;
+        strm.next_out = output.as_mut_ptr();
+        strm.avail_out = output.len() as c_uint;
+        assert_eq!(unsafe { deflate(&mut strm, Z_NO_FLUSH) }, Z_OK);
+
+        let saved_next_out = strm.next_out;
+        let saved_avail_out = strm.avail_out;
+        strm.next_out = ptr::null_mut();
+        strm.avail_out = 128;
+        assert_eq!(
+            unsafe { deflateParams(&mut strm, 9, Z_DEFAULT_STRATEGY) },
+            Z_STREAM_ERROR,
+            "a parameter change that MUST flush still rejects an invalid output \
+             buffer, exactly as C's internal `deflate` does"
+        );
+
+        // --- Pre-flush required + valid buffers: accepted --------------------
+        // Same change, buffers restored: the guard must not be over-broad.
+        strm.next_out = saved_next_out;
+        strm.avail_out = saved_avail_out;
+        assert_eq!(
+            unsafe { deflateParams(&mut strm, 9, Z_DEFAULT_STRATEGY) },
+            Z_OK,
+            "with room available the flush completes and the change is applied"
+        );
+        // Finish the stream so the mid-flight change is proven end to end, then
+        // close cleanly (`Z_OK`, because the state is no longer `Busy`).
+        strm.next_in = unsafe { corpus.as_ptr().add(4096) };
+        strm.avail_in = (corpus.len() - 4096) as c_uint;
+        assert_eq!(unsafe { deflate(&mut strm, Z_FINISH) }, Z_STREAM_END);
+        let switched_len = strm.total_out as usize;
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+        assert_eq!(
+            corpus,
+            zlib_inflate(&output[..switched_len]),
+            "a stream whose level changed mid-flight must still decode exactly"
+        );
+
+        // --- Pre-flush required but no output room: Z_BUF_ERROR --------------
+        // The flush cannot complete, so C reports `Z_BUF_ERROR` (not
+        // `Z_STREAM_ERROR`): the pointers are valid, there is simply no space.
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe { deflateInit_(&mut strm, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+        strm.next_in = corpus.as_ptr();
+        strm.avail_in = 4096;
+        strm.next_out = output.as_mut_ptr();
+        strm.avail_out = 8;
+        let _ = unsafe { deflate(&mut strm, Z_NO_FLUSH) };
+        strm.avail_out = 0;
+        assert_eq!(
+            unsafe { deflateParams(&mut strm, 1, Z_DEFAULT_STRATEGY) },
+            Z_BUF_ERROR,
+            "an incomplete flush is Z_BUF_ERROR, never Z_STREAM_ERROR"
+        );
+        // Ending a stream that is still `Busy` is C's documented `Z_DATA_ERROR`
+        // ("the stream was freed prematurely"), not `Z_OK`.
+        assert_eq!(
+            unsafe { deflateEnd(&mut strm) },
+            ReturnCode::DataError.as_c_int()
+        );
+
+        // --- Out-of-range arguments still win over everything ---------------
+        // C validates the level/strategy range BEFORE it considers a flush, so a
+        // null `next_out` cannot change the answer.
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe { deflateInit_(&mut strm, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+        strm.next_out = ptr::null_mut();
+        strm.avail_out = 128;
+        assert_eq!(
+            unsafe { deflateParams(&mut strm, 10, Z_DEFAULT_STRATEGY) },
             Z_STREAM_ERROR
         );
+        assert_eq!(
+            unsafe { deflateParams(&mut strm, -2, Z_DEFAULT_STRATEGY) },
+            Z_STREAM_ERROR
+        );
+        assert_eq!(unsafe { deflateParams(&mut strm, 6, 5) }, Z_STREAM_ERROR);
         assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+
+        // A stream with no engine installed is `Z_STREAM_ERROR`, and so is null.
+        let mut bare = zeroed_stream();
+        assert_eq!(
+            unsafe { deflateParams(&mut bare, 6, Z_DEFAULT_STRATEGY) },
+            Z_STREAM_ERROR
+        );
+        assert_eq!(
+            unsafe { deflateParams(ptr::null_mut(), 6, Z_DEFAULT_STRATEGY) },
+            Z_STREAM_ERROR
+        );
     }
 
     #[test]

@@ -155,6 +155,18 @@ jobs:
     - name: Test
       if: ${{ matrix.test }}
       run: cargo +stable test --verbose ${{ matrix.features }}
+    # The SHIPPED profile, tested. `[profile.release]` sets `opt-level = 3`,
+    # `lto = true` and `codegen-units = 1`, none of which apply to the debug test
+    # run above, so a debug-only gate cannot see a defect whose reproduction
+    # depends on optimization. That is not hypothetical: a guarantee in
+    # `src/ffi/alloc.rs` that delegated its size ceiling to `malloc` held in debug
+    # and did not hold here, because at these settings the call was removed and
+    # the null test folded away. `cargo build --release` above compiles the
+    # library but runs no assertion, so it could not catch it either. This step is
+    # the gate that does.
+    - name: Test (release profile)
+      if: ${{ matrix.test }}
+      run: cargo +stable test --release --verbose ${{ matrix.features }}
     - name: Upload build logs
       uses: actions/upload-artifact@v4
       if: failure()
@@ -215,6 +227,14 @@ jobs:
       run: cargo +stable test --no-default-features
     - name: Test (no-std feature)
       run: cargo +stable test --no-default-features --features no-std
+    # Both std-off rows again under the SHIPPED profile. See the rationale on the
+    # `build-test` job's release step: `[profile.release]`'s `opt-level = 3` +
+    # `lto` + `codegen-units = 1` can decide whether an assertion holds, so the
+    # profile that ships has to be the profile that is tested.
+    - name: Test (no default features, release profile)
+      run: cargo +stable test --release --no-default-features
+    - name: Test (no-std feature, release profile)
+      run: cargo +stable test --release --no-default-features --features no-std
 
   # Formatting and linting. Clippy runs with warnings promoted to errors.
   #
@@ -544,3 +564,162 @@ jobs:
           echo "unsafe boundary intact: core is unsafe-free, 2 scoped carve-outs, crate-root deny in place"
         fi
         exit "$status"
+
+  # C-ABI linkage gate: the emitted `cdylib`/`staticlib` must actually be
+  # consumable by a C program in every feature configuration.
+  #
+  # Why this job has to exist separately from `build-test`: `cargo build --release`
+  # succeeding proves only that rustc emitted an archive and a shared object. It
+  # does NOT prove either artifact can be linked, because an `rlib`-to-`staticlib`
+  # roll-up is allowed to carry unresolved references, and a `cdylib` is allowed to
+  # be produced with undefined symbols that only surface when something tries to
+  # resolve them. Every std-off row was in exactly that state: the sysroot `core`
+  # and `alloc` rlibs carry `.data.DW.ref.rust_eh_personality` LSDA references that
+  # `std` normally satisfies, so with `--no-default-features` the artifacts built
+  # clean and then failed at `ld` time with `undefined reference to
+  # rust_eh_personality` — for a static link, for a dynamic link, and for
+  # `dlopen(RTLD_NOW)` alike. `src/lib.rs`'s freestanding runtime block now supplies
+  # the symbol; this job is what keeps it supplied.
+  #
+  # The three link forms are all tested because they fail independently: a static
+  # link resolves against the archive's member objects, a dynamic link against the
+  # shared object's dynamic symbol table, and `dlopen(RTLD_NOW)` resolves eagerly at
+  # load time — which is the only one of the three that a lazily-bound program would
+  # not reveal until first call.
+  #
+  # `expect_personality` is asserted in BOTH directions on purpose. A std-off row
+  # must define the symbol (1); the `std` control row must NOT (0), because `std`
+  # already provides it and an unconditional definition would be a duplicate.
+  # Asserting only the positive direction would let the `cfg` gate be widened to
+  # `always` without anything noticing.
+  #
+  # Each matrix row runs on its own runner, so the "a previous feature row left
+  # `target/release/libzlib_rs.a` holding a different feature set" hazard cannot
+  # occur here. Feature-crossing artifacts are why that matters: `--no-default-features`
+  # turns `gzip` off as well as `std`, so the consumer below deliberately exercises
+  # only the always-present surface (checksums, `compressBound`, `compress2` /
+  # `uncompress`, `zlibVersion`) and never gzip framing.
+  c-abi-linkage:
+    name: C ABI linkage (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    # Rank-2 override: beats the rank-4 `rust-toolchain.toml` repository pin,
+    # which would otherwise force this job onto the MSRV floor.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: std-off
+            features: '--no-default-features'
+            expect_personality: '1'
+          - name: std-off + no-std
+            features: '--no-default-features --features no-std'
+            expect_personality: '1'
+          - name: std-off + simd
+            features: '--no-default-features --features simd'
+            expect_personality: '1'
+          - name: std control
+            features: ''
+            expect_personality: '0'
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Install Rust stable toolchain
+      uses: dtolnay/rust-toolchain@stable
+    # `rust-toolchain.toml` pins this repository to the MSRV floor, and that
+    # repository pin OUTRANKS the `rustup default` that the toolchain action
+    # above sets. The job-level `RUSTUP_TOOLCHAIN` env var is a higher-priority
+    # override, so it is what actually selects current stable here. This step fails the
+    # job if that override is ever lost, rather than letting the gate silently
+    # run on the wrong compiler.
+    - name: Verify the resolved toolchain is stable
+      run: |
+        set -euo pipefail
+        rustc --version --verbose
+        active="$(rustup show active-toolchain)"
+        echo "active toolchain: $active"
+        case "$active" in
+          stable-*) ;;
+          *) echo "::error::expected the stable toolchain, but resolved '$active'."\
+             " The RUSTUP_TOOLCHAIN override was lost and rust-toolchain.toml won."; exit 1 ;;
+        esac
+    - name: Build the shipped artifacts (release)
+      run: cargo +stable build --release --locked --verbose ${{ matrix.features }}
+    - name: Assert the freestanding personality symbol is present exactly when required
+      run: |
+        set -euo pipefail
+        so=target/release/libzlib_rs.so
+        test -f "$so" || { echo "::error::$so was not emitted"; exit 1; }
+        found=$(nm -D --defined-only "$so" | grep -c ' T rust_eh_personality' || true)
+        want='${{ matrix.expect_personality }}'
+        echo "rust_eh_personality defined (T) in $so: $found (expected $want)"
+        if [ "$found" != "$want" ]; then
+          echo "::error::expected $want definition(s) of rust_eh_personality for" \
+               "features '${{ matrix.features }}', found $found. A std-off artifact must" \
+               "supply it or nothing can link; a std artifact must not, or it duplicates" \
+               "the definition std already provides."
+          exit 1
+        fi
+    - name: Link and load a C consumer against both artifacts
+      run: |
+        set -euo pipefail
+        cat > consumer.c <<'CONSUMER'
+        /* Exercises only the surface every feature row provides: no gzip framing,
+           because `--no-default-features` turns the `gzip` feature off too. */
+        #include <stdio.h>
+        #include <string.h>
+        #include "zlib.h"
+        int main(void) {
+            static unsigned char src[8192], comp[16384], back[8192];
+            for (unsigned i = 0; i < sizeof src; i++)
+                src[i] = (unsigned char)(i * 31u + (i >> 4));
+            if (crc32(crc32(0L, Z_NULL, 0), (const Bytef *)"123456789", 9) != 0xcbf43926UL) {
+                puts("FAIL crc32"); return 1;
+            }
+            if (adler32(adler32(0L, Z_NULL, 0), (const Bytef *)"123456789", 9) != 0x091e01deUL) {
+                puts("FAIL adler32"); return 1;
+            }
+            if (compressBound(9) != 22) { puts("FAIL compressBound"); return 1; }
+            uLongf clen = sizeof comp;
+            if (compress2(comp, &clen, src, sizeof src, 9) != Z_OK) { puts("FAIL compress2"); return 1; }
+            uLongf blen = sizeof back;
+            if (uncompress(back, &blen, comp, clen) != Z_OK) { puts("FAIL uncompress"); return 1; }
+            if (blen != sizeof src || memcmp(back, src, sizeof src) != 0) { puts("FAIL roundtrip"); return 1; }
+            printf("PASS ver=%s clen=%lu\n", zlibVersion(), (unsigned long)clen);
+            return 0;
+        }
+        CONSUMER
+        cat > loader.c <<'LOADER'
+        /* RTLD_NOW resolves every symbol at load time, so an undefined reference
+           fails here rather than at first call. */
+        #include <dlfcn.h>
+        #include <stdio.h>
+        #include <string.h>
+        int main(int argc, char **argv) {
+            void *h = dlopen(argv[1], RTLD_NOW);
+            if (!h) { printf("FAIL dlopen: %s\n", dlerror()); return 1; }
+            unsigned long (*crc)(unsigned long, const unsigned char *, unsigned) =
+                (unsigned long (*)(unsigned long, const unsigned char *, unsigned))dlsym(h, "crc32");
+            const char *(*ver)(void) = (const char *(*)(void))dlsym(h, "zlibVersion");
+            if (!crc || !ver) { printf("FAIL dlsym: %s\n", dlerror()); return 1; }
+            if (crc(crc(0UL, NULL, 0), (const unsigned char *)"123456789", 9) != 0xcbf43926UL) {
+                puts("FAIL dlopen crc32"); return 1;
+            }
+            printf("PASS dlopen ver=%s\n", ver());
+            return dlclose(h) == 0 ? 0 : 1;
+        }
+        LOADER
+
+        echo "--- static link ---"
+        gcc -O2 -I. consumer.c target/release/libzlib_rs.a -o consumer_static -lpthread -ldl -lm
+        ./consumer_static
+
+        echo "--- dynamic link ---"
+        gcc -O2 -I. consumer.c -L"$PWD/target/release" -lzlib_rs \
+            -Wl,-rpath,"$PWD/target/release" -o consumer_dyn
+        ./consumer_dyn
+
+        echo "--- dlopen(RTLD_NOW) ---"
+        gcc -O2 loader.c -o loader -ldl
+        ./loader "$PWD/target/release/libzlib_rs.so"

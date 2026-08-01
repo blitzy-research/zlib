@@ -256,6 +256,39 @@ Return codes (`Z_OK = 0` … `Z_VERSION_ERROR = -6`), buffer bounds, and streami
 semantics are surfaced at the boundary exactly as C callers expect, even though
 the internal implementation uses Rust `Result` types.
 
+### Symbol versioning
+
+The exported symbol **set** matches zlib's exactly — all 54 of `zlib.map`'s
+`global:` names are present and none of its 10 `local:` names leak — but the
+symbols carry **no `@ZLIB_x.y.z` version tags by default**. That is a
+deliberate, documented divergence (AAP §0.8.2 Divergence 4, ranked Low as gap
+D8), and it leaves static linking, ordinary dynamic linking, `-lz` substitution,
+and the `LD_PRELOAD` form above completely unaffected — none of them prints
+anything extra.
+
+The one form that notices is installing the artifact *as* `libz.so.1` for a
+program that was linked against a versioned distribution `libz`: glibc's loader
+then prints `no version information available` once per distinct `ZLIB_x.y.z`
+node that program requires (measured 0, 4, and 9 lines for consumers requiring
+0, 4, and 9 nodes) before the program runs — correctly, with identical results
+either way. Opting in silences it:
+
+```sh
+ZLIB_RS_VERSION_SCRIPT=1 cargo build --release
+```
+
+`build.rs` then derives a version script from `zlib.map` and applies it to the
+`cdylib` only, yielding the same 95 exported symbols with 54 of them tagged and
+all 16 `ZLIB_*` nodes declared. `1`, `true`, `yes`, and `on` all switch it on and
+`0`, `false`, `no`, `off`, and an empty value switch it off (case-insensitively,
+after trimming); any other value fails the build rather than silently guessing,
+so a typo cannot quietly leave it disabled. It is off by default because a
+version script is a GNU-ld/ELF-only construct not yet exercised by CI (AAP gap
+D3); on any target or toolchain where one of its clauses does not hold, the build
+prints a `cargo:warning` naming that clause and links unversioned rather than
+failing. The mechanism, the target clauses, and the full measurements are
+documented in the "Optional cdylib symbol versioning" section of `build.rs`.
+
 ## Feature flags
 
 Feature flags map the C preprocessor conditionals (`GZIP`, `NO_GZCOMPRESS`,

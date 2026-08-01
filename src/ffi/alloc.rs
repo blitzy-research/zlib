@@ -693,6 +693,68 @@ unsafe extern "C" {
     fn free(ptr: *mut c_void);
 }
 
+/// The byte count [`default_zalloc`] will ask `malloc` for, or [`None`] when the
+/// request cannot be expressed as an addressable region at all.
+///
+/// This is deliberately a separate, pure, total function rather than three lines
+/// inlined into [`default_zalloc`], for two reasons.
+///
+/// **It makes the size ceiling structural instead of delegated.** Leaving the
+/// ceiling to `malloc` — handing it the full `items * size` product and trusting
+/// it to refuse an absurd one — does not establish the property as a *guarantee*,
+/// because whether a given `size_t` is refused is a property of the platform
+/// allocator, and because an optimizing compiler is entitled to reason about a
+/// `malloc` whose result is only ever tested for nullity. Measured on this
+/// repository at `opt-level = 3` with `lto = true` and `codegen-units = 1` — the
+/// crate's own `[profile.release]` — the call to `malloc` for an unrepresentable
+/// size was removed outright and the null test folded away, so the property held
+/// in a debug build and silently did not hold in the profile that actually ships.
+/// Deciding the ceiling here, in ordinary integer arithmetic on values the
+/// compiler cannot assume anything about, is what makes the answer identical in
+/// every profile and on every target.
+///
+/// **It makes the guarantee testable without performing an allocation.** The
+/// property under test is a statement about arithmetic, so it is verified as one
+/// (`default_zalloc_rejects_every_unrepresentable_request`), independent of how
+/// much memory the host happens to have and of whether `malloc` is feeling
+/// generous.
+///
+/// # Rejection clauses
+///
+/// Both are required, and which one is load-bearing is target-dependent — the
+/// same complementary pairing already documented on [`hook_request`]:
+///
+/// 1. `items * size` overflows `usize`. Reachable only where `usize` is no wider
+///    than `c_uint`, i.e. on 32-bit targets, where the product of two
+///    `0xFFFF_FFFF`s cannot be held at all.
+/// 2. the product exceeds `isize::MAX`. This is the ceiling every Rust
+///    allocation obeys, the one [`Layout`] enforces for
+///    [`hook_request`], and the same rule already applied to a caller-supplied
+///    window in [`borrow_caller_window`]. On a 64-bit target it is the *only* clause
+///    that rejects the `c_uint` products above `2^63`; on a 32-bit target it
+///    additionally rejects the `2^31 ..= 2^32-1` band that `usize` can hold but
+///    no Rust reference can span.
+///
+/// A **zero** product is deliberately *not* rejected. C's `zcalloc` forwards it
+/// to `malloc(0)`, whose result — null or a unique non-null pointer — is
+/// implementation-defined, and both answers are already handled by every
+/// consumer; rejecting it here would be a behavior change this crate has no
+/// reason to make. The crate's own paths never produce it, because
+/// [`hook_request`] rejects an empty request before the hook is consulted.
+#[inline]
+#[must_use]
+fn default_zalloc_bytes(items: c_uint, size: c_uint) -> Option<usize> {
+    // Clause 1 — the product must be representable at all.
+    let bytes = (items as usize).checked_mul(size as usize)?;
+
+    // Clause 2 — and must be within the ceiling any addressable region obeys.
+    if bytes > isize::MAX as usize {
+        return None;
+    }
+
+    Some(bytes)
+}
+
 /// The crate's counterpart of C `zcalloc` (`zutil.c` L299-L302).
 ///
 /// Substituted for a caller's null `z_stream.zalloc` by
@@ -703,12 +765,20 @@ unsafe extern "C" {
 ///
 /// The one deliberate refinement over C: C evaluates `items * size` in
 /// `unsigned` arithmetic, which silently wraps on overflow and can hand back a
-/// region far smaller than requested. This computes the product in `usize` and
-/// reports an overflowing request as an allocation failure (a null return),
-/// which every caller already maps to `Z_MEM_ERROR`. The refinement is
-/// unobservable through the C ABI in practice, because
+/// region far smaller than requested. Measured against a reference C library
+/// built from this repository's own `zutil.c`, `zcalloc(_, 0xFFFF_FFFF,
+/// 0xFFFF_FFFF)` wraps to `malloc(1)` and answers a 16-exabyte request with a
+/// **one-byte** region — a heap overflow waiting for its first write. This
+/// instead sizes the request through [`default_zalloc_bytes`] and reports
+/// anything it cannot express as an allocation failure (a null return), which
+/// every caller already maps to `Z_MEM_ERROR`.
+///
+/// The refinement is unobservable through the C ABI on any engine path, because
 /// [`try_alloc_foreign_items`] rejects a request whose `items * size` exceeds
-/// `uInt` before the hook is ever consulted.
+/// `uInt` before the hook is ever consulted. It is reachable only by a caller who
+/// invokes the substituted `z_stream.zalloc` directly with a pair no engine path
+/// produces, and for such a caller a null answer is the only one that is not
+/// immediately undefined behavior.
 ///
 /// # Safety
 ///
@@ -722,14 +792,17 @@ pub(crate) unsafe extern "C" fn default_zalloc(
     items: c_uint,
     size: c_uint,
 ) -> *mut c_void {
-    let Some(bytes) = (items as usize).checked_mul(size as usize) else {
+    let Some(bytes) = default_zalloc_bytes(items, size) else {
         // An unrepresentable request is an allocation failure, never a wrapped
-        // (and therefore undersized) one.
+        // (and therefore undersized) one. Decided before `malloc` is reached, so
+        // the guarantee belongs to this crate rather than to the platform
+        // allocator's tolerance or to the optimizer's mood.
         return core::ptr::null_mut();
     };
-    // SAFETY: `malloc` accepts any `size_t` and answers with either null (out of
-    // memory) or a pointer to `bytes` writable, suitably aligned bytes. No
-    // pointer supplied by the caller is dereferenced — `opaque` is ignored.
+    // SAFETY: `bytes` is at most `isize::MAX` (just established), and `malloc`
+    // accepts any `size_t`, answering with either null (out of memory) or a
+    // pointer to `bytes` writable, suitably aligned bytes. No pointer supplied by
+    // the caller is dereferenced — `opaque` is ignored.
     unsafe { malloc(bytes) }
 }
 
@@ -1516,8 +1589,8 @@ mod tests {
 #[cfg(test)]
 mod foreign_alloc_tests {
     use super::{
-        AllocHook, ForeignBuffer, default_zalloc, default_zfree, fill_default, hook_request,
-        try_alloc_foreign,
+        AllocHook, ForeignBuffer, default_zalloc, default_zalloc_bytes, default_zfree,
+        fill_default, hook_request, try_alloc_foreign,
     };
     use crate::stream::AllocBuffer;
     use alloc::boxed::Box;
@@ -1980,24 +2053,183 @@ mod foreign_alloc_tests {
         unsafe { default_zfree(cookie, raw) };
     }
 
+    /// The sizing decision behind [`default_zalloc`], tested as the arithmetic
+    /// statement it is: **every** request that cannot become an addressable
+    /// region is rejected, and every request that can is passed through
+    /// unchanged.
+    ///
+    /// Verifying the pure function rather than only the allocator is what makes
+    /// the guarantee independent of the host's free memory, of whether `malloc`
+    /// chooses to refuse an absurd size, and — the failure this test exists to
+    /// prevent — of whether the optimizer decided to keep the `malloc` call at
+    /// all. It held in a debug build and did not hold at `opt-level = 3` with
+    /// `lto` and one codegen unit when the ceiling was delegated to `malloc`.
+    #[test]
+    fn default_zalloc_rejects_every_unrepresentable_request() {
+        // The ceiling, expressed the way the guard expresses it.
+        let cap = isize::MAX as usize;
+
+        // --- Serviceable requests pass through with the exact product ---------
+        for (items, size) in [(0u32, 1u32), (1, 0), (0, 0), (1, 1), (64, 4), (4096, 1024)] {
+            assert_eq!(
+                default_zalloc_bytes(items, size),
+                Some((items as usize) * (size as usize)),
+                "a serviceable {items}x{size} request must pass through unchanged"
+            );
+        }
+
+        // The largest single-item request this target can address at all. On a
+        // 64-bit target that is `c_uint::MAX`; on a 32-bit target the ceiling
+        // itself, `isize::MAX`, is the smaller of the two.
+        let widest = c_uint::try_from(cap.min(c_uint::MAX as usize))
+            .expect("the minimum of the two ceilings always fits a c_uint");
+        assert_eq!(
+            default_zalloc_bytes(1, widest),
+            Some(widest as usize),
+            "the widest addressable single-item request must be served"
+        );
+
+        // --- Unrepresentable requests are rejected ---------------------------
+        // `0xFFFF_FFFF * 0xFFFF_FFFF`: C's `zcalloc` wraps this in `unsigned`
+        // arithmetic to `malloc(1)` and hands back a one-byte region. Rejected
+        // here by clause 2 on a 64-bit target and by clause 1 on a 32-bit one, so
+        // both widths answer identically.
+        assert_eq!(
+            default_zalloc_bytes(c_uint::MAX, c_uint::MAX),
+            None,
+            "a product that wraps C's `unsigned` multiplication must be rejected"
+        );
+
+        // The tightest possible straddle of the ceiling for this target: two
+        // requests one `items`-multiple apart, one addressable and one not. This
+        // is the case a `checked_mul`-only guard cannot see, because the product
+        // is perfectly representable in `usize`.
+        #[cfg(target_pointer_width = "64")]
+        {
+            // 0xFFFF_FFFF * 0x8000_0000 == 9_223_372_034_707_292_160 <= isize::MAX
+            assert_eq!(
+                default_zalloc_bytes(c_uint::MAX, 0x8000_0000),
+                Some(0xFFFF_FFFFusize * 0x8000_0000usize),
+                "the largest in-range c_uint product must still be served"
+            );
+            // 0xFFFF_FFFF * 0x8000_0001 == 9_223_372_039_002_259_455 >  isize::MAX
+            let over = 0xFFFF_FFFFusize * 0x8000_0001usize;
+            assert!(over > cap, "the companion case must exceed the ceiling");
+            assert_eq!(
+                default_zalloc_bytes(c_uint::MAX, 0x8000_0001),
+                None,
+                "a product representable in usize but above isize::MAX must be \
+                 rejected — `checked_mul` alone never sees this case"
+            );
+        }
+        #[cfg(target_pointer_width = "32")]
+        {
+            assert_eq!(
+                default_zalloc_bytes(1, 0x7FFF_FFFF),
+                Some(0x7FFF_FFFF),
+                "exactly isize::MAX bytes must still be served"
+            );
+            assert_eq!(
+                default_zalloc_bytes(1, 0x8000_0000),
+                None,
+                "one byte past isize::MAX must be rejected even though `usize` \
+                 holds it"
+            );
+        }
+
+        // Breadth coverage. Every pair below is beyond reach on *both* supported
+        // pointer widths — on a 64-bit target by clause 2, on a 32-bit one by
+        // clause 1 — so the table needs no `cfg`. The premise of each row is
+        // re-established in `u128`, which cannot overflow for any `c_uint` pair
+        // and shares no arithmetic with the guard under test, so a mistyped
+        // fixture fails loudly instead of passing vacuously.
+        for (items, size) in [
+            (c_uint::MAX, 0xC000_0000u32), // 13_835_058_052_060_938_240
+            (0xC000_0000, c_uint::MAX),    // 13_835_058_052_060_938_240
+            (0xE000_0000, 0xE000_0000),    // 14_123_288_431_433_875_456
+            (0x9000_0000, 0xF000_0000),    //  9_727_775_195_120_271_360
+        ] {
+            let exact = u128::from(items) * u128::from(size);
+            assert!(
+                exact > cap as u128,
+                "fixture {items:#X}x{size:#X} is actually within this target's reach"
+            );
+            assert_eq!(
+                default_zalloc_bytes(items, size),
+                None,
+                "{items:#X}x{size:#X} can never become an addressable region"
+            );
+        }
+    }
+
     /// A request whose `items * size` product cannot be represented is reported
     /// as an allocation failure (null), never as a wrapped — and therefore
     /// undersized — region. This is the one deliberate refinement over C's
     /// `unsigned` multiplication in `zcalloc`.
     ///
+    /// Every operand and every answer is routed through
+    /// [`core::hint::black_box`] so the assertions describe what the shipped code
+    /// really does: without it a release build is free to fold the whole call
+    /// chain to a constant, and the test would then be checking the optimizer's
+    /// arithmetic rather than the allocator's guard.
+    ///
     /// `default_zfree(_, NULL)` is a no-op, exactly as C's `zcfree` is over
     /// `free(NULL)`.
     #[test]
     fn builtin_zalloc_reports_an_overflowing_product_as_failure() {
-        // `0xFFFF_FFFF * 0xFFFF_FFFF` overflows `u32` (C would wrap to 1) and, on
-        // a 64-bit host, is a `usize` product `malloc` can never serve; the
-        // `checked_mul` guard is what makes the 32-bit host answer identically.
+        use core::hint::black_box;
+
+        // `0xFFFF_FFFF * 0xFFFF_FFFF` overflows `u32` (C would wrap it to 1 and
+        // return a one-byte region) and exceeds `isize::MAX`; on a 32-bit host the
+        // `usize` product overflows as well. Both clauses of the guard reject it,
+        // so every supported width answers null.
         // SAFETY: as in `builtin_hooks_round_trip_a_region`.
-        let raw = unsafe { default_zalloc(core::ptr::null_mut(), c_uint::MAX, c_uint::MAX) };
+        let raw = unsafe {
+            default_zalloc(
+                black_box(core::ptr::null_mut()),
+                black_box(c_uint::MAX),
+                black_box(c_uint::MAX),
+            )
+        };
         assert!(
-            raw.is_null(),
+            black_box(raw).is_null(),
             "an unrepresentable request must fail, not wrap to a tiny region"
         );
+
+        // A product that `usize` holds comfortably but no reference can span. This
+        // reaches the allocator only through the `isize::MAX` clause; a
+        // `checked_mul`-only guard would forward it to `malloc`.
+        // SAFETY: as above.
+        let over = unsafe {
+            default_zalloc(
+                black_box(core::ptr::null_mut()),
+                black_box(c_uint::MAX),
+                black_box(0x8000_0001),
+            )
+        };
+        assert!(
+            black_box(over).is_null(),
+            "a request above isize::MAX must fail without consulting malloc"
+        );
+
+        // The refinement must not spill onto serviceable requests: the same
+        // function, called through the same optimization-opaque path, still
+        // serves a real one.
+        // SAFETY: as above.
+        let fine = unsafe {
+            default_zalloc(
+                black_box(core::ptr::null_mut()),
+                black_box(16),
+                black_box(8),
+            )
+        };
+        assert!(
+            !black_box(fine).is_null(),
+            "a 128-byte request must still be served"
+        );
+        // SAFETY: `fine` came from `default_zalloc` (i.e. `malloc`) and has not
+        // been released; this is its single, matching deallocation.
+        unsafe { default_zfree(core::ptr::null_mut(), fine) };
 
         // SAFETY: a null address is explicitly permitted and is a no-op.
         unsafe { default_zfree(core::ptr::null_mut(), core::ptr::null_mut()) };

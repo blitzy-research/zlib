@@ -72,6 +72,25 @@
 //! *consumption* time by `crc32.rs` with `cfg!(target_endian)`. The byte-wise
 //! `CRC_TABLE` is endianness- and word-size-independent, so it needs no variant.
 //!
+//! That claim is about this script's *output*, and it carries through to the
+//! shipped artifacts: two clean release builds of one source tree into two
+//! different target directories produce a bit-identical `libzlib_rs.a` and
+//! `libzlib_rs.so`. It does **not** extend to `libzlib_rs.rlib`. That archive's
+//! `lib.rmeta` member records the absolute path of the file this script
+//! generates — `${OUT_DIR}/crc32_tables.rs`, pulled in by the
+//! `include!(concat!(env!("OUT_DIR"), …))` in `src/checksum/crc32.rs` — so two
+//! such builds differ inside `lib.rmeta` in exactly the bytes that spell that
+//! path (measured: 33 differing bytes for one pair of equal-length target
+//! directories) while the rlib's compiled object member is bit-identical. An
+//! rlib is a Rust-internal intermediate rather than a C-consumer artifact, so
+//! the difference is inert. A consumer who needs identical metadata as well can
+//! normalise it with `--remap-path-prefix`: measured, two builds whose target
+//! directories differ produce a bit-identical rlib once both prefixes are mapped
+//! to the same replacement. Both mappings must be present in *one* flag string
+//! used by both builds, because `RUSTFLAGS` itself feeds Cargo's unit hash — and
+//! that is precisely why this stays a consumer-side rustflag and is not baked in
+//! here, for the reasons `.cargo/config.toml` gives.
+//!
 //! # Optional cdylib symbol versioning (AAP §0.8.2 Divergence 4 / gap D8)
 //!
 //! The C build links `libz.so` through `zlib.map`, a GNU-ld *version script* that

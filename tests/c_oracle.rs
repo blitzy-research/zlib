@@ -517,6 +517,33 @@ fn smoke_corpus() -> Vec<(&'static str, Vec<u8>)> {
 // ===========================================================================
 // The private work directory (std only — there is no `tempfile` dependency)
 // ===========================================================================
+//
+// This harness creates a directory under the shared system temporary directory
+// and then removes it recursively, which is precisely the shape that makes
+// CWE-377 (insecure temporary file) and CWE-367 (time-of-check/time-of-use)
+// exploitable if it is done naively. Three rules keep it safe, and they are
+// mirrored from the already-hardened in-crate precedents — `safe_component` /
+// `create_private_dir` / `TempGz` in `src/gz/state.rs` and `Scratch` in
+// `build.rs` — so the whole repository states the same policy once:
+//
+//  1. **Create-new, never adopt.** The directory is created with a
+//     *non-recursive* `DirBuilder::create`, which reports `AlreadyExists` when
+//     the name is taken — including when it is taken by a symlink somebody
+//     planted. An occupied candidate is *skipped*, never followed and never
+//     deleted, so a pre-planted path can be neither destroyed nor traversed.
+//     `create_dir_all` would instead silently adopt whatever it found, and the
+//     `Drop` below would then recursively delete it.
+//  2. **Private from the instant it exists.** On Unix the `0o700` mode is handed
+//     to `mkdir(2)` itself rather than applied afterwards with
+//     `set_permissions`, so there is no window in which the directory is
+//     group- or world-accessible (the classic TOCTOU race). With a default
+//     `umask` of `0o022`, `create_dir_all` would have produced `0o755` and left
+//     every intermediate artifact world-readable.
+//  3. **Create-new for the files, too.** Every file this harness writes inside
+//     the directory goes through [`WorkDir::write_new`] / [`WorkDir::copy_new`],
+//     which refuse to overwrite. Belt-and-braces given rule 1, and it also turns
+//     an accidental name collision between two sweeps into a loud failure
+//     instead of a silent overwrite.
 
 /// How many distinct directory names [`WorkDir::new`] will try before giving up.
 ///
@@ -725,6 +752,11 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
 /// [`AlreadyExists`]: std::io::ErrorKind::AlreadyExists
 struct WorkDir {
     /// Absolute path of the directory.
+    ///
+    /// Invariant, and the reason the recursive delete in [`Drop`] is safe: the
+    /// only constructor is [`WorkDir::new`], which returns `Ok` solely after
+    /// [`create_private_dir`] created this exact path. A `WorkDir` therefore
+    /// never names a directory it did not itself bring into existence.
     path: PathBuf,
 }
 
@@ -2335,6 +2367,7 @@ impl Oracle {
     /// directory. The blob is deleted as soon as it has been read: it is by far
     /// the largest artifact the harness produces, and nothing needs it again.
     fn sweep(&self, tag: &str, axes: &Axes) -> Vec<Record> {
+        let tag = safe_component(tag);
         let blob_path = self.work.join(format!("results_{tag}.bin"));
         let params_name = format!("sweep_{tag}.params");
 

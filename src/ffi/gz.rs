@@ -345,6 +345,38 @@ impl GzHandle {
     }
 }
 
+/// Reads the direction of the handle behind `file` **without taking ownership**
+/// of it.
+///
+/// This exists so the close shims can reproduce C's *validate-then-act* order
+/// exactly. C inspects `state->mode` while the allocation is still owned by the
+/// caller and returns `Z_STREAM_ERROR` for a wrong-direction request **without
+/// touching any allocation** (`gzread.c` L650-L651 `if (state->mode != GZ_READ)
+/// return Z_STREAM_ERROR;` and the matching `gzwrite.c` guard in `gzclose_w`),
+/// leaving the handle fully usable. Reconstructing the owning [`Box`] first —
+/// and therefore dropping it on the rejection path — would free a handle the
+/// caller is still entitled to use.
+///
+/// Unlike [`gz_handle`] this deliberately does **not** go through
+/// [`GzBorrow`]: it reads one `Copy` field and must not reconcile or re-sync the
+/// `gzFile_s` prefix, so that a rejected close leaves the handle byte-for-byte
+/// as it was.
+///
+/// # Safety
+///
+/// Same contract as [`gz_handle`]: `file` must be a non-null handle produced by
+/// [`box_state`] (i.e. by `gzopen*`/`gzdopen`) and not yet closed.
+#[cfg(feature = "gz-io")]
+#[inline]
+unsafe fn gz_handle_mode(file: gzFile) -> GzMode {
+    // SAFETY: per the contract `file` points at a live `GzHandle` whose
+    // `gzFile_s` prefix sits at offset 0 (`#[repr(C)]`), so the pointer may be
+    // read as a `*const GzHandle`. Only the `Copy` `mode` field is read, through
+    // a shared borrow that ends with this expression; nothing is mutated and no
+    // ownership is taken.
+    unsafe { (*(file as *const GzHandle)).state.mode }
+}
+
 /// Borrows the [`GzHandle`] behind the opaque `file` pointer.
 ///
 /// # Safety
@@ -460,14 +492,18 @@ enum CloseDirection {
 #[cfg(feature = "gz-io")]
 #[inline]
 unsafe fn take_for_close(file: gzFile, want: CloseDirection) -> Option<Box<GzHandle>> {
-    // SAFETY: per the contract `file` points at a live `GzHandle` whose
-    // `gzFile_s` prefix sits at offset 0, so the cast is the identity on the
-    // address. The place expression borrows the handle (and, through its `Box`,
-    // the `GzState`) only for this statement and copies the `GzMode` out, so no
-    // reference outlives the read and none is live when the box is reclaimed
-    // below. Nothing is mutated, so a rejected close leaves the handle — prefix
-    // included — bit-for-bit as C leaves it.
-    let mode = unsafe { (*(file as *const GzHandle)).state.mode };
+    // The direction is read through [`gz_handle_mode`], the one place in this
+    // module that touches `state.mode` without taking ownership: it borrows the
+    // handle (and, through its `Box`, the `GzState`) only for that expression and
+    // copies the `GzMode` out, so no reference outlives the read and none is live
+    // when the box is reclaimed below. Nothing is mutated, so a rejected close
+    // leaves the handle — prefix included — bit-for-bit as C leaves it.
+    //
+    // SAFETY: `take_for_close`'s own contract is `gz_handle_mode`'s contract —
+    // `file` is a non-null, not-yet-closed handle produced by [`box_state`], so
+    // its `gzFile_s` prefix sits at offset 0 and the cast inside is the identity
+    // on the address.
+    let mode = unsafe { gz_handle_mode(file) };
 
     let matches = match want {
         // `gzclose` has no mode test of its own; it dispatches with
@@ -2383,6 +2419,14 @@ mod tests {
                 );
             }
 
+            // The refusal records nothing on the handle: C returns before it can
+            // reach `gz_error`, so `gzerror` must still answer `Z_OK` with the
+            // empty message a freshly opened handle carries.
+            let mut errnum: c_int = Z_STREAM_ERROR;
+            let msg = gzerror(wf, &raw mut errnum);
+            assert_eq!(errnum, Z_OK, "a rejected close must not poison the handle");
+            assert!(!msg.is_null() && CStr::from_ptr(msg).to_bytes().is_empty());
+
             // The handle survived every refusal: it still reports its position and
             // still accepts writes.
             assert_eq!(gztell(wf), head.len() as z_off_t);
@@ -2419,6 +2463,16 @@ mod tests {
                     "gzclose_w on a reader must be refused (attempt {attempt})"
                 );
             }
+
+            // Same on the read side: the refusal left the error state pristine.
+            let mut errnum: c_int = Z_STREAM_ERROR;
+            let msg = gzerror(rf, &raw mut errnum);
+            assert_eq!(errnum, Z_OK, "a rejected close must not poison the handle");
+            assert!(!msg.is_null() && CStr::from_ptr(msg).to_bytes().is_empty());
+
+            // Every status accessor still works on the surviving handle.
+            assert_eq!(gzeof(rf), 0);
+            assert_eq!(gzdirect(rf), 0);
 
             // Reading resumes exactly where it left off — nothing was torn down.
             let mut rest = [0u8; 9];
