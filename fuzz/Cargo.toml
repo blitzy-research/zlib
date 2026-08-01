@@ -66,7 +66,9 @@ libfuzzer-sys = "0.4"
 
 [dependencies.zlib-rs]
 # Fuzz the real crate through its public API and its C FFI boundary. Default
-# features (std + gzip + gz-io + simd) give the harnesses the full surface.
+# features (std + gzip + gz-io + simd) give the harnesses the full surface; the
+# two that the gated legs actually depend on are additionally forwarded from this
+# crate's own `gzip` feature below, so they are guaranteed rather than inherited.
 path = ".."
 
 # --- Features --------------------------------------------------------------
@@ -79,11 +81,28 @@ path = ".."
 # false — silently compiling the gzip coverage out of the gzip harness — and
 # `rustc`'s `unexpected_cfgs` lint rejects the unknown value outright ("no
 # expected values for `feature`"), which the folder's blocking
-# `clippy --all-targets -- -D warnings` gate turns into an error. Declaring it
-# and forwarding it to `zlib-rs/gzip` makes the predicate both defined and
-# truthful: whenever a gated leg compiles, the library capability that leg needs
-# is guaranteed enabled rather than merely inherited from `zlib-rs`'s own
-# defaults.
+# `clippy --all-targets -- -D warnings` gate turns into an error.
+#
+# Declaring it makes the predicate defined; forwarding it to EVERY library
+# capability the gated legs actually use is what makes it truthful. There are
+# two, and both must be named:
+#
+#   * `zlib-rs/gzip` — RFC 1952 framing in the deflate/inflate engines, which is
+#     what the `windowBits` +16 / +32 bands and `deflate_set_header` /
+#     `inflate_get_header` legs need.
+#   * `zlib-rs/gz-io` — the IDIOMATIC gzip file-I/O layer. `src/lib.rs` declares
+#     `pub mod gz` behind `#[cfg(feature = "gz-io")]` (it needs `std::fs` /
+#     `std::io`), so `fuzz_gzip.rs`'s `use zlib_rs::gz::{gzopen, gzread,
+#     gzwrite, gzclose_r, gzclose_w}` resolves only when `gz-io` is on.
+#
+# Forwarding only `gzip` left that second capability merely INHERITED from the
+# path dependency's own defaults rather than guaranteed by this manifest: the
+# gz-file legs happened to compile, but nothing in the feature graph said they
+# had to, so a future `default-features = false` on the dependency (or a change
+# to `zlib-rs`'s default set) would have broken them at a distance. Naming both
+# closes that gap. `gz-io` already expands to `["std", "gzip"]` upstream, so the
+# two entries overlap by design — `gzip` stays listed explicitly so the framing
+# capability remains guaranteed independently of how `gz-io` is defined.
 #
 # It is ON by default, so a plain `cargo +nightly fuzz build|run` keeps the full
 # gzip coverage. `--no-default-features` compiles the gzip-specific legs out
@@ -94,7 +113,7 @@ path = ".."
 # versions, not feature selections, so `fuzz/Cargo.lock` is unaffected.
 [features]
 default = ["gzip"]
-gzip = ["zlib-rs/gzip"]
+gzip = ["zlib-rs/gzip", "zlib-rs/gz-io"]
 
 # libFuzzer wants line-level debug info in the optimized build for actionable
 # crash reports; overflow checks stay on so arithmetic mistakes surface as

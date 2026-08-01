@@ -151,6 +151,16 @@ const WBITS_GZIP: i32 = 31;
 /// zlib wrapper only (RFC 1950). Always available — never gated on `gzip`.
 const WBITS_ZLIB: i32 = 15;
 
+/// Ceiling on the candidate names [`TempGzWorkspace::new`] will try.
+///
+/// The loop only ever advances to the next name — it never deletes an occupied
+/// candidate — so it needs a bound, and this one is generous: each candidate
+/// already carries the process id, a monotonic counter and a sanitized clone
+/// index, so a collision means another process is actively planting names rather
+/// than that the name space is crowded.
+#[cfg(feature = "gzip")]
+const TEMP_DIR_ATTEMPTS: u32 = 64;
+
 /// Raw DEFLATE (RFC 1951): no wrapper, no checksum. Always available.
 const WBITS_RAW: i32 = -15;
 
@@ -1151,37 +1161,48 @@ fn ascii_field(src: &mut Bytes<'_>, fallback: &str) -> Vec<u8> {
 ///
 /// # Path safety
 ///
-/// The path contains **no** input-derived component: a fixed prefix, the process
-/// id, and a monotonic counter. That is deliberate — a fuzzer-chosen path
-/// fragment is a directory-traversal primitive, and this harness must not become
-/// one. Both handles are closed explicitly (a `GzState` destructor deliberately
+/// The path contains **no** input-derived component — a fuzzer-chosen path
+/// fragment is a directory-traversal primitive and this harness must not become
+/// one — and it is not merely unpredictable but *unshared*: [`TempGzWorkspace`]
+/// creates a fresh, owner-only directory with create-new semantics and puts the
+/// payload inside it, so nothing that another user could have planted in the
+/// shared temp directory is ever opened, followed, or truncated.
+///
+/// Both handles are closed explicitly (a `GzState` destructor deliberately
 /// performs no finishing work, precisely so a deferred write error cannot be
-/// swallowed), and the file is removed on every exit path.
+/// swallowed), and the workspace is removed on every exit path: by the guard's
+/// `Drop` on the ordinary and unwinding routes, and by an explicit
+/// [`TempGzWorkspace::cleanup`] immediately before each `panic!`, because
+/// libFuzzer's panic hook aborts rather than unwinding and would otherwise skip
+/// every destructor.
 ///
 /// A `gzclose_w` that cannot flush is asserted rather than tolerated: the payload
-/// is bounded and the temp directory is the platform's own, so a failure here is
-/// a genuine finding in the write path.
+/// is bounded and the directory was created empty a moment earlier, so a failure
+/// here is a genuine finding in the write path.
 #[cfg(feature = "gzip")]
 fn probe_gz_lifecycle(payload: &[u8]) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!("zlib_rs_fuzz_gzip_{}_{seq}.gz", std::process::id()));
+    // A workspace the environment refuses is not a library finding; the in-memory
+    // probes carry the coverage on their own in that case.
+    let Some(temp) = TempGzWorkspace::new() else {
+        return;
+    };
 
     // ---- write leg ----
-    let mut out = match gzopen(&path, "wb") {
+    // `"wbx"` adds `O_EXCL` (`src/gz/open.rs` maps the `'x'` flag to
+    // `create_new(true)`), so even inside a directory that did not exist a moment
+    // ago the file is never opened through a pre-existing name.
+    let mut out = match gzopen(temp.path(), "wbx") {
         Ok(state) => state,
-        // The environment refusing a temp file is not a library finding; the
-        // in-memory probes carry the coverage on their own in that case.
+        // Same environmental tolerance as above — an exhausted descriptor table or
+        // a full filesystem is not a finding about the library. It is *only* that:
+        // every library outcome after this point is asserted, never skipped.
         Err(_) => return,
     };
     let written = gzwrite(&mut out, payload);
     let write_ok = written == payload.len() as i32;
     let closed = gzclose_w(out);
     if !write_ok || closed != ReturnCode::Ok.as_c_int() {
-        let _ = std::fs::remove_file(&path);
+        temp.cleanup();
         panic!(
             "gz write leg failed for a {}-byte payload: gzwrite returned \
              {written}, gzclose_w returned {closed}",
@@ -1191,7 +1212,7 @@ fn probe_gz_lifecycle(payload: &[u8]) {
 
     // ---- read leg ----
     let read_back = (|| -> Result<Vec<u8>, String> {
-        let mut inp = gzopen(&path, "rb").map_err(|e| format!("gzopen for read: {e:?}"))?;
+        let mut inp = gzopen(temp.path(), "rb").map_err(|e| format!("gzopen for read: {e:?}"))?;
         let mut got = Vec::with_capacity(payload.len());
         let mut chunk = [0u8; 512];
         loop {
@@ -1204,11 +1225,18 @@ fn probe_gz_lifecycle(payload: &[u8]) {
                 break;
             }
             got.extend_from_slice(&chunk[..n as usize]);
-            assert!(
-                got.len() <= payload.len(),
-                "gzread produced more than the {} bytes written",
-                payload.len()
-            );
+            // Reported rather than asserted, so the reader is still closed and the
+            // workspace still removed on this route: a bare `assert!` here would
+            // abort under libFuzzer holding an open `gzFile` and leaving the
+            // directory behind.
+            if got.len() > payload.len() {
+                let code = gzclose_r(inp);
+                return Err(format!(
+                    "gzread produced {} bytes, more than the {} written (gzclose_r {code})",
+                    got.len(),
+                    payload.len()
+                ));
+            }
         }
         let code = gzclose_r(inp);
         if code != ReturnCode::Ok.as_c_int() {
@@ -1217,8 +1245,8 @@ fn probe_gz_lifecycle(payload: &[u8]) {
         Ok(got)
     })();
 
-    // Remove the file before asserting, so a failure cannot leak it.
-    let _ = std::fs::remove_file(&path);
+    // Remove the workspace before asserting, so an abort-on-panic cannot leak it.
+    temp.cleanup();
     let got = read_back.unwrap_or_else(|e| panic!("gz read leg failed: {e}"));
     assert_eq!(
         got.len(),
@@ -1231,6 +1259,152 @@ fn probe_gz_lifecycle(payload: &[u8]) {
         got, payload,
         "the gz round trip must recover the written bytes exactly"
     );
+}
+
+/// Sanitizes `raw` into a single filesystem component that cannot escape its
+/// parent directory.
+///
+/// Only ASCII alphanumerics, `_` and `-` survive, capped at 32 characters, and an
+/// input that filters down to nothing becomes `x`. Every traversal and separator
+/// form — `..`, `/`, `\`, a drive prefix — is therefore collapsed to something
+/// that can only ever name a child of the directory it is joined to. The only
+/// value this is applied to is the `CLONE_INDEX` environment variable, which
+/// parallel clones of this repository use to stay distinct inside one shared
+/// `/tmp`; no fuzz input reaches it.
+#[cfg(feature = "gzip")]
+fn safe_path_component(raw: &str) -> String {
+    let filtered: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(32)
+        .collect();
+    if filtered.is_empty() {
+        "x".to_owned()
+    } else {
+        filtered
+    }
+}
+
+/// Creates `path` as a new, private directory, failing if anything is already
+/// there.
+///
+/// Non-recursive on purpose: unlike `create_dir_all` this reports
+/// [`std::io::ErrorKind::AlreadyExists`] when the name is taken — including when
+/// it is taken by a symlink someone else planted — which is what lets
+/// [`TempGzWorkspace::new`] move to the next candidate instead of following the
+/// link or deleting it. On Unix the `0o700` mode is handed to `mkdir(2)` itself,
+/// so the directory is never even briefly group- or world-accessible and there is
+/// no `set_permissions` window to race. Both properties describe the moment of
+/// creation; on other targets the mode is the platform default.
+#[cfg(feature = "gzip")]
+fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::DirBuilder::new().create(path)
+    }
+}
+
+/// An owned private directory holding one temporary `.gz` payload, both removed
+/// when the guard is dropped.
+///
+/// # Why the directory carries the uniqueness
+///
+/// The predecessor of this type was a single filename in the shared temp
+/// directory — `zlib_rs_fuzz_gzip_<pid>_<seq>.gz` — opened for create-and-
+/// truncate. Every component of that name is derivable by anyone on the host, and
+/// a create-and-truncate open follows a symlink: a name planted ahead of the
+/// harness redirects the write to whatever the attacker chose (CWE-59), and the
+/// use of a predictable name in a world-writable directory is CWE-377 in its own
+/// right.
+///
+/// Moving the uniqueness up one level fixes both. The directory name combines a
+/// fixed prefix, a [`safe_path_component`]-sanitized `CLONE_INDEX`, the process
+/// id, a monotonic counter and a retry ordinal, which keeps it distinct across
+/// libFuzzer's workers, across concurrent runs, and across sibling clones sharing
+/// one `/tmp`; and it is created with create-new semantics, so an occupied
+/// candidate — file, directory or symlink — is *skipped*, never followed and never
+/// deleted. Nothing pre-existing is ever removed.
+///
+/// The payload name is then predictable only *within* a directory that did not
+/// exist a moment earlier and, on Unix, was owner-only from `mkdir(2)` onwards.
+/// The file itself is still opened with `O_EXCL` (`gzopen(…, "wbx")`) so a name
+/// that somehow is taken fails loudly rather than being truncated. These are
+/// creation-time properties: the guard holds paths rather than open handles, so it
+/// makes no claim about the directory still being the same object later.
+#[cfg(feature = "gzip")]
+struct TempGzWorkspace {
+    dir: std::path::PathBuf,
+    path: std::path::PathBuf,
+}
+
+#[cfg(feature = "gzip")]
+impl TempGzWorkspace {
+    /// Creates the private directory and returns the guard, or [`None`] when the
+    /// environment will not provide one.
+    ///
+    /// Returning [`None`] rather than panicking is deliberate: a read-only or full
+    /// temp directory is a property of the host, and a fuzz target that aborted on
+    /// it would report an environment problem as a library crash. The retry loop is
+    /// bounded at [`TEMP_DIR_ATTEMPTS`] so a pathological environment cannot spin.
+    fn new() -> Option<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let clone = safe_path_component(&std::env::var("CLONE_INDEX").unwrap_or_default());
+        let pid = std::process::id();
+        let base = std::env::temp_dir();
+
+        // Retry only ever advances the candidate name; it never deletes.
+        for attempt in 0..TEMP_DIR_ATTEMPTS {
+            let candidate = base.join(format!("zlib_rs_fuzz_gz_{clone}_{pid}_{seq}_{attempt}"));
+            match create_private_dir(&candidate) {
+                Ok(()) => {
+                    let path = candidate.join("payload.gz");
+                    return Some(Self {
+                        dir: candidate,
+                        path,
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    /// The payload path inside the private directory.
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Removes the payload and the directory, best effort.
+    ///
+    /// Idempotent, and called both from [`Drop`] and explicitly before every
+    /// `panic!` on this path — libFuzzer's panic hook aborts rather than unwinding,
+    /// so a destructor alone would not run on the failing route.
+    fn cleanup(&self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[cfg(feature = "gzip")]
+impl Drop for TempGzWorkspace {
+    fn drop(&mut self) {
+        // The recursive removal rests on `dir` not having existed before `new`
+        // created it with create-new semantics, so the removal set starts from a
+        // path this guard brought into existence rather than one it adopted, and on
+        // Unix from one no other user could enter. Best effort on every route out,
+        // including an unwinding one: failing to clean up must never mask the
+        // original failure.
+        self.cleanup();
+    }
 }
 
 /// Builds a bounded, always **non-empty** payload for the anchor.

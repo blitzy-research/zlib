@@ -1052,6 +1052,12 @@ pub unsafe extern "C" fn deflateSetHeader(strm: z_streamp, head: gz_headerp) -> 
 /// C's full-struct copy. Returns `Z_MEM_ERROR` if a copy allocation fails, in
 /// which case `dest` is left entirely untouched.
 ///
+/// `Z_STREAM_ERROR` is returned when either pointer is null, when `source`
+/// carries no deflate state, or when `source`'s caller-visible `zalloc`/`zfree`
+/// pair is only half present — the conditions C reaches through
+/// `deflateStateCheck(source) || dest == Z_NULL` (`deflate.c` L1327-L1329,
+/// L540-L541) before it touches `dest` or allocates anything.
+///
 /// # Safety
 ///
 /// `dest` and `source` must each be null or a valid, exclusively-owned
@@ -1064,6 +1070,33 @@ pub unsafe extern "C" fn deflateCopy(dest: z_streamp, source: z_streamp) -> c_in
         if dest.is_null() || source.is_null() {
             return Z_STREAM_ERROR;
         }
+
+        // Capture the source's **caller-visible** `zalloc`/`zfree`/`opaque`
+        // triple. C charges every clone allocation to exactly this triple: it
+        // `zmemcpy`s the whole `z_stream` from `source` into `dest` and then
+        // allocates through `ZALLOC(dest, …)` (`deflate.c` L1332-L1341), so the
+        // pair the caller can currently see — not whatever pair was captured at
+        // initialization — owns the cloned buffers. The read yields a plain
+        // `Copy` value, so it completes here and no shared borrow survives into
+        // the `&mut` borrows taken below.
+        // SAFETY: `source` is non-null and a valid `z_stream`; only the plain
+        // `Copy` allocator fields are copied out, and no hook pointer is
+        // dereferenced.
+        let source_alloc = unsafe { CAllocator::from_stream(&*source) };
+        // C rejects a source whose `zalloc` **or** `zfree` is null through
+        // `deflateStateCheck(source)` (`deflate.c` L540-L541), evaluated in
+        // `deflateCopy` before the first `ZALLOC(dest, …)` (`deflate.c`
+        // L1327-L1329). `init_allocator_prologue` substitutes the crate's
+        // built-in for every missing half, so a stream this crate initialized
+        // always publishes two non-null halves and this can only fire when the
+        // fields were mutated after initialization. Rejecting here — before
+        // `dest` is written and before anything is allocated — keeps the copy
+        // from silently allocating out of the global heap while the caller
+        // believes their own hook owns the memory.
+        if source_alloc.is_half_present() {
+            return Z_STREAM_ERROR;
+        }
+
         // SAFETY: both pointers are non-null and, per the zlib contract, refer
         // to distinct (non-aliasing) valid streams for this call.
         let d = unsafe { &mut *dest };
@@ -1079,7 +1112,7 @@ pub unsafe extern "C" fn deflateCopy(dest: z_streamp, source: z_streamp) -> c_in
             let Some(src_zs) = (unsafe { deflate_state(src) }) else {
                 return Z_STREAM_ERROR;
             };
-            let mut new_zs = ZStream::with_allocator(*src_zs.allocator());
+            let mut new_zs = ZStream::with_allocator(source_alloc);
             if let Err(err) = engine::deflate_copy(&mut new_zs, src_zs) {
                 return err.as_return_code().as_c_int();
             }
@@ -2019,6 +2052,187 @@ mod tests {
         assert!(!dst.state.is_null());
 
         assert_eq!(unsafe { deflateEnd(&mut dst) }, Z_OK);
+        assert_eq!(unsafe { deflateEnd(&mut src) }, Z_OK);
+    }
+
+    /// Which half of the source's published allocator pair a
+    /// [`copy_rejects_half_present_source`] scenario knocks out after init.
+    #[derive(Copy, Clone)]
+    enum ClearedHalf {
+        /// Clear `source->zalloc`, leaving `source->zfree` in place.
+        Zalloc,
+        /// Clear `source->zfree`, leaving `source->zalloc` in place.
+        Zfree,
+    }
+
+    /// Shared body for the two half-present-source rejection tests.
+    ///
+    /// C's `deflateCopy` reaches `Z_STREAM_ERROR` through
+    /// `deflateStateCheck(source)`, which classifies a stream whose `zalloc`
+    /// **or** `zfree` is null as invalid (`deflate.c` L540-L541), and it reaches
+    /// that verdict *before* `zmemcpy(dest, source, sizeof(z_stream))` and before
+    /// the first `ZALLOC(dest, …)` (`deflate.c` L1327-L1341). Because
+    /// `init_allocator_prologue` substitutes the crate's built-in for every
+    /// missing half, the only route to a half-present pair is post-init surgery
+    /// on the caller's `z_stream` — and that must never be allowed to route the
+    /// clone through the global heap while the caller believes their own hook
+    /// owns the memory.
+    fn copy_rejects_half_present_source(cleared: ClearedHalf) {
+        let budget = Budget {
+            remaining: core::sync::atomic::AtomicUsize::new(64),
+        };
+
+        let mut src = zeroed_stream();
+        attach_budget(&mut src, &budget);
+        assert_eq!(
+            unsafe { deflateInit_(&mut src, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+
+        // Post-init surgery: knock out exactly one half of the published pair.
+        let saved_zalloc = src.zalloc;
+        let saved_zfree = src.zfree;
+        match cleared {
+            ClearedHalf::Zalloc => src.zalloc = None,
+            ClearedHalf::Zfree => src.zfree = None,
+        }
+
+        let mut dst = zeroed_stream();
+        attach_budget(&mut dst, &budget);
+        let budget_before = budget.remaining.load(core::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(
+            unsafe { deflateCopy(&mut dst, &mut src) },
+            Z_STREAM_ERROR,
+            "a half-present source allocator pair must be rejected exactly as C's \
+             deflateStateCheck does"
+        );
+
+        // `dest` must be *entirely* untouched, because C evaluates the check
+        // before its full-struct copy: not one observable field is written.
+        assert!(dst.state.is_null(), "no state may be installed");
+        assert!(dst.next_in.is_null());
+        assert_eq!(dst.avail_in, 0);
+        assert_eq!(dst.total_in, 0);
+        assert!(dst.next_out.is_null());
+        assert_eq!(dst.avail_out, 0);
+        assert_eq!(dst.total_out, 0);
+        assert!(dst.msg.is_null());
+        assert_eq!(dst.data_type, 0);
+        assert_eq!(dst.adler, 0);
+        assert_eq!(dst.reserved, 0);
+        assert_eq!(
+            budget.remaining.load(core::sync::atomic::Ordering::SeqCst),
+            budget_before,
+            "the rejection must precede every allocation"
+        );
+
+        // Restoring the missing half leaves the source fully usable: the copy now
+        // succeeds and both streams tear down cleanly.
+        src.zalloc = saved_zalloc;
+        src.zfree = saved_zfree;
+        assert_eq!(unsafe { deflateCopy(&mut dst, &mut src) }, Z_OK);
+        assert!(!dst.state.is_null());
+        assert_eq!(unsafe { deflateEnd(&mut dst) }, Z_OK);
+        assert_eq!(unsafe { deflateEnd(&mut src) }, Z_OK);
+    }
+
+    /// A `source` whose `zalloc` was cleared after initialization must be
+    /// rejected with `Z_STREAM_ERROR`, leaving `dest` untouched.
+    #[test]
+    fn copy_rejects_a_source_whose_zalloc_was_cleared_after_init() {
+        copy_rejects_half_present_source(ClearedHalf::Zalloc);
+    }
+
+    /// The `zfree` half is checked too: C's `deflateStateCheck` tests both, so a
+    /// guard that only looked at `zalloc` would still diverge.
+    #[test]
+    fn copy_rejects_a_source_whose_zfree_was_cleared_after_init() {
+        copy_rejects_half_present_source(ClearedHalf::Zfree);
+    }
+
+    /// A caller who supplied **neither** half is still a valid copy source.
+    ///
+    /// C's `deflateStateCheck` rejects only a *null* half, and this crate's
+    /// `init_allocator_prologue` has already published its built-in substitutes
+    /// into the caller's `z_stream` (mirroring `deflate.c` L400-L414), so both
+    /// halves are non-null after any successful init. The new guard must
+    /// therefore never fire for a hookless caller — the historical
+    /// global-allocator path stays exactly as it was.
+    #[test]
+    fn copy_succeeds_for_a_hookless_source() {
+        let mut src = zeroed_stream();
+        assert_eq!(
+            unsafe { deflateInit_(&mut src, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+        assert!(
+            src.zalloc.is_some() && src.zfree.is_some(),
+            "init publishes both built-in substitutes (deflate.c L400-L414)"
+        );
+
+        let mut dst = zeroed_stream();
+        assert_eq!(unsafe { deflateCopy(&mut dst, &mut src) }, Z_OK);
+        assert!(!dst.state.is_null());
+        assert_eq!(unsafe { deflateEnd(&mut dst) }, Z_OK);
+        assert_eq!(unsafe { deflateEnd(&mut src) }, Z_OK);
+    }
+
+    /// The clone is charged to the pair `source` publishes **at the time of the
+    /// copy**, which is what C does by `zmemcpy`ing the whole `z_stream` into
+    /// `dest` and then allocating through `ZALLOC(dest, …)` (`deflate.c`
+    /// L1332-L1341). Swapping in a *different* live arena after init — both
+    /// halves present, so the guard does not fire — must therefore make the
+    /// clone draw from the new arena, and exhausting that new arena must surface
+    /// `Z_MEM_ERROR` even though the arena captured at init still has budget.
+    #[test]
+    fn copy_charges_the_clone_to_the_sources_current_allocator_pair() {
+        let init_arena = Budget {
+            remaining: core::sync::atomic::AtomicUsize::new(64),
+        };
+        let empty_arena = Budget {
+            remaining: core::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let mut src = zeroed_stream();
+        attach_budget(&mut src, &init_arena);
+        assert_eq!(
+            unsafe { deflateInit_(&mut src, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+        let init_remaining = init_arena
+            .remaining
+            .load(core::sync::atomic::Ordering::SeqCst);
+        assert!(
+            init_remaining > 0,
+            "the init arena must retain budget so the assertion below is meaningful"
+        );
+
+        // Republish an exhausted arena on the source. Both halves stay non-null,
+        // so this is not the half-present case — it is the "which pair pays"
+        // question, and C's answer is the pair `source` currently publishes.
+        attach_budget(&mut src, &empty_arena);
+
+        let mut dst = zeroed_stream();
+        attach_budget(&mut dst, &empty_arena);
+        assert_eq!(
+            unsafe { deflateCopy(&mut dst, &mut src) },
+            Z_MEM_ERROR,
+            "the clone must draw from the arena the source publishes now, not the \
+             one captured at init"
+        );
+        assert!(dst.state.is_null());
+        assert_eq!(
+            init_arena
+                .remaining
+                .load(core::sync::atomic::Ordering::SeqCst),
+            init_remaining,
+            "the init arena must not have funded the clone"
+        );
+
+        // Hand the source's own arena back so teardown releases the init-time
+        // buffers through the allocator that produced them.
+        attach_budget(&mut src, &init_arena);
         assert_eq!(unsafe { deflateEnd(&mut src) }, Z_OK);
     }
 

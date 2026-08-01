@@ -1434,8 +1434,19 @@ fn probe_inflate_table(selector: u64, data: &[u8]) {
         _ => CodeType::Dists,
     };
 
-    // `codes` is allowed to reach `lens.len()` and to exceed the alphabet size
-    // of the chosen code type, which is what reaches the geometry rejections.
+    // `codes` deliberately stays INSIDE `inflate_table`'s caller-geometry
+    // contract: it never exceeds `lens.len()`/`work.len()`, and `lens.len()`
+    // (`MAXBITS + 1`) sits below every alphabet size, so the geometry prologue
+    // always passes here and the fuzzer's bytes reach the arithmetic validation
+    // and the table build behind it. Drawing `codes` past the 288-symbol
+    // literal/length or 32-symbol distance bound from this leg would mean
+    // sizing these buffers at `289`, which would reject the majority of draws
+    // in the prologue and starve the build of exactly the exploration this leg
+    // exists for. Every comparison in that prologue — `codes` above
+    // `19`/`288`/`32` for `Codes`/`Lens`/`Dists`, and `codes` above the
+    // supplied `lens` or `work` slice length — is instead covered by the
+    // constructed vectors in `probe_inflate_table_fixed_vectors`, which pin the
+    // EXACT error variant rather than mere legality.
     let codes = usize::from(data.first().copied().unwrap_or(0)) % (lens.len() + 1);
     let requested_bits = usize::from(data.last().copied().unwrap_or(1)) % (MAXBITS + 1);
 
@@ -1499,7 +1510,12 @@ fn probe_inflate_table(selector: u64, data: &[u8]) {
 /// Each pins a SPECIFIC error variant, which is legitimate because these inputs
 /// are built here rather than supplied by the fuzzer, so each has exactly one
 /// correct answer. Together they cover both of C's non-zero `inflate_table`
-/// returns and both halves of its `(type == CODES || max != 1)` disjunction.
+/// returns, both halves of its `(type == CODES || max != 1)` disjunction, and
+/// every comparison in the caller-geometry prologue this port adds because it
+/// exposes the builder publicly where C trusts its single internal caller.
+/// [`probe_inflate_table`] cannot reach that prologue — its buffers are
+/// `MAXBITS + 1` long and its `codes` never exceeds them — so the geometry
+/// vectors below are the only coverage those comparisons get.
 fn probe_inflate_table_fixed_vectors() {
     // --- (a) the ENOUGH arena bound, C's `+1` -------------------------------
     // `test/infcover.c`'s `cover_trees` vector: lengths 1..=15 plus a second
@@ -1601,6 +1617,121 @@ fn probe_inflate_table_fixed_vectors() {
     );
     assert_eq!(table_index, 0, "no table entry is published");
     assert_eq!(bits, 7, "the root-bit request is untouched");
+
+    // --- (e) the alphabet bound of the caller-geometry prologue, C's `-1` ---
+    // This port exposes `inflate_table` publicly, so it validates the geometry C
+    // trusts its one internal caller for: `codes > max_codes || codes >
+    // lens.len() || codes > work.len()`, where `max_codes` is the alphabet size
+    // — 19 code-length symbols, 288 literal/length symbols, 32 distance
+    // symbols. Each vector below makes exactly ONE of those three comparisons
+    // true, so a comparison that is dropped or mis-widened fails this harness on
+    // its own vector instead of hiding behind a sibling comparison.
+    //
+    // The buffers are sized for the widest overrun and every call is handed the
+    // leading `codes` elements, which pins `codes == lens.len() == work.len()`
+    // and leaves the alphabet comparison as the only true one.
+    const WIDEST_OVERRUN: usize = 289;
+    let mut wide_lens = [0u16; WIDEST_OVERRUN];
+    let mut wide_work = [0u16; WIDEST_OVERRUN];
+    let mut wide_arena = [Code::default(); ENOUGH];
+    for (code_type, alphabet, base_len, splits) in [
+        (CodeType::Codes, 19usize, 4u16, 4usize),
+        (CodeType::Lens, 288usize, 8u16, 33usize),
+        (CodeType::Dists, 32usize, 5u16, 1usize),
+    ] {
+        // A COMPLETE code over `alphabet + 1` symbols: `2^base_len` symbols of
+        // `base_len` bits have a Kraft sum of exactly one, and splitting
+        // `splits` of them into pairs one bit longer adds one symbol per split
+        // while leaving that sum at one. Completeness is what makes the vector a
+        // discriminator rather than a tautology: with the alphabet comparison
+        // removed the builder would either accept the set outright, failing the
+        // assertion below, or index its base/extra tables past their last symbol,
+        // raising the very panic that prologue exists to prevent. Every length
+        // stays at or below `base_len + 1`, well inside `MAXBITS`, so the length
+        // check further down cannot claim the rejection instead.
+        let codes = alphabet + 1;
+        let base_count = 1usize << base_len;
+        assert_eq!(
+            base_count + splits,
+            codes,
+            "{code_type:?}: the split schedule must describe exactly {codes} symbols"
+        );
+        for (index, slot) in wide_lens[..codes].iter_mut().enumerate() {
+            *slot = if index < base_count - splits {
+                base_len
+            } else {
+                base_len + 1
+            };
+        }
+
+        let mut table_index = 0usize;
+        let mut bits = 9usize;
+        assert_eq!(
+            inflate_table(
+                code_type,
+                &wide_lens[..codes],
+                codes,
+                &mut wide_arena,
+                &mut table_index,
+                &mut bits,
+                &mut wide_work[..codes],
+            ),
+            Err(InflateTableError::Invalid),
+            "{code_type:?}: {codes} codes overrun the {alphabet}-symbol alphabet and must be rejected even as a complete set"
+        );
+        assert_eq!(
+            table_index, 0,
+            "{code_type:?}: an alphabet overrun publishes no table entry"
+        );
+        assert_eq!(
+            bits, 9,
+            "{code_type:?}: an alphabet overrun leaves the root-bit request untouched"
+        );
+    }
+
+    // --- (f) the slice bounds of the same prologue, C's `-1` ----------------
+    // The two remaining comparisons. Both vectors use the 288-symbol
+    // literal/length alphabet, which `codes` stays far below, so the alphabet
+    // comparison is false and exactly one slice comparison is true in each case.
+    //
+    // The lengths form a COMPLETE eight-symbol code — eight three-bit codes fill
+    // a three-bit code space exactly — for the same discriminator reason as the
+    // alphabet vectors above. An over-subscribed set would be turned away by the
+    // arithmetic validation whether or not the slice comparison survived, so such
+    // a vector would pass a port that had dropped the comparison entirely. With a
+    // complete set, dropping `codes > lens.len()` reads the four-element length
+    // slice out of range and dropping `codes > work.len()` writes the
+    // four-element work slice out of range while sorting symbols: two loud
+    // failures instead of silent agreement.
+    let complete_octet = [3u16; 8];
+    let mut slice_work = [0u16; 8];
+    let mut slice_arena = [Code::default(); ENOUGH];
+    let codes = complete_octet.len();
+    for (bound, lens_len, work_len) in [("lens", 4usize, 8usize), ("work", 8usize, 4usize)] {
+        let mut table_index = 0usize;
+        let mut bits = 9usize;
+        assert_eq!(
+            inflate_table(
+                CodeType::Lens,
+                &complete_octet[..lens_len],
+                codes,
+                &mut slice_arena,
+                &mut table_index,
+                &mut bits,
+                &mut slice_work[..work_len],
+            ),
+            Err(InflateTableError::Invalid),
+            "{codes} codes must be rejected when the supplied `{bound}` slice is shorter (lens={lens_len}, work={work_len})"
+        );
+        assert_eq!(
+            table_index, 0,
+            "a `{bound}`-bound rejection publishes no table entry"
+        );
+        assert_eq!(
+            bits, 9,
+            "a `{bound}`-bound rejection leaves the root-bit request untouched"
+        );
+    }
 }
 
 fuzz_target!(|data: &[u8]| {

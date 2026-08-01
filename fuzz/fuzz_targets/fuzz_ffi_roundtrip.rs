@@ -114,7 +114,7 @@ use zlib_rs::ffi::{
     HandleKind, deflate, deflateBound, deflateCopy, deflateEnd, deflateInit_, deflateInit2_,
     deflateReset, deflateResetKeep, inflate, inflateBackEnd, inflateBackInit_, inflateCopy,
     inflateEnd, inflateInit_, inflateInit2_, inflateReset, inflateReset2, inflateResetKeep,
-    inflateSync, peek_handle_kind, uLong, z_stream,
+    inflateSync, peek_handle_kind, uLong, z_stream, zlibCompileFlags,
 };
 
 // zlib return codes / flush modes (ABI-stable integer values).
@@ -182,6 +182,24 @@ const RESET_PAYLOAD_MAX: usize = 128;
 /// libFuzzer timeout misattributed to the library. Every legitimate drive below
 /// completes in a handful of spins.
 const DRIVE_GUARD: usize = 64;
+
+/// Floor of the `windowBits` band that selects the RFC 1952 gzip wrapper.
+///
+/// `zlib.h` documents `windowBits + 16` as the gzip request, so `24..=31` is the
+/// band and `24` is its floor. Naming it keeps the wrapper expectation of
+/// [`assert_wrapper_header`] and the capability check of [`probe_reset_family`]
+/// reading off the same boundary as [`zlib_rs::constants::parse_window_bits`].
+const GZIP_WINDOW_FLOOR: c_int = 24;
+
+/// Bit 17 of the `zlibCompileFlags` word — C's `NO_GZIP`, set when the library
+/// was built without gzip framing.
+///
+/// Read at runtime rather than through a `cfg!` on this crate's features: this
+/// harness is a separate crate, so its own `gzip` feature describes its
+/// forwarding switch, while the library it links against can still have gzip
+/// enabled through the path dependency's defaults. The capability word is the
+/// library's own answer, so it is the only predicate that cannot disagree with it.
+const NO_GZIP_FLAG: uLong = 1 << 17;
 
 /// An out-of-range `windowBits` for [`inflateReset2`].
 ///
@@ -431,6 +449,71 @@ fn assert_exact_code(ret: c_int, contract: Contract, expected: c_int, what: &str
         "{what}: {} returned {ret}, but the C contract pins {expected} here",
         contract.entry_point()
     );
+}
+
+/// Reports whether the linked library implements RFC 1952 gzip framing.
+///
+/// Answered by the library's own capability word — [`NO_GZIP_FLAG`] of
+/// `zlibCompileFlags` — so a probe can pin the exact code a gzip `windowBits`
+/// must produce instead of accepting either outcome. That is what lets
+/// [`probe_reset_family`] assert its initialisation rather than gate on it.
+fn gzip_framing_supported() -> bool {
+    // SAFETY: `zlibCompileFlags` takes no arguments, reads no caller memory and
+    // has no failure mode; it is `unsafe` only for being an `extern "C"` shim.
+    let flags = unsafe { zlibCompileFlags() };
+    flags & NO_GZIP_FLAG == 0
+}
+
+/// Asserts `out` opens with the wrapper `window_bits` selects.
+///
+/// This is the observable, framing-level consequence of a reset that returns the
+/// encoder's status to its initial value: the next `deflate` has to re-emit the
+/// RFC 1950 CMF/FLG pair, or the RFC 1952 magic, ahead of any compressed data.
+/// The raw band carries no wrapper at all, so nothing is claimed for it.
+///
+/// The zlib branch checks every field C computes: the `CM` nibble is
+/// [`Z_DEFLATED`], `CINFO + 8` is the window the caller asked for, and the
+/// 16-bit big-endian header is a multiple of 31 — the `FCHECK` invariant. It
+/// deliberately does *not* constrain `FLG`'s `PRESET_DICT` bit in either
+/// direction: a stream reset with `deflateResetKeep` keeps its match-finder
+/// history, so `strstart` may still be non-zero and the bit may legitimately be
+/// set where a freshly initialised stream would clear it.
+fn assert_wrapper_header(out: &[u8], window_bits: c_int) {
+    if window_bits >= GZIP_WINDOW_FLOOR {
+        assert!(
+            out.len() >= 3,
+            "a gzip-wrapped stream must emit at least its 3-byte header, got {}",
+            out.len()
+        );
+        assert_eq!(
+            &out[..3],
+            &[0x1f, 0x8b, Z_DEFLATED as u8],
+            "a gzip-wrapped stream must open with the RFC 1952 magic and CM=8"
+        );
+    } else if window_bits >= 8 {
+        assert!(
+            out.len() >= 2,
+            "a zlib-wrapped stream must emit at least its 2-byte header, got {}",
+            out.len()
+        );
+        let cmf = out[0];
+        let flg = out[1];
+        assert_eq!(
+            c_int::from(cmf & 0x0f),
+            Z_DEFLATED,
+            "the zlib header's CM nibble must be Z_DEFLATED"
+        );
+        assert_eq!(
+            c_int::from(cmf >> 4) + 8,
+            window_bits,
+            "the zlib header's CINFO must encode the requested windowBits"
+        );
+        assert_eq!(
+            ((u16::from(cmf) << 8) | u16::from(flg)) % 31,
+            0,
+            "the zlib header must satisfy the FCHECK multiple-of-31 invariant"
+        );
+    }
 }
 
 // ===========================================================================
@@ -840,49 +923,61 @@ fn probe_init_ladder() {
 
     // The version and size guards run *before* the null-stream guard, so a call
     // that is wrong in both ways reports `Z_VERSION_ERROR`. That ordering is
-    // observable behaviour a caller can depend on, so it is pinned exactly.
+    // observable behaviour a caller can depend on, so it is pinned exactly — and
+    // it is pinned per entry point, because each shim runs its own ladder. Every
+    // assertion below therefore checks the return value of *its own* call: a
+    // single `ret` reused across three endpoints would report a clean run while
+    // two of the three ladders were never executed at all.
     // SAFETY: passing a null `z_streamp` is a defined, rejected call — the shim
     // checks the pointer instead of dereferencing it.
-    let ret = unsafe { deflateInit_(no_stream, DEFAULT_LEVEL, bad_major, size) };
+    let dret = unsafe { deflateInit_(no_stream, DEFAULT_LEVEL, bad_major, size) };
     assert_eq!(
-        ret, Z_VERSION_ERROR,
+        dret, Z_VERSION_ERROR,
         "the version guard must precede the null-stream guard in deflateInit_"
     );
     // SAFETY: `no_stream` is null, which the shim checks before any dereference;
     // `good` points at a static NUL-terminated version literal and the mismatched
     // `stream_size` of `0` is a plain `c_int`.
+    let iret = unsafe { inflateInit_(no_stream, good, 0) };
     assert_eq!(
-        ret, Z_VERSION_ERROR,
+        iret, Z_VERSION_ERROR,
         "the stream_size guard must precede the null-stream guard in inflateInit_"
     );
+    // The null window pointer is bound before the proof so the `unsafe` block
+    // stays on the line immediately after its `// SAFETY:` comment.
+    let no_window = ptr::null_mut::<u8>();
     // SAFETY: `no_stream` is null and checked before any dereference; `bad_major`
     // is a static NUL-terminated literal; the null window pointer is likewise
     // only ever checked, and the version guard rejects before either is used.
+    let bret = unsafe { inflateBackInit_(no_stream, 9, no_window, bad_major, size) };
     assert_eq!(
-        ret, Z_VERSION_ERROR,
+        bret, Z_VERSION_ERROR,
         "the version guard must precede the null-stream guard in inflateBackInit_"
     );
 
     // A null stream with an otherwise valid call is `Z_STREAM_ERROR`.
     // SAFETY: a null `z_streamp` is checked, never dereferenced.
-    let ret = unsafe { deflateInit_(no_stream, DEFAULT_LEVEL, good, size) };
+    let dret = unsafe { deflateInit_(no_stream, DEFAULT_LEVEL, good, size) };
     assert_eq!(
-        ret, Z_STREAM_ERROR,
+        dret, Z_STREAM_ERROR,
         "deflateInit_ must reject a null stream"
     );
     // SAFETY: `no_stream` is null, which the shim checks before dereferencing it;
     // `good` points at a static NUL-terminated version literal that is readable
     // for the bytes the version guard inspects, and `size` is a plain `c_int`.
+    let iret = unsafe { inflateInit_(no_stream, good, size) };
     assert_eq!(
-        ret, Z_STREAM_ERROR,
+        iret, Z_STREAM_ERROR,
         "inflateInit_ must reject a null stream"
     );
+    let win = window.as_mut_ptr();
     // SAFETY: as for the call above — `no_stream` is checked, never dereferenced,
     // and `good`/`size` are a readable static version literal and a `c_int` — plus
-    // `window` is a live, exclusively borrowed 512-byte buffer matching
+    // `win` addresses a live, exclusively borrowed 512-byte buffer matching
     // `windowBits = 9` that outlives this call.
+    let bret = unsafe { inflateBackInit_(no_stream, 9, win, good, size) };
     assert_eq!(
-        ret, Z_STREAM_ERROR,
+        bret, Z_STREAM_ERROR,
         "inflateBackInit_ must reject a null stream"
     );
 }
@@ -1745,9 +1840,9 @@ fn probe_allocator_failure_timing(data: &[u8]) {
     // SAFETY: `ds` is a valid owned `z_stream` whose `opaque` addresses
     // `starved`, which outlives the call; the hook returns null once its budget
     // is spent, which is how a C caller reports out-of-memory.
-    let ret = unsafe { deflateInit2_(&mut ds, DEFAULT_LEVEL, Z_DEFLATED, 9, 1, 0, good, size) };
+    let dinit = unsafe { deflateInit2_(&mut ds, DEFAULT_LEVEL, Z_DEFLATED, 9, 1, 0, good, size) };
     assert_eq!(
-        ret, Z_MEM_ERROR,
+        dinit, Z_MEM_ERROR,
         "a deflate allocation shortfall of {shortfall}/{DEFLATE_INIT_ALLOCATIONS} \
          must surface Z_MEM_ERROR from deflateInit2_ itself"
     );
@@ -1770,8 +1865,9 @@ fn probe_allocator_failure_timing(data: &[u8]) {
     // which is how a C caller reports out-of-memory. `good`/`size` are the
     // readable static version literal and `size_of::<z_stream>()`, and
     // `RAW_WINDOW_BITS` is a valid raw `windowBits`.
+    let iinit = unsafe { inflateInit2_(&mut is, RAW_WINDOW_BITS, good, size) };
     assert_eq!(
-        ret, Z_MEM_ERROR,
+        iinit, Z_MEM_ERROR,
         "an inflate state allocation that cannot be satisfied must surface \
          Z_MEM_ERROR from inflateInit2_"
     );
@@ -2082,14 +2178,24 @@ fn drive_inflate(strm: &mut z_stream, input: &[u8], out: &mut [u8], flush: c_int
 ///
 /// Runs on the global allocator, so it cannot disturb the hook accounting of the
 /// probe that calls it.
+///
+/// The initialisation is asserted rather than used as a gate. Its arguments are
+/// fixed and in range — a valid version pair and the same `RAW_WINDOW_BITS` the
+/// encoder used — so `Z_OK` is the only answer the C contract permits; returning
+/// early on anything else would silently skip the byte-for-byte comparison that
+/// is the entire point of this helper, turning a broken decoder into a clean run.
 fn assert_raw_round_trip(stream: &[u8], expected: &[u8]) {
     let mut is = zeroed_stream();
     // SAFETY: `is` is a valid owned `z_stream`; `RAW_WINDOW_BITS` matches the
     // window of the encoder that produced `stream`, which is what C requires of a
     // raw decoder.
-    if unsafe { inflateInit2_(&mut is, RAW_WINDOW_BITS, version_ok(), stream_size_ok()) } != Z_OK {
-        return;
-    }
+    let init = unsafe { inflateInit2_(&mut is, RAW_WINDOW_BITS, version_ok(), stream_size_ok()) };
+    assert_exact_code(
+        init,
+        Contract::InflateInit,
+        Z_OK,
+        "inflateInit2_ for the independent raw verification decode",
+    );
     let mut back = vec![0u8; expected.len() + 16];
     let run = drive_inflate(&mut is, stream, &mut back, Z_FINISH);
     // SAFETY: `is` holds a live inflate handle. Reclaimed before the assertions
@@ -2134,7 +2240,7 @@ fn probe_deflate_copy_convergence(payload: &[u8], cut: usize, level: c_int) {
     // SAFETY: `src` is a valid owned `z_stream` whose `opaque` addresses `hooks`,
     // which outlives every call below; `RAW_WINDOW_BITS` with `memLevel = 1` is a
     // legal, deliberately small configuration and `level` is in range.
-    if unsafe {
+    let init = unsafe {
         deflateInit2_(
             &mut src,
             level,
@@ -2145,10 +2251,18 @@ fn probe_deflate_copy_convergence(payload: &[u8], cut: usize, level: c_int) {
             good,
             size,
         )
-    } != Z_OK
-    {
-        return;
-    }
+    };
+    // Every argument is in range and the hook budget is unlimited, so `Z_OK` is
+    // the only answer the contract leaves open — which is exactly why it is
+    // asserted. Returning early instead would make the whole convergence probe
+    // self-disabling: a regression that broke `deflateInit2_` would skip the copy,
+    // the divergence comparison and the teardown accounting, and report success.
+    assert_exact_code(
+        init,
+        Contract::DeflateInit,
+        Z_OK,
+        "deflateInit2_ for the copy-convergence source stream",
+    );
 
     // Both engines get the same deliberately over-sized room, so a mismatch in the
     // comparison below can only come from the engines themselves and never from
@@ -2337,9 +2451,17 @@ fn probe_inflate_copy_convergence(payload: &[u8], cut: usize) {
     install_hooks(&mut src, &hooks);
     // SAFETY: `src` is a valid owned `z_stream` whose `opaque` addresses `hooks`,
     // which outlives every call below.
-    if unsafe { inflateInit2_(&mut src, RAW_WINDOW_BITS, good, size) } != Z_OK {
-        return;
-    }
+    let init = unsafe { inflateInit2_(&mut src, RAW_WINDOW_BITS, good, size) };
+    // Fixed, in-range arguments and an unlimited hook budget pin this to `Z_OK`,
+    // so it is asserted for the same reason `raw_deflate` asserts its own
+    // completion above: a probe that returns early here would skip the copy, the
+    // convergence comparison and the allocation accounting on every execution.
+    assert_exact_code(
+        init,
+        Contract::InflateInit,
+        Z_OK,
+        "inflateInit2_ for the copy-convergence source stream",
+    );
 
     let cap = payload.len() + 16;
     let mut back_src = vec![0u8; cap];
@@ -2502,9 +2624,15 @@ fn probe_inflate_copy_convergence(payload: &[u8], cut: usize) {
 /// initialised one — *byte*-identically, which is the property that matters for a
 /// library whose compressed output must match reference zlib (AAP §0.8.1 D-1).
 ///
-/// `deflateResetKeep` deliberately gets the weaker treatment: it keeps the
-/// allocations and does **not** re-emit the wrapper header, so a following stream
-/// is legitimately different and only the counter and `msg` contract is assertable.
+/// `deflateResetKeep` gets a *different* treatment rather than a weaker one. It
+/// keeps the allocations and skips `lm_init`, so the match-finder history — and
+/// with it `strstart` — survives; a following stream is therefore legitimately
+/// **not** byte-identical to a fresh one and byte equality is not asserted. What
+/// it does do, contrary to a natural reading of "keep", is re-emit the wrapper
+/// header: its state-side reset returns `status` to `Init` (42) or `Gzip` (57), and
+/// the driver emits the RFC 1950 CMF/FLG pair or the RFC 1952 magic from exactly
+/// that status. So the wrapper *is* asserted, through [`assert_wrapper_header`],
+/// while the compressed body deliberately is not.
 ///
 /// `inflateReset2` gets the strongest treatment available, because a reset that
 /// silently ignored its `windowBits` would still pass every counter check: the
@@ -2526,7 +2654,7 @@ fn probe_reset_family(payload: &[u8], window_bits: c_int) {
     // SAFETY: `ds` is a valid owned `z_stream` whose `opaque` addresses `hooks`,
     // which outlives every call below; `window_bits` is one of the legal values
     // chosen by the caller and `memLevel = 1` keeps the handle small.
-    if unsafe {
+    let init = unsafe {
         deflateInit2_(
             &mut ds,
             DEFAULT_LEVEL,
@@ -2537,8 +2665,37 @@ fn probe_reset_family(payload: &[u8], window_bits: c_int) {
             good,
             size,
         )
-    } == Z_OK
-    {
+    };
+    // The outcome is *pinned* either way rather than used as a gate. Only one of
+    // the caller's `window_bits` values is conditional: a value in the gzip band
+    // is refused with `Z_STREAM_ERROR` by a library built without gzip framing,
+    // and the library advertises that through `zlibCompileFlags`' `NO_GZIP` bit —
+    // so the expectation is read from the library's own capability word rather
+    // than guessed from a `cfg!` on this crate's forwarding features. An unchecked
+    // `if init == Z_OK` here would instead make the whole deflate half
+    // self-disabling: a regression that broke valid initialisation would skip
+    // every reset assertion below and report a clean run.
+    if window_bits >= GZIP_WINDOW_FLOOR && !gzip_framing_supported() {
+        assert_exact_code(
+            init,
+            Contract::DeflateInit,
+            Z_STREAM_ERROR,
+            "deflateInit2_ with a gzip wrapper against a NO_GZIP build",
+        );
+        // SAFETY: `ds` is a valid `z_stream`; a refused init installs no handle.
+        let kind = unsafe { peek_handle_kind(&ds) };
+        assert!(
+            kind.is_none(),
+            "a refused gzip-wrapper deflateInit2_ must install no handle"
+        );
+        hooks.assert_balanced("deflate reset family against a NO_GZIP build");
+    } else {
+        assert_exact_code(
+            init,
+            Contract::DeflateInit,
+            Z_OK,
+            "deflateInit2_ for the deflate reset-family probe",
+        );
         let mut first = vec![0u8; cap];
         let mut second = vec![0u8; cap];
         let run1 = drive_deflate(&mut ds, payload, &mut first, Z_FINISH);
@@ -2579,12 +2736,29 @@ fn probe_reset_family(payload: &[u8], window_bits: c_int) {
         assert_eq!(ds.total_out, 0, "deflateResetKeep must zero total_out");
         assert!(ds.msg.is_null(), "deflateResetKeep must clear msg");
 
-        // A reset stream is no longer `BUSY_STATE`, so this is C's clean teardown.
-        // SAFETY: `ds` holds a live, freshly reset deflate handle.
+        // The wrapper contract of `deflateResetKeep`, asserted rather than assumed.
+        // Its state-side reset puts `status` back to `Init`/`Gzip`, so the next
+        // `deflate` must lead with the wrapper again — while the compressed body
+        // may legitimately differ from `first`, because the retained match-finder
+        // history can leave `strstart` non-zero and set the header's `PRESET_DICT`
+        // bit. Checking the framing and not the body is precisely the distinction
+        // between what "keep" preserves and what it resets.
+        let mut third = vec![0u8; cap];
+        let run3 = drive_deflate(&mut ds, payload, &mut third, Z_FINISH);
+        assert_contract_code(
+            run3.code,
+            Contract::Deflate,
+            "deflate after deflateResetKeep",
+        );
+        assert_wrapper_header(&third[..run3.produced], window_bits);
+
+        // The stream above ran to `Z_FINISH`, so `status` is `FINISH_STATE` rather
+        // than `BUSY_STATE` — C's clean-teardown condition either way.
+        // SAFETY: `ds` holds a live, finished deflate handle.
         let ret = unsafe { deflateEnd(&mut ds) };
         assert_eq!(
             ret, Z_OK,
-            "deflateEnd must succeed for a freshly reset stream"
+            "deflateEnd must succeed for a stream finished after deflateResetKeep"
         );
         hooks.assert_balanced("deflate reset family");
     }
@@ -2603,9 +2777,17 @@ fn probe_reset_family(payload: &[u8], window_bits: c_int) {
     install_hooks(&mut is, &ihooks);
     // SAFETY: `is` is a valid owned `z_stream` whose `opaque` addresses `ihooks`,
     // which outlives every call below.
-    if unsafe { inflateInit2_(&mut is, RAW_WINDOW_BITS, good, size) } != Z_OK {
-        return;
-    }
+    let init = unsafe { inflateInit2_(&mut is, RAW_WINDOW_BITS, good, size) };
+    // Asserted, not gated: the arguments are fixed and in range and the hook
+    // budget is unlimited, so `Z_OK` is the contract's only answer. An early
+    // return here would silently drop the entire inflate half of the reset-family
+    // probe — including the `inflateReset2` wrapper re-selection below.
+    assert_exact_code(
+        init,
+        Contract::InflateInit,
+        Z_OK,
+        "inflateInit2_ for the inflate reset-family probe",
+    );
 
     let mut first = vec![0u8; payload.len() + 16];
     let mut second = vec![0u8; payload.len() + 16];
@@ -2856,7 +3038,7 @@ fn probe_copy_and_reset_misuse() {
     let mut ds = zeroed_stream();
     // SAFETY: `ds` is a valid owned `z_stream`; `RAW_WINDOW_BITS` with
     // `memLevel = 1` is a legal, deliberately small configuration.
-    if unsafe {
+    let init = unsafe {
         deflateInit2_(
             &mut ds,
             DEFAULT_LEVEL,
@@ -2867,196 +3049,272 @@ fn probe_copy_and_reset_misuse() {
             good,
             size,
         )
-    } == Z_OK
-    {
-        // SAFETY: the inflate family validates the offset-0 tag before reborrowing
-        // the handle, so a deflate stream is rejected rather than reinterpreted as
-        // an inflate handle; `ds` and `dest` are distinct valid streams.
-        let inflate_reset = unsafe { inflateReset(&mut ds) };
-        assert_eq!(
-            inflate_reset, Z_STREAM_ERROR,
-            "inflateReset must reject a deflate handle"
-        );
-        // SAFETY: as above — the offset-0 tag is validated before any reborrow.
-        let inflate_reset2 = unsafe { inflateReset2(&mut ds, 15) };
-        assert_eq!(
-            inflate_reset2, Z_STREAM_ERROR,
-            "inflateReset2 must reject a deflate handle"
-        );
-        // SAFETY: as above — the offset-0 tag is validated before any reborrow.
-        let inflate_reset_keep = unsafe { inflateResetKeep(&mut ds) };
-        assert_eq!(
-            inflate_reset_keep, Z_STREAM_ERROR,
-            "inflateResetKeep must reject a deflate handle"
-        );
-        // SAFETY: as above — the offset-0 tag is validated before any reborrow.
-        let inflate_copy = unsafe { inflateCopy(&mut dest, &mut ds) };
-        assert_eq!(
-            inflate_copy, Z_STREAM_ERROR,
-            "inflateCopy must reject a deflate source"
-        );
-        // SAFETY: `dest` is a valid `z_stream`; the rejected copy installs nothing.
-        let kind = unsafe { peek_handle_kind(&dest) };
-        assert!(
-            kind.is_none(),
-            "a rejected inflateCopy must install no handle in dest"
-        );
-        // SAFETY: `ds` is a valid `z_stream`; the rejected calls must have left its
-        // handle intact.
-        let kind = unsafe { peek_handle_kind(&ds) };
-        assert_eq!(
-            kind,
-            Some(HandleKind::DEFLATE),
-            "a rejected cross-engine reset must leave the deflate handle intact"
-        );
-        // The same live handle still copies through its *own* engine, and the copy
-        // is an independent stream that has to be reclaimed on its own.
-        // SAFETY: `dest` and `ds` are distinct valid streams and `ds` holds a live
-        // deflate handle.
-        if unsafe { deflateCopy(&mut dest, &mut ds) } == Z_OK {
-            // SAFETY: `dest` now owns its own tagged deflate handle.
-            let kind = unsafe { peek_handle_kind(&dest) };
-            assert_eq!(
-                kind,
-                Some(HandleKind::DEFLATE),
-                "deflateCopy must install a DEFLATE-tagged handle"
-            );
-            // SAFETY: `dest` holds a live deflate handle that never left `Init`, so
-            // this is C's clean teardown.
-            let ret = unsafe { deflateEnd(&mut dest) };
-            assert_eq!(ret, Z_OK, "deflateEnd must reclaim a copied deflate handle");
-        }
-        // SAFETY: `ds` still holds its own live deflate handle.
-        let ret = unsafe { deflateEnd(&mut ds) };
-        assert_eq!(ret, Z_OK, "deflateEnd must reclaim the copy source");
-        // SAFETY: the handle is gone, so the family now sees a null `state` — the
-        // post-`*End` case a C caller reaches by resetting a closed stream.
-        let deflate_reset = unsafe { deflateReset(&mut ds) };
-        assert_eq!(
-            deflate_reset, Z_STREAM_ERROR,
-            "deflateReset must reject an already-reclaimed stream"
-        );
-        // SAFETY: as above — the reclaimed stream now presents a null `state`.
-        let deflate_reset_keep = unsafe { deflateResetKeep(&mut ds) };
-        assert_eq!(
-            deflate_reset_keep, Z_STREAM_ERROR,
-            "deflateResetKeep must reject an already-reclaimed stream"
-        );
-        // SAFETY: as above — the reclaimed stream now presents a null `state`.
-        let deflate_copy = unsafe { deflateCopy(&mut dest, &mut ds) };
-        assert_eq!(
-            deflate_copy, Z_STREAM_ERROR,
-            "deflateCopy must reject an already-reclaimed source"
-        );
-    }
+    };
+    // Raw framing depends on no optional capability and every other argument is
+    // fixed and in range, so `Z_OK` is the contract's only answer and it is
+    // asserted. Gating on it would silently drop every cross-engine rejection
+    // below — the entire point of this probe — the moment valid initialisation
+    // regressed.
+    assert_exact_code(
+        init,
+        Contract::DeflateInit,
+        Z_OK,
+        "deflateInit2_ for the cross-engine misuse source",
+    );
+    // SAFETY: the inflate family validates the offset-0 tag before reborrowing
+    // the handle, so a deflate stream is rejected rather than reinterpreted as
+    // an inflate handle; `ds` and `dest` are distinct valid streams.
+    let inflate_reset = unsafe { inflateReset(&mut ds) };
+    assert_eq!(
+        inflate_reset, Z_STREAM_ERROR,
+        "inflateReset must reject a deflate handle"
+    );
+    // SAFETY: as above — the offset-0 tag is validated before any reborrow.
+    let inflate_reset2 = unsafe { inflateReset2(&mut ds, 15) };
+    assert_eq!(
+        inflate_reset2, Z_STREAM_ERROR,
+        "inflateReset2 must reject a deflate handle"
+    );
+    // SAFETY: as above — the offset-0 tag is validated before any reborrow.
+    let inflate_reset_keep = unsafe { inflateResetKeep(&mut ds) };
+    assert_eq!(
+        inflate_reset_keep, Z_STREAM_ERROR,
+        "inflateResetKeep must reject a deflate handle"
+    );
+    // SAFETY: as above — the offset-0 tag is validated before any reborrow.
+    let inflate_copy = unsafe { inflateCopy(&mut dest, &mut ds) };
+    assert_eq!(
+        inflate_copy, Z_STREAM_ERROR,
+        "inflateCopy must reject a deflate source"
+    );
+    // SAFETY: `dest` is a valid `z_stream`; the rejected copy installs nothing.
+    let kind = unsafe { peek_handle_kind(&dest) };
+    assert!(
+        kind.is_none(),
+        "a rejected inflateCopy must install no handle in dest"
+    );
+    // SAFETY: `ds` is a valid `z_stream`; the rejected calls must have left its
+    // handle intact.
+    let kind = unsafe { peek_handle_kind(&ds) };
+    assert_eq!(
+        kind,
+        Some(HandleKind::DEFLATE),
+        "a rejected cross-engine reset must leave the deflate handle intact"
+    );
+
+    // C's `deflateStateCheck` rejects a source whose `zalloc` or `zfree` is
+    // null (`deflate.c` L540-L541), and `deflateCopy` reaches it before its
+    // first `ZALLOC(dest, …)` (`deflate.c` L1327-L1329), so this shim must too:
+    // a half-present pair would otherwise have the clone taken from the global
+    // heap while the caller believes their hook owns it. This is the exact
+    // mirror of the `inflateCopy` case below, and it clears the *other* half of
+    // the pair so the two probes together cover both directions of the
+    // half-present test. Clearing a public `z_stream` field is precisely what a
+    // C caller can do, and the restore below puts it back.
+    let saved_zfree = ds.zfree;
+    ds.zfree = None;
+    // SAFETY: `dest` and `ds` are distinct valid streams; the shim reads the
+    // plain allocator fields and rejects before allocating or invoking a hook.
+    let ret = unsafe { deflateCopy(&mut dest, &mut ds) };
+    assert_eq!(
+        ret, Z_STREAM_ERROR,
+        "deflateCopy must reject a source with a half-present allocator pair"
+    );
+    ds.zfree = saved_zfree;
+    // SAFETY: `dest` is a valid `z_stream`; the rejection installs nothing.
+    let kind = unsafe { peek_handle_kind(&dest) };
+    assert!(
+        kind.is_none(),
+        "a refused deflateCopy must install no handle in dest"
+    );
+    // SAFETY: `ds` is a valid `z_stream`; a refused copy must not disturb the
+    // source, so its own handle has to still be there and still be tagged.
+    let kind = unsafe { peek_handle_kind(&ds) };
+    assert_eq!(
+        kind,
+        Some(HandleKind::DEFLATE),
+        "a refused deflateCopy must leave the source handle intact"
+    );
+
+    // With the pair whole again the same live handle copies through its *own*
+    // engine, and the copy is an independent stream that has to be reclaimed on
+    // its own. Both allocator halves are present and the source is live, so
+    // `Z_OK` is asserted rather than gated on.
+    // SAFETY: `dest` and `ds` are distinct valid streams and `ds` holds a live
+    // deflate handle.
+    let copy = unsafe { deflateCopy(&mut dest, &mut ds) };
+    assert_exact_code(
+        copy,
+        Contract::DeflateCopy,
+        Z_OK,
+        "deflateCopy of a live deflate handle with a whole allocator pair",
+    );
+    // SAFETY: `dest` now owns its own tagged deflate handle.
+    let kind = unsafe { peek_handle_kind(&dest) };
+    assert_eq!(
+        kind,
+        Some(HandleKind::DEFLATE),
+        "deflateCopy must install a DEFLATE-tagged handle"
+    );
+    // SAFETY: `dest` holds a live deflate handle that never left `Init`, so
+    // this is C's clean teardown.
+    let ret = unsafe { deflateEnd(&mut dest) };
+    assert_eq!(ret, Z_OK, "deflateEnd must reclaim a copied deflate handle");
+    // SAFETY: `ds` still holds its own live deflate handle.
+    let ret = unsafe { deflateEnd(&mut ds) };
+    assert_eq!(ret, Z_OK, "deflateEnd must reclaim the copy source");
+    // SAFETY: the handle is gone, so the family now sees a null `state` — the
+    // post-`*End` case a C caller reaches by resetting a closed stream.
+    let deflate_reset = unsafe { deflateReset(&mut ds) };
+    assert_eq!(
+        deflate_reset, Z_STREAM_ERROR,
+        "deflateReset must reject an already-reclaimed stream"
+    );
+    // SAFETY: as above — the reclaimed stream now presents a null `state`.
+    let deflate_reset_keep = unsafe { deflateResetKeep(&mut ds) };
+    assert_eq!(
+        deflate_reset_keep, Z_STREAM_ERROR,
+        "deflateResetKeep must reject an already-reclaimed stream"
+    );
+    // SAFETY: as above — the reclaimed stream now presents a null `state`.
+    let deflate_copy = unsafe { deflateCopy(&mut dest, &mut ds) };
+    assert_eq!(
+        deflate_copy, Z_STREAM_ERROR,
+        "deflateCopy must reject an already-reclaimed source"
+    );
 
     // ---- The mirror case: an inflate handle is invisible to the deflate
     // reset/copy family, and `inflateCopy` additionally rejects a source whose
     // allocator pair has been broken. ----
     let mut is = zeroed_stream();
     // SAFETY: `is` is a valid owned `z_stream` with the expected version pair.
-    if unsafe { inflateInit2_(&mut is, RAW_WINDOW_BITS, good, size) } == Z_OK {
-        // SAFETY: the deflate family validates the offset-0 tag first, so an
-        // inflate stream is rejected rather than reinterpreted; `is` and `dest` are
-        // distinct valid streams.
-        let deflate_reset = unsafe { deflateReset(&mut is) };
-        assert_eq!(
-            deflate_reset, Z_STREAM_ERROR,
-            "deflateReset must reject an inflate handle"
-        );
-        // SAFETY: as above — the offset-0 tag is validated before any reborrow.
-        let deflate_reset_keep = unsafe { deflateResetKeep(&mut is) };
-        assert_eq!(
-            deflate_reset_keep, Z_STREAM_ERROR,
-            "deflateResetKeep must reject an inflate handle"
-        );
-        // SAFETY: as above — the offset-0 tag is validated before any reborrow.
-        let deflate_copy = unsafe { deflateCopy(&mut dest, &mut is) };
-        assert_eq!(
-            deflate_copy, Z_STREAM_ERROR,
-            "deflateCopy must reject an inflate source"
-        );
-        // SAFETY: `dest` is a valid `z_stream`; nothing may have been installed.
-        let kind = unsafe { peek_handle_kind(&dest) };
-        assert!(
-            kind.is_none(),
-            "a rejected deflateCopy must install no handle in dest"
-        );
-        // SAFETY: `is` is a valid `z_stream`; its handle must be intact.
-        let kind = unsafe { peek_handle_kind(&is) };
-        assert_eq!(
-            kind,
-            Some(HandleKind::INFLATE),
-            "a rejected cross-engine reset must leave the inflate handle intact"
-        );
+    let init = unsafe { inflateInit2_(&mut is, RAW_WINDOW_BITS, good, size) };
+    // Asserted for the same reason as the deflate half: raw framing is
+    // unconditional, so an outcome other than `Z_OK` is a finding, and gating on it
+    // would silently drop the mirror-case rejections, the half-present allocator
+    // probe and the post-`*End` ladder below.
+    assert_exact_code(
+        init,
+        Contract::InflateInit,
+        Z_OK,
+        "inflateInit2_ for the cross-engine misuse source",
+    );
+    // SAFETY: the deflate family validates the offset-0 tag first, so an
+    // inflate stream is rejected rather than reinterpreted; `is` and `dest` are
+    // distinct valid streams.
+    let deflate_reset = unsafe { deflateReset(&mut is) };
+    assert_eq!(
+        deflate_reset, Z_STREAM_ERROR,
+        "deflateReset must reject an inflate handle"
+    );
+    // SAFETY: as above — the offset-0 tag is validated before any reborrow.
+    let deflate_reset_keep = unsafe { deflateResetKeep(&mut is) };
+    assert_eq!(
+        deflate_reset_keep, Z_STREAM_ERROR,
+        "deflateResetKeep must reject an inflate handle"
+    );
+    // SAFETY: as above — the offset-0 tag is validated before any reborrow.
+    let deflate_copy = unsafe { deflateCopy(&mut dest, &mut is) };
+    assert_eq!(
+        deflate_copy, Z_STREAM_ERROR,
+        "deflateCopy must reject an inflate source"
+    );
+    // SAFETY: `dest` is a valid `z_stream`; nothing may have been installed.
+    let kind = unsafe { peek_handle_kind(&dest) };
+    assert!(
+        kind.is_none(),
+        "a rejected deflateCopy must install no handle in dest"
+    );
+    // SAFETY: `is` is a valid `z_stream`; its handle must be intact.
+    let kind = unsafe { peek_handle_kind(&is) };
+    assert_eq!(
+        kind,
+        Some(HandleKind::INFLATE),
+        "a rejected cross-engine reset must leave the inflate handle intact"
+    );
 
-        // C's `inflateStateCheck` rejects a source whose `zalloc` or `zfree` is
-        // null (`inflate.c` L90-L91, reached from `inflateCopy` before its
-        // `ZALLOC(source, …)`), so this shim must too: a half-present pair would
-        // otherwise have the clone taken from the global heap while the caller
-        // believes their hook owns it. Clearing a *public* `z_stream` field is
-        // exactly what a C caller can do, and the restore below puts it back.
-        let saved_zalloc = is.zalloc;
-        is.zalloc = None;
-        // SAFETY: `dest` and `is` are distinct valid streams; the shim reads the
-        // allocator fields and rejects before allocating or calling the now-absent
-        // hook.
-        let ret = unsafe { inflateCopy(&mut dest, &mut is) };
-        assert_eq!(
-            ret, Z_STREAM_ERROR,
-            "inflateCopy must reject a source with a half-present allocator pair"
-        );
-        is.zalloc = saved_zalloc;
-        // SAFETY: `dest` is a valid `z_stream`; the rejection installs nothing.
-        let kind = unsafe { peek_handle_kind(&dest) };
-        assert!(
-            kind.is_none(),
-            "a refused inflateCopy must install no handle in dest"
-        );
+    // C's `inflateStateCheck` rejects a source whose `zalloc` or `zfree` is
+    // null (`inflate.c` L90-L91, reached from `inflateCopy` before its
+    // `ZALLOC(source, …)`), so this shim must too: a half-present pair would
+    // otherwise have the clone taken from the global heap while the caller
+    // believes their hook owns it. Clearing a *public* `z_stream` field is
+    // exactly what a C caller can do, and the restore below puts it back.
+    let saved_zalloc = is.zalloc;
+    is.zalloc = None;
+    // SAFETY: `dest` and `is` are distinct valid streams; the shim reads the
+    // allocator fields and rejects before allocating or calling the now-absent
+    // hook.
+    let ret = unsafe { inflateCopy(&mut dest, &mut is) };
+    assert_eq!(
+        ret, Z_STREAM_ERROR,
+        "inflateCopy must reject a source with a half-present allocator pair"
+    );
+    is.zalloc = saved_zalloc;
+    // SAFETY: `dest` is a valid `z_stream`; the rejection installs nothing.
+    let kind = unsafe { peek_handle_kind(&dest) };
+    assert!(
+        kind.is_none(),
+        "a refused inflateCopy must install no handle in dest"
+    );
 
-        // With the pair whole again the same source copies cleanly.
-        // SAFETY: `dest` and `is` are distinct valid streams and `is` holds a live
-        // inflate handle with both allocator halves installed.
-        if unsafe { inflateCopy(&mut dest, &mut is) } == Z_OK {
-            // SAFETY: `dest` now owns its own tagged inflate handle.
-            let kind = unsafe { peek_handle_kind(&dest) };
-            assert_eq!(
-                kind,
-                Some(HandleKind::INFLATE),
-                "inflateCopy must install an INFLATE-tagged handle"
-            );
-            // SAFETY: `dest` holds a live inflate handle.
-            let ret = unsafe { inflateEnd(&mut dest) };
-            assert_eq!(ret, Z_OK, "inflateEnd must reclaim a copied inflate handle");
-        }
-        // SAFETY: `is` still holds its own live inflate handle.
-        let ret = unsafe { inflateEnd(&mut is) };
-        assert_eq!(ret, Z_OK, "inflateEnd must reclaim the copy source");
-        // SAFETY: the handle is gone, so the family now sees a null `state`.
-        let inflate_reset = unsafe { inflateReset(&mut is) };
-        assert_eq!(
-            inflate_reset, Z_STREAM_ERROR,
-            "inflateReset must reject an already-reclaimed stream"
-        );
-        // SAFETY: as above — the reclaimed stream now presents a null `state`.
-        let inflate_reset2 = unsafe { inflateReset2(&mut is, 15) };
-        assert_eq!(
-            inflate_reset2, Z_STREAM_ERROR,
-            "inflateReset2 must reject an already-reclaimed stream"
-        );
-        // SAFETY: as above — the reclaimed stream now presents a null `state`.
-        let inflate_reset_keep = unsafe { inflateResetKeep(&mut is) };
-        assert_eq!(
-            inflate_reset_keep, Z_STREAM_ERROR,
-            "inflateResetKeep must reject an already-reclaimed stream"
-        );
-        // SAFETY: as above — the reclaimed stream now presents a null `state`.
-        let inflate_copy = unsafe { inflateCopy(&mut dest, &mut is) };
-        assert_eq!(
-            inflate_copy, Z_STREAM_ERROR,
-            "inflateCopy must reject an already-reclaimed source"
-        );
-    }
+    // SAFETY: `is` is a valid `z_stream`; a refused copy must not disturb the
+    // source, so its own handle has to still be there and still be tagged.
+    let kind = unsafe { peek_handle_kind(&is) };
+    assert_eq!(
+        kind,
+        Some(HandleKind::INFLATE),
+        "a refused inflateCopy must leave the source handle intact"
+    );
+
+    // With the pair whole again the same source copies cleanly — asserted, not
+    // gated: both halves are present and the source is live, so `Z_OK` is the
+    // only answer the contract permits.
+    // SAFETY: `dest` and `is` are distinct valid streams and `is` holds a live
+    // inflate handle with both allocator halves installed.
+    let copy = unsafe { inflateCopy(&mut dest, &mut is) };
+    assert_exact_code(
+        copy,
+        Contract::InflateCopy,
+        Z_OK,
+        "inflateCopy of a live inflate handle with a whole allocator pair",
+    );
+    // SAFETY: `dest` now owns its own tagged inflate handle.
+    let kind = unsafe { peek_handle_kind(&dest) };
+    assert_eq!(
+        kind,
+        Some(HandleKind::INFLATE),
+        "inflateCopy must install an INFLATE-tagged handle"
+    );
+    // SAFETY: `dest` holds a live inflate handle.
+    let ret = unsafe { inflateEnd(&mut dest) };
+    assert_eq!(ret, Z_OK, "inflateEnd must reclaim a copied inflate handle");
+    // SAFETY: `is` still holds its own live inflate handle.
+    let ret = unsafe { inflateEnd(&mut is) };
+    assert_eq!(ret, Z_OK, "inflateEnd must reclaim the copy source");
+    // SAFETY: the handle is gone, so the family now sees a null `state`.
+    let inflate_reset = unsafe { inflateReset(&mut is) };
+    assert_eq!(
+        inflate_reset, Z_STREAM_ERROR,
+        "inflateReset must reject an already-reclaimed stream"
+    );
+    // SAFETY: as above — the reclaimed stream now presents a null `state`.
+    let inflate_reset2 = unsafe { inflateReset2(&mut is, 15) };
+    assert_eq!(
+        inflate_reset2, Z_STREAM_ERROR,
+        "inflateReset2 must reject an already-reclaimed stream"
+    );
+    // SAFETY: as above — the reclaimed stream now presents a null `state`.
+    let inflate_reset_keep = unsafe { inflateResetKeep(&mut is) };
+    assert_eq!(
+        inflate_reset_keep, Z_STREAM_ERROR,
+        "inflateResetKeep must reject an already-reclaimed stream"
+    );
+    // SAFETY: as above — the reclaimed stream now presents a null `state`.
+    let inflate_copy = unsafe { inflateCopy(&mut dest, &mut is) };
+    assert_eq!(
+        inflate_copy, Z_STREAM_ERROR,
+        "inflateCopy must reject an already-reclaimed source"
+    );
 }
 
 // ===========================================================================
@@ -3094,22 +3352,28 @@ fn probe_copy_and_reset_misuse() {
 /// [`HandleKind::INFLATE`] while it lives and reclaimed afterwards, and the
 /// teardown itself returns a defined code.
 ///
-/// A rejected `inflateInit2_` returns early, which is both the original
-/// harness's behaviour and the signal that this build has gzip compiled out —
-/// the `40..=47` request then fails the `8..=15` bounds test exactly as a C zlib
-/// built without `GUNZIP` does. A failed init installs no handle, so there is
-/// nothing to tear down.
+/// The initialisation itself is *not* left open, even though the bytes fed to it
+/// are. `WBITS_AUTO` is the only configuration in this file whose acceptance
+/// depends on an optional capability: a build with gzip framing must accept the
+/// `40..=47` request, and a build without it must fail the `8..=15` bounds test
+/// exactly as a C zlib built without `GUNZIP` does. The library publishes which
+/// build this is through `zlibCompileFlags`' `NO_GZIP` bit, so the expected code is
+/// read from [`gzip_framing_supported`] and pinned, rather than being whichever
+/// value happened to come back. On the rejecting side no handle may be installed,
+/// so there is nothing to tear down and the probe returns.
 fn probe_raw_gzip_autodetect(data: &[u8]) {
     let mut strm = zeroed_stream();
     // SAFETY: `strm` is a live, owned, zeroed `z_stream`; `version_ok()` and
     // `stream_size_ok()` are precisely the values the shim validates against.
     let init = unsafe { inflateInit2_(&mut strm, WBITS_AUTO, version_ok(), stream_size_ok()) };
-    assert_contract_code(
+    let gzip_available = gzip_framing_supported();
+    assert_exact_code(
         init,
         Contract::InflateInit,
+        if gzip_available { Z_OK } else { Z_STREAM_ERROR },
         "inflateInit2_ with auto-detect windowBits",
     );
-    if init != Z_OK {
+    if !gzip_available {
         // SAFETY: `strm` is a valid `z_stream`; a rejected init must leave
         // `state` null, so reading the tag is defined and yields `None`.
         let kind = unsafe { peek_handle_kind(&strm) };

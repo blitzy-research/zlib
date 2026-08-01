@@ -824,8 +824,9 @@ impl WorkDir {
     ///   under a brand-new name instead of being reused.
     /// * **The result is re-read** by [`WorkDir::assert_fresh_and_private`] before
     ///   the directory is handed out, which catches a creation that did not come
-    ///   out as requested (a `umask` widening the mode, say). It re-resolves the
-    ///   path to do so, so it confirms properties, not identity.
+    ///   out as requested (a `umask` narrowing the mode past the owner bits the
+    ///   harness needs, say — masking can only clear bits, never set them). It
+    ///   re-resolves the path to do so, so it confirms properties, not identity.
     ///
     /// Note the ordering in the success arm: the guard is constructed *before* it
     /// is verified, so a failed verification drops it and its [`Drop`] removes the
