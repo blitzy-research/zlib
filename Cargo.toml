@@ -157,6 +157,28 @@ cfg-if = "1.0.4"
 # SIMD-accelerated CRC-32 backing the `checksum::crc32` hot path. `optional` so
 # it is pulled in only by the `simd` feature; `default-features = false` keeps
 # it `no_std`-compatible when the crate's own `std` feature is disabled.
+#
+# `default-features = false` is NOT the whole story, and getting the rest of it
+# wrong silently DE-optimizes the shipped library. `crc32fast`'s only default
+# feature is its own `std`, and that feature is what chooses between two
+# different bodies of `specialized::…::State::new`:
+#
+#   * with    `crc32fast/std` -> `is_x86_feature_detected!("pclmulqdq"/"sse2"/
+#     "sse4.1")` (or `is_aarch64_feature_detected!("crc")`), a RUN-TIME probe;
+#   * without `crc32fast/std` -> `cfg!(target_feature = …)`, a COMPILE-TIME test
+#     that is false on a stock `x86_64-unknown-linux-gnu` build (only `sse2` is
+#     baseline there), so `State::new` returns `None`, the carry-less-multiply
+#     code is compiled but NEVER selected, and execution silently falls back to
+#     `crc32fast`'s software table — which is measurably SLOWER than this
+#     crate's own braided scalar path.
+#
+# So the dependency must stay `default-features = false` (for `no_std`) while the
+# crate's OWN `std` feature re-enables `crc32fast/std`; that is what the weak
+# `crc32fast?/std` entry under `[features] std` below does. Without it, enabling
+# the default-on `simd` feature makes CRC-32 slower than omitting it, and
+# `cargo bench`/`cargo test` hide the defect because the `flate2`
+# dev-dependency pulls in `crc32fast/default` and Cargo feature unification then
+# turns `crc32fast/std` on for those builds only.
 crc32fast = { version = "1.5.0", optional = true, default-features = false }
 
 [dev-dependencies]
@@ -180,7 +202,31 @@ default = ["std", "gzip", "gz-io", "simd"]
 # Standard-library build: enables `std::io`/`std::fs` for the gz layer and the
 # `catch_unwind` panic guards at the FFI boundary. When this feature is OFF the
 # crate is `#![no_std]` + `alloc` (built via `--no-default-features`).
-std = []
+#
+# It also forwards to `crc32fast/std` — through the WEAK `?` form, which is
+# load-bearing in both directions:
+#
+#   * `crc32fast?/std` enables that feature only if some OTHER entry has already
+#     pulled the optional dependency in (i.e. `simd`). It never pulls
+#     `crc32fast` into the graph itself, so `--no-default-features --features
+#     std` keeps the runtime closure at `cfg-if` alone, exactly as before.
+#   * Enabling it is what gives the SHIPPED library `crc32fast`'s run-time CPU
+#     probe instead of a compile-time `cfg!(target_feature = …)` test that is
+#     false on a stock x86_64 target. Without this forward, `cargo build
+#     --release` (the artifact consumers link) silently used `crc32fast`'s
+#     software table — slower than this crate's own braided scalar path — while
+#     `cargo bench`/`cargo test` measured the accelerated path, because their
+#     dev-dependency graph (`flate2` -> `crc32fast/default`) unified the feature
+#     on. That divergence is now closed: the effective `crc32fast`
+#     configuration is identical in the bench, test, and release builds.
+#
+# A `no_std` build (`--no-default-features [--features simd]`) still gets
+# `crc32fast` WITHOUT its `std` feature, which is the only configuration in
+# which it can be linked freestanding; `src/checksum/crc32.rs` detects that the
+# accelerated path is unreachable there and keeps its own braid, so the `simd`
+# feature can never be slower than omitting it. Features are resolution inputs
+# only, so this line cannot alter either lockfile.
+std = ["crc32fast?/std"]
 # gzip framing within deflate/inflate (maps the C `#ifdef GZIP`).
 gzip = []
 # gzip file-I/O layer (the `gz*` API; maps the C `#ifndef NO_GZCOMPRESS`).
@@ -201,6 +247,15 @@ gz-io = ["std", "gzip"]
 # convenience marker documenting intent for a core-only build.
 no-std = []
 # SIMD-accelerated CRC-32 hot path via the optional `crc32fast` dependency.
+#
+# Deliberately just `dep:crc32fast`, NOT `["dep:crc32fast", "crc32fast/std"]`:
+# spelling the `std` forward here would force `crc32fast`'s `std` feature on in a
+# `--no-default-features --features simd` build, i.e. break the freestanding
+# build this crate supports. The forward therefore lives on the crate's own `std`
+# feature above (as the weak `crc32fast?/std`), which is exactly the
+# "gate it as `std` + `simd`" shape: the run-time CPU probe appears precisely
+# when both features are active, and `src/checksum/crc32.rs` falls back to its
+# braided scalar path whenever the probe is unavailable or negative.
 simd = ["dep:crc32fast"]
 #
 # `inflate_strict` below is an intentional, documented opt-in extra beyond the

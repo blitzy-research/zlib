@@ -7,32 +7,68 @@
 //! exposed through the public API because it is useful to applications on its
 //! own.
 //!
-//! The implementation contains **no `unsafe`** code and depends only on
-//! `core`, so it is usable in `no_std` builds. Its output is bit-identical to
-//! reference zlib for every input, which is the defining acceptance criterion
-//! for the migration.
+//! The implementation contains **no `unsafe`** code. Everything that computes a
+//! checksum depends only on `core`, so it is usable in `no_std` builds; the one
+//! `std` touch point is the CPU-capability probe described below, which is
+//! compiled only when the crate's `std` feature is on. Its output is
+//! bit-identical to reference zlib for every input, which is the defining
+//! acceptance criterion for the migration.
 //!
 //! # Computation paths
 //!
-//! Two interchangeable bulk-CRC paths are provided, selected at compile time by
-//! the `simd` Cargo feature; both produce identical output for every input:
+//! Two interchangeable bulk-CRC paths exist. Both produce identical output for
+//! every input, so a caller never observes which one ran — only throughput
+//! changes — and [`crc32_backend`] reports the choice:
 //!
-//! * **`simd` (enabled by default)** delegates the hot loop to the `crc32fast`
-//!   crate, which uses hardware-accelerated carry-less multiplication where it
-//!   is available. `crc32fast` follows the same external CRC convention as zlib
-//!   (pre- and post-conditioning performed internally), so it is a bit-exact
-//!   drop-in for the byte-wise algorithm.
-//! * **The scalar fallback** (`--no-default-features`, and every `no_std`
-//!   build) is the *braided*, word-at-a-time algorithm ported from the `#ifdef
-//!   W` fast path in `crc32.c`: `CRC_BRAID_N` (5) independent CRCs are advanced
-//!   over interleaved `CRC_BRAID_W`-byte (8-byte) words and combined at the end
-//!   of the final block, which breaks the serial dependency of the byte-wise
-//!   loop. Little- and big-endian variants are both compiled and selected by
+//! * **`crc32fast` ([`Crc32Backend::Crc32Fast`])** delegates the hot loop to the
+//!   `crc32fast` crate, which uses hardware-accelerated carry-less
+//!   multiplication (x86 `pclmulqdq`) or the dedicated ARM CRC instructions.
+//!   `crc32fast` follows the same external CRC convention as zlib (pre- and
+//!   post-conditioning performed internally), so it is a bit-exact drop-in for
+//!   the byte-wise algorithm. It is selected only when the `simd` Cargo feature
+//!   is enabled **and** its hardware path is genuinely reachable — see
+//!   "Reachability" below.
+//! * **The braided scalar path** ([`Crc32Backend::Braid`]) is the *braided*,
+//!   word-at-a-time algorithm ported from the `#ifdef W` fast path in
+//!   `crc32.c`: `CRC_BRAID_N` (5) independent CRCs are advanced over interleaved
+//!   `CRC_BRAID_W`-byte (8-byte) words and combined at the end of the final
+//!   block, which breaks the serial dependency of the byte-wise loop. Little-
+//!   and big-endian variants are both compiled and selected by
 //!   `cfg!(target_endian = ...)`, and the classic reflected byte-wise table loop
 //!   over `CRC_TABLE` still handles short inputs and the trailing bytes. It
 //!   needs no external crate and is the guaranteed-correct baseline; the
 //!   equivalence of the braided and byte-wise results is asserted by tests over
-//!   every length and every word offset.
+//!   every length and every word offset. It backs every `--no-default-features`
+//!   and every `no_std` build, and it is also the fallback whenever the
+//!   accelerated path is not reachable.
+//!
+//! ## Reachability: why the `simd` feature is not by itself the selector
+//!
+//! `crc32fast` decides internally whether it may execute its accelerated code,
+//! and it decides differently depending on whether **its own** `std` feature is
+//! on: with it, `State::new` performs a RUN-TIME `is_x86_feature_detected!` /
+//! `is_aarch64_feature_detected!` probe; without it, a COMPILE-TIME
+//! `cfg!(target_feature = ...)` test. On a stock `x86_64` target only `sse2` is
+//! baseline, so the compile-time test fails, `State::new` returns `None`, and
+//! `crc32fast` silently falls back to its own software table — which is slower
+//! than the braided path in this module. Selecting `crc32fast` unconditionally
+//! from the `simd` feature alone therefore made enabling `simd` a *pessimization*
+//! for the shipped library, while `cargo test`/`cargo bench` hid the defect
+//! because their dev-dependency graph unified `crc32fast/std` on.
+//!
+//! Two changes close that gap and are load-bearing together:
+//!
+//! 1. `Cargo.toml` forwards the crate's own `std` feature to `crc32fast?/std`,
+//!    so a std build of this crate gives `crc32fast` its run-time probe (and a
+//!    `no_std` build still links it without `std`).
+//! 2. This module tests reachability itself, mirroring `crc32fast`'s own gate
+//!    conditions, and keeps the braid whenever the accelerated path would not be
+//!    selected — including on architectures for which `crc32fast` has no
+//!    specialized backend at all. That makes the invariant unconditional:
+//!    **enabling `simd` is never slower than omitting it.**
+//!
+//! Because both paths are bit-exact, this selection cannot change a single
+//! emitted byte; only the instruction mix does.
 //!
 //! # Combining checksums
 //!
@@ -48,15 +84,17 @@
 // `${OUT_DIR}/crc32_tables.rs`; the values are bit-identical to the checked-in
 // C header `crc32.h`.
 //
-// The `dead_code` allowance is conditional on `simd`, deliberately. With `simd`
-// off, this module consumes ALL SEVEN generated artifacts — `CRC_TABLE` and
+// NO `dead_code` allowance is granted, in ANY configuration, and that is a
+// deliberate strengthening rather than an omission. The braided path below is
+// now compiled unconditionally — with `simd` on it is the fallback taken
+// whenever `crc32fast`'s hardware backend is unreachable — so all SEVEN
+// generated artifacts are consumed in every feature row: `CRC_TABLE` and
 // `X2N_TABLE` here, and `CRC_BRAID_N`, `CRC_BRAID_W`, `CRC_BIG_TABLE`,
-// `CRC_BRAID_TABLE`, `CRC_BRAID_BIG_TABLE` in `braid` — so no allowance is
-// granted and the compiler itself proves nothing generated is unused. With
-// `simd` on, the braided path is not compiled (the hot loop is `crc32fast`'s)
-// and its five tables are genuinely unreferenced, which is the only
-// configuration that needs the allowance.
-#[cfg_attr(feature = "simd", allow(dead_code))]
+// `CRC_BRAID_TABLE`, `CRC_BRAID_BIG_TABLE` in `braid`. The compiler therefore
+// proves, in every configuration, that nothing `build.rs` emits has gone unused
+// — which is exactly the producer/consumer drift signal an `allow(dead_code)`
+// would have suppressed. `the_generated_contract_cannot_be_silently_weakened`
+// pins that no suppression reappears.
 mod tables {
     include!(concat!(env!("OUT_DIR"), "/crc32_tables.rs"));
 }
@@ -214,17 +252,159 @@ pub fn crc32_z(crc: u32, buf: &[u8]) -> u32 {
     crc32_bulk(crc, buf)
 }
 
-/// SIMD-accelerated bulk CRC-32 (active when the `simd` feature is enabled).
+/// Which bulk CRC-32 implementation this build will actually execute.
 ///
-/// Delegates to `crc32fast`, which maintains the same external CRC convention
-/// as zlib: `new_with_initial(crc)` seeds the running value, `update` folds in
-/// the bytes, and `finalize` applies the trailing conditioning and returns the
-/// updated CRC. This yields output identical to the scalar table loop below.
+/// Both variants compute the same value for every input — they are bit-exact
+/// equivalents, and the whole test suite asserts that — so this type carries no
+/// correctness meaning. It exists so that *performance* claims can be tied to
+/// the code they describe: a benchmark, a CI job, or a bug report can record
+/// which path it measured instead of inferring it from a feature flag, which is
+/// precisely the inference that hid a CRC-32 pessimization in the shipped
+/// library while `cargo bench` measured the accelerated path (see the module
+/// documentation, "Reachability").
+///
+/// Obtain the value from [`crc32_backend`].
+///
+/// The enumeration is `#[non_exhaustive]`: adding a third backend must not be a
+/// breaking change for a consumer that only prints or compares the value, which
+/// is the only intended use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum Crc32Backend {
+    /// The braided, word-at-a-time scalar port of `crc32.c`'s `#ifdef W` fast
+    /// path, contained entirely in this module.
+    ///
+    /// Always the answer when the `simd` feature is off (including every
+    /// `no_std` build), and also the answer when `simd` is on but `crc32fast`'s
+    /// hardware backend is unreachable on this target or CPU.
+    Braid,
+    /// The `crc32fast` crate's hardware-accelerated backend (x86 `pclmulqdq` or
+    /// the AArch64 CRC instructions).
+    ///
+    /// Requires the `simd` feature *and* a target/CPU on which `crc32fast` will
+    /// really select that backend.
+    Crc32Fast,
+}
+
+/// Reports which bulk CRC-32 implementation [`crc32`] executes on this machine.
+///
+/// The answer is stable for the lifetime of the process: it depends only on the
+/// compiled feature set, the target architecture, and immutable CPU capability
+/// bits. It is not affected by the input length.
+///
+/// This is diagnostic information, never a correctness switch — both backends
+/// return identical values for identical input.
+///
+/// # Examples
+///
+/// ```
+/// # use zlib_rs::checksum::crc32::{crc32, crc32_backend};
+/// // Whichever backend is reported, the canonical check value is the same.
+/// let backend = crc32_backend();
+/// println!("CRC-32 backend: {backend:?}");
+/// assert_eq!(crc32(0, b"123456789"), 0xcbf4_3926);
+/// ```
+#[must_use]
+pub fn crc32_backend() -> Crc32Backend {
+    // `cfg!` rather than `#[cfg]` so both arms type-check in every feature row.
+    // With `simd` off the predicate is never reached at run time (`&&` short
+    // circuits on a compile-time `false`), but it is still compiled, so it
+    // cannot rot in the configuration that does not use it.
+    if cfg!(feature = "simd") && accelerated_backend_is_reachable() {
+        Crc32Backend::Crc32Fast
+    } else {
+        Crc32Backend::Braid
+    }
+}
+
+// Whether `crc32fast`'s hardware backend can actually be selected here.
+//
+// These arms MIRROR `crc32fast` 1.5.0's own gates, which is the only way to know
+// the answer: `crc32fast` reports neither the backend it chose nor the
+// conditions it tested.
+//
+//   * `specialized::pclmulqdq::State::new` requires `pclmulqdq`, `sse2` and
+//     `sse4.1`, probed at RUN TIME when `crc32fast/std` is on and at COMPILE
+//     TIME (`cfg!(target_feature = ...)`) when it is off;
+//   * `specialized::aarch64::State::new` requires `crc`, probed the same two
+//     ways;
+//   * every other architecture resolves to an uninhabited `State` whose `new`
+//     always returns `None`, so no acceleration is possible.
+//
+// The crate's own `std` feature is what forwards to `crc32fast/std`
+// (`Cargo.toml`), so gating the run-time arms on `feature = "std"` tests exactly
+// the condition that decides which `State::new` body was compiled.
+//
+// Mirroring can only ever be conservative: if a future `crc32fast` narrowed its
+// gate, this predicate could claim acceleration that is not taken, and the
+// consequence is a throughput difference — never a wrong checksum, because the
+// two paths are bit-exact equivalents. The `Cargo.lock` pin keeps the mirrored
+// version fixed, and `crc32fast`'s AArch64 backend additionally needs its own
+// `stable_arm_crc32_intrinsics` cfg, which its build script sets for every
+// rustc from 1.80 onwards — always true at this crate's 1.85.0 MSRV.
+//
+// Only the x86_64 arms are exercised by this project's CI (all jobs run on
+// `ubuntu-latest`); the AArch64 and other-architecture arms are written to
+// `crc32fast`'s source and remain unmeasured here, which is stated rather than
+// implied (AAP §0.7.2 standard S8).
+cfg_if::cfg_if! {
+    if #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))] {
+        /// x86/x86-64 with `std`: run-time CPU probe, matching `crc32fast`'s
+        /// `#[cfg(feature = "std")] State::new`.
+        fn accelerated_backend_is_reachable() -> bool {
+            std::arch::is_x86_feature_detected!("pclmulqdq")
+                && std::arch::is_x86_feature_detected!("sse2")
+                && std::arch::is_x86_feature_detected!("sse4.1")
+        }
+    } else if #[cfg(any(target_arch = "x86", target_arch = "x86_64"))] {
+        /// x86/x86-64 without `std`: compile-time test, matching `crc32fast`'s
+        /// `#[cfg(not(feature = "std"))] State::new`. False on a stock target,
+        /// true when the caller built with `-C target-feature=+pclmulqdq,+sse4.1`.
+        fn accelerated_backend_is_reachable() -> bool {
+            cfg!(all(
+                target_feature = "pclmulqdq",
+                target_feature = "sse2",
+                target_feature = "sse4.1"
+            ))
+        }
+    } else if #[cfg(all(feature = "std", target_arch = "aarch64"))] {
+        /// AArch64 with `std`: run-time probe for the CRC instructions.
+        fn accelerated_backend_is_reachable() -> bool {
+            std::arch::is_aarch64_feature_detected!("crc")
+        }
+    } else if #[cfg(target_arch = "aarch64")] {
+        /// AArch64 without `std`: compile-time test for the CRC instructions.
+        fn accelerated_backend_is_reachable() -> bool {
+            cfg!(target_feature = "crc")
+        }
+    } else {
+        /// Architectures for which `crc32fast` has no specialized backend: its
+        /// `State::new` can only return `None`, so the braid is always the
+        /// faster and simpler choice.
+        fn accelerated_backend_is_reachable() -> bool {
+            false
+        }
+    }
+}
+
+/// Bulk CRC-32 with the `simd` feature enabled: `crc32fast` when its hardware
+/// backend is reachable, the braided scalar path otherwise.
+///
+/// `crc32fast` maintains the same external CRC convention as zlib:
+/// `new_with_initial(crc)` seeds the running value, `update` folds in the bytes,
+/// and `finalize` applies the trailing conditioning and returns the updated CRC.
+/// Its output is identical to [`braid::crc32_bulk`] for every input, so the
+/// branch below is a pure throughput decision.
 #[cfg(feature = "simd")]
 fn crc32_bulk(crc: u32, buf: &[u8]) -> u32 {
-    let mut hasher = crc32fast::Hasher::new_with_initial(crc);
-    hasher.update(buf);
-    hasher.finalize()
+    match crc32_backend() {
+        Crc32Backend::Crc32Fast => {
+            let mut hasher = crc32fast::Hasher::new_with_initial(crc);
+            hasher.update(buf);
+            hasher.finalize()
+        }
+        Crc32Backend::Braid => braid::crc32_bulk(crc, buf),
+    }
 }
 
 /// Scalar bulk CRC-32 (active when the `simd` feature is disabled, including
@@ -278,12 +458,12 @@ fn crc32_bulk(crc: u32, buf: &[u8]) -> u32 {
 /// local to the `cfg!` in [`crc32_bulk`]: both branches already exist and are
 /// already tested.
 ///
-/// This module is compiled when the `simd` feature is **off** (where it is the
-/// bulk implementation) and additionally under `cfg(test)`, so its equivalence
-/// tests run in every feature configuration. Under a non-test `simd` build it is
-/// absent entirely, which is why the generated tables carry a `simd`-conditional
-/// `dead_code` allowance.
-#[cfg(any(test, not(feature = "simd")))]
+/// This module is compiled **unconditionally**. With the `simd` feature off it
+/// is the bulk implementation; with `simd` on it is the fallback [`crc32_bulk`]
+/// takes whenever `crc32fast`'s hardware backend is unreachable (see the module
+/// documentation, "Reachability"), so it is live code in every feature row —
+/// which is also why the generated tables need no `dead_code` allowance any
+/// more, and why its equivalence tests run in every configuration.
 mod braid {
     use super::tables::{
         CRC_BIG_TABLE, CRC_BRAID_BIG_TABLE, CRC_BRAID_N, CRC_BRAID_TABLE, CRC_BRAID_W, CRC_TABLE,
@@ -713,8 +893,9 @@ pub fn get_crc_table() -> &'static [u32; 256] {
 mod tests {
     use super::{
         BIG_BRAID_ENTRY_1, BIG_CRC_ENTRY_1, CRC_BIG_TABLE, CRC_BRAID_BIG_TABLE, CRC_BRAID_N,
-        CRC_BRAID_TABLE, CRC_BRAID_W, CRC_TABLE, LITTLE_BRAID_ENTRY_1, LITTLE_CRC_ENTRY_1,
-        SELECTED_BRAID_ENTRY_1, SELECTED_CRC_ENTRY_1, X2N_TABLE, crc32, crc32_combine,
+        CRC_BRAID_TABLE, CRC_BRAID_W, CRC_TABLE, Crc32Backend, LITTLE_BRAID_ENTRY_1,
+        LITTLE_CRC_ENTRY_1, SELECTED_BRAID_ENTRY_1, SELECTED_CRC_ENTRY_1, X2N_TABLE,
+        accelerated_backend_is_reachable, braid, crc32, crc32_backend, crc32_combine,
         crc32_combine_gen, crc32_combine_op, crc32_z, get_crc_table, multmodp,
     };
 
@@ -782,6 +963,98 @@ mod tests {
             *byte = ((i * 37 + 11) & 0xff) as u8;
         }
         assert_eq!(crc32(0, &big), 0x897e_9e86);
+    }
+
+    // -----------------------------------------------------------------------
+    // Backend selection. These tests pin the *dispatch*, not the arithmetic: the
+    // value tests above already prove both paths are bit-exact, so what has to be
+    // guaranteed here is that the reported backend is the one that actually runs,
+    // that it can never be `Crc32Fast` without the `simd` feature, and that
+    // selecting it can never change a checksum.
+    // -----------------------------------------------------------------------
+
+    /// The reported backend must agree with the compiled configuration and with
+    /// the reachability predicate — never merely with the feature flag, which is
+    /// exactly the inference that let a pessimization ship unnoticed.
+    #[test]
+    fn the_reported_backend_matches_the_compiled_configuration() {
+        let backend = crc32_backend();
+
+        if cfg!(feature = "simd") {
+            let expected = if accelerated_backend_is_reachable() {
+                Crc32Backend::Crc32Fast
+            } else {
+                Crc32Backend::Braid
+            };
+            assert_eq!(
+                backend, expected,
+                "with `simd` on, the backend must follow the reachability probe"
+            );
+        } else {
+            assert_eq!(
+                backend,
+                Crc32Backend::Braid,
+                "without the `simd` feature there is no `crc32fast` in the graph, \
+                 so the braid is the only possible backend"
+            );
+        }
+
+        // Stable for the lifetime of the process: the probe reads immutable CPU
+        // capability bits, so repeated calls cannot disagree.
+        assert_eq!(backend, crc32_backend());
+    }
+
+    /// Whichever backend is selected, it must agree with the braided reference
+    /// over every length that spans the sub-threshold path, the braid threshold,
+    /// whole blocks, and the unrolled tail — including a non-zero seed.
+    ///
+    /// With `simd` on and the hardware path reachable, this is the cross-check
+    /// between `crc32fast` and this module's own implementation; with `simd` off
+    /// (or unreachable) it compares the braid with itself, which is trivially true
+    /// but keeps the test meaningful in every feature row without a `cfg`.
+    #[test]
+    fn the_selected_backend_agrees_with_the_braid_for_every_length() {
+        let mut data = [0u8; 700];
+        let mut state = 0x1234_5678_9abc_def0_u64;
+        for byte in data.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = (state >> 24) as u8;
+        }
+
+        for len in 0..=data.len() {
+            let slice = &data[..len];
+            assert_eq!(
+                crc32(0, slice),
+                braid::crc32_bulk(0, slice),
+                "backend {:?} disagrees with the braid at length {len}",
+                crc32_backend()
+            );
+            assert_eq!(
+                crc32(0xdead_beef, slice),
+                braid::crc32_bulk(0xdead_beef, slice),
+                "backend {:?} disagrees with the braid at length {len} for a \
+                 non-zero seed",
+                crc32_backend()
+            );
+        }
+    }
+
+    /// The canonical vectors must hold for the braid specifically, not only for
+    /// whichever backend the host selects. Without this, a CI host that happens to
+    /// select `crc32fast` would leave the shipped-elsewhere braid unvalidated by
+    /// the value tests above.
+    #[test]
+    fn the_braid_reproduces_the_canonical_vectors_independently() {
+        assert_eq!(braid::crc32_bulk(0, b""), 0);
+        assert_eq!(braid::crc32_bulk(0, b"123456789"), 0xcbf4_3926);
+        assert_eq!(braid::crc32_bulk(0, b"a"), 0xe8b7_be43);
+        assert_eq!(braid::crc32_bulk(0, b"abc"), 0x3524_41c2);
+        assert_eq!(
+            braid::crc32_bulk(0, b"The quick brown fox jumps over the lazy dog"),
+            0x414f_a339
+        );
     }
 
     #[test]
@@ -1068,13 +1341,14 @@ mod tests {
     /// the contract, so weakening it is a test failure rather than a silent loss of
     /// coverage.
     ///
-    /// The one suppression the contract permits is the `simd`-conditional one on
-    /// `mod tables`: with `simd` enabled the braided word-at-a-time path is not
-    /// compiled and its five inputs are genuinely unused, while with `simd`
-    /// disabled the allowance evaporates and every generated output must be
-    /// consumed — which is precisely the configuration in which producer drift has
-    /// to be detectable. An unconditional allowance would remove that signal from
-    /// both configurations, so it stays rejected.
+    /// NO suppression is permitted on `mod tables`, in any form — not even a
+    /// `cfg_attr`-conditional one. The braided word-at-a-time path is compiled in
+    /// every feature row (with `simd` on it is the fallback taken when
+    /// `crc32fast`'s hardware backend is unreachable), so all seven generated
+    /// outputs are consumed in every configuration and the compiler itself proves
+    /// nothing `build.rs` emits has gone unused. An allowance — conditional or
+    /// not — would remove exactly that signal, so the attribute list above the
+    /// declaration must be empty.
     #[test]
     fn the_generated_contract_cannot_be_silently_weakened() {
         const SRC: &str = include_str!("crc32.rs");
@@ -1095,12 +1369,11 @@ mod tests {
             !SRC.contains(&inner_allow),
             "an inner allow(dead_code) would suppress the whole module"
         );
-        // The only outer attribute `mod tables` may carry is the
-        // `simd`-conditional allowance. Checking structurally — every attribute
-        // line above the declaration — rather than matching one permitted spelling
-        // loosely, so `#[allow(dead_code)]`, `#[allow(dead_code, unused)]` or any
-        // other unconditional variant is rejected.
-        let permitted = format!("#{}", "[cfg_attr(feature = \"simd\", allow(dead_code))]");
+        // `mod tables` must carry NO outer attribute at all. Checking
+        // structurally — every attribute line above the declaration — rather than
+        // matching one forbidden spelling, so `#[allow(dead_code)]`,
+        // `#[allow(dead_code, unused)]`, and any `cfg_attr`-conditional variant
+        // are all rejected.
         let lines: Vec<&str> = SRC.lines().collect();
         let decl = lines
             .iter()
@@ -1113,27 +1386,36 @@ mod tests {
             .filter(|l| l.trim_start().starts_with('#'))
             .copied()
             .collect();
-        for attr in &attrs {
-            assert_eq!(
-                attr.trim(),
-                permitted,
-                "`mod tables` may carry only the simd-conditional allowance; an \
-                 unconditional suppression masks drift in the generated outputs in \
-                 the very configuration that consumes them"
-            );
-        }
         assert!(
-            attrs.len() <= 1,
-            "one suppression is the whole allowance, found {attrs:?}"
+            attrs.is_empty(),
+            "`mod tables` must carry no attribute: every generated output is \
+             consumed in every feature row, so any suppression — conditional or \
+             not — would mask producer drift instead of reporting it. Found \
+             {attrs:?}"
         );
 
-        // The other half of the same contract: the braided path that consumes the
-        // five `simd`-off outputs must exist, otherwise the conditional allowance
-        // above would be hiding permanently dead tables rather than
-        // configuration-dependent ones.
+        // The other half of the same contract: the braided path that consumes five
+        // of the seven outputs must exist AND must be compiled unconditionally,
+        // otherwise a feature row would exist in which those tables are dead and
+        // the absent allowance above would stop being provable.
+        let decl_braid = lines
+            .iter()
+            .position(|l| l.trim_end() == "mod braid {")
+            .expect("the braided word-at-a-time path must exist to consume the braid tables");
+        let braid_attrs: Vec<&str> = lines[..decl_braid]
+            .iter()
+            .rev()
+            .take_while(|l| {
+                let t = l.trim_start();
+                t.starts_with('#') || t.starts_with("///") || l.trim().is_empty()
+            })
+            .filter(|l| l.trim_start().starts_with('#'))
+            .copied()
+            .collect();
         assert!(
-            SRC.contains("mod braid {"),
-            "the braided word-at-a-time path must exist to consume the braid tables"
+            braid_attrs.is_empty(),
+            "`mod braid` must be compiled unconditionally so the braid tables are \
+             live in every feature row; found {braid_attrs:?}"
         );
 
         // Every promised name is imported, so a renamed or removed output is an

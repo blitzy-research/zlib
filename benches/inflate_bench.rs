@@ -11,18 +11,28 @@
 //! `inflate_fast` hot path.
 //!
 //! Measured position — external evidence recorded in the plan, not a figure this
-//! harness produces, and the only throughput figures quoted anywhere in this
-//! file: decompression runs at 107%-127% of reference C zlib, so it is at or
-//! above parity, while compression runs at approximately 85% of it (AAP 0.8.3,
+//! harness produces, and the only C-relative throughput figures quoted anywhere
+//! in this file: decompression runs at 107%-127% of reference C zlib, so it is at
+//! or above parity, while compression runs at approximately 85% of it (AAP 0.8.3,
 //! "Performance Expectations"). Compression is therefore the interesting side,
 //! and it is measured separately in `benches/deflate_bench.rs`; nothing timed
 //! here is a compression figure.
 //!
+//! Of the two, the decompression figure is the one that has survived contact with
+//! measurement: a per-profile comparison against a reference C build put these
+//! cases at 104%-125%, which brackets the quoted 107%-127%. The compression
+//! figure is an aggregate and must not be read as localising the shortfall to any
+//! particular input profile — the same comparison inverted the intuitive story,
+//! and `benches/deflate_bench.rs` carries the corrected per-profile distribution.
+//!
 //! What this file itself measures is `zlib-rs` alone: it links no C library and
-//! runs no reference implementation, so every number it prints describes how
-//! fast this crate turns compressed bytes back into payload bytes. The
+//! runs no reference implementation, so every number it prints describes how fast
+//! this crate turns compressed bytes back into payload bytes, and is useful for
+//! comparing this crate against itself across levels, profiles, and commits. The
 //! C-relative percentages above come from AAP 0.8.3; they are not produced by a
-//! run of this harness.
+//! run of this harness, and the repository has no automated in-tree performance
+//! oracle that could re-check them on demand. Treat them as attributed context
+//! rather than as a property this suite verifies.
 //!
 //! # Every case validates its own output before it is timed
 //!
@@ -50,6 +60,48 @@
 //! and byte-identity against reference zlib is owned exclusively by
 //! `tests/interop.rs`.
 //!
+//! # Measurement configuration: noise threshold
+//!
+//! Criterion's default `noise_threshold` is 0.01, and its verdict rule is a plain
+//! comparison of the change confidence interval against that value: "regressed"
+//! iff both bounds exceed `+noise`, "improved" iff both fall below `-noise`,
+//! otherwise "within noise" (`src/report.rs`, `compare_to_threshold`). One
+//! percent is well below what this workload actually reproduces run to run — the
+//! `uncompress` cases here measured a coefficient of variation of 5.25% on the
+//! CI-class host that motivated this setting — so an unchanged binary earns
+//! "Performance has regressed" purely from scheduling noise.
+//!
+//! [`NOISE_THRESHOLD`] is therefore set above the measured variation of these
+//! cases. The policy is shared with `benches/deflate_bench.rs` and
+//! `benches/checksum_bench.rs`: pick a threshold that exceeds the largest
+//! run-to-run drift observed for the workload on an unchanged binary — 0.05 where
+//! that drift stays within roughly 3%, and 0.10 where it reaches the 5%-8% band
+//! these decompression cases and the incompressible compression cases occupy.
+//! `benches/deflate_bench.rs` carries the full derivation, including why
+//! `--noise-threshold` on the command line cannot override a value set on the
+//! group.
+//!
+//! Sampling mode is deliberately left at Criterion's `Auto` default here. Every
+//! case in this file decodes 64 KiB in well under a millisecond, so Linear
+//! sampling reaches an iteration step of `d >= 1`, never prints the "Unable to
+//! complete 100 samples" warning that the ~1.8 ms compression cases in
+//! `deflate_bench.rs` had to switch to `Flat` to silence, and keeps the
+//! regression-slope estimate that is the more accurate one at this magnitude.
+//!
+//! # Operating this harness
+//!
+//! The pinned harness (`criterion = "0.5.1"`, AAP 0.5.1) has several behaviours
+//! that can silently invalidate a measurement or a CI gate and that cannot be
+//! fixed from this repository — among them: a filter that matches nothing exits 0
+//! having measured nothing; invoking the bench binary by path without `--bench`
+//! runs in Test mode and collects no data; an unwritable `CRITERION_HOME` still
+//! exits 0; invalid numeric arguments such as `--sample-size 9` abort with status
+//! 101; `--help` is unavailable while `--version` prints no version; and
+//! `Gnuplot not found, using plotters backend` is expected and harmless.
+//! `benches/checksum_bench.rs` holds the authoritative list with the exact
+//! assertion sites, exit codes, and CI mitigations. Read it before wiring any of
+//! these benchmarks into an automated gate.
+//!
 //! Registered in `Cargo.toml` as `[[bench]] name = "inflate_bench"` with
 //! `harness = false`. No `[[bench]]` block carries a `path` key, so Cargo
 //! auto-discovers the target by filename: renaming this file breaks the build
@@ -60,6 +112,15 @@ use zlib_rs::{compress_bound, compress2, uncompress};
 
 /// Payload size used by the inflate benchmarks (64 KiB).
 const SIZE: usize = 64 * 1024;
+
+/// Criterion noise threshold for every case in this file.
+///
+/// Ten percent, set above the 5.25% coefficient of variation measured for these
+/// `uncompress` cases so that a verdict carries information instead of reporting
+/// scheduling noise as a regression. It remains far below the magnitude of any
+/// optimisation worth landing, so genuine movement is still flagged. See the
+/// module header, and `benches/deflate_bench.rs` for the full derivation.
+const NOISE_THRESHOLD: f64 = 0.10;
 
 /// Deterministic xorshift64 generator for incompressible, high-entropy input.
 fn xorshift_bytes(len: usize, seed: u64) -> Vec<u8> {
@@ -135,6 +196,9 @@ fn bench_by_level(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("inflate_by_level");
     group.throughput(Throughput::Bytes(orig_len as u64));
+    // Raise the verdict threshold off Criterion's unusable 1% default; sampling
+    // mode stays `Auto` because these cases are sub-millisecond (module header).
+    group.noise_threshold(NOISE_THRESHOLD);
     for level in [1i32, 6, 9] {
         let compressed = deflate_to_vec(&original, level);
         group.bench_with_input(
@@ -168,6 +232,9 @@ fn bench_by_profile(c: &mut Criterion) {
     ];
 
     let mut group = c.benchmark_group("inflate_by_profile");
+    // Same policy as `bench_by_level`: raise the verdict threshold off
+    // Criterion's 1% default, leave sampling mode at `Auto` (module header).
+    group.noise_threshold(NOISE_THRESHOLD);
     for (name, original) in &profiles {
         let orig_len = original.len();
         let compressed = deflate_to_vec(original, 6);

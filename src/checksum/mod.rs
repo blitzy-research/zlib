@@ -9,5 +9,6 @@ pub mod crc32;
 
 pub use adler32::{adler32, adler32_combine, adler32_z};
 pub use crc32::{
-    crc32, crc32_combine, crc32_combine_gen, crc32_combine_op, crc32_z, get_crc_table,
+    Crc32Backend, crc32, crc32_backend, crc32_combine, crc32_combine_gen, crc32_combine_op,
+    crc32_z, get_crc_table,
 };
