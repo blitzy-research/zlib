@@ -454,7 +454,7 @@ fuzz_target!(|data: &[u8]| {
     assert_known_answers();
 
     // (2) The baseline contract: identity seeds, the whole input, mid-point
-    //     split. Preserved exactly as originally written.
+    //     split.
     let split = data.len() / 2;
     let (a, b) = data.split_at(split);
 

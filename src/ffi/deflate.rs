@@ -38,6 +38,45 @@
 //! finds nothing to free. A stream carrying another engine's handle fails the
 //! tag check, leaves `state` untouched, and yields `Z_STREAM_ERROR` instead of
 //! deallocating with a mismatched `Layout`.
+//!
+//! ## Defined rejections — deliberately part of the caller contract
+//!
+//! A C consumer cannot be trusted to be well-formed. Reference zlib already
+//! answers *some* malformed calls with a defined error — that is what
+//! `deflateStateCheck` is for — and this boundary deliberately extends the same
+//! treatment to the rest, so that every case below is a diagnosable error
+//! instead of undefined behavior. The following inputs are therefore
+//! **explicitly within** the contract of every non-initializing shim in this
+//! module: each is detected and rejected with `Z_STREAM_ERROR` (`Z_MEM_ERROR` is
+//! never fabricated for them), nothing is dereferenced beyond the plain `Copy`
+//! fields of the `z_stream` itself, and no allocation is created, freed, or
+//! reinterpreted.
+//!
+//! * **A null `z_streamp`.** Tested first in every body, before any field read.
+//! * **A zeroed or never-initialized `z_stream`.** `state` is null, which
+//!   [`peek_handle_kind`] reports as "no handle" without loading through it.
+//! * **A stream whose `*End` already ran.** Teardown nulls `state`, so this is
+//!   indistinguishable from the previous case: a second `deflateEnd` is a
+//!   defined `Z_STREAM_ERROR`, never a double free.
+//! * **A stream carrying another engine's handle** — for example `deflateEnd`
+//!   on an `inflateInit2_`-initialized stream, or the converse. The
+//!   [`HandleKind`] tag at offset 0 is compared before the pointer is
+//!   reinterpreted, so a cross-engine terminator can neither drop with a
+//!   mismatched `Layout` nor observe another engine's fields. This one is a
+//!   deliberate hardening **beyond** the C contract: reference zlib's
+//!   `deflateEnd` would cast the opaque `state` blindly, so portable C code must
+//!   still never do it — but against this implementation it is defined.
+//! * **Inconsistent buffer descriptors** on the entry points that take them: a
+//!   null `next_out`, or a null `next_in` paired with a non-zero `avail_in`.
+//!   These fail `stream_buffers_valid`/`input_ptr_valid` and are rejected
+//!   *before* any slice is formed.
+//!
+//! What remains the caller's obligation is only this: when a buffer pointer is
+//! non-null and its `avail_*` is non-zero, that many bytes must really be
+//! readable (input) or writable (output) for the duration of the call, and the
+//! two regions must not overlap. A pointer that is merely *unused* on the path
+//! taken need not be valid — [`deflateParams`] documents the one case where
+//! that distinction is observable.
 
 // zlib's public symbols are camelCase C identifiers; `#[unsafe(no_mangle)]`
 // exempts them from `non_snake_case`, but this keeps the module warning-free
@@ -487,8 +526,22 @@ pub unsafe extern "C" fn deflateResetKeep(strm: z_streamp) -> c_int {
 /// # Safety
 ///
 /// `strm` must be null or a valid `z_stream` initialized by `deflateInit*`.
-/// When `avail_out` is non-zero, `next_out` must address that many writable
-/// bytes (pending output may be flushed here).
+///
+/// The caller's buffers are read and written **only when the change requires a
+/// pre-flush** — that is, only when it switches the block producer or the
+/// strategy *and* the stream has already started (C's
+/// `s->last_flush != -2`). The buffer obligations therefore apply only to that
+/// case: `next_out` must be non-null and address `avail_out` writable bytes,
+/// `next_in` must address `avail_in` readable bytes whenever `avail_in` is
+/// non-zero, and the two regions must be disjoint. Both are validated on entry
+/// and `Z_STREAM_ERROR` is returned if either is inconsistent.
+///
+/// Every other call — including the common "raise the level immediately after
+/// `deflateInit2`, before any `deflate`" case — is pure bookkeeping. This shim
+/// then neither forms a slice over, nor computes an offset from, `next_in` or
+/// `next_out`, so those fields may hold anything at all (a stale pointer, a
+/// region far smaller than `avail_*` claims, or null) exactly as they may in C,
+/// which likewise returns `Z_OK` there without touching a byte.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn deflateParams(strm: z_streamp, level: c_int, strategy: c_int) -> c_int {
     guard_int(Z_STREAM_ERROR, || {
@@ -542,11 +595,37 @@ pub unsafe extern "C" fn deflateParams(strm: z_streamp, level: c_int, strategy: 
             return Z_STREAM_ERROR;
         }
 
-        // SAFETY: `next_in`/`avail_in` describe a readable input region.
-        let input = unsafe { input_slice(s) };
-        // SAFETY: `next_out`/`avail_out` describe a writable region disjoint
-        // from `input`.
-        let output = unsafe { output_slice(s) };
+        // Bridge the caller's buffers ONLY when the pre-flush will actually run.
+        //
+        // On the no-pre-flush path C never dereferences `next_in`/`next_out`, so
+        // it never requires either to address `avail_in`/`avail_out` live bytes —
+        // and a caller raising the level between `deflateInit2` and its first
+        // `deflate` may legitimately still have a stale, undersized, or not-yet-
+        // wired region recorded there. Constructing a Rust slice is itself the
+        // load-bearing assertion: `&[u8]`/`&mut [u8]` require the *whole*
+        // declared region to be one live allocation from the moment the
+        // reference exists, even when not a single byte is read or written. So
+        // building them unconditionally turned a call reference zlib answers
+        // with `Z_OK` into undefined behavior. Empty slices assert nothing about
+        // the caller's pointers, and `engine::deflate_params` provably never
+        // touches either argument off the pre-flush path — the lone forward to
+        // `deflate(strm, input, output, Z_BLOCK)` sits inside its
+        // `if deflate_params_flushes(..)` branch (`src/deflate/mod.rs`).
+        let (input, output): (&[u8], &mut [u8]) = if flushes {
+            // SAFETY: `stream_buffers_valid` above confirmed `next_out` is
+            // non-null and that `next_in` is non-null whenever `avail_in > 0`;
+            // the caller's contract makes the input region readable for
+            // `avail_in` bytes for the duration of the call.
+            let input = unsafe { input_slice(s) };
+            // SAFETY: as above for the output region — writable for `avail_out`
+            // bytes and, per the same contract, disjoint from `input`.
+            let output = unsafe { output_slice(s) };
+            (input, output)
+        } else {
+            // Statically promoted empty slices: no caller memory is named, so
+            // nothing whatsoever is asserted about `next_in`/`next_out`.
+            (&[], &mut [])
+        };
 
         let (code, consumed, produced, adler, data_type, msg) = {
             // SAFETY: installed engine state (see `deflate`).
@@ -564,10 +643,29 @@ pub unsafe extern "C" fn deflateParams(strm: z_streamp, level: c_int, strategy: 
             )
         };
 
-        // SAFETY: `consumed <= avail_in` (engine invariant).
-        unsafe { advance_input(s, consumed) };
-        // SAFETY: `produced <= avail_out` (engine invariant).
-        unsafe { advance_output(s, produced) };
+        if flushes {
+            // SAFETY: `consumed <= avail_in` (engine invariant) and the
+            // pre-flush path validated the pointers, so the advanced cursor
+            // stays inside the caller's input buffer.
+            unsafe { advance_input(s, consumed) };
+            // SAFETY: `produced <= avail_out` (engine invariant), as above for
+            // the output buffer.
+            unsafe { advance_output(s, produced) };
+        } else {
+            // Nothing was bridged, so nothing can have moved. Leaving the
+            // cursors alone is what C does: on this path `deflateParams` is pure
+            // bookkeeping and writes no `z_stream` buffer field at all, so the
+            // shim must not compute an offset from a pointer the caller never
+            // promised was live.
+            debug_assert_eq!(
+                consumed, 0,
+                "deflateParams consumed input without a pre-flush"
+            );
+            debug_assert_eq!(
+                produced, 0,
+                "deflateParams produced output without a pre-flush"
+            );
+        }
         set_adler(s, adler);
         set_data_type(s, data_type);
         set_msg(s, msg);
@@ -1409,6 +1507,136 @@ mod tests {
         assert_eq!(
             unsafe { deflateParams(ptr::null_mut(), 6, Z_DEFAULT_STRATEGY) },
             Z_STREAM_ERROR
+        );
+    }
+
+    /// The no-pre-flush `deflateParams` path must never form a Rust slice over —
+    /// or compute an offset from — a region the caller has not promised is live.
+    ///
+    /// This is the sharper companion to the null-pointer coverage above. A null
+    /// `next_out` is the *easy* case: `input_slice`/`output_slice` mask a null
+    /// pointer down to an empty slice, and under strict provenance a zero-offset
+    /// `ptr::add` needs no allocation, so a null-only test passes even when the
+    /// slices are built unconditionally. What no masking can rescue is a
+    /// **non-null but undersized** region: `slice::from_raw_parts_mut(p, 128)`
+    /// over a one-byte allocation is undefined behavior the instant the
+    /// reference exists, whether or not a single byte is read or written.
+    ///
+    /// Reference C is entirely unbothered by this input. With `last_flush == -2`
+    /// no pre-flush runs, so `deflateParams` never dereferences `next_in` or
+    /// `next_out`; it returns `Z_OK`, applies the change, and leaves the caller's
+    /// cursors and totals exactly as they were. A drop-in replacement must reach
+    /// the same answer *without naming the caller's memory at all* — which is
+    /// what the `flushes`-gated bridge in `deflateParams` guarantees.
+    ///
+    /// Under `cargo +nightly miri test` this is the executable proof of that
+    /// guarantee; under an ordinary build it still pins the whole observable
+    /// contract: `Z_OK`, the change applied, cursors and totals untouched, and
+    /// the one honest byte of each buffer left alone.
+    #[test]
+    fn deflate_params_without_a_preflush_never_touches_an_undersized_buffer() {
+        /// Sentinel written into the single honest output byte; a shim that
+        /// wrote through the overstated region would disturb it.
+        const SENTINEL: u8 = 0xA5;
+
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe { deflateInit_(&mut strm, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+
+        // Deliberately dishonest descriptors: one live byte each, with
+        // `avail_in`/`avail_out` claiming far more. Nothing here is UB by
+        // itself — a `z_stream` is a plain `#[repr(C)]` struct of scalars — and
+        // C tolerates it precisely because it never looks.
+        let honest_in = *b"z";
+        let mut honest_out = [SENTINEL];
+        strm.next_in = honest_in.as_ptr();
+        strm.avail_in = 64;
+        strm.next_out = honest_out.as_mut_ptr();
+        strm.avail_out = 128;
+
+        assert_eq!(
+            unsafe { deflateParams(&mut strm, 9, Z_DEFAULT_STRATEGY) },
+            Z_OK,
+            "a parameter change needing no pre-flush must succeed without \
+             regard to the buffers, exactly as reference C does"
+        );
+
+        // Cursors, counts, and totals must be untouched: the engine cannot have
+        // consumed or produced anything, so the shim must not have advanced
+        // anything either.
+        assert_eq!(strm.next_in, honest_in.as_ptr(), "next_in must not move");
+        assert_eq!(strm.avail_in, 64, "avail_in must not change");
+        assert_eq!(
+            strm.next_out,
+            honest_out.as_mut_ptr(),
+            "next_out must not move"
+        );
+        assert_eq!(strm.avail_out, 128, "avail_out must not change");
+        assert_eq!(strm.total_in, 0, "total_in must stay at zero");
+        assert_eq!(strm.total_out, 0, "total_out must stay at zero");
+        assert_eq!(
+            honest_out[0], SENTINEL,
+            "the one live output byte must be untouched"
+        );
+
+        // The same must hold for a strategy-only change, and for a request that
+        // resolves to the level already in force (`Z_DEFAULT_COMPRESSION` == 6).
+        // `1` is `Z_FILTERED`; the raw integer is what a C caller passes.
+        assert_eq!(
+            unsafe { deflateParams(&mut strm, 9, 1) },
+            Z_OK,
+            "a strategy change is likewise pure bookkeeping here"
+        );
+        assert_eq!(
+            unsafe { deflateParams(&mut strm, Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY) },
+            Z_OK,
+            "Z_DEFAULT_COMPRESSION resolves to 6 and still needs no flush"
+        );
+        assert_eq!(strm.total_out, 0, "still nothing produced");
+        assert_eq!(
+            honest_out[0], SENTINEL,
+            "the one live output byte is still untouched"
+        );
+
+        // Now wire up honest buffers and prove the *last* accepted change really
+        // took effect, so the fix cannot have been "ignore the call entirely":
+        // the stream must emit exactly what a level-6 / default-strategy stream
+        // emits from the start.
+        let corpus: Vec<u8> = (0..20_000u32).map(|i| b'a' + (i % 5) as u8).collect();
+        let mut produced = std::vec![0u8; 64 * 1024];
+        strm.next_in = corpus.as_ptr();
+        strm.avail_in = corpus.len() as c_uint;
+        strm.next_out = produced.as_mut_ptr();
+        strm.avail_out = produced.len() as c_uint;
+        assert_eq!(unsafe { deflate(&mut strm, Z_FINISH) }, Z_STREAM_END);
+        let produced_len = strm.total_out as usize;
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+
+        let mut native = zeroed_stream();
+        assert_eq!(
+            unsafe { deflateInit_(&mut native, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+        let mut native_out = std::vec![0u8; 64 * 1024];
+        native.next_in = corpus.as_ptr();
+        native.avail_in = corpus.len() as c_uint;
+        native.next_out = native_out.as_mut_ptr();
+        native.avail_out = native_out.len() as c_uint;
+        assert_eq!(unsafe { deflate(&mut native, Z_FINISH) }, Z_STREAM_END);
+        let native_len = native.total_out as usize;
+        assert_eq!(unsafe { deflateEnd(&mut native) }, Z_OK);
+
+        assert_eq!(
+            &produced[..produced_len],
+            &native_out[..native_len],
+            "the last accepted parameter change must be the one in force"
+        );
+        assert_eq!(
+            corpus,
+            zlib_inflate(&produced[..produced_len]),
+            "the stream must still decode to the original bytes"
         );
     }
 

@@ -657,7 +657,25 @@ pub struct DeflateState {
     /// Length of the best match found (C `match_length`).
     pub match_length: usize,
     /// Previous match position (C `prev_match`, an `IPos`).
-    pub prev_match: u16,
+    ///
+    /// Held at the **same width as [`match_start`](Self::match_start)**, which
+    /// it is a verbatim copy of (`deflate.c` L1985: `s->prev_match =
+    /// s->match_start`). C declares `prev_match` as `IPos` (`typedef unsigned
+    /// IPos`, `deflate.h` L98) — exactly as wide as the `uInt match_start`
+    /// (`deflate.h` L167) it receives — and that equal width is load-bearing,
+    /// not incidental.
+    ///
+    /// The window slide in [`fill_window`](Self::fill_window) subtracts
+    /// `w_size` from `match_start` unconditionally (`deflate.c` L288), so a
+    /// `match_start` that is stale rather than freshly set by
+    /// [`longest_match`](Self::longest_match) wraps around. C recovers the true
+    /// distance regardless, because `strstart` and `match_start` are reduced by
+    /// the same amount on every slide and `strstart - 1 - prev_match` is
+    /// evaluated in the same modular arithmetic — the wrap cancels exactly.
+    /// Narrowing this field would discard the high bits of a wrapped value,
+    /// break that cancellation, and yield a bogus match distance (see
+    /// `deflate::slow::deflate_slow`).
+    pub prev_match: usize,
     /// Set when a deferred (lazy) match from the previous step exists (C
     /// `match_available`, an `int` used as a boolean).
     pub match_available: bool,
@@ -2471,14 +2489,14 @@ mod tests {
     /// the crate's single authoritative tuning table, and there must be exactly
     /// one such table.
     ///
-    /// `src/deflate/state.rs` previously carried a private duplicate of
-    /// `configuration_table`, so `lm_init` (init) and `deflate_params`
-    /// (re-dispatch) read *different* copies of the same numbers. Two copies can
-    /// diverge silently, and any divergence changes the lazy-match decisions and
+    /// The invariant matters because two copies of the tuning numbers can diverge
+    /// silently: if `lm_init` (init) and `deflate_params` (re-dispatch) were to read
+    /// *different* tables, any divergence would change the lazy-match decisions and
     /// therefore the emitted token stream — breaking byte-identity with reference
-    /// zlib without breaking decodability (AAP §0.6.4, TO-5). The duplicate is
-    /// gone; this test pins the surviving one against live state for all ten
-    /// levels plus the `Z_DEFAULT_COMPRESSION` alias.
+    /// zlib without breaking decodability (AAP §0.6.4, TO-5). There is exactly one
+    /// table, [`crate::deflate::strategy::CONFIGURATION_TABLE`], and this test pins
+    /// it against live state for all ten levels plus the `Z_DEFAULT_COMPRESSION`
+    /// alias.
     #[test]
     fn lm_init_loads_every_level_from_the_authoritative_table() {
         for level in 0..=9i32 {
@@ -2746,9 +2764,10 @@ mod tests {
     /// `deflateCopy` produces a genuinely independent snapshot of a **live**
     /// compressor, not a shallow alias.
     ///
-    /// The previous version of this test cloned a *freshly initialised* state,
-    /// poked one window byte, and compared lengths — which a shallow copy that
-    /// shared every buffer would also have passed. This version:
+    /// Cloning a *freshly initialised* state, poking one window byte and comparing
+    /// lengths would be satisfied by a shallow copy that shared every buffer. The
+    /// snapshot is therefore taken mid-compression and the independence asserted
+    /// directly:
     ///
     /// 1. drives real compression so the sliding window, the `head`/`prev` hash
     ///    chains, the overlaid symbol region and the pending buffer all hold live
@@ -3629,7 +3648,7 @@ mod tests {
     /// Both are offsets from the same base — `sym_buf` is `pending_buf +
     /// lit_bufsize` — so subtracting it leaves
     /// `lit_bufsize < pending_out + ((Buf_size + 7) >> 3)`, which is the
-    /// expression `deflate_prime` evaluates verbatim now that both quantities are
+    /// expression `deflate_prime` evaluates verbatim, because both quantities are
     /// stored as indices. This test pins the boundary from both sides at the
     /// smallest `lit_bufsize` (`mem_level = 1`, 128 bytes), where the guard is
     /// tightest.

@@ -1224,11 +1224,11 @@ mod tests {
         };
         assert_eq!(rc, Z_DATA_ERROR);
         // The corrupt byte 0xFF decodes to BFINAL=1, BTYPE=11 (an invalid,
-        // reserved block type), so decoding fails at the block-type check
-        // before emitting any output. Zero is therefore the *true* produced
-        // count here, not the old force-to-zero behavior; the general
-        // partial-output contract is verified by
-        // `uncompress2_reports_partial_output_on_error` below.
+        // reserved block type), so decoding fails at the block-type check before
+        // emitting any output. Zero is therefore the count this fixture genuinely
+        // produced, and `out_len` reports produced bytes rather than being reset on
+        // error: the case where a failing decode has already emitted output is
+        // covered by `uncompress2_reports_partial_output_on_error` below.
         assert_eq!(out_len, 0);
     }
 

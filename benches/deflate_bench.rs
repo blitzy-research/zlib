@@ -8,7 +8,8 @@
 //! measurement rather than a property of the workload, so normalising by it
 //! would make two levels on the same input incomparable.
 //!
-//! Measured position, and the only throughput figures quoted anywhere in this
+//! Measured position — external evidence recorded in the plan, not a figure this
+//! harness produces, and the only throughput figures quoted anywhere in this
 //! file: compression runs at approximately 85% of reference C zlib, while
 //! decompression runs at 107%-127% of it (AAP 0.8.3, "Performance
 //! Expectations"). Decompression is therefore at or above parity and
@@ -17,11 +18,36 @@
 //! work. Keeping that specific number honest is what `bench_incompressible_guard`
 //! below exists for.
 //!
+//! What this file itself measures is `zlib-rs` alone: it links no C library and
+//! runs no reference implementation, so every number it prints is a Rust-only
+//! level-and-profile throughput figure, useful for comparing this crate against
+//! itself across levels, inputs and commits. The C-relative percentages above
+//! come from AAP 0.8.3; they are not produced by a run of this harness.
+//!
 //! This folder MEASURES; it does not AUTHORISE. Performance is a constraint on
 //! the migration, not its objective, so no timing taken here is on its own a
 //! licence to change anything under `src/` (AAP 0.8.3). Byte-identity against
 //! reference zlib is owned exclusively by `tests/interop.rs`; the full
 //! obligation is spelled out on `bench_incompressible_guard`.
+//!
+//! # Every case validates its own output before it is timed
+//!
+//! A benchmark that checks only `Result::is_ok()` can report a perfectly
+//! plausible throughput figure for wrong bytes, because `compress2` returning
+//! `Ok` says nothing about *what* it wrote. Every case below therefore runs one
+//! UNTIMED compression outside `b.iter`, truncates the destination to the
+//! produced length, decodes exactly those bytes with `uncompress`, and asserts
+//! both the exact recovered length and byte-for-byte equality with the input.
+//! Only then is the timed closure registered. The check costs one compression
+//! plus one decompression per case and Criterion never folds it into a sample.
+//!
+//! Per AAP 0.8.3 no throughput target was ever specified for this migration and
+//! this is explicitly not a performance refactor, so the percentages above are
+//! evidence about where the code stands rather than a goal to optimise toward.
+//! A candidate speed-up is viable only if it provably cannot change the token
+//! stream — bounds-check elision, memory-access patterns, inlining, and
+//! buffer-copy strategy — and only after clearing the byte-identity gate, which
+//! is owned exclusively by the tier-1 oracle vectors in `tests/interop.rs`.
 //!
 //! Strategy scope: `compress2` selects only the compression *level*. Strategy
 //! selection (`Z_FILTERED`, `Z_HUFFMAN_ONLY`, `Z_RLE`, `Z_FIXED`) is reached
@@ -45,7 +71,7 @@
 // than API and must not be relied on; the C-ABI shims are deliberately not
 // re-exported at the root at all, and a benchmark never reaches for them.
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use zlib_rs::{compress_bound, compress2};
+use zlib_rs::{compress_bound, compress2, uncompress};
 
 /// Payload size used by the deflate benchmarks (64 KiB).
 const SIZE: usize = 64 * 1024;
@@ -85,6 +111,52 @@ fn repetitive_bytes(len: usize) -> Vec<u8> {
     out
 }
 
+/// Compresses `data` at `level` into `dest`, then decodes the produced bytes and
+/// asserts byte-for-byte recovery. This is the untimed self-check every case
+/// runs before Criterion takes a single sample.
+///
+/// Three properties are pinned, and each one closes a way a benchmark can time
+/// the wrong work:
+///
+/// 1. `compress2` must SUCCEED. `dest` is sized by `compress_bound`, which is
+///    zlib's own worst-case bound, and `level` is always in range, so an error
+///    here is a library defect rather than a benchmark-setup problem.
+/// 2. Only the `written` prefix of `dest` is decoded. Handing `uncompress` the
+///    whole buffer would let leftover scratch bytes stand in for real output.
+/// 3. The decode must return exactly `data.len()` bytes and they must equal
+///    `data`. A truncated or corrupted stream that happens to decode to
+///    *something* is rejected here rather than being reported as throughput.
+///
+/// `dest` is the same buffer the timed closure reuses, so a successful check
+/// also proves the buffer is large enough for the level about to be measured.
+fn assert_compresses_exactly(dest: &mut [u8], data: &[u8], level: i32, case: &str) {
+    let written = match compress2(dest, data, level) {
+        Ok(written) => written,
+        Err(code) => panic!("{case}: compress2 failed at level {level}: {code:?}"),
+    };
+
+    let mut restored = vec![0u8; data.len()];
+    let produced = match uncompress(&mut restored, &dest[..written]) {
+        Ok(produced) => produced,
+        Err(code) => panic!(
+            "{case}: the {written}-byte stream compress2 produced at level {level} \
+             did not decode: {code:?}"
+        ),
+    };
+
+    assert_eq!(
+        produced,
+        data.len(),
+        "{case}: level {level} decoded to {produced} bytes, expected {}",
+        data.len()
+    );
+    assert_eq!(
+        &restored[..produced],
+        data,
+        "{case}: level {level} did not round-trip byte for byte"
+    );
+}
+
 /// Compression throughput across all ten levels (`0..=9`) on compressible text.
 fn bench_levels(c: &mut Criterion) {
     let data = text_like_bytes(SIZE);
@@ -95,11 +167,9 @@ fn bench_levels(c: &mut Criterion) {
     for level in 0..=9 {
         group.bench_with_input(BenchmarkId::from_parameter(level), &level, |b, &level| {
             let mut dest = vec![0u8; bound];
-            // Sanity: compression must succeed before we measure it.
-            assert!(
-                compress2(&mut dest, &data, level).is_ok(),
-                "compress2 failed at level {level}"
-            );
+            // Untimed self-check: the stream must succeed AND decode back to the
+            // exact input before a single sample is taken.
+            assert_compresses_exactly(&mut dest, &data, level, "deflate_levels");
             b.iter(|| {
                 let written = compress2(&mut dest, &data, level).expect("compress2 failed");
                 black_box(written);
@@ -124,10 +194,9 @@ fn bench_profiles(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(data.len() as u64));
         group.bench_with_input(BenchmarkId::new("level6", *name), data, |b, data| {
             let mut dest = vec![0u8; bound];
-            assert!(
-                compress2(&mut dest, data, LEVEL).is_ok(),
-                "compress2 failed for profile {name}"
-            );
+            // Same untimed self-check as `bench_levels`: succeed, then decode
+            // back to the exact profile bytes.
+            assert_compresses_exactly(&mut dest, data, LEVEL, name);
             b.iter(|| {
                 let written = compress2(&mut dest, data, LEVEL).expect("compress2 failed");
                 black_box(written);
@@ -184,12 +253,10 @@ fn bench_incompressible_guard(c: &mut Criterion) {
     for level in [1i32, 6, 9] {
         group.bench_with_input(BenchmarkId::from_parameter(level), &level, |b, &level| {
             let mut dest = vec![0u8; bound];
-            // Sanity: compression must succeed before we measure it, so the
-            // guard can never report a fast failure as a fast encode.
-            assert!(
-                compress2(&mut dest, &data, level).is_ok(),
-                "compress2 failed on incompressible input at level {level}"
-            );
+            // Incompressible input is exactly where a silently wrong encoder
+            // would look fastest, so the untimed decode-and-compare matters most
+            // in this group.
+            assert_compresses_exactly(&mut dest, &data, level, "deflate_incompressible_guard");
             b.iter(|| {
                 let written = compress2(&mut dest, &data, level).expect("compress2 failed");
                 black_box(written);

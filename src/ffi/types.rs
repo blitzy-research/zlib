@@ -617,7 +617,7 @@ impl Allocator for CAllocator {
     /// global-allocator path. See `CAllocator::is_builtin_pair`: this is what
     /// keeps a hookless C caller's allocation count and engine-state footprint
     /// byte-for-byte unchanged (AAP §0.6.5) even though the raw `z_stream` fields
-    /// are now populated exactly as C populates them.
+    /// are populated exactly as C populates them.
     #[inline]
     fn hook(&self) -> AllocHook {
         if self.is_builtin_pair() {
@@ -875,7 +875,7 @@ pub unsafe fn state_take<T>(strm: &mut z_stream) -> Option<Box<T>> {
 /// a valid `u64`, and only the published magics compare equal. The values have
 /// their high bits set so they can never collide with the small integer that
 /// leads a bare engine state, providing defense-in-depth even though every FFI
-/// init shim now installs a tagged `#[repr(C)]` handle.
+/// init shim installs a tagged `#[repr(C)]` handle.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(transparent)]
 pub struct HandleKind(u64);
@@ -1847,6 +1847,58 @@ mod tests {
         assert_eq!(offset_of!(DeflateHandle, kind), 0);
     }
 
+    /// The three published [`HandleKind`] magics must be *these exact* `u64`
+    /// values.
+    ///
+    /// Distinctness alone is not enough. Three magics that all drifted together —
+    /// a copy-paste while adding a fourth engine, a mechanical renumbering — stay
+    /// pairwise distinct and stay `u64`-shaped, so
+    /// [`handle_kind_magics_are_distinct_and_u64_shaped`] keeps passing while the
+    /// tag values themselves have silently changed. Nothing else in the crate
+    /// notices, because every producer and consumer reads the same constants:
+    /// the drift is *internally self-consistent*.
+    ///
+    /// It is still observable. A handle installed by one build of this library and
+    /// terminated by another — a `cdylib` swapped underneath a running consumer,
+    /// or a `staticlib` linked alongside a differently-versioned copy — would fail
+    /// its tag check and report `Z_STREAM_ERROR` from a perfectly valid `*End`.
+    /// Pinning the literals makes any such change a deliberate, visible edit.
+    ///
+    /// The high-bit property the [`HandleKind`] documentation claims is asserted
+    /// alongside them: each magic exceeds `u32::MAX`, so it can never collide with
+    /// the small integer that leads a bare, untagged engine state.
+    #[test]
+    fn handle_kind_magics_are_the_published_literals() {
+        assert_eq!(
+            HandleKind::DEFLATE.0,
+            0xDEF1_A7E5_0DEF_0001,
+            "the DEFLATE handle tag is part of the compiled ABI and must not drift"
+        );
+        assert_eq!(
+            HandleKind::INFLATE.0,
+            0x14F1_A7E5_0114_0002,
+            "the INFLATE handle tag is part of the compiled ABI and must not drift"
+        );
+        assert_eq!(
+            HandleKind::INFLATE_BACK.0,
+            0x14F1_A7E5_BAC6_0003,
+            "the INFLATE_BACK handle tag is part of the compiled ABI and must not \
+             drift"
+        );
+
+        for (name, kind) in [
+            ("DEFLATE", HandleKind::DEFLATE),
+            ("INFLATE", HandleKind::INFLATE),
+            ("INFLATE_BACK", HandleKind::INFLATE_BACK),
+        ] {
+            assert!(
+                kind.0 > u64::from(u32::MAX),
+                "the {name} tag must keep its high bits set so it cannot collide \
+                 with the small leading integer of an untagged engine state"
+            );
+        }
+    }
+
     /// The tag gates `deflate_state`/`deflate_take`: a foreign engine's handle is
     /// rejected WITHOUT reconstituting a wrong-type box, and `state` is left
     /// intact so nothing is ever dropped through a mismatched `Layout`.
@@ -2081,8 +2133,9 @@ mod tests {
     /// `tests/inflate_coverage.rs` uses) so `zfree` can reconstruct the layout
     /// and actually release the memory instead of leaking. The header size is
     /// also the alignment, which keeps every returned pointer `usize`-aligned —
-    /// enough for the `u8`/`u16`/`u32` element types the engines request and for
-    /// the 4-byte-aligned probe type used below.
+    /// enough for the `u8`/`u16` element types the engines request, for the `u32`
+    /// buffers the tests below allocate, and for the 4-byte-aligned probe type
+    /// used below.
     const HOOK_HEADER: usize = size_of::<usize>();
 
     /// Allocates `bytes` usable bytes through the global allocator with a size
@@ -2886,9 +2939,9 @@ mod tests {
         }
     }
 
-    /// Finding #11 — an empty [`HeaderPublication`] must authorize **no** write,
-    /// so a call that reached no gzip header state leaves the caller's struct and
-    /// every capture buffer exactly as it found them.
+    /// An empty [`HeaderPublication`] authorizes **no** write, so a call that
+    /// reached no gzip header state leaves the caller's struct and every capture
+    /// buffer exactly as it found them.
     ///
     /// This is the property a bulk mirror cannot have, and it is what makes C's
     /// sentinel-based "has this field arrived yet?" idiom work: C assigns each
@@ -2925,9 +2978,9 @@ mod tests {
         );
     }
 
-    /// Finding #11 — buffer bytes are written at the offset C wrote them, so a
-    /// field delivered across several `inflate` calls lands contiguously and no
-    /// call rewrites an earlier call's bytes.
+    /// Buffer bytes are written at the offset C wrote them, so a field delivered
+    /// across several `inflate` calls lands contiguously and no call rewrites an
+    /// earlier call's bytes.
     ///
     /// C's `EXTRA` state copies to `head->extra + (extra_len - state->length)`
     /// (`inflate.c` L614-L621) — the count already consumed. The record carries
@@ -2994,9 +3047,9 @@ mod tests {
         );
     }
 
-    /// Finding #8 — the tri-state `done` reaches the C caller verbatim, including
-    /// the `-1` that says "this stream carries no gzip header" and which a Rust
-    /// [`bool`] cannot represent (`inflate.c` L505-L506).
+    /// The tri-state `done` reaches the C caller verbatim, including the `-1` that
+    /// says "this stream carries no gzip header" and which a Rust [`bool`] cannot
+    /// represent (`inflate.c` L505-L506).
     #[test]
     #[cfg(feature = "gzip")]
     fn publish_gz_header_publishes_the_tri_state_done_verbatim() {
@@ -3020,9 +3073,9 @@ mod tests {
         }
     }
 
-    /// Finding #11 — the `*_null` flags publish C's `Z_NULL` assignments for an
-    /// absent field (`inflate.c` L605-L606, L643-L644, L665-L666) without touching
-    /// the buffer the caller handed over.
+    /// The `*_null` flags publish C's `Z_NULL` assignments for an absent field
+    /// (`inflate.c` L605-L606, L643-L644, L665-L666) without touching the buffer
+    /// the caller handed over.
     #[test]
     #[cfg(feature = "gzip")]
     fn publish_gz_header_nulls_only_the_pointers_the_record_names() {
@@ -3054,8 +3107,8 @@ mod tests {
         );
     }
 
-    /// Finding #10 — the declared `XLEN` is published **unclamped**, from the
-    /// record rather than from `extra.len()`.
+    /// The declared `XLEN` is published **unclamped**, from the record rather than
+    /// from `extra.len()`.
     ///
     /// C assigns `head->extra_len = (unsigned)hold` in `EXLEN` (`inflate.c`
     /// L599-L600) gated on neither `extra`'s nullity nor `extra_max`'s size, while

@@ -69,14 +69,14 @@ build = "build.rs"
 #
 # NEVER add to this list — these ARE the crate: `src/**`, `tests/**`,
 # `benches/**`, `build.rs`, `Cargo.toml`, `Cargo.lock`, `README.md`, `LICENSE`,
-# `deny.toml`, `rustfmt.toml`, `rust-toolchain.toml`.
+# `deny.toml`, `clippy.toml`, `rustfmt.toml`, `rust-toolchain.toml`.
 #
-# The same prohibition applies in advance to four artifacts the migration plan
-# calls for that DO NOT EXIST in this tree yet: `CHANGELOG.md` (AAP gap D5),
-# `SECURITY.md` and `CONTRIBUTING.md` (gap D6), and `clippy.toml` (gap D11, the
-# companion to `rustfmt.toml`). They are named here so that whoever writes them
-# does not have to rediscover the rule: each belongs in the published crate, so
-# none of them may ever be added below. Note especially that the `test/**`
+# The same prohibition applies in advance to three artifacts the migration plan
+# calls for that DO NOT EXIST in this tree yet: `CHANGELOG.md` (AAP gap D5), and
+# `SECURITY.md` and `CONTRIBUTING.md` (gap D6). They are named here so that
+# whoever writes them does not have to rediscover the rule: each belongs in the
+# published crate, so none of them may ever be added below. Note especially that
+# the `test/**`
 # entry below is the *C driver* directory (`test/example.c`, `test/infcover.c`,
 # `test/minigzip.c`) and is a DIFFERENT path from the Rust integration suite
 # `tests/**`, which must remain packaged. Do not conflate the two.
@@ -269,8 +269,8 @@ harness = false
 # `tests/c_oracle.rs` and compile it on every plain `cargo test`, which would
 # drag a C-toolchain requirement into the default suite. With the block, the
 # target is not even compiled unless `--features c-oracle` (or `--all-features`)
-# is passed, so the default `cargo test` run is byte-for-byte the same suite as
-# before this target existed and the `c_oracle` binary never appears in it.
+# is passed, so the default `cargo test` run stays C-toolchain-free and the
+# `c_oracle` binary never appears in it.
 #
 # `autotests` is intentionally left at its default (`true`, for edition 2024), so
 # the other six integration tests — `checksum`, `gzip_compat`, `inflate_coverage`,
@@ -284,9 +284,8 @@ harness = false
 # both abort with "can't find integration-test `c_oracle` at path
 # …/tests/c_oracle.rs" — which is the `--all-features` row of the `build-test`
 # matrix. So this declaration and that file are a single unit: neither may be
-# removed without the other. The harness BODY is reviewed against its own
-# checkpoint boundary (it is the AAP §0.4.1.8 CREATE that closes gap D9); this
-# manifest owns only the target's gating, which is verified here.
+# removed without the other. This manifest owns only the target's gating; the
+# harness body documents its own contracts.
 [[test]]
 name = "c_oracle"
 path = "tests/c_oracle.rs"

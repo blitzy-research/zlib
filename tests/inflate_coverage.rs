@@ -50,8 +50,9 @@
 //! them as integer offsets plus a table-source discriminant instead, so a deep
 //! clone is correct with no fix-up at all (AAP §0.6.3). The `inf()` driver below
 //! copies a live stream on every iteration but releases the copy immediately, so
-//! [`inflate_copy_mid_decode_resumes_identically`] closes the remaining half of
-//! that contract: it copies a stream *after* its dynamic Huffman tables have been
+//! it exercises only that a copy can be taken and dropped.
+//! [`inflate_copy_mid_decode_resumes_identically`] carries the stronger
+//! guarantee: it copies a stream *after* its dynamic Huffman tables have been
 //! built — observed through the public [`inflate_codes_used`], never by reading
 //! private state — then finishes the decode through the original **and** the copy
 //! and requires both to recover the input byte-for-byte. A port that copied the
@@ -1498,7 +1499,7 @@ unsafe extern "C" fn cap_free(opaque: *mut c_void, address: *mut c_void) {
 ///    window — the outcome `infcover.c` pins under its tight allocation limit.
 #[test]
 fn mem_limit_forces_mem_error() {
-    // Size of the inflate state, which reference zlib (and now zlib-rs) reserves
+    // Size of the inflate state, which reference zlib and zlib-rs both reserve
     // through the caller's `zalloc` at `inflateInit2_`.
     const STATE_SIZE: usize = zlib_rs::inflate::InflateState::C_LAYOUT_SIZE;
     // The raw 8-bit inflate window (`1 << 8`) allocated lazily by `inflate`.

@@ -926,7 +926,13 @@ fn inf_leave<I: InFunc, O: OutFunc>(
 }
 
 /// Decode a single **raw** DEFLATE stream, pulling input from `in_func` and
-/// pushing output to `out_func` through the caller-supplied window.
+/// pushing output to `out_func` through the state's sliding/output window.
+///
+/// That window is *owned* by the state for anything built by
+/// [`inflate_back_init`] and its allocator-aware siblings; it is backed by
+/// caller-supplied storage only for states produced by the crate-private
+/// borrowed-window constructor, which exists solely for the FFI bridge (C's
+/// `inflateBackInit_` takes the window from its caller).
 ///
 /// Port of `inflateBack` (`infback.c` L191-L570). The `state` must have been
 /// produced by [`inflate_back_init`]. Decoding runs to completion in this one

@@ -5,8 +5,9 @@
 //! the output `zlib-rs` produces for the identical input and the identical
 //! `(windowBits, memLevel, level, strategy)` configuration. It is the
 //! in-repository, reproducible form of the migration's defining acceptance
-//! criterion, and it closes gap **D9** of the Agent Action Plan's register
-//! (AAP §0.10.1), authorised by the transformation row at AAP §0.4.1.8.
+//! criterion, and it is the harness specified by **D9** of the Agent Action
+//! Plan's register (AAP §0.10.1), authorised by the transformation row at
+//! AAP §0.4.1.8.
 //!
 //! # Its relationship to the always-on gate — strictly additive
 //!
@@ -25,8 +26,8 @@
 //! The crate's defining test-suite property is that `cargo test` needs no C
 //! toolchain. So this target is declared explicitly in `Cargo.toml` with
 //! `required-features = ["c-oracle"]`: without that feature Cargo does not even
-//! compile this file, and the default suite is byte-for-byte the suite that
-//! existed before this target did (plan-adopted standard **S5**, AAP §0.7.2).
+//! compile this file, so the default suite runs exactly as it does with this
+//! target absent (plan-adopted standard **S5**, AAP §0.7.2).
 //! The `c-oracle` feature deliberately expands to `[]` — it adds **no
 //! dependency of any kind**, so `Cargo.lock` and `cargo metadata` are wholly
 //! unaffected.
@@ -71,14 +72,25 @@
 //!   makes it diagnosable.
 //!
 //! The distinction is enforced one level down as well, where a tool is first
-//! looked for. **Exactly one spawn error means *absent*: "no such command"**
-//! ([`NotFound`]). Every other spawn error — including *"found it, but you may
-//! not execute it"* ([`PermissionDenied`]) — and any non-zero `--version` mean a
-//! tool exists and something is wrong with it or with the machine's access to it,
-//! and none of those may ever produce a skip. So a machine with a broken or
-//! unreadable `cc` alongside a working `gcc` proceeds normally, while a machine
-//! whose only compiler cannot be used **fails and says so**, rather than claiming
-//! no compiler was found — which would not be true.
+//! looked for. **Exactly one spawn error may mark a candidate unavailable:
+//! [`NotFound`]** — the kernel reporting that the launch could not find what it
+//! needed, overwhelmingly because no command of that name is on `PATH`. That is
+//! an assumption about the environment rather than a proof about it: on Unix the
+//! same error kind also comes back when a matching file *is* found but its
+//! `#!` interpreter or dynamic loader is not, and it is what a working directory
+//! that vanished between the check and the spawn produces too. The harness
+//! accepts that assumption, and bounds it: [`temp_root`] validates the spawn's
+//! working directory first so the commonest confounder is ruled out, and a
+//! candidate marked unavailable only advances to the next candidate — a skip
+//! requires *every* candidate to answer this way.
+//!
+//! Every other spawn error — including *"found it, but you may not execute it"*
+//! ([`PermissionDenied`]) — and any non-zero `--version` mean a tool exists and
+//! something is wrong with it or with the machine's access to it, and none of
+//! those may ever produce a skip. So a machine with a broken or unreadable `cc`
+//! alongside a working `gcc` proceeds normally, while a machine whose only
+//! compiler cannot be used **fails and says so**, rather than claiming no
+//! compiler was found — which would not be true.
 //!
 //! Permission denial is called out because grouping it with absence is the exact
 //! mistake this section exists to prevent (CWE-754, CWE-703). A `gcc` that is
@@ -111,12 +123,14 @@
 //! <cc> -O2 -I. -o oracle_driver oracle_driver.c libz_ref.a
 //! ```
 //!
-//! which was measured in this environment at `libz_ref.a` = 135,206 bytes with
-//! zero warnings under `gcc 15.2.0` (AAP §0.6.4 records 130 KB under
-//! `gcc 13.3.0`; the delta is the compiler version). When `ar` is unavailable —
-//! on an MSVC toolchain the archiver is `lib.exe`, not `ar` — the harness falls
-//! back to linking the object files straight into the driver, which is
-//! equivalent for the sweep's purposes.
+//! reproducing the recipe AAP §0.6.4 records for its reference build. The
+//! archive's size and the compiler that produced it depend on the machine, so
+//! neither is baked in here: the harness prints the command it selected, that
+//! command's `--version` banner and the resulting archive size at run time, as
+//! evidence of which toolchain actually produced the oracle. When `ar` is
+//! unavailable — on an MSVC toolchain the archiver is `lib.exe`, not `ar` — the
+//! harness falls back to linking the object files straight into the driver, which
+//! is equivalent for the sweep's purposes.
 //!
 //! # Why it is a subprocess oracle rather than an FFI link
 //!
@@ -156,21 +170,29 @@
 //!   directory as its working directory, so no object file, archive, binary,
 //!   corpus or result blob can land in the repository tree. The directory is
 //!   removed by a [`Drop`] guard when the test finishes.
-//! * **That temporary directory is created, never adopted — and proved fresh and
-//!   private before anything is built or run inside it.** It holds C sources that
-//!   get compiled and a binary that gets *executed*, and it is finally deleted
-//!   recursively, so using a directory this harness did not itself create would be
-//!   indefensible. The system temporary directory is moreover frequently shared
-//!   and world-writable, often without even the sticky bit that would stop one
-//!   user removing another's entries, so the directory is a trust boundary rather
-//!   than a convenience. [`WorkDir::new`] therefore anchors itself to an absolute,
-//!   already-resolved temporary base, creates the directory with a single
-//!   non-recursive — hence atomic — `mkdir` that *fails* rather than adopts when
-//!   anything already occupies the path, requests owner-only permissions at
-//!   creation time on Unix, steps to a fresh name when one is taken, and
-//!   re-verifies both properties before handing the directory out — see that type
-//!   for how this closes the insecure-temporary-directory, link-following and
-//!   time-of-check/time-of-use exposures (CWE-377, CWE-59, CWE-367).
+//! * **That temporary directory is created, never adopted.** It holds C sources
+//!   that get compiled and a binary that gets *executed*, and it is finally
+//!   deleted recursively, so using a directory this harness did not itself create
+//!   would be indefensible. The system temporary directory is moreover frequently
+//!   shared and world-writable, often without even the sticky bit that would stop
+//!   one user removing another's entries, so the directory is a trust boundary
+//!   rather than a convenience. [`WorkDir::new`] therefore anchors itself to an
+//!   absolute, already-resolved temporary base, creates the directory with a
+//!   single non-recursive — hence atomic — `mkdir` that *fails* rather than adopts
+//!   when anything already occupies the path, requests owner-only permissions from
+//!   `mkdir(2)` itself on Unix, and steps to a fresh name when one is taken.
+//!
+//!   What that buys is precise, and no more: at the moment of creation the
+//!   directory provably did not already exist, so nothing pre-existing — including
+//!   a planted symlink — is ever adopted or followed (CWE-377, CWE-59), and on
+//!   Unix it is owner-only from its first instant rather than being widened and
+//!   then narrowed (CWE-377 again). It is **not** a guarantee about the path over
+//!   the guard's lifetime: the harness holds a path, not an open directory handle,
+//!   so nothing here prevents the entry being renamed or replaced afterwards by a
+//!   process that can write the parent, and [`WorkDir::assert_fresh_and_private`]
+//!   re-reads the path rather than proving it is the same object. On non-Unix
+//!   platforms the mode is the platform default and this harness makes no privacy
+//!   claim of its own.
 //! * **Never adjust an expectation to make a comparison pass.** Preservation
 //!   directive **D-2** (AAP §0.8.1) forbids altering a constant, and a mismatch
 //!   here is a real byte-identity defect in the encoder that must be reported,
@@ -180,9 +202,20 @@
 //! * **It measures bytes, never time.** Performance is a constraint on the
 //!   migration and not its objective (AAP §0.8.3), so there is no timing
 //!   assertion anywhere.
-//! * **It is hermetic and deterministic.** Every corpus comes from a fixed-seed
-//!   generator written inline, the grid is fixed, and the only environment
-//!   variable consulted is `CC`.
+//! * **The corpus and the grid are deterministic; the environment is not.**
+//!   Every corpus comes from a fixed-seed generator written inline and the grid
+//!   is a fixed literal, so the inputs and the configuration axes are the same on
+//!   every run. The surrounding environment is *not* sealed off, and this harness
+//!   does not claim otherwise: compiler selection reads `CC` and then resolves
+//!   candidate names through `PATH`, the work directory follows the platform's
+//!   temporary-directory configuration (`TMPDIR` or its equivalent, resolved by
+//!   [`temp_root`]), and every tool it spawns inherits this process's
+//!   environment. The harness is therefore **not hermetic** — which compiler
+//!   answers `--version`, and hence which bytes the oracle emits, is a property
+//!   of the machine. That is the design: the value of a live sweep is comparing
+//!   against the C library *this* platform builds (see the `OS_CODE` discussion
+//!   above), and the banner of the selected compiler is printed as evidence of
+//!   exactly which one that was.
 
 #![forbid(unsafe_code)]
 
@@ -521,10 +554,12 @@ fn smoke_corpus() -> Vec<(&'static str, Vec<u8>)> {
 // This harness creates a directory under the shared system temporary directory
 // and then removes it recursively, which is precisely the shape that makes
 // CWE-377 (insecure temporary file) and CWE-367 (time-of-check/time-of-use)
-// exploitable if it is done naively. Three rules keep it safe, and they are
-// mirrored from the already-hardened in-crate precedents — `safe_component` /
+// exploitable if it is done naively. Three rules govern the creation step, and
+// they are mirrored from the in-crate precedents — `safe_component` /
 // `create_private_dir` / `TempGz` in `src/gz/state.rs` and `Scratch` in
-// `build.rs` — so the whole repository states the same policy once:
+// `build.rs` — so the whole repository states the same policy once. All three
+// are properties of the moment of creation; none of them pins the path
+// afterwards, because path-based code cannot:
 //
 //  1. **Create-new, never adopt.** The directory is created with a
 //     *non-recursive* `DirBuilder::create`, which reports `AlreadyExists` when
@@ -533,12 +568,13 @@ fn smoke_corpus() -> Vec<(&'static str, Vec<u8>)> {
 //     deleted, so a pre-planted path can be neither destroyed nor traversed.
 //     `create_dir_all` would instead silently adopt whatever it found, and the
 //     `Drop` below would then recursively delete it.
-//  2. **Private from the instant it exists.** On Unix the `0o700` mode is handed
-//     to `mkdir(2)` itself rather than applied afterwards with
-//     `set_permissions`, so there is no window in which the directory is
-//     group- or world-accessible (the classic TOCTOU race). With a default
-//     `umask` of `0o022`, `create_dir_all` would have produced `0o755` and left
-//     every intermediate artifact world-readable.
+//  2. **Private from the instant it exists, on Unix.** The `0o700` mode is
+//     handed to `mkdir(2)` itself rather than applied afterwards with
+//     `set_permissions`, so there is no window in which the directory is group-
+//     or world-accessible. With a default `umask` of `0o022`, `create_dir_all`
+//     would have produced `0o755` and left every intermediate artifact
+//     world-readable. On other platforms the mode is whatever the platform
+//     applies by default and no privacy property is asserted here.
 //  3. **Create-new for the files, too.** Every file this harness writes inside
 //     the directory goes through [`WorkDir::write_new`] / [`WorkDir::copy_new`],
 //     which refuse to overwrite. Belt-and-braces given rule 1, and it also turns
@@ -576,10 +612,12 @@ const WORKDIR_MODE: u32 = 0o700;
 /// The harness would then print "no working C compiler found" and pass, on a
 /// machine that has a perfectly good compiler.
 ///
-/// Checking here makes that impossible and costs one `stat` per call. It also
-/// buys the classification in [`Probe::Absent`] its precision: with the working
-/// directory proven to exist, a [`NotFound`] from a spawn can only mean the
-/// command itself is missing.
+/// Checking here removes that confounder for one `stat` per call, and it is what
+/// makes the [`Probe::Absent`] reading defensible: with the working directory
+/// checked immediately beforehand, a [`NotFound`] from a spawn is attributable to
+/// the command rather than to a misconfigured `TMPDIR`. It is a check, not a
+/// proof — see [`Probe::Absent`] for the residual cases the error kind still
+/// covers.
 ///
 /// # Why the value is resolved rather than taken as returned
 ///
@@ -681,14 +719,14 @@ fn safe_component(raw: &str) -> String {
 /// **execute** a binary inside it and finally remove it recursively. Refusing
 /// with [`AlreadyExists`] instead is what lets [`WorkDir::new`] step to the next
 /// candidate rather than follow the link (CWE-59), and it means the directory
-/// handed back provably did not exist a moment ago, which is in turn what makes
-/// the recursive delete in [`Drop`] safe (CWE-367).
+/// handed back provably did not exist a moment ago — which is the basis on which
+/// the recursive delete in [`Drop`] operates.
 ///
 /// On Unix the `0o700` mode is passed to `mkdir(2)` itself, so the directory is
 /// never even momentarily group- or world-accessible; there is no
-/// `set_permissions` window for another process to race (CWE-377). Elsewhere the
-/// platform default applies, which on Windows already excludes other users from
-/// a per-user temporary directory.
+/// `set_permissions` window for another process to race (CWE-377). On other
+/// platforms the mode is the platform default and this function asserts no
+/// privacy property.
 ///
 /// [`AlreadyExists`]: std::io::ErrorKind::AlreadyExists
 fn create_private_dir(path: &Path) -> std::io::Result<()> {
@@ -729,34 +767,36 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
 /// therefore not safe to use for any of those steps, so it never adopts one:
 /// [`create_private_dir`] is non-recursive and owner-private, and [`WorkDir::new`]
 /// treats an occupied name purely as a reason to try the next one. Concretely
-/// that closes three distinct exposures in the system temporary directory, which
-/// on a shared machine is world-writable:
+/// that addresses two exposures in the system temporary directory, which on a
+/// shared machine is world-writable:
 ///
-/// * **CWE-377, insecure temporary file.** The name is unpredictable *and* the
-///   directory is `0o700` from `mkdir(2)` onwards, so another user can neither
-///   guess it nor read the sources, objects and corpora inside it.
+/// * **CWE-377, insecure temporary file.** On Unix the directory is `0o700` from
+///   `mkdir(2)` onwards, so another user cannot read the sources, objects and
+///   corpora inside it. The *name* is not a secret — it is built from the process
+///   id, a counter and a timestamp, all guessable — so privacy rests on the mode
+///   and on create-new semantics, never on the name.
 /// * **CWE-59, link following.** A symlink planted at a candidate name is not
 ///   followed: `create_dir_all` would have succeeded through it and written the C
 ///   sources, the archive and the driver binary wherever it pointed, whereas
 ///   create-new semantics report [`AlreadyExists`] and the candidate is skipped.
-/// * **CWE-367, time-of-check/time-of-use.** There is no check-then-use window at
-///   all, because there is no check: the single `mkdir(2)` both proves the name
-///   was free and takes it. That is also what makes the recursive delete in
-///   [`Drop`] sound — the path provably did not exist an instant earlier, so it
-///   cannot be a pre-existing directory or a link into one.
 ///
-/// This is the same pattern the build script's schema-test helpers already use,
-/// deliberately so: one hardened idiom, applied identically wherever this
-/// repository creates a temporary directory.
+/// Both are properties of the instant of creation. The guard holds a path, not an
+/// open directory handle, so it cannot and does not claim the entry is still the
+/// same object later; what the recursive delete in [`Drop`] relies on is stated on
+/// that impl, together with the `openat`/`unlinkat` traversal `std` performs.
+///
+/// This is the same pattern the build script's schema-test helpers use,
+/// deliberately so: one idiom, applied identically wherever this repository
+/// creates a temporary directory.
 ///
 /// [`AlreadyExists`]: std::io::ErrorKind::AlreadyExists
 struct WorkDir {
     /// Absolute path of the directory.
     ///
-    /// Invariant, and the reason the recursive delete in [`Drop`] is safe: the
-    /// only constructor is [`WorkDir::new`], which returns `Ok` solely after
+    /// Invariant, and the premise the recursive delete in [`Drop`] rests on: the
+    /// only constructor is [`WorkDir::new`], which returns solely after
     /// [`create_private_dir`] created this exact path. A `WorkDir` therefore
-    /// never names a directory it did not itself bring into existence.
+    /// never names a path it did not itself bring into existence.
     path: PathBuf,
 }
 
@@ -771,19 +811,21 @@ impl WorkDir {
     /// single component by construction.
     ///
     /// That makes collisions vanishingly unlikely — but *unlikely* is not the
-    /// property this function needs, because the name is derived from public
+    /// property this function relies on, because the name is derived from public
     /// values and is therefore guessable, and the system temporary directory is
-    /// routinely shared between users and world-writable. Three mechanisms turn
-    /// the name into a guarantee:
+    /// routinely shared between users and world-writable. Correctness rests on
+    /// three mechanisms instead of on the name:
     ///
     /// * **The base is resolved and validated first** by [`temp_root`], so the
     ///   path is anchored to an absolute, already-resolved directory.
-    /// * **The directory itself is created atomically and privately** by
+    /// * **The directory itself is created atomically and, on Unix, privately** by
     ///   [`create_private_dir`], which fails rather than adopting anything that
     ///   already occupies the path. A collision — honest or hostile — is retried
     ///   under a brand-new name instead of being reused.
-    /// * **The result is re-verified** by [`WorkDir::assert_fresh_and_private`]
-    ///   before the directory is handed out.
+    /// * **The result is re-read** by [`WorkDir::assert_fresh_and_private`] before
+    ///   the directory is handed out, which catches a creation that did not come
+    ///   out as requested (a `umask` widening the mode, say). It re-resolves the
+    ///   path to do so, so it confirms properties, not identity.
     ///
     /// Note the ordering in the success arm: the guard is constructed *before* it
     /// is verified, so a failed verification drops it and its [`Drop`] removes the
@@ -854,17 +896,22 @@ impl WorkDir {
         );
     }
 
-    /// Re-reads the directory this guard owns and proves it is the one that was
-    /// just created: a plain directory, not a symlink, and — on Unix — private to
-    /// its owner.
+    /// Re-reads the path this guard owns and checks the two properties that must
+    /// hold before anything is built or run inside it: it is a plain directory
+    /// rather than a symlink, and — on Unix — it grants its owner full access and
+    /// no other user any.
     ///
-    /// Strictly this is defence in depth: [`create_private_dir`] is
-    /// non-recursive, so it already fails on anything pre-existing, and
-    /// `mkdir(2)` already applied [`WORKDIR_MODE`]. It is kept because it costs
-    /// one `lstat`, because it states the invariant in executable form rather
-    /// than in a comment, and because the consequence of the invariant not
-    /// holding is arbitrary code execution — the harness is about to compile and
-    /// run a binary from here.
+    /// This is defence in depth, and its scope is worth being exact about.
+    /// [`create_private_dir`] is non-recursive, so it already fails on anything
+    /// pre-existing, and `mkdir(2)` already applied [`WORKDIR_MODE`]; what the
+    /// re-read adds is a check that the result came out as requested — a `umask`
+    /// can only have narrowed the mode, and this is where that is caught. Because
+    /// it resolves the path afresh it observes whatever the name refers to *now*,
+    /// so it confirms those properties rather than proving the entry is the same
+    /// object `mkdir(2)` returned. It is kept because it costs one `lstat`, because
+    /// it states the invariant in executable form rather than in a comment, and
+    /// because the consequence of the invariant not holding is arbitrary code
+    /// execution — the harness is about to compile and run a binary from here.
     fn assert_fresh_and_private(&self) -> std::io::Result<()> {
         // `symlink_metadata` deliberately does *not* follow the final component,
         // so a symlink is reported as a symlink instead of as whatever it aims
@@ -958,19 +1005,24 @@ impl Drop for WorkDir {
         // leaving a few hundred KiB behind is not worth failing a conformance
         // gate over.
         //
-        // Safe to recurse, on two independent grounds. First, `WorkDir::new`
-        // created this path with create-new semantics, so it was not a
-        // pre-existing directory and not a symlink into one — nothing
-        // pre-existing is ever in the removal set. Second, the directory is
-        // `0o700` from `mkdir(2)` onward, so no other user could have planted a
-        // symlink inside it for the traversal to follow; `std`'s own
-        // `remove_dir_all` is additionally implemented with `openat`/`unlinkat`
-        // on Unix and so does not re-resolve paths as it descends (CWE-367).
-        // Without those guarantees this call would be the payload of the CWE-59
-        // exposure described on the type, not a tidy-up. It is therefore safe to
-        // run unconditionally, including on the path where `WorkDir::new` rejects
-        // a directory it has just created, because the directory is only ever one
-        // this guard owns.
+        // What the recursion rests on, stated precisely. First, `WorkDir::new`
+        // created this path with create-new semantics, so at that moment it was
+        // not a pre-existing directory and not a symlink into one — the removal
+        // set starts from a path this guard brought into existence, never one it
+        // adopted. Second, on Unix the directory is `0o700` from `mkdir(2)`
+        // onward, so no other user could enter it to plant a symlink for the
+        // traversal to follow, and `std`'s `remove_dir_all` descends with
+        // `openat`/`unlinkat` rather than re-resolving paths as it goes. Without
+        // the first of those this call would be the payload of the CWE-59
+        // exposure described on the type rather than a tidy-up.
+        //
+        // What it does not rest on: the path is not held open, so nothing here
+        // rules out the top-level entry having been renamed or replaced by a
+        // process able to write the temporary base after creation, and on
+        // non-Unix platforms the directory's mode is the platform default. It is
+        // run unconditionally — including on the path where `WorkDir::new`
+        // rejects a directory it has just created — because the guard only ever
+        // names a path it created itself.
         let _ = fs::remove_dir_all(&self.path);
     }
 }
@@ -994,8 +1046,13 @@ struct Toolchain {
 }
 
 /// Candidate C compilers in priority order: `$CC` when set and non-empty, then
-/// the conventional names. `CC` is the only environment variable this harness
-/// reads.
+/// the conventional names `cc`, `gcc` and `clang`.
+///
+/// `CC` is the only environment variable this function itself reads, but it is
+/// not the only one that shapes the run: each candidate name is resolved through
+/// `PATH` by [`Command::new`], the work directory follows the platform's
+/// temporary-directory configuration, and every spawned tool inherits this
+/// process's environment.
 fn compiler_candidates() -> Vec<String> {
     let mut candidates = Vec::new();
     if let Ok(cc) = std::env::var("CC") {
@@ -1016,47 +1073,54 @@ fn compiler_candidates() -> Vec<String> {
 ///
 /// Three outcomes rather than the two a plain `Option` offers, because the two
 /// an `Option` is forced to collapse together are not the same kind of thing at
-/// all. *"There is no such command"* is a fact about the machine, and it is the
-/// only fact that may ever lead to a skip. *"The command is there and something
-/// went wrong"* is a failure, and a failure has to be reported however it
-/// happens to be spelled — otherwise a resource limit, an unreadable interpreter
-/// line or a mis-installed compiler wrapper all launder themselves into
-/// "no C compiler found" and the conformance gate reports green without having
-/// compared a single byte.
+/// all. *"Nothing could be launched under this name"* is the only outcome that
+/// may ever lead to a skip. *"The command is there and something went wrong"* is
+/// a failure, and a failure has to be reported however it happens to be spelled
+/// — otherwise a resource limit, an executable this process may not run, or a
+/// compiler wrapper that answers `--version` with a non-zero status all launder
+/// themselves into "no C compiler found" and the conformance gate reports green
+/// without having compared a single byte.
 ///
 /// `Debug` is derived so the harness's own self-tests can name the outcome they
 /// actually observed when an assertion about the classification fails.
 #[derive(Debug)]
 enum Probe {
-    /// Nothing is installed under this name. The spawn failed with exactly one
-    /// error kind — [`NotFound`], meaning no matching command exists anywhere on
-    /// `PATH`. That says "try the next candidate", and if every candidate answers
-    /// this way then there genuinely is no C compiler and a skip is the truthful
-    /// outcome.
+    /// This candidate is unavailable: the spawn failed with exactly one error
+    /// kind — [`NotFound`] — which in the overwhelming majority of cases means no
+    /// matching command exists anywhere on `PATH`. That says "try the next
+    /// candidate", and if every candidate answers this way the harness reads it as
+    /// no C compiler being installed and skips.
+    ///
+    /// **That reading is an assumption about the environment, not a proof.**
+    /// [`NotFound`] is what the kernel reports when the launch could not find
+    /// something it needed, and on Unix that also covers a matching file whose
+    /// `#!` interpreter or dynamic loader is missing, and a working directory that
+    /// disappeared between validation and spawn. The assumption is deliberately
+    /// bounded rather than asserted away: [`temp_root`] validates the working
+    /// directory before any probe runs, which removes the confounder this harness
+    /// can actually control, and one candidate answering [`NotFound`] never
+    /// decides anything on its own — every candidate must answer this way before a
+    /// skip is even considered.
     ///
     /// [`NotFound`] is **the only** kind admitted here, and deliberately so.
     /// [`PermissionDenied`] in particular is *not* absence: it is the kernel
     /// confirming that a matching executable **was found** and that this process
-    /// may not run it. Classifying that as absent — as an earlier revision of this
-    /// harness did — lets a present-but-blocked compiler produce a printed
-    /// `SKIPPED — no working C compiler found`, a statement that is false on a
-    /// machine which demonstrably has one, and it lets the byte-identity gate
-    /// report green without comparing a byte (CWE-754, CWE-703). It is classified
-    /// [`Probe::Unusable`] instead, which no code path can turn into a skip.
-    ///
-    /// [`NotFound`] is unambiguous here only because [`temp_root`] has already
-    /// proved the spawn's working directory exists; otherwise a bad `TMPDIR`
-    /// would produce the identical error kind and be misread as an absent tool.
+    /// may not run it. Classifying that as absent would let a present-but-blocked
+    /// compiler produce a printed `SKIPPED — no working C compiler found`, a
+    /// statement that is false on a machine which demonstrably has one, and it
+    /// would let the byte-identity gate report green without comparing a byte
+    /// (CWE-754, CWE-703). It is classified [`Probe::Unusable`] instead, which no
+    /// code path can turn into a skip.
     ///
     /// [`NotFound`]: std::io::ErrorKind::NotFound
     /// [`PermissionDenied`]: std::io::ErrorKind::PermissionDenied
     Absent,
     /// A tool exists under this name but could not be used: it spawned and exited
     /// non-zero, the machine refused to execute it ([`PermissionDenied`]), or the
-    /// spawn failed for some other reason that is not "no such command" — a
-    /// resource limit, an I/O error, a broken interpreter line. The payload
-    /// records which, so the eventual message is diagnosable and names the
-    /// remedy. This outcome can never produce a skip.
+    /// spawn failed for some other reason that is not [`NotFound`] — a resource
+    /// limit or an I/O error, for instance. The payload records which, so the
+    /// eventual message is diagnosable and names the remedy. This outcome can
+    /// never produce a skip.
     ///
     /// [`PermissionDenied`]: std::io::ErrorKind::PermissionDenied
     Unusable(String),
@@ -1099,9 +1163,12 @@ fn probe_tool(name: &str) -> Probe {
     {
         Ok(out) => out,
         // The one classification that matters, and it admits exactly one error
-        // kind: only "no such command" means absent. Every other `io::Error`
-        // describes a machine on which a matching tool was found and could not be
-        // run, which is a defect to report.
+        // kind. `NotFound` means the launch could not find something it needed;
+        // this harness reads that as "no command of this name", having already
+        // validated the working directory in `temp_root`, and moves to the next
+        // candidate. Every other `io::Error` describes a machine on which a
+        // matching tool was found and could not be run, which is a defect to
+        // report. See `Probe::Absent` for the bounds of the `NotFound` reading.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Probe::Absent;
         }
@@ -1144,11 +1211,13 @@ fn probe_tool(name: &str) -> Probe {
 
 /// Probes for a compiler and, independently, for `ar`.
 ///
-/// Returns [`None`] for exactly one condition: **no C compiler exists under any
-/// candidate name**, every probe having failed with [`NotFound`]. That is the
-/// environmental fact the module header promises will skip, and it is the only
+/// Returns [`None`] for exactly one condition: **every candidate name probed as
+/// [`Probe::Absent`]**, i.e. every spawn failed with [`NotFound`]. The harness
+/// reads that as no C compiler being installed under any candidate name — the
+/// environmental assumption the module header promises will skip, and the only
 /// one. A candidate that exists but cannot be executed does *not* qualify — see
-/// [`Probe::Absent`] for why conflating the two is a false-green.
+/// [`Probe::Absent`] for the bounds of the [`NotFound`] reading and for why
+/// conflating the two would be a false-green.
 ///
 /// [`NotFound`]: std::io::ErrorKind::NotFound
 ///
@@ -1171,9 +1240,8 @@ fn probe_toolchain() -> Option<Toolchain> {
 /// [`probe_toolchain`] over an explicit candidate list.
 ///
 /// Split out for one reason: it makes the "every candidate exists and none can be
-/// used" path — the false-green this finding was about — reachable from a
-/// self-test without mutating `$CC`, which several tests in this binary share a
-/// process with and could not do safely.
+/// used" path reachable from a self-test without mutating `$CC`, which several
+/// tests in this binary share a process with and could not do safely.
 ///
 /// # Panics
 ///
@@ -3122,10 +3190,10 @@ fn probe_classifies_a_missing_command_as_absent() {
 /// A command that exists and fails must classify as [`Probe::Unusable`], never as
 /// absent.
 ///
-/// This is the crux of the skip/fail separation. Before the fix, both of the
-/// cases below arrived as a bare `None` indistinguishable from "nothing is
-/// installed", so a machine whose only compiler was broken reported
-/// "no working C compiler found" and **passed**.
+/// This is the crux of the skip/fail separation. Collapsing either of the cases
+/// below into "nothing is installed" would let a machine whose only compiler is
+/// broken report "no working C compiler found" and **pass**, so both must land in
+/// [`Probe::Unusable`], which no code path can turn into a skip.
 #[cfg(unix)]
 #[test]
 fn probe_classifies_a_present_but_failing_command_as_unusable() {
@@ -3160,11 +3228,11 @@ fn probe_classifies_a_present_but_failing_command_as_unusable() {
     }
 
     // Case 2: present but not executable. The kernel found a matching file and
-    // refused to exec it, which is the opposite of "nothing is installed". This is
-    // the case the finding was about: classifying it as Absent let a machine with
-    // a `chmod 000` compiler print `SKIPPED — no working C compiler found` and
-    // pass. It must be Unusable, and the message must name the permission remedy
-    // rather than suggesting an install.
+    // refused to exec it, which is the opposite of "nothing is installed".
+    // Classifying it as Absent would let a machine with a `chmod 000` compiler
+    // print `SKIPPED — no working C compiler found` and pass, so it must be
+    // Unusable, and the message must name the permission remedy rather than
+    // suggesting an install.
     let not_executable = work.join("not_executable");
     fs::write(&not_executable, "#!/bin/sh\nexit 0\n").expect("file must be writable");
     fs::set_permissions(&not_executable, fs::Permissions::from_mode(0o644))
@@ -3196,17 +3264,17 @@ fn probe_classifies_a_present_but_failing_command_as_unusable() {
 /// A toolchain whose every candidate is present but unusable must **fail**, never
 /// skip.
 ///
-/// This is the finding's end-to-end consequence, tested at the level that
-/// actually decides the gate's verdict. [`probe_tool`] classifying a denied tool
-/// as [`Probe::Unusable`] is only half the fix: the other half is that
+/// This asserts the skip/fail separation at the level that actually decides the
+/// gate's verdict. [`probe_tool`] classifying a denied tool as
+/// [`Probe::Unusable`] is only half of it: the other half is that
 /// [`probe_toolchain_from`] must convert a non-empty unusable list into a panic
 /// instead of returning [`None`], because [`None`] is what
 /// [`build_oracle`] turns into a printed `SKIPPED` and a passing test.
 ///
-/// Both candidates below exist on disk and are mode `0o644`, i.e. exactly the
-/// `chmod 000` compiler this finding described. Before the fix they both probed as
-/// [`Probe::Absent`], `unusable` stayed empty, and this function returned
-/// [`None`] — a green run on a machine that had a compiler sitting right there.
+/// Both candidates below exist on disk and are mode `0o644` — the blocked
+/// compiler this separation exists for. Were they classified [`Probe::Absent`],
+/// `unusable` would stay empty and this function would return [`None`]: a green
+/// run on a machine that had a compiler sitting right there.
 #[cfg(unix)]
 #[test]
 fn an_all_unusable_toolchain_fails_instead_of_skipping() {

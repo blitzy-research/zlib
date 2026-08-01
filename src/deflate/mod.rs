@@ -1614,6 +1614,77 @@ mod tests {
         out
     }
 
+    /// Decompresses a **complete** zlib stream with the crate's own inflate
+    /// engine, asserting `Z_STREAM_END` and that the whole stream was consumed.
+    ///
+    /// Decoding in-crate keeps these tests free of `std` and of any third-party
+    /// codec, so they run in every feature configuration.
+    fn inflate_all(stream: &[u8], expect_len: usize) -> Vec<u8> {
+        let mut strm: ZStream = ZStream::new();
+        crate::inflate::inflate_init2(&mut strm, MAX_WBITS).expect("inflate_init2");
+        let mut out = vec![0u8; expect_len + 64];
+        let r = crate::inflate::inflate(&mut strm, stream, &mut out, Z_NO_FLUSH);
+        assert_eq!(
+            r.code,
+            ReturnCode::StreamEnd,
+            "the stream must decode fully"
+        );
+        assert_eq!(
+            r.consumed,
+            stream.len(),
+            "Z_STREAM_END must leave no stream bytes unread"
+        );
+        out.truncate(r.produced);
+        crate::inflate::inflate_end(&mut strm).expect("inflate_end");
+        out
+    }
+
+    /// Decompresses an **unfinished** stream prefix, asserting `Z_OK` — the
+    /// stream is not over — and returning everything the decoder could produce.
+    fn inflate_prefix(prefix: &[u8], room: usize) -> Vec<u8> {
+        let mut strm: ZStream = ZStream::new();
+        crate::inflate::inflate_init2(&mut strm, MAX_WBITS).expect("inflate_init2");
+        let mut out = vec![0u8; room + 64];
+        let r = crate::inflate::inflate(&mut strm, prefix, &mut out, Z_NO_FLUSH);
+        assert_eq!(
+            r.code,
+            ReturnCode::Ok,
+            "an unfinished prefix must report Z_OK, not {:?}",
+            r.code
+        );
+        out.truncate(r.produced);
+        crate::inflate::inflate_end(&mut strm).expect("inflate_end");
+        out
+    }
+
+    /// Compresses `data` in one call with `flush`, into a generously sized
+    /// buffer, and returns `(emitted bytes, bi_valid after the call)`.
+    ///
+    /// `bi_valid` is the number of bits still held in the bit buffer, i.e. the
+    /// direct observation of whether the emitted prefix is byte-aligned.
+    fn flush_once(flush: i32, data: &[u8]) -> (Vec<u8>, i32) {
+        let mut strm = init(6, MAX_WBITS, DEF_MEM_LEVEL, Strategy::Default);
+        let mut out = vec![0u8; deflate_bound(&strm, data.len()) + 512];
+        let outcome = deflate(&mut strm, data, &mut out, flush);
+        assert_eq!(
+            outcome.code,
+            ReturnCode::Ok,
+            "a non-final flush into a bound-sized buffer must return Z_OK"
+        );
+        assert_eq!(outcome.consumed, data.len(), "all input must be consumed");
+        let bits = strm.deflate_state().expect("state").bi_valid;
+        out.truncate(outcome.produced);
+        // C `deflateEnd` reports Z_DATA_ERROR when it tears down a stream still
+        // in BUSY_STATE, which is exactly where a non-final flush leaves it.
+        assert_eq!(
+            deflate_end(&mut strm),
+            Err(ZlibError::DataError),
+            "ending a stream that a non-final flush left BUSY must report \
+             Z_DATA_ERROR"
+        );
+        (out, bits)
+    }
+
     /// Without an installed state, C returns the larger of the two conservative
     /// bounds plus a full 18-byte wrapper (`deflate.c` L877-L878), and
     /// `deflateBound` forwards to `deflateBound_z` unchanged.
@@ -2125,7 +2196,11 @@ mod tests {
         let mut strm = init(6, MAX_WBITS, DEF_MEM_LEVEL, Strategy::Default);
         let outcome = deflate(&mut strm, &corpus, &mut out, Z_NO_FLUSH);
         assert_eq!(outcome.code, ReturnCode::Ok);
+        assert_eq!(outcome.consumed, corpus.len(), "all input must be consumed");
         assert_ne!(strm.deflate_state().expect("state").last_flush, -2);
+        // Every byte this stream emits is accumulated in `out` so the re-dispatch
+        // can be proved not to corrupt it (see the decode at the end).
+        let mut produced = outcome.produced;
 
         // Same producer band (6 -> 4..=9) and same strategy: no flush.
         for level in [4, 5, 6, 7, 8, 9, Z_DEFAULT_COMPRESSION] {
@@ -2160,12 +2235,176 @@ mod tests {
         assert_eq!((quiet.consumed, quiet.produced), (0, 0));
         assert_eq!(strm.deflate_state().expect("state").level, 9);
 
-        // Now a real producer switch with room available: accepted, and the
-        // finished stream still decodes to the original bytes.
-        let mut room = vec![0u8; 64 * 1024];
-        let switch = deflate_params(&mut strm, &[], &mut room, 1, Strategy::Default);
+        // Now a real producer switch with room available: accepted, and — the
+        // part that has to be demonstrated rather than asserted about state — the
+        // finished stream still decodes to the original bytes. A re-dispatch that
+        // mangled the block in flight would leave the level field looking correct
+        // while producing an undecodable or wrong stream, so the switch is
+        // followed here by an actual finish, an actual decode, and an actual
+        // byte-for-byte comparison against `corpus`.
+        let switch = deflate_params(&mut strm, &[], &mut out[produced..], 1, Strategy::Default);
         assert_eq!(switch.code, ReturnCode::Ok);
         assert_eq!(strm.deflate_state().expect("state").level, 1);
+        produced += switch.produced;
+
+        loop {
+            let finish = deflate(&mut strm, &[], &mut out[produced..], Z_FINISH);
+            produced += finish.produced;
+            match finish.code {
+                ReturnCode::StreamEnd => break,
+                ReturnCode::Ok => assert!(
+                    finish.produced != 0,
+                    "the finish must make progress with {} bytes of room left",
+                    out.len() - produced
+                ),
+                other => panic!("finishing after a re-dispatch returned {other:?}"),
+            }
+        }
+        out.truncate(produced);
+        deflate_end(&mut strm).expect("deflate_end must succeed after Z_STREAM_END");
+        assert_eq!(
+            inflate_all(&out, corpus.len()),
+            corpus,
+            "a stream whose level was switched mid-flight must still decode \
+             byte-exactly"
+        );
+    }
+
+    /// `Z_PARTIAL_FLUSH` honours the two clauses `zlib.h` states for it: every
+    /// input byte seen so far becomes available to the decompressor, and the
+    /// emitted output is **not** aligned to a byte boundary.
+    ///
+    /// `zlib.h` (L290-L305) specifies the mechanism as well: the current block is
+    /// completed and followed by "an empty fixed codes block that is 10 bits
+    /// long", which guarantees enough bytes are emitted for the decompressor to
+    /// finish the real block. The port implements exactly that at [`deflate`]
+    /// L1148-L1149 via [`trees::_tr_align`] — a 3-bit `STATIC_TREES` header plus
+    /// the 7-bit static `END_BLOCK` code, then `bi_flush`, which writes out whole
+    /// bytes only and therefore leaves the remainder in the bit buffer.
+    ///
+    /// Three flushes are run over identical input with identical parameters, so
+    /// the data block they emit is identical and only the terminator differs:
+    ///
+    /// | flush | terminator appended | aligned? |
+    /// |-------|--------------------|----------|
+    /// | `Z_BLOCK` | none (block closed, bits withheld) | no |
+    /// | `Z_PARTIAL_FLUSH` | empty **static** block, 10 bits | no |
+    /// | `Z_SYNC_FLUSH` | `bi_windup` + empty **stored** block `00 00 ff ff` | yes |
+    ///
+    /// That makes the byte-count relationships exact rather than approximate: 10
+    /// bits can flush at most two whole bytes, while a sync marker costs at least
+    /// one alignment byte plus four marker bytes.
+    ///
+    /// One measured nuance, recorded so the strength of the decode assertion is
+    /// not overstated: the terminator is deliberately *insurance*. Truncating the
+    /// emitted prefix by its final byte still decodes this corpus in full, while
+    /// truncating by two or more does not — which is the `zlib.h` clause "assures
+    /// that enough bytes are output" behaving exactly as written.
+    #[test]
+    fn z_partial_flush_publishes_all_input_without_byte_aligning() {
+        // Long enough for the match finder to emit a real block with both
+        // literals and matches, and deterministic.
+        let corpus: Vec<u8> = (0..600u32)
+            .map(|i| b"partial flush behaviour "[(i as usize) % 24])
+            .collect();
+
+        let (block, block_bits) = flush_once(Z_BLOCK, &corpus);
+        let (partial, partial_bits) = flush_once(Z_PARTIAL_FLUSH, &corpus);
+        let (sync, sync_bits) = flush_once(crate::constants::Z_SYNC_FLUSH, &corpus);
+
+        // ---- clause 2: alignment ----
+        // `_tr_stored_block` calls `bi_windup`, so a sync flush always empties the
+        // bit buffer. `_tr_align` calls `bi_flush`, which only writes out whole
+        // bytes, so a partial flush cannot align unless the bit count happens to
+        // land on a boundary — and for this corpus it does not.
+        assert_eq!(
+            sync_bits, 0,
+            "Z_SYNC_FLUSH byte-aligns, so no bits may remain buffered"
+        );
+        assert_ne!(
+            partial_bits, 0,
+            "Z_PARTIAL_FLUSH must not byte-align: bits are expected to remain \
+             buffered after the 10-bit empty static block"
+        );
+        // `bi_flush` empties a full 16-bit buffer outright and otherwise writes
+        // exactly one byte, so from `block_bits` the 10-bit terminator lands on a
+        // value this test can predict in closed form.
+        let raw = block_bits + 10;
+        let expected_bits = if raw == 16 { 0 } else { raw - 8 };
+        assert_eq!(
+            partial_bits, expected_bits,
+            "the empty static block is exactly 10 bits wide, so from \
+             {block_bits} buffered bits `bi_flush` must leave {expected_bits}"
+        );
+
+        // ---- the wire-level shape of each terminator ----
+        assert!(
+            partial.len() >= block.len() && partial.len() <= block.len() + 2,
+            "a 10-bit terminator can flush at most two whole bytes: Z_BLOCK \
+             emitted {} bytes, Z_PARTIAL_FLUSH emitted {}",
+            block.len(),
+            partial.len()
+        );
+        assert!(
+            sync.len() >= block.len() + 4,
+            "a sync marker costs alignment plus four bytes: Z_BLOCK emitted {} \
+             bytes, Z_SYNC_FLUSH emitted {}",
+            block.len(),
+            sync.len()
+        );
+        assert!(
+            partial.len() < sync.len(),
+            "the 10-bit empty static block must be cheaper than a byte-aligned \
+             sync marker ({} vs {} bytes)",
+            partial.len(),
+            sync.len()
+        );
+        assert_eq!(
+            &sync[sync.len() - 4..],
+            &[0x00, 0x00, 0xff, 0xff],
+            "Z_SYNC_FLUSH must end with the empty stored block marker"
+        );
+        assert_ne!(
+            &partial[partial.len() - 4..],
+            &[0x00, 0x00, 0xff, 0xff],
+            "Z_PARTIAL_FLUSH must not emit the byte-aligned sync marker"
+        );
+
+        // ---- clause 1: all input so far is available to the decompressor ----
+        assert_eq!(
+            inflate_prefix(&partial, corpus.len()),
+            corpus,
+            "every byte fed before Z_PARTIAL_FLUSH must be recoverable from the \
+             bytes it emitted"
+        );
+
+        // ---- the stream survives the flush and still finishes correctly ----
+        const TAIL: &[u8] = b"and the tail that follows the partial flush";
+        let mut strm = init(6, MAX_WBITS, DEF_MEM_LEVEL, Strategy::Default);
+        let mut out = vec![0u8; deflate_bound(&strm, corpus.len() + TAIL.len()) + 512];
+        let first = deflate(&mut strm, &corpus, &mut out, Z_PARTIAL_FLUSH);
+        assert_eq!(first.code, ReturnCode::Ok);
+        assert_eq!(first.consumed, corpus.len());
+        assert!(first.produced > 0, "the flush must publish bytes");
+        let mut n = first.produced;
+        let finish = deflate(&mut strm, TAIL, &mut out[n..], Z_FINISH);
+        assert_eq!(
+            finish.code,
+            ReturnCode::StreamEnd,
+            "the stream must finish normally after a partial flush"
+        );
+        assert_eq!(finish.consumed, TAIL.len());
+        n += finish.produced;
+        out.truncate(n);
+        deflate_end(&mut strm).expect("deflate_end after Z_STREAM_END");
+
+        let mut expected = corpus.clone();
+        expected.extend_from_slice(TAIL);
+        assert_eq!(
+            inflate_all(&out, expected.len()),
+            expected,
+            "a stream containing a partial flush must decode byte-exactly"
+        );
     }
 
     /// `params_resolve_level` mirrors C's level resolution and range test, and is
@@ -2188,5 +2427,91 @@ mod tests {
                 "level {bad} is out of range"
             );
         }
+    }
+
+    /// A window slide that wraps `match_start` must still emit the true match
+    /// distance.
+    ///
+    /// `fill_window` subtracts `w_size` from `match_start` unconditionally (C
+    /// `deflate.c` L288), so a `match_start` left stale by an iteration that did
+    /// not call `longest_match` wraps around. C recovers the correct distance
+    /// anyway: `strstart` and `match_start` are reduced by the same amount on
+    /// every slide, and `strstart - 1 - prev_match` (C `deflate.c` L2019) is
+    /// evaluated in the same modular unsigned arithmetic, so the wrap cancels.
+    /// Reproducing that requires `prev_match` to be as wide as `match_start` —
+    /// C declares both `unsigned` (`deflate.h` L98 `IPos`, L167 `uInt`).
+    ///
+    /// This payload drives `deflate_slow` into exactly that state. With
+    /// `windowBits = 9` the window is 512 bytes and `max_dist()` is 250, so
+    /// planting one distinctive seven-byte pattern at offset 511 and another at
+    /// offset 761 makes the match found at `strstart = 761` start at window
+    /// position 511 — a distance of precisely `max_dist()`. The next position,
+    /// 762, is the first that satisfies `strstart >= w_size + max_dist()`, so it
+    /// triggers the initial slide, which wraps `match_start` to `511 - 512`
+    /// before it is copied into `prev_match` and the deferred match is emitted.
+    /// `Z_FILTERED` is required because it discards every match of five bytes or
+    /// fewer, which is what leaves the seven-byte pattern as the only match in
+    /// play.
+    ///
+    /// The expected output was measured with reference C zlib built from this
+    /// repository's own `*.c` sources under `-fsanitize=address,undefined`: it
+    /// compresses this payload to 943 bytes with CRC-32 `0xb573cc1b`, decodes it
+    /// back byte-exactly, and reports no sanitizer diagnostic.
+    #[test]
+    fn a_wrapped_prev_match_still_emits_the_true_distance() {
+        /// Distinct high bytes that the filler below can never produce, so the
+        /// pattern occurs exactly twice and no competing match exists.
+        const PATTERN: [u8; 7] = [0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7];
+        /// Window position of the match the deferred emission refers to.
+        const MATCH_AT: usize = 511;
+        /// Position at which that match is found: `MATCH_AT + max_dist()`.
+        const FOUND_AT: usize = 761;
+        /// Compressed length produced by reference C zlib.
+        const C_PRODUCED: usize = 943;
+        /// CRC-32 of the compressed stream produced by reference C zlib.
+        const C_CRC: u32 = 0xb573_cc1b;
+
+        let mut payload = vec![0u8; 900];
+        let mut x: u32 = 0x1234_5678;
+        for slot in payload.iter_mut() {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            // Confine the filler to 0x00..=0xEF so it cannot collide with
+            // PATTERN, and keep it high-entropy so it forms no long match.
+            *slot = ((x >> 16) % 240) as u8;
+        }
+        payload[MATCH_AT..MATCH_AT + PATTERN.len()].copy_from_slice(&PATTERN);
+        payload[FOUND_AT..FOUND_AT + PATTERN.len()].copy_from_slice(&PATTERN);
+
+        let mut strm = init(7, 9, 1, Strategy::Filtered);
+        let mut out = vec![0u8; deflate_bound(&strm, payload.len()) + 64];
+        let outcome = deflate(&mut strm, &payload, &mut out, Z_FINISH);
+        assert_eq!(
+            outcome.code,
+            ReturnCode::StreamEnd,
+            "the stream must finish rather than fault on the wrapped match_start"
+        );
+        assert_eq!(
+            outcome.consumed,
+            payload.len(),
+            "all input must be consumed"
+        );
+        out.truncate(outcome.produced);
+        deflate_end(&mut strm).expect("deflate_end must succeed after Z_STREAM_END");
+
+        assert_eq!(
+            out.len(),
+            C_PRODUCED,
+            "reference C zlib compresses this payload to {C_PRODUCED} bytes"
+        );
+        assert_eq!(
+            crate::checksum::crc32(0, &out),
+            C_CRC,
+            "the compressed bytes must be identical to reference C zlib"
+        );
+        assert_eq!(
+            inflate_all(&out, payload.len()),
+            payload,
+            "the emitted match distance must be valid, so the stream round-trips"
+        );
     }
 }

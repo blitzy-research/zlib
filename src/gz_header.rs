@@ -684,16 +684,20 @@ mod tests {
         assert!(rendered.contains("GzHeader"));
     }
 
-    /// Finding #10 — `GzHeader`'s public field set is part of the crate's API, so
-    /// it is pinned by an **exhaustive** struct expression and an **exhaustive**
-    /// destructuring pattern (no `..` in either).
+    /// `GzHeader`'s public field set is part of the crate's API, so it is pinned by
+    /// an **exhaustive** struct expression and an **exhaustive** destructuring
+    /// pattern (no `..` in either).
     ///
     /// Every field a caller can name is a compatibility commitment: an exhaustive
     /// struct literal in downstream code stops compiling the moment a field is
     /// added, and a `let Self { .. }` destructuring stops compiling the moment one
     /// is removed. Wire-level decoder observations therefore belong in the
-    /// crate-private [`HeaderPublication`] record, not here — which is what
-    /// removing the short-lived public `extra_len` field restored.
+    /// crate-private [`HeaderPublication`] record rather than here. The declared
+    /// `XLEN` is the clearest instance: C's `EXLEN` state assigns
+    /// `head->extra_len` independently of how many extra bytes were captured, so
+    /// that count travels to the C caller through `HeaderPublication` and is
+    /// written into the raw `gz_header` at the boundary — it is deliberately not a
+    /// field of this thirteen-field public mirror.
     #[test]
     fn public_field_set_is_exactly_the_thirteen_c_mirrored_fields() {
         // Exhaustive construction: adding a field breaks this line.

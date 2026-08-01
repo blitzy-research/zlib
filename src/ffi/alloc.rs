@@ -89,7 +89,7 @@
 //! * every element is initialised by *writing a valid `T::default()` value*
 //!   rather than by zeroing raw bytes, so the region holds `count` valid `T`s
 //!   for **any** `T: Copy + Default`. For the integer buffer types the engines
-//!   actually request (`u8`, `u16`, `u32`) `T::default()` is `0`, so the fill is
+//!   actually request (`u8` and `u16`) `T::default()` is `0`, so the fill is
 //!   byte-for-byte the `zmemzero` that C `zcalloc` performs.
 
 use alloc::boxed::Box;
@@ -225,11 +225,10 @@ impl<T: Copy + Default + ZeroValid> Drop for CForeignBuffer<T> {
 /// replacement window would break all three of those properties at once, which
 /// is why this path must never allocate one.
 ///
-/// This type closes the gap: it presents the caller's region through the same
-/// safe [`ForeignBuffer`] interface [`crate::stream::AllocBuffer::Foreign`]
-/// already uses, so the decoder reads and writes it as an ordinary slice with no
-/// `unsafe` outside this file, while [`Drop`] is **absent** — the region is not
-/// ours to release.
+/// This type presents the caller's region through the same safe
+/// [`ForeignBuffer`] interface [`crate::stream::AllocBuffer::Foreign`] uses, so
+/// the decoder reads and writes it as an ordinary slice with no `unsafe` outside
+/// this file, while [`Drop`] is **absent** — the region is not ours to release.
 ///
 /// # Type invariants
 ///
@@ -582,11 +581,11 @@ pub(crate) fn try_alloc_foreign_items<T: Copy + Default + ZeroValid + 'static>(
     // Each slot is initialized by writing a genuine `T::default()` value rather
     // than by memset-ing raw zero bytes, so this path makes **no** assumption
     // that an all-zero bit pattern is a legal `T`. The sealed `T: ZeroValid`
-    // bound is retained as an independent, compile-time restriction of the
-    // element-type set, so the two sanctioned remedies for this hazard are both
-    // in force. For every type the engines actually request (`u8`, `u16`, `u32`,
-    // whose `Default` is `0`) the result is byte-for-byte identical to C
-    // `zcalloc`'s post-`zalloc` `zmemzero`.
+    // bound is not what makes this sound; it is retained as defence in depth — a
+    // compile-time restriction of the element-type set to a list audited inside
+    // this crate, which a downstream implementor cannot widen. For the types the
+    // engines request (`u8` and `u16`, whose `Default` is `0`) the result is
+    // byte-for-byte identical to C `zcalloc`'s post-`zalloc` `zmemzero`.
     // `MaybeUninit<T>` has the same layout as `T` and imposes no initialization
     // requirement, so a unique slice of `count` `MaybeUninit<T>` over the freshly
     // allocated, unaliased region is valid; filling it writes one valid value per
@@ -899,8 +898,11 @@ pub(crate) mod test_hook {
     const HDR: usize = 16;
 
     /// Alignment of every allocation this hook makes. Chosen to over-satisfy
-    /// every element type the engines request (`u8`, `u16`, `u32`), so a
+    /// every element type in the sealed [`ZeroValid`] set — the engines request
+    /// `u8` and `u16`, and the tests below also allocate `u32` buffers — so a
     /// conforming allocation is never rejected for alignment.
+    ///
+    /// [`ZeroValid`]: crate::stream::ZeroValid
     const ALIGN: usize = 16;
 
     /// Sentinel budget meaning "never report out-of-memory".
@@ -1286,7 +1288,7 @@ mod tests {
     /// global-heap failure reportable as `Z_MEM_ERROR` instead of aborting —
     /// must move its value onto the heap intact.
     ///
-    /// This is the helper every FFI handle installation now routes through
+    /// This is the helper every FFI handle installation routes through
     /// (`deflateInit2_`, `deflateCopy`, `inflateInit2_`, `inflateBackInit_`,
     /// `inflateCopy`, `gzopen`) as well as the `CForeignBuffer` owner above, so
     /// its value-preservation and its zero-sized fast path are both pinned here.
@@ -1851,9 +1853,9 @@ mod foreign_alloc_tests {
     /// The companion validity case: for an element type with no valid all-zero
     /// representation, the initializer must still leave the region holding valid
     /// values. A byte-zeroing fill would materialize the invalid discriminant `0`
-    /// here, which is precisely the undefined behaviour this module now rules out
-    /// — twice over, since such a type additionally cannot satisfy the sealed
-    /// `ZeroValid` bound the allocation path requires.
+    /// here, which is the undefined behaviour this module rules out — twice over,
+    /// since such a type additionally cannot satisfy the sealed `ZeroValid` bound
+    /// the allocation path requires.
     #[test]
     fn non_zero_discriminant_elements_are_initialized_with_valid_values() {
         // Both variants are inhabited, so the comparison below is a real runtime
@@ -2196,9 +2198,12 @@ mod foreign_alloc_tests {
             "an unrepresentable request must fail, not wrap to a tiny region"
         );
 
-        // A product that `usize` holds comfortably but no reference can span. This
-        // reaches the allocator only through the `isize::MAX` clause; a
-        // `checked_mul`-only guard would forward it to `malloc`.
+        // A product no reference can span. Which guard rejects it depends on the
+        // target: on a 64-bit `usize` the product fits comfortably and only the
+        // `isize::MAX` clause catches it, so a `checked_mul`-only guard would
+        // forward it to `malloc`; on a 32-bit `usize` the multiplication itself
+        // overflows and `checked_mul` rejects it first. Either way the request must
+        // fail, which is what the assertion below requires.
         // SAFETY: as above.
         let over = unsafe {
             default_zalloc(

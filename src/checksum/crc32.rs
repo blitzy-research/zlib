@@ -1301,11 +1301,16 @@ mod tests {
         // Both endian forms are asserted on *every* target, not just the one that
         // matches the host. An anchor written only inside a
         // `#[cfg(target_endian = "big")]` block is never compiled on a
-        // little-endian host, so a wrong index or a wrong table in it would only
-        // surface the first time someone built for big-endian hardware — which CI
-        // does not currently do (AAP §0.6.6 residual risk, §0.7.2 standard S8).
-        // Checking the relationship between the two forms closes that hole here
-        // and now.
+        // little-endian host, so a wrong index or a wrong table in it would stay
+        // invisible until someone built for big-endian hardware. Checking the
+        // relationship between the two forms instead makes both anchors live on
+        // every host, and CI compiles the library for `s390x-unknown-linux-gnu`
+        // (the `build-script-tests` job) so the big-endian `cfg` arms are
+        // type-checked as well.
+        //
+        // What neither covers is *running* the braid loops on a big-endian target:
+        // no CI job executes on such hardware, so the residual gap is execution,
+        // not selection (AAP §0.6.6 residual risk, §0.7.2 standard S8).
         assert_eq!(
             LITTLE_CRC_ENTRY_1, 0x7707_3096,
             "the little-endian CRC anchor is CRC_TABLE[1]"

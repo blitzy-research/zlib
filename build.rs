@@ -1818,10 +1818,11 @@ mod tests {
     ///
     /// Non-recursive on purpose: unlike `create_dir_all`, this reports
     /// `AlreadyExists` when the name is taken — including when it is taken by a
-    /// symlink an attacker planted — which is what lets [`Scratch::new`] skip to
-    /// the next candidate instead of following the link. On Unix the `0o700` mode
-    /// is handed to `mkdir(2)` itself, so the directory is never even briefly
-    /// group- or world-accessible; there is no `set_permissions` window to race.
+    /// symlink somebody planted — which is what lets [`Scratch::new`] skip to
+    /// the next candidate instead of adopting or following what is already there.
+    /// On Unix the `0o700` mode is handed to `mkdir(2)` itself, so the directory
+    /// carries owner-only permissions from the moment it exists rather than
+    /// acquiring them afterwards through `set_permissions`.
     fn create_private_dir(path: &Path) -> std::io::Result<()> {
         #[cfg(unix)]
         {
@@ -1841,10 +1842,16 @@ mod tests {
     /// The directory is created with create-new semantics inside the system
     /// temporary directory, and its name is assembled only from a
     /// [`safe_component`]-sanitized `CLONE_INDEX`, the process id, a monotonic
-    /// counter, and a caller tag. Nothing pre-existing is ever removed: an
-    /// occupied candidate name is skipped rather than deleted, so a symlink or
-    /// directory planted at a predictable path can neither be destroyed nor
-    /// followed (CWE-22 / CWE-367).
+    /// counter, and a caller tag — so the name is always a single path component
+    /// and cannot traverse out of the temporary directory (CWE-22).
+    ///
+    /// The guarantee this provides is about the moment of creation, and it is
+    /// worth stating no more than that: the `mkdir(2)` either takes a free name
+    /// or fails, so nothing pre-existing is ever adopted, followed, or removed —
+    /// an occupied candidate is skipped rather than deleted. It does not pin the
+    /// path afterwards. Nothing here re-verifies that the name still resolves to
+    /// the same directory later on, so this is initial-adoption safety plus
+    /// Unix creation-time permissions, not a lifetime guarantee.
     struct Scratch {
         path: std::path::PathBuf,
     }
@@ -1875,9 +1882,12 @@ mod tests {
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            // Safe to recurse: this directory did not exist before `Scratch::new`
-            // created it with create-new semantics, so it cannot be a pre-existing
-            // path or a symlink into one. Best effort on every path, including a
+            // The removal set is a path this guard brought into existence:
+            // `Scratch::new` created it with create-new semantics, so it was not
+            // adopted from anything pre-existing, and on Unix it was owner-only
+            // from `mkdir(2)` onward. Those are creation-time facts rather than a
+            // lifetime guarantee about the path, which is why the recursion is
+            // best effort and its result is discarded on every path, including a
             // panicking one: leaving a directory behind is not worth masking the
             // original failure.
             let _ = fs::remove_dir_all(&self.path);
@@ -1887,10 +1897,10 @@ mod tests {
     /// `safe_component` must collapse every traversal and separator form to a
     /// single harmless component.
     ///
-    /// The first case is the exact payload the review cited: with the raw value
-    /// interpolated, `slot/../../security_target` escaped the temporary directory
-    /// lexically and resolved to `/security_target_<pid>_0`. Sanitized, it can only
-    /// ever name a child of the temporary directory.
+    /// The first case is the one that matters most: interpolated raw,
+    /// `slot/../../security_target` escapes the temporary directory lexically and
+    /// resolves to `/security_target_<pid>_0`. Sanitized, it can only ever name a
+    /// child of the temporary directory.
     #[test]
     fn safe_component_neutralizes_traversal_and_separators() {
         for raw in [

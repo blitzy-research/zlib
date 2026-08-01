@@ -36,6 +36,26 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+# --- Lints -----------------------------------------------------------------
+# `fuzz_ffi_roundtrip.rs` is the only place in this project where a fuzzer
+# crosses the `unsafe` C ABI boundary, so the two lints that police that
+# boundary are hard errors here rather than warn-by-default suggestions.
+#
+# Declaring them in the manifest is what makes the DETACHED workspace's own
+# `cargo +nightly clippy --all-targets -- -D warnings` enforce the same
+# discipline the library enforces on itself with
+# `#![warn(clippy::undocumented_unsafe_blocks)]` at the crate root: the
+# repository-root `clippy` invocation cannot resolve this workspace, so without
+# this table the rule would simply never be applied to the harnesses. A manifest
+# table also reaches every target at once, which a per-file inner attribute
+# could not do without adding a second `#![...]` to each `#![no_main]` binary.
+#
+# `rustc` recognises `clippy` as a registered tool namespace and ignores lint
+# names inside it, so `cargo +nightly fuzz build` is unaffected.
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+
 # Detach from the parent package: an empty workspace table here prevents the
 # fuzz crate from being pulled into (or affecting) the root crate's build graph.
 [workspace]
@@ -49,63 +69,32 @@ libfuzzer-sys = "0.4"
 # features (std + gzip + gz-io + simd) give the harnesses the full surface.
 path = ".."
 
-# REDUCED-FEATURE FUZZING IS NOT SUPPORTED FROM THIS WORKSPACE, BY DESIGN.
-# =======================================================================
-# `--no-default-features` and `--features …` passed to `cargo fuzz build` are
-# SILENTLY INERT here, and that is a deliberate trade rather than an oversight.
-# Two facts combine to produce it: the dependency above inherits `zlib-rs`'s
-# defaults implicitly (there is no `default-features = false`), and this package
-# declares no `[features]` table, so it has nothing to forward. Measured, not
-# assumed: with these two lines as they stand, `cargo +nightly fuzz build` and
-# `cargo +nightly fuzz build --no-default-features` produce BYTE-IDENTICAL
-# binaries for all five targets — cargo does not even recompile — and
-# `cargo +nightly metadata --no-default-features` still resolves `zlib-rs` with
-# `default, gz-io, gzip, simd, std` and the full 13-package graph.
+# --- Features --------------------------------------------------------------
+# `gzip` is a FORWARDING feature. It exists so the harnesses can carry
+# `#[cfg(feature = "gzip")]` on their gzip-specific imports, helpers, and legs.
 #
-# Making the flags work would take exactly two additions: `default-features =
-# false` on the dependency above, plus a forwarding table of the shape
+# Cargo defines a `feature` predicate only for the crate it is compiling, and
+# that crate here is `zlib-rs-fuzz`, not `zlib-rs`. Without a declaration in this
+# manifest a `gzip` predicate is therefore undefined: it would be permanently
+# false — silently compiling the gzip coverage out of the gzip harness — and
+# `rustc`'s `unexpected_cfgs` lint rejects the unknown value outright ("no
+# expected values for `feature`"), which the folder's blocking
+# `clippy --all-targets -- -D warnings` gate turns into an error. Declaring it
+# and forwarding it to `zlib-rs/gzip` makes the predicate both defined and
+# truthful: whenever a gated leg compiles, the library capability that leg needs
+# is guaranteed enabled rather than merely inherited from `zlib-rs`'s own
+# defaults.
 #
-#     [features]
-#     default        = ["std", "gzip", "gz-io", "simd", "zlib-rs/default"]
-#     std            = ["zlib-rs/std"]
-#     gzip           = ["zlib-rs/gzip"]
-#     gz-io          = ["std", "gzip", "zlib-rs/gz-io"]
-#     simd           = ["zlib-rs/simd"]
-#     no-std         = ["zlib-rs/no-std"]
-#     inflate_strict = ["zlib-rs/inflate_strict"]
+# It is ON by default, so a plain `cargo +nightly fuzz build|run` keeps the full
+# gzip coverage. `--no-default-features` compiles the gzip-specific legs out
+# while every `fuzz_target!` — and therefore every `main` — stays unconditional,
+# so all five `[[bin]]` targets still link.
 #
-# That shape was built and exercised to confirm it does work: all five targets
-# compile under seven feature rows, `--no-default-features` then resolves
-# `zlib-rs` with NO features and a 12-package graph (`crc32fast` drops out with
-# `simd`), the binaries shrink by 0.4–0.7 MB each, all five replay a corpus at
-# `-runs=0` with exit 0 and zero artifacts, and this lockfile stays at its
-# committed 13 packages. So the table is withheld on merit, not for lack of a
-# working recipe.
-#
-# WHY IT IS WITHHELD. The absence of a `[features]` table is load-bearing
-# SAFETY, not an accident of minimalism. Cargo defines a `feature` predicate
-# only for the crate being compiled, so with no table here a
-# `#[cfg(feature = "gzip")]` written in any harness is an UNKNOWN value that
-# `rustc`'s `unexpected_cfgs` lint rejects outright ("no expected values for
-# `feature`"), which this folder's blocking `cargo +nightly clippy --all-targets
-# -- -D warnings` gate turns into a compile error. That is the guardrail: the
-# mistake cannot land. Add the table and the predicate becomes DEFINED but
-# semantically wrong — `zlib-rs/gz-io` can switch the library's gzip framing on
-# without this crate's `gzip` flag being set — so the same mistake would compile
-# silently and delete all coverage of the RFC 1952 header parser, the most
-# attacker-exposed surface in the decoder, with no gate reporting anything. All
-# three of `fuzz_targets/fuzz_gzip.rs`, `fuzz_targets/fuzz_inflate.rs`, and
-# `fuzz_targets/fuzz_deflate_roundtrip.rs` document that reasoning in full and
-# resolve gzip availability by RUN-TIME capability query instead
-# (`zlibCompileFlags` bit 17, or a rejected `inflate_init2`), which is exact
-# under every feature set and keeps the mandatory libFuzzer `main`
-# unconditional.
-#
-# Net effect: a single binary that is correct under any library configuration,
-# and a compiler-enforced barrier against the one mistake that would silently
-# cost coverage. If reduced-feature fuzzing is ever genuinely needed, add the
-# table above AND audit those three rationales in the same change — they become
-# false the moment it lands.
+# This adds no package to the dependency graph: a lockfile records packages and
+# versions, not feature selections, so `fuzz/Cargo.lock` is unaffected.
+[features]
+default = ["gzip"]
+gzip = ["zlib-rs/gzip"]
 
 # libFuzzer wants line-level debug info in the optimized build for actionable
 # crash reports; overflow checks stay on so arithmetic mistakes surface as

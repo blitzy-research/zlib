@@ -587,11 +587,34 @@ jobs:
   # load time — which is the only one of the three that a lazily-bound program would
   # not reveal until first call.
   #
-  # `expect_personality` is asserted in BOTH directions on purpose. A std-off row
-  # must define the symbol (1); the `std` control row must NOT (0), because `std`
-  # already provides it and an unconditional definition would be a duplicate.
-  # Asserting only the positive direction would let the `cfg` gate be widened to
-  # `always` without anything noticing.
+  # The personality symbol is asserted on two independent axes, because the two
+  # properties fail in different ways and neither implies the other.
+  #
+  #   * EXACTLY ONE DEFINITION must exist in the artifact, on every row. Both
+  #     failure directions are caught by `ld` before this job's assertion is even
+  #     reached: zero definitions is the `undefined reference` above, and two — the
+  #     `cfg` gate widened so a `std` build also compiles the freestanding block —
+  #     is a duplicate-symbol error. Pinning the count to `1` uniformly is what
+  #     keeps that guarantee observable, and it is strictly stronger than the
+  #     per-row dynamic-table count this job used to compare: because a `std` build
+  #     links `std`'s own copy, the artifact defines the symbol on EVERY row, so a
+  #     per-row `0`/`1` expectation could only ever have described where the
+  #     definition was *visible*, never which crate supplied it.
+  #   * IT MUST NEVER BE EXPORTED, on every row. `#[unsafe(no_mangle)]` gives the
+  #     definition default ELF visibility, so a std-off `cdylib` published it as
+  #     `FUNC GLOBAL DEFAULT` and measured 96 dynamic `T` symbols where the `std`
+  #     build measures 95. That both widened the drop-in `libz` ABI with a symbol
+  #     no `libz` has and exposed an *aborting* routine to ELF interposition — in a
+  #     global symbol scope it can win the process-wide lookup for another Rust
+  #     shared object's personality references. `src/lib.rs` therefore emits a
+  #     `.hidden` directive beside the definition; the reference it exists to
+  #     satisfy is resolved at static-link time, so internal linkage suffices.
+  #
+  # The export-set step that follows then pins the whole surface rather than that
+  # one symbol: every row must publish the same 95 dynamic `T` symbols, cover all
+  # 54 `zlib.map` `global:` names, and leak none of the 10 `local:` ones. A symbol
+  # set that varies with a Cargo feature is an ABI break, and comparing against
+  # `zlib.map` is what makes the check independent of this job's own arithmetic.
   #
   # Each matrix row runs on its own runner, so the "a previous feature row left
   # `target/release/libzlib_rs.a` holding a different feature set" hazard cannot
@@ -612,16 +635,12 @@ jobs:
         include:
           - name: std-off
             features: '--no-default-features'
-            expect_personality: '1'
           - name: std-off + no-std
             features: '--no-default-features --features no-std'
-            expect_personality: '1'
           - name: std-off + simd
             features: '--no-default-features --features simd'
-            expect_personality: '1'
           - name: std control
             features: ''
-            expect_personality: '0'
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -646,21 +665,85 @@ jobs:
         esac
     - name: Build the shipped artifacts (release)
       run: cargo +stable build --release --locked --verbose ${{ matrix.features }}
-    - name: Assert the freestanding personality symbol is present exactly when required
+    - name: Assert the personality symbol is defined exactly once and never exported
       run: |
         set -euo pipefail
         so=target/release/libzlib_rs.so
         test -f "$so" || { echo "::error::$so was not emitted"; exit 1; }
-        found=$(nm -D --defined-only "$so" | grep -c ' T rust_eh_personality' || true)
-        want='${{ matrix.expect_personality }}'
-        echo "rust_eh_personality defined (T) in $so: $found (expected $want)"
-        if [ "$found" != "$want" ]; then
-          echo "::error::expected $want definition(s) of rust_eh_personality for" \
-               "features '${{ matrix.features }}', found $found. A std-off artifact must" \
-               "supply it or nothing can link; a std artifact must not, or it duplicates" \
-               "the definition std already provides."
+        # Axis 1: exactly one definition, anywhere in the symbol table. `ld` has
+        # already rejected zero (undefined reference) and two (duplicate symbol);
+        # this makes the surviving guarantee observable.
+        defined=$(nm --defined-only "$so" | grep -cE ' [tT] rust_eh_personality' || true)
+        # Axis 2: never in the DYNAMIC table. This is the property the `.hidden`
+        # directive in `src/lib.rs` exists to enforce.
+        exported=$(nm -D --defined-only "$so" | grep -c ' T rust_eh_personality' || true)
+        echo "rust_eh_personality: definitions=$defined (want 1), exported=$exported (want 0)"
+        if [ "$defined" != "1" ]; then
+          echo "::error::expected exactly 1 definition of rust_eh_personality for features" \
+               "'${{ matrix.features }}', found $defined. A std-off artifact must supply it" \
+               "or nothing can link; a std build must not add a second, because std already" \
+               "provides one."
           exit 1
         fi
+        if [ "$exported" != "0" ]; then
+          echo "::error::rust_eh_personality is exported from the dynamic symbol table for" \
+               "features '${{ matrix.features }}'. It must carry internal linkage: exporting" \
+               "it widens the drop-in libz ABI with a symbol no libz has, and publishes an" \
+               "aborting routine that ELF interposition can select for another Rust shared" \
+               "object's unwinds. Check the .hidden directive in src/lib.rs."
+          exit 1
+        fi
+    - name: Assert the dynamic export set matches the zlib.map contract on every row
+      run: |
+        set -euo pipefail
+        so=target/release/libzlib_rs.so
+        # A version script is a sequence of `NAME { ... } [parent];` nodes. Inside a
+        # node the default visibility is `global`, and `global:`/`local:` switch
+        # scope for THAT NODE ONLY — a parser that lets `local:` persist across node
+        # boundaries mis-sorts most of the file. `_*` is a pattern, not a name.
+        python3 - "$so" <<'PY'
+        import re, subprocess, sys, pathlib
+        so = sys.argv[1]
+        text = pathlib.Path("zlib.map").read_text()
+        nodes = re.findall(r'([A-Za-z0-9_.]+)\s*\{(.*?)\}\s*([A-Za-z0-9_.]*)\s*;', text, re.S)
+        g, l = set(), set()
+        for _name, body, _parent in nodes:
+            mode = "g"
+            for raw in body.split(";"):
+                s = raw.strip()
+                while s.startswith("global:") or s.startswith("local:"):
+                    mode = "g" if s.startswith("global:") else "l"
+                    s = s.split(":", 1)[1].strip()
+                for tok in s.split():
+                    if tok != "_*" and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', tok):
+                        (g if mode == "g" else l).add(tok)
+        assert (len(nodes), len(g), len(l)) == (16, 54, 10), \
+            f"zlib.map parsed as {len(nodes)} nodes / {len(g)} global / {len(l)} local, " \
+            "expected 16 / 54 / 10 — the version script changed or the parser drifted"
+        out = subprocess.run(["nm", "-D", "--defined-only", so],
+                             capture_output=True, text=True, check=True).stdout
+        T = {p[2] for p in (line.split() for line in out.splitlines())
+             if len(p) == 3 and p[1] == "T"}
+        missing, leaked = sorted(g - T), sorted(l & T)
+        print(f"dynamic T={len(T)}  zlib.map globals {len(g)-len(missing)}/{len(g)}  "
+              f"locals leaked {len(leaked)}/{len(l)}")
+        failed = False
+        # 96 `#[unsafe(no_mangle)]` names minus the `#[cfg(windows)]`-gated
+        # `gzopen_w`. Identical on every feature row: `pub mod ffi` is declared
+        # unconditionally so the artifact always presents the full C symbol table,
+        # and anything inside it that needs `std` is gated in the function body.
+        if len(T) != 95:
+            print(f"::error::expected 95 dynamic T symbols, found {len(T)}. The exported "
+                  "surface must not vary with a Cargo feature — that is an ABI break.")
+            failed = True
+        if missing:
+            print(f"::error::zlib.map global: symbols absent from the artifact: {missing}")
+            failed = True
+        if leaked:
+            print(f"::error::zlib.map local: symbols leaked into the dynamic table: {leaked}")
+            failed = True
+        sys.exit(1 if failed else 0)
+        PY
     - name: Link and load a C consumer against both artifacts
       run: |
         set -euo pipefail

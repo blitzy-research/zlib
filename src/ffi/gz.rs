@@ -59,7 +59,7 @@
 //! prefix to re-expose the current read buffer (`have`, a raw `next` pointer
 //! into `out_buf`, and `pos`). The real `gzgetc`/`gzgetc_` functions are still
 //! exported for callers that take the function pointer, and they observe
-//! identical return values; the macro fast path now works too.
+//! identical return values; the macro fast path is supported too.
 //!
 //! # `gzprintf` / `gzvprintf` — supported zlib ABI variant (no secure `*printf`)
 //!
@@ -2054,8 +2054,9 @@ mod tests {
     /// unconditional half of the contract unproven: a hypothetical
     /// partially-functional implementation would pass that assertion.
     ///
-    /// This test closes the gap. It drives both raw exports on a live `"wb"`
-    /// handle with a format string containing **no conversion specifier** — the
+    /// This test verifies the unconditional stub contract on a live handle. It
+    /// drives both raw exports on an open `"wb"` handle with a format string
+    /// containing **no conversion specifier** — the
     /// easiest possible input, which a functional implementation would copy
     /// verbatim and report a length for — and pins the whole contract:
     ///

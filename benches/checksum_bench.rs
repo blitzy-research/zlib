@@ -27,6 +27,14 @@
 //! A benchmark result is likewise never on its own a licence to change `src/`
 //! (AAP 0.8.3): this folder measures, it does not authorise.
 //!
+//! The distinction is CRC-32-only. `src/checksum/crc32.rs` dispatches its
+//! private `crc32_bulk` helper to `crc32fast::Hasher` under `simd` and to the
+//! braided, word-at-a-time scalar table loop without it; both are bit-identical
+//! to reference zlib, so only throughput changes. `src/checksum/adler32.rs` has
+//! no `simd` code path at all, so the `adler32` group is expected to report the
+//! same figures under both rows — a divergence there would indicate measurement
+//! noise, not a different implementation.
+//!
 //! Registered in `Cargo.toml` as `[[bench]] name = "checksum_bench"` with
 //! `harness = false`, so this file supplies its own entry point via
 //! `criterion_group!` / `criterion_main!` (not the libtest harness). No

@@ -65,9 +65,9 @@
 #         "builds on exactly the declared MSRV", so the version it runs belongs
 #         in the job, not inherited from a file it does not own.
 #       * `.github/workflows/ci.yml` `build-test`, `no-std-tests`, `lint`,
-#         `benches`, `build-script-tests`, `unsafe-boundary` —
-#         `RUSTUP_TOOLCHAIN: stable`. Without it all six resolve to the pin:
-#         most would still PASS (the crate is MSRV-clean — see the measured
+#         `benches`, `build-script-tests`, `unsafe-boundary`, `c-abi-linkage` —
+#         `RUSTUP_TOOLCHAIN: stable`. Without it each of them resolves to the
+#         pin: most would still PASS (the crate is MSRV-clean — see the measured
 #         results below) while silently ceasing to cover current stable, and
 #         `lint` would run the floor's clippy instead of stable's, which is
 #         strictly weaker. See "THE LINT GATE RUNS AT CURRENT STABLE".

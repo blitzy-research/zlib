@@ -52,7 +52,7 @@ use std::io::{self, Write};
 use crate::constants::{DEF_MEM_LEVEL, FlushMode, MAX_WBITS, Strategy, Z_DEFLATED, Z_FINISH};
 use crate::deflate;
 use crate::error::{ReturnCode, ZlibError};
-use crate::gz::state::{GzMode, GzState};
+use crate::gz::state::{GzFile, GzMode, GzState};
 
 /// Returns `true` if `state` is a live write stream with no *serious* pending
 /// error, i.e. it is ready to accept a new write request.
@@ -89,6 +89,17 @@ fn write_ready(state: &GzState) -> bool {
 /// accepts (`deflate.c` L436): C forwards those values unvalidated and reports
 /// the engine's rejection here, and so does this port — the deferred failure is
 /// how a caller's out-of-range `gzsetparams` argument surfaces.
+///
+/// Every failure path releases whatever this call had already allocated, exactly
+/// as C does (`free(state->in)` before the `malloc(state->out)` failure return,
+/// `free(state->out); free(state->in);` before the `deflateInit2` failure return
+/// — C L19-L44). The allocation *order*, *count*, and reported code are
+/// unchanged, so a caller still observes the failure at the same point in the
+/// stream's life; only the retained memory is given back. Without the rollback a
+/// stream whose recorded `level`/`strategy` can never be accepted would hold
+/// `3 * want` bytes — the doubled input buffer plus the output buffer — for the
+/// rest of its life, on every rejected write, even though `size` correctly stays
+/// `0` and marks the stream uninitialized.
 pub(crate) fn gz_init(state: &mut GzState) -> Result<(), ZlibError> {
     // Allocate the input buffer, double-sized for `gzprintf` (C L14-L19).
     state.in_buf = vec![0u8; state.want << 1];
@@ -115,10 +126,12 @@ pub(crate) fn gz_init(state: &mut GzState) -> Result<(), ZlibError> {
         // must be propagated identically — substituting a default here would
         // silently compress with a strategy the caller never asked for, making
         // the caller's mistake invisible in the return code, `gzerror`, and
-        // `gzclose_w` alike. An out-of-range `level` already fails this way
-        // (`deflate_init2` rejects it below), so both parameters of the same
-        // `gzsetparams` call now behave identically.
+        // `gzclose_w` alike. An out-of-range `level` fails the same way, being
+        // rejected by `deflate_init2` below, so both parameters of one
+        // `gzsetparams` call are handled identically.
         let Some(strategy) = Strategy::from_c_int(state.strategy) else {
+            // C L37-L43 frees both buffers before reporting; see `gz_init_rollback`.
+            gz_init_rollback(state);
             state.error(ReturnCode::MemError, Some("out of memory"));
             return Err(ZlibError::MemError);
         };
@@ -132,7 +145,9 @@ pub(crate) fn gz_init(state: &mut GzState) -> Result<(), ZlibError> {
         )
         .is_err()
         {
-            // C L37-L43: any init failure is surfaced as an out-of-memory error.
+            // C L37-L43: any init failure is surfaced as an out-of-memory error,
+            // after `free(state->out); free(state->in);`.
+            gz_init_rollback(state);
             state.error(ReturnCode::MemError, Some("out of memory"));
             return Err(ZlibError::MemError);
         }
@@ -141,12 +156,14 @@ pub(crate) fn gz_init(state: &mut GzState) -> Result<(), ZlibError> {
     // The compressed-output window (C L49-L55, `strm->avail_out = state->size;
     // strm->next_out = state->out; state->x.next = strm->next_out;`) is modelled
     // as `out_buf[0..size]` — the scratch area handed to `deflate` on each call —
-    // plus the persistent cursor
-    // [`GzState::out_pending`](crate::gz::state::GzState), which counts the bytes
-    // `deflate` produced that the OS has not accepted yet. C's cursor is a
-    // pointer into `state->out`; the safe-index counterpart starts empty here,
-    // exactly as C's starts equal to `strm->next_out`.
+    // plus the persistent cursor pair
+    // [`GzState::out_start`](crate::gz::state::GzState) /
+    // [`GzState::out_pending`](crate::gz::state::GzState), which locate and count
+    // the bytes `deflate` produced that the OS has not accepted yet. C's cursor is
+    // a pointer into `state->out`; the safe-index counterpart starts empty and
+    // front-anchored here, exactly as C's starts equal to `strm->next_out`.
     state.out_pending = 0;
+    state.out_start = 0;
 
     // Mark the state as initialized (C L46). This must stay the *last* statement:
     // a non-zero `size` is the sentinel every caller tests to decide whether the
@@ -154,6 +171,29 @@ pub(crate) fn gz_init(state: &mut GzState) -> Result<(), ZlibError> {
     // half-built state if any step above failed.
     state.size = state.want;
     Ok(())
+}
+
+/// Releases everything [`gz_init`] had allocated before it hit a failure — the
+/// `free(state->out); free(state->in);` that precedes every C `gz_init` error
+/// return (`gzwrite.c` L19-L44).
+///
+/// Called *before* [`GzState::error`](crate::gz::state::GzState::error) so the
+/// recorded code and message — and therefore everything a caller can observe
+/// through `gzerror`, the entry point's return value, or `gzclose_w` — are
+/// untouched by the rollback. [`GzState::size`](crate::gz::state::GzState) is
+/// still `0` at every one of those failure points, so the stream correctly
+/// remains "uninitialized" and a later call re-runs [`gz_init`] from scratch,
+/// exactly as it would in C.
+///
+/// The deflate engine needs no rollback: `deflate_init2` installs the engine
+/// state on the stream only after it has been built successfully, so a failed
+/// init leaves [`GzState::strm`](crate::gz::state::GzState) with no state object
+/// to release (the diagnostic message it records on the stream is C-parity —
+/// `deflate.c` L505-L514 — and is deliberately preserved).
+#[inline]
+fn gz_init_rollback(state: &mut GzState) {
+    state.out_buf = Vec::new();
+    state.in_buf = Vec::new();
 }
 
 /// The maximum number of bytes written to the file in a single `write` call —
@@ -209,20 +249,176 @@ impl CompOutcome {
     }
 }
 
-/// Hands `state.out_buf[0..state.out_pending]` to the operating system, keeping
-/// the unwritten remainder addressable — the inner drain loop of C `gz_comp`
-/// (`gzwrite.c` L114-L124).
+/// Hands `buf` to the operating system once, reporting how many bytes it
+/// accepted — the single `write(2)` call shared by [`drain_pending`] and
+/// [`write_direct`].
+///
+/// Taking `&mut GzFile` rather than `&mut GzState` is deliberate: both callers
+/// pass a slice borrowed from a *different* field of the same state (the pending
+/// output window, or the caller's input), and only a disjoint field borrow lets
+/// that compile without copying the bytes somewhere else first.
+///
+/// # Test-only fault injection
+///
+/// A short write and a non-blocking stall are the two operating-system behaviours
+/// the pending-output window exists to survive, yet neither can be provoked from a
+/// regular file — and this module is `#![deny(unsafe_code)]`, so `pipe(2)`,
+/// `socketpair(2)`, `fcntl(O_NONBLOCK)`, and `SO_SNDBUF` are all out of reach.
+/// Under `cfg(test)` this indirection therefore consults a thread-local script
+/// (see [`fault`]) that can make one write accept only part of its buffer or fail
+/// with [`io::ErrorKind::WouldBlock`], [`io::ErrorKind::Interrupted`], or `Ok(0)`,
+/// which makes all four of the outcomes an operating-system write can report
+/// deterministic and portable to test with no `unsafe`, no extra dependency, and
+/// no platform-specific code. A scripted partial acceptance really does write that
+/// prefix to the file, so end-to-end assertions still decode genuine output.
+///
+/// Outside `cfg(test)` the entire mechanism is absent: the function below is the
+/// only definition compiled into the library, and it is the bare `write` call.
+#[cfg(not(test))]
+#[inline]
+fn write_some(file: &mut GzFile, buf: &[u8]) -> io::Result<usize> {
+    file.write(buf)
+}
+
+/// The `cfg(test)` counterpart of [`write_some`](fn@write_some): consults the
+/// thread-local fault script first, then falls back to a real `write`.
+///
+/// See the non-test definition for why this seam exists.
+#[cfg(test)]
+fn write_some(file: &mut GzFile, buf: &[u8]) -> io::Result<usize> {
+    match fault::next_step() {
+        // No script installed, or it is exhausted: behave exactly as the
+        // production definition does.
+        None => file.write(buf),
+        Some(fault::Step::WouldBlock) => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+        Some(fault::Step::Interrupted) => Err(io::Error::from(io::ErrorKind::Interrupted)),
+        Some(fault::Step::Refuse) => Ok(0),
+        Some(fault::Step::Accept(n)) => {
+            let n = core::cmp::min(n, buf.len());
+            // Deliver the accepted prefix for real, so the file on disk is exactly
+            // what a destination behaving this way would have received.
+            file.write_all(&buf[..n])?;
+            Ok(n)
+        }
+    }
+}
+
+/// Deterministic write-fault injection for this module's unit tests.
+///
+/// The script is thread-local, so tests running concurrently under the default
+/// test harness cannot influence one another, and [`Guard`](fault::Guard) clears
+/// it on scope exit — including while unwinding from a failed assertion — so a
+/// scripted fault can never leak into an unrelated test.
+#[cfg(test)]
+mod fault {
+    use std::cell::{Cell, RefCell};
+
+    /// One scripted answer for the next write performed by
+    /// [`write_some`](super::write_some).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Step {
+        /// Accept only this many bytes (clamped to the buffer length) — a short
+        /// write, as a stream socket or pipe with partial room performs.
+        Accept(usize),
+        /// Fail with [`io::ErrorKind::WouldBlock`](std::io::ErrorKind::WouldBlock)
+        /// — the `EAGAIN`/`EWOULDBLOCK` stall of a non-blocking descriptor.
+        WouldBlock,
+        /// Fail with
+        /// [`io::ErrorKind::Interrupted`](std::io::ErrorKind::Interrupted) before
+        /// any byte moves — the `EINTR` a signal delivers mid-`write(2)`. The loop
+        /// must retry it, and retrying must not resubmit an accepted byte.
+        Interrupted,
+        /// Accept nothing at all (`Ok(0)`) while bytes remain. Per the
+        /// [`Write::write`] contract that means the destination can take no more,
+        /// so it must be reported rather than spun on or silently dropped.
+        Refuse,
+    }
+
+    thread_local! {
+        /// One-shot steps not yet consumed on this thread, stored in reverse so
+        /// taking the next one is a cheap `pop`.
+        static SCRIPT: RefCell<Vec<Step>> = const { RefCell::new(Vec::new()) };
+        /// A standing per-write byte cap applied once [`SCRIPT`] is exhausted.
+        static CAP: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Installs `steps` (consumed front-to-back), replacing any previous setup.
+    ///
+    /// The returned guard must be held for as long as the script should apply.
+    /// Once the steps run out, writes behave normally again.
+    pub(super) fn script(steps: &[Step]) -> Guard {
+        CAP.with(|c| c.set(None));
+        SCRIPT.with(|s| {
+            let mut s = s.borrow_mut();
+            s.clear();
+            s.extend(steps.iter().rev().copied());
+        });
+        Guard
+    }
+
+    /// Caps *every* write at `n` bytes for as long as the returned guard lives —
+    /// a destination that dribbles, however many writes that takes.
+    pub(super) fn cap_every_write(n: usize) -> Guard {
+        SCRIPT.with(|s| s.borrow_mut().clear());
+        CAP.with(|c| c.set(Some(n)));
+        Guard
+    }
+
+    /// Takes the next scripted step, the standing cap, or [`None`] when neither is
+    /// installed.
+    pub(super) fn next_step() -> Option<Step> {
+        if let Some(step) = SCRIPT.with(|s| s.borrow_mut().pop()) {
+            return Some(step);
+        }
+        CAP.with(Cell::get).map(Step::Accept)
+    }
+
+    /// How many one-shot steps have not been consumed yet.
+    pub(super) fn remaining() -> usize {
+        SCRIPT.with(|s| s.borrow().len())
+    }
+
+    /// Clears the installed script and cap when it goes out of scope.
+    pub(super) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SCRIPT.with(|s| s.borrow_mut().clear());
+            CAP.with(|c| c.set(None));
+        }
+    }
+}
+
+/// Hands the pending window
+/// `state.out_buf[state.out_start .. state.out_start + state.out_pending]` to the
+/// operating system, keeping the unwritten remainder addressable — the inner
+/// drain loop of C `gz_comp` (`gzwrite.c` L114-L128).
 ///
 /// C advances a cursor that lives on the state
 /// (`while (strm->next_out > state->x.next) { … state->x.next += writ; }`), so a
 /// write that stops early leaves the remainder reachable for the next call. This
-/// keeps the equivalent window front-anchored: each successful partial write
-/// compacts what is left down to `out_buf[0]` and reduces
-/// [`GzState::out_pending`](crate::gz::state::GzState) by the amount accepted, so
-/// on return the invariant `out_buf[0..out_pending]` still names exactly the
-/// bytes the OS has not taken. When the write completes in full — every write to
-/// a regular blocking file — the compaction is a zero-length `copy_within` and
-/// costs nothing.
+/// does the same thing with an index: a successful partial write advances
+/// [`GzState::out_start`](crate::gz::state::GzState) by the amount accepted and
+/// reduces [`GzState::out_pending`](crate::gz::state::GzState) by the same amount,
+/// so on return the window still names exactly the bytes the OS has not taken.
+///
+/// # Why the cursor advances instead of compacting
+///
+/// Sliding the unwritten remainder back to `out_buf[0]` after every partial write
+/// would make delivering an `N`-byte window cost `(N-1) + (N-2) + … + 1` byte
+/// copies against a destination that accepts one byte at a time — quadratic work
+/// an ordinary flow-controlled pipe or socket can provoke, and unlike C, whose
+/// pointer bump copies nothing. Advancing an offset is `O(1)` per write and
+/// `O(N)` overall, matching C exactly.
+///
+/// The window is re-anchored at the front (`out_start = 0`) once, when it empties
+/// — the counterpart of C reclaiming the buffer with
+/// `strm->next_out = state->out; state->x.next = state->out;` (C L125-L128). That
+/// restores the invariant `out_pending == 0 ⇒ out_start == 0` that the compress
+/// loop relies on: `deflate` is only ever handed the scratch area while the window
+/// is empty, so it always receives the whole `out_buf[..size]` starting at index
+/// `0`, and the compressed byte sequence is therefore identical no matter how the
+/// destination chunked its acceptance.
 ///
 /// [`std::io::Write::write_all`] is deliberately not used: it reports only
 /// *whether* it failed, not how far it got, so a partial write followed by a
@@ -245,17 +441,18 @@ impl CompOutcome {
 fn drain_pending(state: &mut GzState) -> Result<(), ZlibError> {
     while state.out_pending > 0 {
         state.again = false;
-        let end = core::cmp::min(WRITE_MAX, state.out_pending);
-        match state.file.write(&state.out_buf[..end]) {
+        let start = state.out_start;
+        let end = start + core::cmp::min(WRITE_MAX, state.out_pending);
+        match write_some(&mut state.file, &state.out_buf[start..end]) {
             Ok(0) => {
                 // The destination accepts nothing while output is still pending.
                 state.error(ReturnCode::ErrNo, Some("write error"));
                 return Err(ZlibError::ErrNo);
             }
             Ok(written) => {
-                // Slide the unwritten tail down to the front so the window stays
-                // front-anchored. A complete write makes this a no-op.
-                state.out_buf.copy_within(written..state.out_pending, 0);
+                // Advance the cursor past what the OS took — C's
+                // `state->x.next += writ` (C L124). No bytes move.
+                state.out_start += written;
                 state.out_pending -= written;
             }
             // A signal interrupted the write before any byte moved; retry.
@@ -271,6 +468,12 @@ fn drain_pending(state: &mut GzState) -> Result<(), ZlibError> {
             }
         }
     }
+
+    // The window is empty: re-anchor it at the front so the next `deflate` call
+    // receives the whole scratch area from index `0` (C L125-L128's buffer
+    // reclaim). Reached only by the loop draining completely — every error path
+    // above returns early with the cursor left exactly where the OS stopped.
+    state.out_start = 0;
     Ok(())
 }
 
@@ -292,7 +495,7 @@ fn write_direct(state: &mut GzState, input: &[u8]) -> CompOutcome {
     while off < input.len() {
         state.again = false;
         let end = off + core::cmp::min(WRITE_MAX, input.len() - off);
-        match state.file.write(&input[off..end]) {
+        match write_some(&mut state.file, &input[off..end]) {
             Ok(0) => {
                 // The destination accepts nothing while input remains. Reporting
                 // this (rather than breaking out silently) is what stops the
@@ -386,10 +589,19 @@ fn gz_deflate_loop(state: &mut GzState, input: &[u8], flush: FlushMode) -> CompO
 
         consumed += outcome.consumed;
 
-        // Hand the freshly produced bytes to the file (C L114-L124). They occupy
-        // `out_buf[0..produced]`, which is exactly the pending window's shape, so
-        // publishing the count and draining is all that is required; whatever the
-        // OS declines to take stays pending for the next call.
+        // Hand the freshly produced bytes to the file (C L114-L128). They occupy
+        // `out_buf[0..produced]`, so publishing the count is all that is required;
+        // whatever the OS declines to take stays pending for the next call.
+        //
+        // The window is front-anchored here by construction: `drain_pending`
+        // resets `out_start` to `0` when it empties the window, and it is only
+        // reached below when it returned `Ok`. Asserting rather than assigning is
+        // deliberate — a future change that broke the invariant must fail loudly in
+        // tests instead of silently discarding compressed bytes the OS never took.
+        debug_assert_eq!(
+            state.out_start, 0,
+            "the pending window must be empty and front-anchored before deflate"
+        );
         state.out_pending = outcome.produced;
         if let Err(e) = drain_pending(state) {
             return CompOutcome::err(consumed, e);
@@ -504,10 +716,36 @@ fn gz_comp_slice(state: &mut GzState, input: &[u8], flush: FlushMode) -> CompOut
 /// Propagates the [`ZlibError`] from [`gz_init`] (memory) or [`gz_comp_slice`]
 /// (a corrupt stream or a file write error); the state's error code is set as a
 /// side effect.
+///
+/// # Reporting the ingested count
+///
+/// Callers that must credit partial progress before reacting to a failure — the
+/// only one is [`gz_zero`], mirroring C's
+/// `n -= strm->avail_in; state->x.pos += n; state->skip -= n;` *before*
+/// `if (ret == -1) return -1;` (`gzwrite.c` L177-L181) — use
+/// [`gz_comp_counted`] instead, which is this function without the discarded
+/// count. The [`Result`](core::result::Result)-returning wrapper is kept because
+/// every other call site genuinely has nothing to do with the count, and
+/// widening them all would invite the mistake of ignoring it.
 pub(crate) fn gz_comp(state: &mut GzState, flush: FlushMode) -> Result<(), ZlibError> {
+    gz_comp_counted(state, flush).result
+}
+
+/// [`gz_comp`] that also reports how much of the buffered input the engine
+/// ingested, valid on the error paths as well as on success.
+///
+/// See [`gz_comp`] for the behaviour and [`CompOutcome`] for why the count has to
+/// survive the error. The reported count is the engine's true intake — the exact
+/// analogue of C's `n - strm->avail_in` — and is deliberately *not* the clamped
+/// value used below for the `in_buf` bookkeeping: a fatal error zeroes
+/// [`GzState::have`](crate::gz::state::GzState) to signal that nothing is left to
+/// hand back, which must not be mistaken for "nothing was taken".
+fn gz_comp_counted(state: &mut GzState, flush: FlushMode) -> CompOutcome {
     // Allocate memory if this is the first time through (C L70-L71).
     if state.size == 0 {
-        gz_init(state)?;
+        if let Err(e) = gz_init(state) {
+            return CompOutcome::err(0, e);
+        }
     }
 
     // Move the input buffer out so the borrow of its `[0..have]` slice does not
@@ -538,7 +776,7 @@ pub(crate) fn gz_comp(state: &mut GzState, flush: FlushMode) -> Result<(), ZlibE
         state.have = end - consumed;
     }
 
-    outcome.result
+    outcome
 }
 
 /// Compress [`GzState::skip`](crate::gz::state::GzState) zero bytes to the
@@ -548,9 +786,33 @@ pub(crate) fn gz_comp(state: &mut GzState, flush: FlushMode) -> Result<(), ZlibE
 /// compressing the requested number of zero bytes. Any buffered input is
 /// flushed first, then zeros are fed in `size`-sized chunks.
 ///
+/// # Crediting progress before propagating a failure
+///
+/// Each chunk's ingested count is added to
+/// [`GzState::pos`](crate::gz::state::GzState) and subtracted from
+/// [`GzState::skip`](crate::gz::state::GzState) **before** the chunk's result is
+/// inspected, which is the order C uses verbatim (`gzwrite.c` L177-L181):
+///
+/// ```text
+/// ret = gz_comp(state, Z_NO_FLUSH);
+/// n -= strm->avail_in;
+/// state->x.pos += n;
+/// state->skip -= n;
+/// if (ret == -1)
+///     return -1;
+/// ```
+///
+/// The order is what bounds the damage a non-blocking stall can do. `deflate` may
+/// have ingested part of the chunk before the drain hit
+/// `EAGAIN`/`EWOULDBLOCK`; if `skip` were left untouched (the shape `?` produces),
+/// the retry would regenerate every zero the engine had already compressed —
+/// emitting more zeros than the seek asked for, changing the output, and doing the
+/// work twice. Crediting first means the retry re-stages only the part of the
+/// chunk the engine did *not* take, exactly as reference zlib does.
+///
 /// # Errors
 ///
-/// Propagates the [`ZlibError`] from [`gz_comp`].
+/// Propagates the [`ZlibError`] from [`gz_comp`] / [`gz_comp_counted`].
 pub(crate) fn gz_zero(state: &mut GzState) -> Result<(), ZlibError> {
     // Consume whatever is left in the input buffer (C L160-L162).
     if state.have != 0 {
@@ -575,9 +837,35 @@ pub(crate) fn gz_zero(state: &mut GzState) -> Result<(), ZlibError> {
 
         // Present the `n` zero bytes as the buffered input and compress them.
         state.have = n;
-        gz_comp(state, FlushMode::NoFlush)?;
-        state.pos += n as i64;
-        state.skip -= n as i64;
+        let outcome = gz_comp_counted(state, FlushMode::NoFlush);
+
+        // Credit what the engine actually took, then react to the result — C's
+        // `n -= strm->avail_in; state->x.pos += n; state->skip -= n;` followed by
+        // `if (ret == -1) return -1;`. `consumed` can never exceed `n`, so `skip`
+        // cannot go negative and the loop still terminates.
+        debug_assert!(
+            outcome.consumed <= n,
+            "the engine cannot take more than it was given"
+        );
+        state.pos += outcome.consumed as i64;
+        state.skip -= outcome.consumed as i64;
+        outcome.result?;
+
+        // Termination guarantee. `skip` now shrinks by the ingested count rather
+        // than by the whole chunk, so forward progress is no longer structural: a
+        // step that reported success while ingesting nothing would re-stage the
+        // same chunk forever. `deflate` cannot legitimately do that — it is handed
+        // a non-empty scratch buffer (`want`, and therefore `size`, is at least
+        // `8`) together with at least one input byte, so it must consume, produce,
+        // or fail — which makes this unreachable in practice; reporting it as the
+        // engine misbehaviour it would be is the only safe alternative to spinning.
+        if outcome.consumed == 0 {
+            state.error(
+                ReturnCode::StreamError,
+                Some("internal error: deflate stream corrupt"),
+            );
+            return Err(ZlibError::StreamError);
+        }
     }
 
     Ok(())
@@ -1046,9 +1334,9 @@ mod tests {
 
     use super::*;
 
-    use crate::gz::state::{GzFile, How};
+    use crate::gz::state::How;
     use crate::stream::ZStream;
-    use std::fs::File;
+    use std::fs::{File, OpenOptions};
     use std::io::Read;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -1058,19 +1346,122 @@ mod tests {
     /// `Z_SYNC_FLUSH` numeric flush code (mirrors `FlushMode::SyncFlush`).
     const Z_SYNC_FLUSH: i32 = 2;
 
-    /// Generates a unique, process- and counter-tagged temporary file path.
+    /// A uniquely named output file inside a freshly created, caller-private
+    /// directory, removed together with that directory when the guard drops.
     ///
-    /// The `blitzy_adhoc_test_` prefix keeps these files out of any commit and
-    /// makes them easy to clean up.
-    fn temp_path(tag: &str) -> PathBuf {
-        static CTR: AtomicU32 = AtomicU32::new(0);
-        let n = CTR.fetch_add(1, Ordering::Relaxed);
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "blitzy_adhoc_test_gzwrite_{tag}_{}_{n}.gz",
-            std::process::id()
-        ));
-        p
+    /// Dereferences to [`Path`], so it can be passed anywhere a `&Path` is
+    /// expected.
+    ///
+    /// # Why not a bare path in the shared temporary directory
+    ///
+    /// Naming a file `…_<pid>_<counter>.gz` directly in [`std::env::temp_dir`] and
+    /// opening it with a truncating `File::create` is both guessable and
+    /// link-following: on a shared `/tmp` another user can pre-place — or race in
+    /// — a symlink at that name and have the test write through it to a target of
+    /// their choosing (CWE-377 insecure temporary file, CWE-59 link following,
+    /// CWE-367 time-of-check/time-of-use). Manual `remove_file` calls make it
+    /// worse rather than better, because a failing assertion unwinds straight past
+    /// them and leaves the name in place for the next attempt.
+    ///
+    /// So each file gets its own directory created with `mkdir(2)` semantics:
+    /// atomic, never following a symlink for the final component, and failing with
+    /// [`io::ErrorKind::AlreadyExists`] instead of adopting whatever is already
+    /// there. On Unix the mode is set to `0700` **at creation time**, leaving no
+    /// window in which another user could enumerate it, let alone plant a name
+    /// inside it. Files within it are opened with `create_new(true)`, which fails
+    /// rather than following a link or truncating. [`Drop`] then removes the
+    /// directory and its contents — on the unwinding path as well as the happy
+    /// one.
+    struct TempFile {
+        /// The private directory; removed recursively on drop.
+        dir: PathBuf,
+        /// The primary output path inside [`Self::dir`].
+        file: PathBuf,
+    }
+
+    impl TempFile {
+        /// Creates a fresh private directory tagged with `tag` and names an output
+        /// file inside it.
+        ///
+        /// # Panics
+        ///
+        /// If the directory cannot be created exclusively. A name collision is
+        /// retried with the next counter value rather than reported.
+        fn new(tag: &str) -> Self {
+            static CTR: AtomicU32 = AtomicU32::new(0);
+            let base = std::env::temp_dir();
+            for _ in 0..64 {
+                let n = CTR.fetch_add(1, Ordering::Relaxed);
+                // The `blitzy_adhoc_test_` prefix keeps these out of any commit.
+                let dir = base.join(format!(
+                    "blitzy_adhoc_test_gzwrite_{tag}_{}_{n}",
+                    std::process::id()
+                ));
+                match create_private_dir(&dir) {
+                    Ok(()) => {
+                        let file = dir.join("out.gz");
+                        return Self { dir, file };
+                    }
+                    // Someone (or a previous run) already owns that name: never
+                    // reuse it, just move on to the next candidate.
+                    Err(ref e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("create private temp dir {}: {e}", dir.display()),
+                }
+            }
+            panic!("no private temp directory could be created after 64 attempts");
+        }
+
+        /// A second path inside the *same* private directory, for the tests that
+        /// need two destinations.
+        fn sibling(&self, name: &str) -> PathBuf {
+            self.dir.join(name)
+        }
+    }
+
+    impl std::ops::Deref for TempFile {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.file
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            // Best effort: a test that already failed must not fail again here.
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Creates `dir` exclusively and restricted to the current user.
+    ///
+    /// `DirBuilder::mode` applies the permissions to the `mkdir(2)` call itself,
+    /// so the directory is never momentarily group- or world-accessible the way a
+    /// create-then-`set_permissions` sequence would leave it.
+    #[cfg(unix)]
+    fn create_private_dir(dir: &Path) -> io::Result<()> {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(dir)
+    }
+
+    /// Creates `dir` exclusively.
+    ///
+    /// Non-Unix targets get no explicit mode: Windows already gives each user a
+    /// private `%TEMP%`, and there is no portable `0700` equivalent to apply.
+    /// Exclusive creation — the part that defeats a pre-placed name — still holds.
+    #[cfg(not(unix))]
+    fn create_private_dir(dir: &Path) -> io::Result<()> {
+        std::fs::DirBuilder::new().create(dir)
+    }
+
+    /// Creates `path` exclusively: it must not already exist, no symlink at that
+    /// name is followed, and nothing is truncated.
+    fn create_new_file(path: &Path) -> File {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .unwrap_or_else(|e| panic!("exclusively create {}: {e}", path.display()))
     }
 
     /// Builds a fresh write-mode [`GzState`] backed by a real, truncated temp
@@ -1083,7 +1474,7 @@ mod tests {
         strategy: i32,
         direct: i32,
     ) -> GzState {
-        let file = File::create(path).expect("create writable temp file");
+        let file = create_new_file(path);
         GzState {
             have: 0,
             next: 0,
@@ -1108,6 +1499,7 @@ mod tests {
             strategy,
             reset: false,
             out_pending: 0,
+            out_start: 0,
             skip: 0,
             err: ReturnCode::Ok,
             msg: None,
@@ -1126,11 +1518,13 @@ mod tests {
         out
     }
 
-    /// Reads the whole file at `path`, then removes it, returning the bytes.
-    fn read_and_remove(path: &Path) -> Vec<u8> {
-        let bytes = std::fs::read(path).expect("read compressed output");
-        let _ = std::fs::remove_file(path);
-        bytes
+    /// Reads the whole file at `path`.
+    ///
+    /// Deliberately does **not** remove anything: cleanup belongs to the
+    /// [`TempFile`] guard, which runs even when an assertion below this call
+    /// unwinds past it.
+    fn read_output(path: &Path) -> Vec<u8> {
+        std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
     }
 
     /// Replaces a state's destination with a handle every `write` will reject,
@@ -1144,8 +1538,12 @@ mod tests {
     /// with no `unsafe`, no extra dependency, and no platform-specific flags
     /// (this module is `#![deny(unsafe_code)]`).
     fn wedge_destination(state: &mut GzState, path: &Path) {
-        File::create(path).expect("create temp file");
-        let ro = File::open(path).expect("reopen read-only");
+        // `path` was created exclusively by `new_write_state` inside a private
+        // 0700 directory, so reopening it by name cannot pick up a foreign file.
+        let ro = OpenOptions::new()
+            .read(true)
+            .open(path)
+            .unwrap_or_else(|e| panic!("reopen {} read-only: {e}", path.display()));
         state.file = GzFile::new(ro);
     }
 
@@ -1162,19 +1560,21 @@ mod tests {
             .collect()
     }
 
-    /// QA finding A/F-2, defect 1: output the destination declined must stay
-    /// pending, and a later successful drain must deliver it — losing nothing.
+    /// Output the destination declined stays pending, and a later successful drain
+    /// delivers it — losing nothing.
     ///
-    /// Before the fix, a drain that stopped early returned an error while
-    /// abandoning `out_buf[off..produced]`; the next `deflate` call overwrote
-    /// those bytes, so the destination received a spliced, undecodable DEFLATE
-    /// stream. The check is end-to-end: after the destination recovers, the
+    /// The invariant: a drain that stops early must not abandon
+    /// `out_buf[off..produced]`, because the next `deflate` call writes over that
+    /// region and the destination would then receive a spliced, undecodable
+    /// DEFLATE stream. The check is end-to-end: after the destination recovers, the
     /// bytes it received must gunzip to exactly the prefix of the input that the
     /// stream position claims was accepted.
     #[test]
     fn output_the_destination_declined_is_retained_and_resumes_without_loss() {
-        let wedged = temp_path("afdefect1_wedged");
-        let good = temp_path("afdefect1_good");
+        // Two destinations, one private directory: the wedged primary and a
+        // sibling that stands in for the destination recovering.
+        let wedged = TempFile::new("afdefect1");
+        let good = wedged.sibling("recovered.gz");
         let data = corpus(4096);
 
         // `want = 64` keeps `size` small, so the engine fills the output scratch
@@ -1201,13 +1601,12 @@ mod tests {
         );
 
         // The destination becomes writable again; finish the member.
-        state.file = GzFile::new(File::create(&good).expect("create good temp file"));
+        state.file = GzFile::new(create_new_file(&good));
         state.clear_error();
         gz_comp(&mut state, FlushMode::Finish).expect("the resumed flush succeeds");
         assert_eq!(state.out_pending, 0, "everything pending was delivered");
 
-        let bytes = read_and_remove(&good);
-        let _ = std::fs::remove_file(&wedged);
+        let bytes = read_output(&good);
         let recovered = gunzip(&bytes);
         assert_eq!(
             recovered.len(),
@@ -1221,16 +1620,15 @@ mod tests {
         );
     }
 
-    /// QA finding A/F-2, defect 2: a failed compress-and-write step must still
-    /// report how much input it ingested.
+    /// A failed compress-and-write step still reports how much input it ingested.
     ///
-    /// Before the fix the count was discarded with the error, so the stream
-    /// position did not advance at all and a caller retrying from the reported
-    /// offset resubmitted bytes `deflate` had already compressed — duplicating
-    /// them in the output.
+    /// The invariant: the ingested count must survive the error, because it is what
+    /// advances the stream position. Discarding it would leave the position
+    /// unmoved, and a caller retrying from the reported offset would resubmit bytes
+    /// `deflate` had already compressed — duplicating them in the output.
     #[test]
     fn a_failed_write_still_accounts_for_the_ingested_input() {
-        let wedged = temp_path("afdefect2");
+        let wedged = TempFile::new("afdefect2");
         let data = corpus(8192);
 
         let mut state = new_write_state(&wedged, 64, 6, 0, 0);
@@ -1246,7 +1644,6 @@ mod tests {
             (state.pos as usize) <= data.len(),
             "the accounted count can never exceed the input"
         );
-        let _ = std::fs::remove_file(&wedged);
     }
 
     /// The transparent (`direct`) path must likewise account for the bytes that
@@ -1254,7 +1651,7 @@ mod tests {
     /// rather than abandoning the tail silently.
     #[test]
     fn transparent_writes_report_failure_and_account_for_progress() {
-        let wedged = temp_path("afdefect2_direct");
+        let wedged = TempFile::new("afdefect2_direct");
         let data = corpus(2048);
 
         let mut state = new_write_state(&wedged, 64, 6, 0, 1);
@@ -1270,7 +1667,6 @@ mod tests {
             outcome.consumed, 0,
             "nothing reached a destination that rejects every write"
         );
-        let _ = std::fs::remove_file(&wedged);
     }
 
     /// A fatal (non-retryable) failure marks the file as having nothing left to
@@ -1282,7 +1678,7 @@ mod tests {
     /// is never resurrected on a stream that has just been declared dead.
     #[test]
     fn a_fatal_write_error_does_not_resurrect_buffered_input() {
-        let wedged = temp_path("afdefect2_haveclamp");
+        let wedged = TempFile::new("afdefect2_haveclamp");
 
         let mut state = new_write_state(&wedged, 128, 6, 0, 0);
         gz_init(&mut state).expect("gz_init");
@@ -1299,14 +1695,13 @@ mod tests {
             state.have, 0,
             "a fatal error leaves no buffered input to hand back"
         );
-        let _ = std::fs::remove_file(&wedged);
     }
 
     /// Buffered input is fully consumed on the ordinary success path, and the
     /// pending-output window is left empty.
     #[test]
     fn a_successful_comp_consumes_all_buffered_input() {
-        let path = temp_path("afdefect2_success");
+        let path = TempFile::new("afdefect2_success");
 
         let mut state = new_write_state(&path, 256, 6, 0, 0);
         gz_init(&mut state).expect("gz_init");
@@ -1318,13 +1713,623 @@ mod tests {
         assert_eq!(state.have, 0, "every buffered byte was ingested");
         assert_eq!(state.out_pending, 0, "every produced byte was delivered");
 
-        let bytes = read_and_remove(&path);
+        let bytes = read_output(&path);
         assert_eq!(gunzip(&bytes).as_slice(), data.as_slice());
+    }
+
+    /// A partial write must advance the pending-window cursor, not slide the
+    /// remainder back to `out_buf[0]`.
+    ///
+    /// Compaction is what turns a run of short writes into quadratic copying
+    /// (CWE-400): delivering an `N`-byte window one byte at a time would move
+    /// `(N-1) + (N-2) + … + 1` bytes, where C's `state->x.next += writ`
+    /// (`gzwrite.c` L124) moves none. The discriminating observation is the buffer
+    /// itself — after the cursor advances, every byte of the window is still at the
+    /// index `deflate` wrote it to.
+    #[test]
+    fn a_short_write_advances_the_cursor_instead_of_recopying_the_window() {
+        let path = TempFile::new("cursor");
+        let mut state = new_write_state(&path, 64, 6, 0, 0);
+        gz_init(&mut state).expect("gz_init");
+
+        // Stage a recognisable pending window by hand, exactly as a `deflate` call
+        // that produced 16 bytes would leave it.
+        let window: Vec<u8> = (0..16u8).collect();
+        state.out_buf[..window.len()].copy_from_slice(&window);
+        state.out_pending = window.len();
+        assert_eq!(state.out_start, 0, "a fresh window is front-anchored");
+
+        // The destination takes five bytes, then stalls.
+        {
+            let _fault = fault::script(&[fault::Step::Accept(5), fault::Step::WouldBlock]);
+            assert!(
+                drain_pending(&mut state).is_err(),
+                "the scripted stall is reported"
+            );
+            assert_eq!(fault::remaining(), 0, "both scripted steps were exercised");
+        }
+        assert!(state.again, "a WouldBlock stall is retryable");
+        assert_eq!(state.err, ReturnCode::ErrNo);
+        assert_eq!(
+            state.out_start, 5,
+            "the cursor advanced past what the OS took"
+        );
+        assert_eq!(
+            state.out_pending, 11,
+            "the untaken remainder is still pending"
+        );
+        assert_eq!(
+            &state.out_buf[..window.len()],
+            window.as_slice(),
+            "advancing a cursor must not move a single byte of the pending window"
+        );
+
+        // Retry against a destination that behaves: the remainder is delivered and
+        // the window re-anchors so the next `deflate` gets the whole scratch area.
+        state.clear_error();
+        drain_pending(&mut state).expect("the retry drains the remainder");
+        assert_eq!(state.out_pending, 0, "the window is empty");
+        assert_eq!(state.out_start, 0, "and re-anchored at the front");
+        assert_eq!(
+            read_output(&path),
+            window,
+            "every byte arrived exactly once, in order"
+        );
+    }
+
+    /// A destination that accepts one byte per write must produce **byte-identical**
+    /// output to one that accepts everything.
+    ///
+    /// This is the guarantee that makes the cursor safe to introduce at all: the
+    /// pending window is re-anchored only when it empties, so `deflate` always
+    /// receives `out_buf[..size]` from index `0` and the compressed byte sequence
+    /// cannot depend on how the destination chunked its acceptance.
+    #[test]
+    fn short_writes_do_not_change_a_single_output_byte() {
+        let data = corpus(4096);
+
+        // Baseline: an ordinary destination that accepts every write in full.
+        let plain = TempFile::new("dribble_baseline");
+        {
+            let mut state = new_write_state(&plain, 64, 6, 0, 0);
+            assert_eq!(gz_write(&mut state, &data), data.len());
+            assert_eq!(finish_write(&mut state), ReturnCode::Ok);
+        }
+        let expected = read_output(&plain);
+
+        // Same input, same settings, but one byte accepted per write.
+        let dribble = TempFile::new("dribble");
+        {
+            let mut state = new_write_state(&dribble, 64, 6, 0, 0);
+            let _fault = fault::cap_every_write(1);
+            assert_eq!(
+                gz_write(&mut state, &data),
+                data.len(),
+                "a dribbling destination still accepts the whole input"
+            );
+            assert_eq!(finish_write(&mut state), ReturnCode::Ok);
+            assert_eq!(state.out_pending, 0, "nothing was left undelivered");
+            assert_eq!(state.out_start, 0, "the window ends re-anchored");
+        }
+        let actual = read_output(&dribble);
+
+        assert_eq!(
+            actual, expected,
+            "the compressed bytes must not depend on how the destination chunked \
+             its writes"
+        );
+        assert_eq!(gunzip(&actual), data, "and the member still round-trips");
+    }
+
+    // ---------------------------------------------------------------------
+    // Write-outcome branch coverage.
+    //
+    // An operating-system write reports exactly four outcomes, and both output
+    // loops must handle each one differently: accept-everything, accept-a-prefix
+    // (`Ok(n)`), `EINTR` ([`io::ErrorKind::Interrupted`]), `EAGAIN`
+    // ([`io::ErrorKind::WouldBlock`]), and accept-nothing (`Ok(0)`). Only the
+    // first is exercised by an ordinary file, so each of the others is driven
+    // through the [`fault`] seam against the **production** loops themselves —
+    // `drain_pending` and `write_direct` — rather than against a copy of them, so
+    // a divergence between the tested code and the shipped code is impossible.
+    //
+    // The retry flag and the pending-window bookkeeping are asserted alongside
+    // the delivered bytes, because a loop can deliver the right bytes while still
+    // leaving a caller unable to resume.
+    // ---------------------------------------------------------------------
+
+    /// Stages `window` as a hand-built pending output window on `state`, exactly
+    /// as a `deflate` call that produced those bytes would leave it.
+    ///
+    /// Asserts the front-anchored precondition the compress loop guarantees
+    /// (`out_pending == 0 ⇒ out_start == 0`), so a test that starts from a stale
+    /// cursor fails here rather than misattributing the cause later.
+    fn stage_pending_window(state: &mut GzState, window: &[u8]) {
+        assert_eq!(state.out_pending, 0, "the window must start empty");
+        assert_eq!(state.out_start, 0, "and therefore front-anchored");
+        assert!(
+            window.len() <= state.out_buf.len(),
+            "the staged window must fit the scratch area"
+        );
+        state.out_buf[..window.len()].copy_from_slice(window);
+        state.out_pending = window.len();
+    }
+
+    /// Drain branch 1 of 3 — `Interrupted`: the write is retried, and the retry
+    /// resubmits only what the OS did not take.
+    ///
+    /// `EINTR` means no byte moved, so the correct response is to reissue the same
+    /// window unchanged. Treating it as an error would abort a perfectly healthy
+    /// stream on any signal; advancing the cursor for it would drop bytes.
+    #[test]
+    fn drain_pending_retries_an_interrupted_write_without_duplicating_bytes() {
+        let path = TempFile::new("drain_eintr");
+        let mut state = new_write_state(&path, 64, 6, 0, 0);
+        gz_init(&mut state).expect("gz_init");
+
+        let window: Vec<u8> = (0..16u8).collect();
+        stage_pending_window(&mut state, &window);
+        // Deliberately stale: the first attempt must clear it.
+        state.again = true;
+
+        {
+            let _fault = fault::script(&[
+                fault::Step::Interrupted,
+                fault::Step::Accept(3),
+                fault::Step::Interrupted,
+                fault::Step::Accept(usize::MAX),
+            ]);
+            drain_pending(&mut state).expect("an interrupted write is retried, never reported");
+            assert_eq!(fault::remaining(), 0, "every scripted step was exercised");
+        }
+
+        assert_eq!(state.out_pending, 0, "every pending byte was delivered");
+        assert_eq!(state.out_start, 0, "and the window re-anchored");
+        assert!(!state.again, "a completed drain leaves no retry pending");
+        assert_eq!(state.err, ReturnCode::Ok, "an EINTR retry is not an error");
+        assert_eq!(
+            read_output(&path),
+            window,
+            "the retries must not duplicate, drop, or reorder a byte"
+        );
+    }
+
+    /// Drain branch 2 of 3 — `WouldBlock`: every undelivered byte stays
+    /// addressable through the cursor, and `again` is set so the caller may retry.
+    ///
+    /// This is the transition the pending window exists for. The companion test
+    /// [`a_short_write_advances_the_cursor_instead_of_recopying_the_window`]
+    /// asserts the cursor *arithmetic*; this one asserts the *bytes* — that
+    /// `out_buf[out_start..out_start + out_pending]` names exactly the tail the OS
+    /// declined, and that the destination received exactly the accepted prefix and
+    /// nothing more.
+    #[test]
+    fn drain_pending_stall_keeps_the_undelivered_tail_addressable() {
+        let path = TempFile::new("drain_eagain");
+        let mut state = new_write_state(&path, 64, 6, 0, 0);
+        gz_init(&mut state).expect("gz_init");
+
+        let window: Vec<u8> = (0..16u8).collect();
+        stage_pending_window(&mut state, &window);
+
+        {
+            let _fault = fault::script(&[fault::Step::Accept(3), fault::Step::WouldBlock]);
+            assert_eq!(
+                drain_pending(&mut state),
+                Err(ZlibError::ErrNo),
+                "a non-blocking stall is reported to the caller"
+            );
+            assert_eq!(fault::remaining(), 0, "both scripted steps were exercised");
+        }
+
+        assert!(state.again, "a stall is retryable, so `again` must be set");
+        assert_eq!(state.err, ReturnCode::ErrNo, "a stall reports Z_ERRNO");
+        assert_eq!(
+            state.out_pending, 13,
+            "the undelivered tail is still pending"
+        );
+        let start = state.out_start;
+        assert_eq!(
+            &state.out_buf[start..start + state.out_pending],
+            &window[3..],
+            "the cursor names exactly the bytes the destination declined"
+        );
+        assert_eq!(
+            read_output(&path),
+            window[..3].to_vec(),
+            "only the accepted prefix reached the destination"
+        );
+
+        // The destination recovers: the retained tail is delivered once, in order.
+        state.clear_error();
+        drain_pending(&mut state).expect("the resumed drain succeeds");
+        assert_eq!(state.out_pending, 0, "everything pending was delivered");
+        assert_eq!(
+            read_output(&path),
+            window,
+            "the retained bytes were delivered exactly once"
+        );
+    }
+
+    /// Drain branch 3 of 3 — `Ok(0)`: the refusal is reported, and the retained
+    /// bytes are neither dropped nor resurrected.
+    ///
+    /// A destination that accepts nothing while output remains can take no more, so
+    /// spinning would hang and breaking out silently would lose the tail. Unlike a
+    /// stall this is not advertised as retryable, yet the window must still survive
+    /// intact — the second drain proves it is delivered once and in full.
+    #[test]
+    fn drain_pending_reports_a_destination_that_accepts_nothing_without_losing_data() {
+        let path = TempFile::new("drain_zero");
+        let mut state = new_write_state(&path, 64, 6, 0, 0);
+        gz_init(&mut state).expect("gz_init");
+
+        let window: Vec<u8> = (0..16u8).collect();
+        stage_pending_window(&mut state, &window);
+
+        {
+            let _fault = fault::script(&[fault::Step::Accept(2), fault::Step::Refuse]);
+            assert_eq!(
+                drain_pending(&mut state),
+                Err(ZlibError::ErrNo),
+                "a destination that takes nothing is reported, not spun on"
+            );
+            assert_eq!(fault::remaining(), 0, "both scripted steps were exercised");
+        }
+
+        assert!(!state.again, "`Ok(0)` is not a retryable stall");
+        assert_eq!(
+            state.err,
+            ReturnCode::ErrNo,
+            "zero progress reports Z_ERRNO"
+        );
+        assert_eq!(state.out_pending, 14, "the refused tail is still pending");
+        let start = state.out_start;
+        assert_eq!(
+            &state.out_buf[start..start + state.out_pending],
+            &window[2..],
+            "the refused tail stays addressable through the cursor"
+        );
+        assert_eq!(
+            read_output(&path),
+            window[..2].to_vec(),
+            "only the accepted prefix reached the destination"
+        );
+
+        state.clear_error();
+        drain_pending(&mut state).expect("the resumed drain succeeds");
+        assert_eq!(state.out_pending, 0, "everything pending was delivered");
+        assert_eq!(state.out_start, 0, "and the window re-anchored");
+        assert_eq!(
+            read_output(&path),
+            window,
+            "the retained bytes were delivered once, in order"
+        );
+    }
+
+    /// Transparent branch 1 of 3 — `Interrupted`: the copy is retried and every
+    /// byte of the caller's slice reaches the file exactly once.
+    #[test]
+    fn write_direct_retries_an_interrupted_write_without_duplicating_bytes() {
+        let path = TempFile::new("direct_eintr");
+        let mut state = new_write_state(&path, 64, 6, 0, 1);
+        let input = b"transparent-copy";
+        // Deliberately stale: the first attempt must clear it.
+        state.again = true;
+
+        let outcome = {
+            let _fault = fault::script(&[
+                fault::Step::Accept(4),
+                fault::Step::Interrupted,
+                fault::Step::Accept(6),
+                fault::Step::Accept(usize::MAX),
+            ]);
+            let outcome = write_direct(&mut state, input);
+            assert_eq!(fault::remaining(), 0, "every scripted step was exercised");
+            outcome
+        };
+
+        assert!(outcome.result.is_ok(), "an interrupted write is retried");
+        assert_eq!(
+            outcome.consumed,
+            input.len(),
+            "the full length is reported as written"
+        );
+        assert!(!state.again, "a completed copy leaves no retry pending");
+        assert_eq!(state.err, ReturnCode::Ok, "an EINTR retry is not an error");
+        assert_eq!(
+            read_output(&path),
+            input.to_vec(),
+            "the retry must not duplicate, drop, or reorder a byte"
+        );
+    }
+
+    /// Transparent branch 2 of 3 — `WouldBlock`: the true progress count is
+    /// reported and `again` is set, so a retry resumes instead of duplicating.
+    ///
+    /// Under-reporting here is precisely what would make a caller resubmit bytes the
+    /// file already holds, so the count matters as much as the error does.
+    #[test]
+    fn write_direct_stall_reports_true_progress_and_sets_again() {
+        let path = TempFile::new("direct_eagain");
+        let mut state = new_write_state(&path, 64, 6, 0, 1);
+        let input = b"transparent-copy";
+
+        let outcome = {
+            let _fault = fault::script(&[fault::Step::Accept(4), fault::Step::WouldBlock]);
+            let outcome = write_direct(&mut state, input);
+            assert_eq!(fault::remaining(), 0, "both scripted steps were exercised");
+            outcome
+        };
+
+        assert_eq!(
+            outcome.result,
+            Err(ZlibError::ErrNo),
+            "a stalled transparent write reports Z_ERRNO"
+        );
+        assert!(state.again, "a stall is retryable, so `again` must be set");
+        assert_eq!(
+            outcome.consumed, 4,
+            "progress is reported on the error path too"
+        );
+        assert_eq!(
+            read_output(&path),
+            input[..4].to_vec(),
+            "exactly the reported prefix reached the destination"
+        );
+    }
+
+    /// Transparent branch 3 of 3 — `Ok(0)`: the refusal is reported with the true
+    /// progress count, and the unwritten tail is not silently discarded.
+    ///
+    /// The caller still owns the tail here — no pending window is needed — so an
+    /// accurate `consumed` is the whole of what a resume requires.
+    #[test]
+    fn write_direct_reports_a_destination_that_accepts_nothing_with_true_progress() {
+        let path = TempFile::new("direct_zero");
+        let mut state = new_write_state(&path, 64, 6, 0, 1);
+        let input = b"transparent-copy";
+
+        let outcome = {
+            let _fault = fault::script(&[fault::Step::Accept(5), fault::Step::Refuse]);
+            let outcome = write_direct(&mut state, input);
+            assert_eq!(fault::remaining(), 0, "both scripted steps were exercised");
+            outcome
+        };
+
+        assert_eq!(
+            outcome.result,
+            Err(ZlibError::ErrNo),
+            "zero progress reports Z_ERRNO rather than spinning"
+        );
+        assert!(!state.again, "`Ok(0)` is not a retryable stall");
+        assert_eq!(
+            outcome.consumed, 5,
+            "the accepted prefix is reported, not zero"
+        );
+        assert_eq!(
+            read_output(&path),
+            input[..5].to_vec(),
+            "exactly the reported prefix reached the destination"
+        );
+
+        // A resumed copy from the reported offset delivers the rest exactly once.
+        state.clear_error();
+        let rest = write_direct(&mut state, &input[outcome.consumed..]);
+        assert!(rest.result.is_ok(), "the resumed copy succeeds");
+        assert_eq!(
+            outcome.consumed + rest.consumed,
+            input.len(),
+            "the two copies cover the input once"
+        );
+        assert_eq!(
+            read_output(&path),
+            input.to_vec(),
+            "the tail was delivered once, in order"
+        );
+    }
+
+    /// The retry flag is per-attempt state, not sticky history: the drain that
+    /// stalls sets it, and the drain that recovers clears it.
+    ///
+    /// This is why both loops assign `again = false` at the top of every attempt
+    /// rather than once on entry. A caller consulting the flag after a successful
+    /// resume must see "no retry pending"; a flag left set from an earlier stall
+    /// would advertise a stall that no longer exists.
+    #[test]
+    fn a_recovered_stall_clears_the_retry_flag() {
+        let path = TempFile::new("flag_drain");
+        let mut state = new_write_state(&path, 64, 6, 0, 0);
+        gz_init(&mut state).expect("gz_init");
+
+        let window: Vec<u8> = (0..16u8).collect();
+        stage_pending_window(&mut state, &window);
+
+        {
+            let _fault = fault::script(&[fault::Step::Accept(3), fault::Step::WouldBlock]);
+            drain_pending(&mut state).expect_err("the first drain stalls");
+        }
+        assert!(state.again, "the stall set the retry flag");
+
+        // Same state, same window: the recovery must reset the flag.
+        state.clear_error();
+        drain_pending(&mut state).expect("the resumed drain succeeds");
+        assert!(!state.again, "the recovery cleared the retry flag");
+        assert_eq!(
+            state.out_pending, 0,
+            "and delivered everything still pending"
+        );
+
+        // The transparent path shares the contract, so it shares the check.
+        let direct = TempFile::new("flag_direct");
+        let mut state = new_write_state(&direct, 64, 6, 0, 1);
+        let input = b"transparent-copy";
+
+        let stalled = {
+            let _fault = fault::script(&[fault::Step::Accept(4), fault::Step::WouldBlock]);
+            write_direct(&mut state, input)
+        };
+        assert!(stalled.result.is_err(), "the first copy stalls");
+        assert!(state.again, "the stall set the retry flag");
+
+        state.clear_error();
+        let rest = write_direct(&mut state, &input[stalled.consumed..]);
+        assert!(rest.result.is_ok(), "the resumed copy succeeds");
+        assert!(!state.again, "the recovery cleared the retry flag");
+        assert_eq!(
+            stalled.consumed + rest.consumed,
+            input.len(),
+            "and covered the input once"
+        );
+    }
+
+    /// Nothing to move means no attempt at all: the destination is never touched
+    /// and the retry flag keeps describing the attempt that last ran.
+    ///
+    /// Both loops clear the flag at the top of each *attempt*, not once on entry,
+    /// so a zero-length drain or copy is inert. That is what stops an incidental
+    /// no-op call — `gz_deflate_loop` drains after every `deflate`, most of which
+    /// produce nothing — from issuing a pointless zero-byte write or from erasing a
+    /// caller's still-valid retry state.
+    #[test]
+    fn an_empty_transfer_touches_neither_the_destination_nor_the_retry_flag() {
+        let path = TempFile::new("empty_transfer");
+        let mut state = new_write_state(&path, 64, 6, 0, 0);
+        gz_init(&mut state).expect("gz_init");
+        assert_eq!(state.out_pending, 0, "the window starts empty");
+        state.again = true;
+
+        // A script the loops must never reach: consuming it would prove a write
+        // was attempted.
+        let _fault = fault::script(&[fault::Step::Refuse]);
+
+        drain_pending(&mut state).expect("an empty window drains trivially");
+        assert_eq!(fault::remaining(), 1, "no write was attempted");
+        assert!(state.again, "no attempt ran, so the flag is unchanged");
+        assert_eq!(state.out_start, 0, "and the empty window stays anchored");
+
+        let outcome = write_direct(&mut state, &[]);
+        assert!(outcome.result.is_ok(), "an empty copy succeeds trivially");
+        assert_eq!(outcome.consumed, 0, "and reports no progress");
+        assert_eq!(fault::remaining(), 1, "still no write was attempted");
+        assert!(
+            state.again,
+            "no attempt ran, so the flag is still unchanged"
+        );
+        assert!(
+            read_output(&path).is_empty(),
+            "the destination received nothing at all"
+        );
+    }
+
+    /// A zero-fill that stalls part-way must credit the zeros it already
+    /// compressed before it reports the stall.
+    ///
+    /// C does this explicitly — `n -= strm->avail_in; state->x.pos += n;
+    /// state->skip -= n;` runs *before* `if (ret == -1) return -1;`
+    /// (`gzwrite.c` L177-L181). Propagating first (what `?` does) would leave
+    /// `skip` at its full value, so the retry would regenerate every zero the
+    /// engine had already taken: more zeros than the seek asked for, different
+    /// output bytes, and the work done twice (CWE-252, CWE-400).
+    #[test]
+    fn a_stalled_zero_fill_credits_the_zeros_it_already_compressed() {
+        let path = TempFile::new("zerostall");
+        let mut state = new_write_state(&path, 64, 6, 0, 0);
+        gz_init(&mut state).expect("gz_init");
+        let total: i64 = 200;
+        state.skip = total;
+
+        // The first chunk of zeros makes `deflate` emit the gzip header, so the
+        // very first drain has something to deliver — and that is what stalls.
+        {
+            let _fault = fault::script(&[fault::Step::WouldBlock]);
+            assert!(gz_zero(&mut state).is_err(), "the stall is reported");
+            assert_eq!(fault::remaining(), 0, "the scripted stall was reached");
+        }
+        assert!(state.again, "a WouldBlock stall is retryable");
+        assert_eq!(state.err, ReturnCode::ErrNo);
+        assert!(
+            state.out_pending > 0,
+            "the header the destination declined is still pending"
+        );
+
+        let credited = state.pos;
+        assert!(
+            credited > 0,
+            "the zeros deflate ingested before the stall must be credited"
+        );
+        assert_eq!(
+            state.skip,
+            total - credited,
+            "the gap shrank by exactly the credited count"
+        );
+        assert_eq!(
+            state.have, 0,
+            "deflate took the whole staged chunk, so nothing is left to re-stage"
+        );
+
+        // Retry against a destination that behaves. Because the ingested prefix was
+        // credited, the fill emits the remaining zeros and no others.
+        state.clear_error();
+        gz_zero(&mut state).expect("the retried fill completes");
+        assert_eq!(state.skip, 0, "the whole gap was realized");
+        assert_eq!(state.pos, total, "and counted exactly once");
+
+        assert_eq!(finish_write(&mut state), ReturnCode::Ok);
+        assert_eq!(
+            gunzip(&read_output(&path)),
+            vec![0u8; total as usize],
+            "exactly the requested number of zeros, none regenerated"
+        );
+    }
+
+    /// The transparent (`direct`) zero-fill credits exactly the bytes that reached
+    /// the destination, and leaves the untaken remainder of the chunk buffered.
+    ///
+    /// This is C's behaviour term for term: the direct branch of `gz_comp` leaves
+    /// `strm->avail_in` describing what it could not write, `gz_zero` recovers the
+    /// difference with `n -= strm->avail_in`, and the retry re-stages that
+    /// remainder through the "consume whatever's left in the input buffer" step at
+    /// the top of `gz_zero` (`gzwrite.c` L160-L162). The remainder is therefore
+    /// re-sent but not re-credited — deliberately identical to reference zlib,
+    /// which is what byte-for-byte compatibility requires.
+    #[test]
+    fn a_stalled_transparent_zero_fill_credits_only_what_reached_the_file() {
+        let path = TempFile::new("zerostall_direct");
+        let mut state = new_write_state(&path, 64, 6, 0, 1);
+        gz_init(&mut state).expect("gz_init");
+        let total: i64 = 200;
+        state.skip = total;
+
+        {
+            let _fault = fault::script(&[fault::Step::Accept(20), fault::Step::WouldBlock]);
+            assert!(gz_zero(&mut state).is_err(), "the stall is reported");
+            assert_eq!(fault::remaining(), 0, "both scripted steps were exercised");
+        }
+        assert!(state.again, "a WouldBlock stall is retryable");
+        assert_eq!(
+            state.pos, 20,
+            "exactly the bytes the destination took are credited"
+        );
+        assert_eq!(
+            state.skip,
+            total - 20,
+            "and exactly those are removed from the gap"
+        );
+        assert_eq!(
+            state.have, 44,
+            "the untaken remainder of the staged chunk stays buffered for the retry"
+        );
+        assert_eq!(
+            read_output(&path),
+            vec![0u8; 20],
+            "only the accepted prefix reached the file"
+        );
     }
 
     #[test]
     fn write_ready_requires_write_mode_and_no_serious_error() {
-        let path = temp_path("ready");
+        let path = TempFile::new("ready");
         let mut state = new_write_state(&path, 8192, 6, 0, 0);
         assert!(write_ready(&state), "fresh write stream is ready");
 
@@ -1340,13 +2345,11 @@ mod tests {
             write_ready(&state),
             "a pending non-blocking retry is writable"
         );
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn gz_init_allocates_buffers_and_engine_for_gzip() {
-        let path = temp_path("init_gzip");
+        let path = TempFile::new("init_gzip");
         let mut state = new_write_state(&path, 128, 6, 0, 0);
         gz_init(&mut state).expect("gz_init succeeds");
 
@@ -1355,13 +2358,11 @@ mod tests {
         assert_eq!(state.out_buf.len(), 128, "output buffer is want");
         assert_eq!(state.size, 128, "size marks the buffers as initialized");
         assert!(state.strm.is_deflate(), "a deflate engine was initialized");
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn gz_init_direct_skips_output_buffer_and_engine() {
-        let path = temp_path("init_direct");
+        let path = TempFile::new("init_direct");
         let mut state = new_write_state(&path, 128, 6, 0, 1);
         gz_init(&mut state).expect("gz_init succeeds");
 
@@ -1376,8 +2377,6 @@ mod tests {
             !state.strm.is_deflate(),
             "no deflate engine for a transparent stream"
         );
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1388,7 +2387,7 @@ mod tests {
         // reports that as `Z_MEM_ERROR` / "out of memory" (C L37-L43) and
         // returns -1. The value must never be silently replaced by a default.
         for bad in [5, 6, -1, i32::MIN, i32::MAX] {
-            let path = temp_path("badstrategy");
+            let path = TempFile::new("badstrategy");
             let mut state = new_write_state(&path, 128, 6, bad, 0);
 
             assert_eq!(
@@ -1420,8 +2419,6 @@ mod tests {
                 !state.strm.is_deflate(),
                 "no engine is installed by a failed init"
             );
-
-            let _ = std::fs::remove_file(&path);
         }
     }
 
@@ -1431,15 +2428,75 @@ mod tests {
         // all five valid strategies (`Z_DEFAULT_STRATEGY`..=`Z_FIXED`) still
         // initialize the engine.
         for good in 0..=4 {
-            let path = temp_path("goodstrategy");
+            let path = TempFile::new("goodstrategy");
             let mut state = new_write_state(&path, 128, 6, good, 0);
 
             gz_init(&mut state).expect("a valid strategy initializes the engine");
             assert_eq!(state.size, 128, "initialization completed");
             assert!(state.strm.is_deflate(), "a deflate engine was installed");
             assert_eq!(state.err, ReturnCode::Ok, "no error was recorded");
+        }
+    }
 
-            let _ = std::fs::remove_file(&path);
+    /// A failed `gz_init` must not retain the buffers it had already allocated.
+    ///
+    /// C frees them on every failure return — `free(state->in)` before the output
+    /// allocation's failure, `free(state->out); free(state->in);` before the
+    /// `deflateInit2` failure (`gzwrite.c` L19-L44). Keeping them would strand
+    /// `3 * want` bytes (the doubled input buffer plus the output buffer) for the
+    /// rest of the stream's life on a configuration that can never succeed
+    /// (CWE-401), and a caller is free to have asked for a very large `gzbuffer`.
+    ///
+    /// Both failure points are covered: the strategy conversion, which fails after
+    /// *both* buffers exist, and `deflate_init2` itself via an out-of-range level.
+    /// What a caller observes — the returned error, `state.err`, the `gzerror`
+    /// text, and `size` still being `0` — is asserted unchanged by
+    /// `gz_init_rejects_out_of_range_strategy_like_c` and its level counterpart.
+    #[test]
+    fn a_failed_gz_init_releases_the_buffers_it_allocated() {
+        // `want` is deliberately large so a leak would be unmistakable: 64 KiB of
+        // output buffer plus 128 KiB of input buffer per failed attempt.
+        const WANT: usize = 1 << 16;
+
+        for (label, level, strategy) in [
+            ("out-of-range strategy", 6, 5),
+            ("out-of-range level", 10, 0),
+        ] {
+            let path = TempFile::new("init_rollback");
+            let mut state = new_write_state(&path, WANT, level, strategy, 0);
+
+            assert_eq!(
+                gz_init(&mut state),
+                Err(ZlibError::MemError),
+                "{label} must fail the deferred init"
+            );
+            assert_eq!(state.err, ReturnCode::MemError, "{label}: code preserved");
+            assert_eq!(
+                state.size, 0,
+                "{label}: the stream is still marked uninitialized, exactly as in C"
+            );
+            assert!(
+                state.in_buf.is_empty() && state.in_buf.capacity() == 0,
+                "{label}: the input buffer was released (C `free(state->in)`)"
+            );
+            assert!(
+                state.out_buf.is_empty() && state.out_buf.capacity() == 0,
+                "{label}: the output buffer was released (C `free(state->out)`)"
+            );
+            assert!(
+                !state.strm.is_deflate(),
+                "{label}: no engine state is left installed"
+            );
+
+            // The rollback must leave the state genuinely re-initializable, the way
+            // a C caller who fixes the parameter and writes again would expect.
+            state.strategy = 0;
+            state.level = 6;
+            state.clear_error();
+            gz_init(&mut state).expect("a corrected configuration initializes");
+            assert_eq!(state.size, WANT, "{label}: the retry allocated cleanly");
+            assert_eq!(state.in_buf.len(), WANT << 1);
+            assert_eq!(state.out_buf.len(), WANT);
         }
     }
 
@@ -1449,7 +2506,7 @@ mod tests {
         // on a writer that has not performed any I/O yet: the first write fails
         // (returns 0), and the error is retrievable afterwards. Compare the
         // out-of-range *level* case below — both parameters behave identically.
-        let path = temp_path("badstrategy_write");
+        let path = TempFile::new("badstrategy_write");
         let mut state = new_write_state(&path, 128, 6, 5, 0);
 
         assert_eq!(
@@ -1465,8 +2522,6 @@ mod tests {
             "the failure is retrievable through gzerror"
         );
         assert_eq!(code, ReturnCode::MemError.as_c_int());
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1474,7 +2529,7 @@ mod tests {
         // The symmetry proof: an out-of-range level is rejected by
         // `deflate_init2` itself, and reaches the caller through exactly the
         // same `gz_init` failure path as an out-of-range strategy.
-        let path = temp_path("badlevel_write");
+        let path = TempFile::new("badlevel_write");
         let mut state = new_write_state(&path, 128, 10, 0, 0);
 
         assert_eq!(
@@ -1490,29 +2545,26 @@ mod tests {
             "the failure is retrievable through gzerror"
         );
         assert_eq!(code, ReturnCode::MemError.as_c_int());
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn gz_write_empty_is_noop() {
-        let path = temp_path("empty");
+        let path = TempFile::new("empty");
         let mut state = new_write_state(&path, 8192, 6, 0, 0);
         assert_eq!(gz_write(&mut state, &[]), 0, "empty write consumes nothing");
         assert_eq!(state.size, 0, "an empty write does not trigger gz_init");
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn roundtrip_small_gzwrite() {
-        let path = temp_path("small");
+        let path = TempFile::new("small");
         let data = b"The quick brown fox jumps over the lazy dog.";
         {
             let mut state = new_write_state(&path, 8192, 6, 0, 0);
             assert_eq!(gzwrite(&mut state, data), data.len() as i32);
             assert_eq!(finish_write(&mut state), ReturnCode::Ok);
         }
-        let compressed = read_and_remove(&path);
+        let compressed = read_output(&path);
         assert!(
             compressed.starts_with(&[0x1f, 0x8b, 0x08]),
             "gzip magic + deflate method are present"
@@ -1522,7 +2574,7 @@ mod tests {
 
     #[test]
     fn roundtrip_crosses_small_buffer() {
-        let path = temp_path("large");
+        let path = TempFile::new("large");
         // ~9 KiB of semi-repetitive data, far larger than the tiny buffer, so
         // both the small-write-buffering and large-write-direct-feed paths run.
         let mut data = Vec::new();
@@ -1534,13 +2586,13 @@ mod tests {
             assert_eq!(gzwrite(&mut state, &data), data.len() as i32);
             assert_eq!(finish_write(&mut state), ReturnCode::Ok);
         }
-        let compressed = read_and_remove(&path);
+        let compressed = read_output(&path);
         assert_eq!(gunzip(&compressed), data, "large input round-trips");
     }
 
     #[test]
     fn roundtrip_mixed_putc_puts_printf() {
-        let path = temp_path("mixed");
+        let path = TempFile::new("mixed");
         let mut expected = Vec::new();
         {
             let mut state = new_write_state(&path, 8192, 6, 0, 0);
@@ -1557,13 +2609,13 @@ mod tests {
 
             assert_eq!(finish_write(&mut state), ReturnCode::Ok);
         }
-        let compressed = read_and_remove(&path);
+        let compressed = read_output(&path);
         assert_eq!(gunzip(&compressed), expected, "mixed API round-trips");
     }
 
     #[test]
     fn gzputc_uses_input_buffer_fast_path() {
-        let path = temp_path("putc");
+        let path = TempFile::new("putc");
         let mut state = new_write_state(&path, 8192, 6, 0, 0);
 
         // First putc lazily initializes (via gz_write) and buffers one byte.
@@ -1576,20 +2628,18 @@ mod tests {
         assert_eq!(state.have, 2);
         assert_eq!(state.in_buf[1], 0x42);
         assert_eq!(state.pos, 2);
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn direct_mode_writes_transparently() {
-        let path = temp_path("direct");
+        let path = TempFile::new("direct");
         let data = b"raw passthrough, no gzip framing here";
         {
             let mut state = new_write_state(&path, 8192, 6, 0, 1);
             assert_eq!(gzwrite(&mut state, data), data.len() as i32);
             assert_eq!(finish_write(&mut state), ReturnCode::Ok);
         }
-        let written = read_and_remove(&path);
+        let written = read_output(&path);
         assert_eq!(written, data, "direct mode writes the bytes verbatim");
     }
 
@@ -1599,7 +2649,7 @@ mod tests {
         let data: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
         for level in [0, 1, 6, 9, -1] {
             for strategy in [0, 1, 2, 3, 4] {
-                let path = temp_path("lvlstrat");
+                let path = TempFile::new("lvlstrat");
                 {
                     let mut state = new_write_state(&path, 8192, level, strategy, 0);
                     assert_eq!(
@@ -1613,7 +2663,7 @@ mod tests {
                         "level {level} strategy {strategy} finalizes cleanly"
                     );
                 }
-                let compressed = read_and_remove(&path);
+                let compressed = read_output(&path);
                 assert_eq!(
                     gunzip(&compressed),
                     data,
@@ -1625,7 +2675,7 @@ mod tests {
 
     #[test]
     fn gzflush_sync_then_continue() {
-        let path = temp_path("flush");
+        let path = TempFile::new("flush");
         {
             let mut state = new_write_state(&path, 8192, 6, 0, 0);
             assert_eq!(gzwrite(&mut state, b"first-"), 6);
@@ -1637,7 +2687,7 @@ mod tests {
             assert_eq!(gzwrite(&mut state, b"second"), 6);
             assert_eq!(finish_write(&mut state), ReturnCode::Ok);
         }
-        let compressed = read_and_remove(&path);
+        let compressed = read_output(&path);
         assert_eq!(
             gunzip(&compressed),
             b"first-second",
@@ -1647,39 +2697,37 @@ mod tests {
 
     #[test]
     fn gzflush_rejects_out_of_range_flush() {
-        let path = temp_path("flushbad");
+        let path = TempFile::new("flushbad");
         let mut state = new_write_state(&path, 8192, 6, 0, 0);
         assert_eq!(gzflush(&mut state, 99), ReturnCode::StreamError.as_c_int());
         assert_eq!(gzflush(&mut state, -1), ReturnCode::StreamError.as_c_int());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn gzfwrite_returns_full_item_count() {
-        let path = temp_path("fwrite");
+        let path = TempFile::new("fwrite");
         let buf = b"ABCDEFGHIJKL"; // 12 bytes = 3 items of 4
         {
             let mut state = new_write_state(&path, 8192, 6, 0, 0);
             assert_eq!(gzfwrite(&mut state, buf, 4, 3), 3, "3 full items written");
             assert_eq!(finish_write(&mut state), ReturnCode::Ok);
         }
-        let compressed = read_and_remove(&path);
+        let compressed = read_output(&path);
         assert_eq!(gunzip(&compressed), buf, "gzfwrite payload round-trips");
     }
 
     #[test]
     fn gzfwrite_overflow_is_rejected() {
-        let path = temp_path("fwrite_ovf");
+        let path = TempFile::new("fwrite_ovf");
         let mut state = new_write_state(&path, 8192, 6, 0, 0);
         // size * nitems overflows usize -> rejected with a stream error.
         assert_eq!(gzfwrite(&mut state, b"x", usize::MAX, 2), 0);
         assert_eq!(state.err, ReturnCode::StreamError);
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn gzwrite_on_read_mode_returns_zero() {
-        let path = temp_path("notwrite");
+        let path = TempFile::new("notwrite");
         let mut state = new_write_state(&path, 8192, 6, 0, 0);
         state.mode = GzMode::Read;
         assert_eq!(
@@ -1687,12 +2735,11 @@ mod tests {
             0,
             "a read stream rejects writes"
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn io_write_trait_roundtrip() {
-        let path = temp_path("iowrite");
+        let path = TempFile::new("iowrite");
         {
             let mut state = new_write_state(&path, 8192, 6, 0, 0);
             state.write_all(b"hello ").expect("write_all succeeds");
@@ -1700,7 +2747,7 @@ mod tests {
             state.flush().expect("io flush (sync) succeeds");
             assert_eq!(finish_write(&mut state), ReturnCode::Ok);
         }
-        let compressed = read_and_remove(&path);
+        let compressed = read_output(&path);
         assert_eq!(
             gunzip(&compressed),
             b"hello world 42",
@@ -1710,13 +2757,13 @@ mod tests {
 
     #[test]
     fn finish_on_empty_stream_is_valid_empty_gzip() {
-        let path = temp_path("emptyfin");
+        let path = TempFile::new("emptyfin");
         {
             let mut state = new_write_state(&path, 8192, 6, 0, 0);
             // No data at all, then finalize.
             assert_eq!(finish_write(&mut state), ReturnCode::Ok);
         }
-        let compressed = read_and_remove(&path);
+        let compressed = read_output(&path);
         assert!(
             compressed.starts_with(&[0x1f, 0x8b, 0x08]),
             "an empty member still has a gzip header"
@@ -1726,7 +2773,7 @@ mod tests {
 
     #[test]
     fn gz_zero_compresses_skip_zero_bytes() {
-        let path = temp_path("zero");
+        let path = TempFile::new("zero");
         {
             let mut state = new_write_state(&path, 8192, 6, 0, 0);
             gz_init(&mut state).expect("init");
@@ -1736,7 +2783,7 @@ mod tests {
             assert_eq!(state.pos, 100, "position advanced by the gap size");
             assert_eq!(finish_write(&mut state), ReturnCode::Ok);
         }
-        let compressed = read_and_remove(&path);
+        let compressed = read_output(&path);
         assert_eq!(
             gunzip(&compressed),
             vec![0u8; 100],

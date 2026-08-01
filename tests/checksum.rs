@@ -14,12 +14,15 @@
 //! and D-2 "constants must never be altered": `adler32`/`crc32` and their
 //! `*_combine` counterparts must match reference zlib exactly).
 //!
-//! All expected constants are real, independently verified checksums, e.g. the
-//! CRC-32/IEEE "check" value `crc32(0, b"123456789") == 0xCBF4_3926` and the
-//! classic Adler-32 example `adler32(1, b"Wikipedia") == 0x11E6_0398`. Every
-//! value mirrored from the C sources — Adler-32's `BASE`/`NMAX` and CRC-32's
-//! reflected polynomial — is *asserted* here and never adjusted: under D-2 a
-//! failing assertion means the expectation is wrong, not the constant.
+//! All expected constants are canonical, independently published checksums,
+//! e.g. the CRC-32/IEEE "check" value `crc32(0, b"123456789") == 0xCBF4_3926`
+//! and the classic Adler-32 example `adler32(1, b"Wikipedia") == 0x11E6_0398`.
+//! Every value mirrored from the C sources — Adler-32's `BASE`/`NMAX` and
+//! CRC-32's reflected polynomial — is *asserted* here against an expectation
+//! derived independently of the port (from the published check values and from
+//! the polynomial recurrence itself) and is never adjusted to match the port's
+//! behavior. Under D-2 the constants are fixed by the wire format, so a
+//! mismatch means the implementation is wrong.
 //!
 //! The tests are pure black-box exercises over the public API: no `unsafe`, no
 //! internal (`crate::`) paths, and fully deterministic (the randomized
@@ -518,19 +521,20 @@ fn crc32_z_matches_crc32() {
 /// `crc32.c` conditions the register with a one's complement on the way in
 /// (`crc = (~crc) & 0xffffffff`) and again on the way out
 /// (`return crc ^ 0xffffffff`), around the byte step
-/// `crc = (crc >> 8) ^ crc_table[(crc ^ byte) & 0xff]`. The naive identity
-/// `crc32(0, &[b]) == table[b]` therefore does **not** hold — measured over all
-/// 256 byte values it matches zero times. Both exact relations are derived from
-/// that conditioning and both are asserted below:
+/// `crc = (crc >> 8) ^ crc_table[(crc ^ byte) & 0xff]`. Substituting a
+/// single-byte input into that sequence yields the two exact relations below,
+/// and neither of them is the naive identity `crc32(0, &[b]) == table[b]`:
 ///
-/// * Seeding with `0xFFFF_FFFF` pre-conditions the register to `0`, so a single
-///   byte step yields precisely `table[b]` and the exit complement gives
+/// * Seeding with `0xFFFF_FFFF` pre-conditions the register to `0`, so the step
+///   reduces to `(0 >> 8) ^ table[(0 ^ b) & 0xff]` — precisely `table[b]` — and
+///   the exit complement gives
 ///   `crc32(0xFFFF_FFFF, &[b]) == table[b] ^ 0xFFFF_FFFF`.
 /// * Seeding with `0` pre-conditions the register to `0xFFFF_FFFF`, so the step
-///   yields `table[b ^ 0xFF] ^ (0xFFFF_FFFF >> 8)` and the exit complement
+///   reduces to `(0xFFFF_FFFF >> 8) ^ table[b ^ 0xFF]` and the exit complement
 ///   gives `crc32(0, &[b]) == table[b ^ 0xFF] ^ 0xFF00_0000`.
 ///
-/// Both were verified to hold for all 256 byte values before being written here.
+/// Both relations are asserted for every one of the 256 byte values, alongside
+/// all 256 table entries recomputed from the polynomial.
 #[test]
 fn crc_table_encodes_reflected_polynomial() {
     /// `POLY` from `crc32.c` (`#define POLY 0xedb88320`) — the IEEE 802.3 /

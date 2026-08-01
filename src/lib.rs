@@ -116,11 +116,12 @@
 // `// SAFETY:` justification (AAP §0.7.2 standard S2 / User Constraint 3). Like
 // `missing_docs` this is a `warn` (never a `deny`) so it cannot break a plain
 // build, but the CI `-D warnings` gate promotes it to an error for the
-// production library target, preventing recurrence of the
-// undocumented-`unsafe` finding across the FFI boundary. The lint is relaxed
-// to `allow` under `cfg(test)` so it governs only the shipped
-// `cdylib`/`staticlib`/`rlib` (whose `unsafe` lives in `src/ffi/**`), not the
-// crate's inline `#[cfg(test)]` unit tests.
+// production library target, so every `unsafe` block crossing the FFI boundary
+// carries its justification where a reader will meet it. The lint is relaxed to
+// `allow` under `cfg(test)` so it governs only the shipped
+// `cdylib`/`staticlib`/`rlib` (whose `unsafe` lives in `src/ffi/**` and in the
+// private `no_std_support` block below), not the crate's inline `#[cfg(test)]`
+// unit tests.
 #![warn(clippy::undocumented_unsafe_blocks)]
 #![cfg_attr(test, allow(clippy::undocumented_unsafe_blocks))]
 // `unsafe` is DENIED crate-wide, converting the migration's unsafe-containment
@@ -130,8 +131,7 @@
 // ERROR. A stray `unsafe` block, `unsafe fn`, `unsafe impl`, or `unsafe extern`
 // anywhere in `src/deflate/**`, `src/inflate/**`, `src/checksum/**`,
 // `src/gz/**`, `src/util/**`, `src/stream.rs`, `src/error.rs`,
-// `src/constants.rs`, or `src/gz_header.rs` now fails the build outright rather
-// than surviving until code review.
+// `src/constants.rs`, or `src/gz_header.rs` fails the build outright.
 //
 // Exactly TWO carve-outs exist, and both are the designated boundaries the AAP
 // names:
@@ -159,7 +159,7 @@ extern crate alloc;
 // `#[global_allocator]` and `#[panic_handler]`: the standard library normally
 // provides both, and without `std` the final `cdylib`/`staticlib` link step
 // fails with "no global memory allocator found" and "`#[panic_handler]`
-// function required, but not found" (see QA finding on the `no-std` build).
+// function required, but not found".
 //
 // It must also supply `rust_eh_personality`, for the same reason one step later
 // in the pipeline: the two items above satisfy *rustc*, but the pre-compiled
@@ -367,6 +367,52 @@ mod no_std_support {
     // unwind here, the process terminates deterministically instead of resuming
     // with an unwind context this crate cannot honor — the same "never unwind
     // across the C ABI" invariant the panic handler upholds.
+    //
+    // ---------------------------------------------------------------------
+    // Symbol VISIBILITY: needed by the linker, never exported to consumers.
+    //
+    // `#[unsafe(no_mangle)]` gives the definition below an unmangled name *and*
+    // default ELF visibility, so a freestanding `cdylib` would publish it in
+    // `.dynsym` as `FUNC GLOBAL DEFAULT`. That is wrong twice over:
+    //
+    //   * it widens the drop-in `libz` surface. A distribution `libz.so.1`
+    //     exports the 54 `zlib.map` globals and nothing else; the default-feature
+    //     build of this crate emits exactly 95 dynamic `T` symbols, and a
+    //     freestanding build must emit the same 95 rather than 96. The symbol set
+    //     is part of the ABI contract, so it must not vary with a Cargo feature.
+    //   * it exposes an *aborting* routine to ELF symbol interposition. Loaded
+    //     into a global symbol scope (`RTLD_GLOBAL`, or as a `DT_NEEDED` of the
+    //     main object) alongside another Rust shared object, this definition can
+    //     win the process-wide lookup for that object's personality references
+    //     and turn its unwinds into an abort.
+    //
+    // The reference this definition exists to satisfy is resolved at *static*
+    // link time, within the artifact, so internal linkage is sufficient: hiding
+    // the symbol keeps every std-off `cdylib`/`staticlib` linkable and loadable
+    // while removing it from the dynamic table entirely.
+    //
+    // An assembler visibility directive is used because no stable, sufficiently
+    // narrow attribute exists at the declared MSRV (1.85.0): `#[no_mangle]` has
+    // no visibility modifier, `#[unsafe(export_name)]` renames without changing
+    // visibility, and `-C default-visibility=hidden` both postdates the MSRV
+    // (stabilized in 1.86) and would apply to every symbol in the crate,
+    // including the 95 that must stay exported. Emitting the directive next to
+    // the definition keeps the two impossible to separate.
+    //
+    // Platform coverage is deliberate and explicit. ELF is the format the
+    // concern above is stated in, and is the only one measured here. Mach-O's
+    // equivalent is `.private_extern` on the underscore-prefixed name; that arm
+    // is provided on the same reasoning but is NOT verified in this environment,
+    // and is documented as such rather than presented as tested. Non-Unix
+    // targets get no directive: COFF has no visibility concept — a DLL's export
+    // table is opt-in — and bare-metal ELF targets emit only a `staticlib`, which
+    // has no dynamic symbol table and therefore no interposition surface.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    core::arch::global_asm!(".hidden rust_eh_personality");
+
+    #[cfg(all(unix, target_vendor = "apple"))]
+    core::arch::global_asm!(".private_extern _rust_eh_personality");
+
     #[unsafe(no_mangle)]
     extern "C" fn rust_eh_personality() {
         // SAFETY: `abort` is the libc process-termination routine declared above;
@@ -1160,6 +1206,183 @@ mod tests {
         );
     }
 
+    /// The complete set of unmangled symbols this crate defines **outside**
+    /// `src/ffi/**`, each paired with the assembler directive that must keep it
+    /// out of the dynamic symbol table.
+    ///
+    /// The emitted symbol surface is part of the C ABI contract: a distribution
+    /// `libz.so.1` publishes the 54 `zlib.map` globals and nothing else, and this
+    /// crate's `cdylib` publishes exactly 95 dynamic `T` symbols — the 96 names
+    /// its `#[unsafe(no_mangle)]` shims declare, minus the `#[cfg(windows)]`-gated
+    /// `gzopen_w`. That count must NOT vary with a Cargo feature.
+    ///
+    /// `crate::ffi`'s own inventory cannot enforce this, because it scans only
+    /// `src/ffi/{module}.rs`. Anything unmangled declared anywhere else is
+    /// invisible to it and reaches `.dynsym` unnoticed on the feature rows that
+    /// compile it — which is exactly what happened to the freestanding
+    /// personality routine: every Rust-side gate stayed green while the std-off
+    /// `cdylib` exported 96 symbols instead of 95, publishing an *aborting*
+    /// routine that ELF interposition could select for another Rust shared
+    /// object's unwinds.
+    ///
+    /// Each entry is `(relative path, symbol, hiding directive)`. A new unmangled
+    /// symbol outside `src/ffi/**` fails the test below until it is either given
+    /// internal linkage and listed here, or moved into a shim module where the
+    /// FFI inventory governs it.
+    const NON_FFI_UNMANGLED_SYMBOLS: [(&str, &str, &str); 1] = [(
+        "src/lib.rs",
+        "rust_eh_personality",
+        ".hidden rust_eh_personality",
+    )];
+
+    /// No unmangled symbol outside `src/ffi/**` escapes into the dynamic symbol
+    /// table, so the exported surface is identical on every feature row.
+    ///
+    /// This is the companion to `crate::ffi`'s inventory, covering precisely the
+    /// blind spot that inventory has by construction (see
+    /// [`NON_FFI_UNMANGLED_SYMBOLS`]). Two independent properties are pinned:
+    ///
+    /// 1. **The set is closed.** Scanning the whole `src/` tree for name-fixing
+    ///    attributes — `#[unsafe(no_mangle)]`, bare `#[no_mangle]`, and
+    ///    `export_name`, since each one publishes a chosen, unmangled name —
+    ///    yields exactly the listed entries and nothing more.
+    /// 2. **Each one is hidden, next to its own definition.** The directive must
+    ///    appear in the same file and, for the crate root, inside
+    ///    `mod no_std_support`, so it is compiled under exactly the predicate that
+    ///    compiles the definition. A directive that drifted out of that gate would
+    ///    either hide nothing or apply to a symbol this build does not define.
+    ///
+    /// The check is deliberately source-based rather than an `nm` sweep of a built
+    /// artifact: it then runs on every feature row of every `cargo test`
+    /// invocation, including `--no-default-features`, with no build-order
+    /// dependency, no external tool, and no conditional skip. The linked artifacts
+    /// are still what proves the mechanism works — a std-off release `cdylib`
+    /// measures 95 dynamic `T` symbols with `rust_eh_personality` present as
+    /// `FUNC LOCAL` and absent from `.dynsym`, while `DW.ref.rust_eh_personality`
+    /// still resolves — and this test is what keeps the source in the shape that
+    /// produced that measurement.
+    #[test]
+    fn no_unmangled_symbol_outside_the_ffi_shims_reaches_the_dynamic_table() {
+        // Attributes that fix an unmangled, externally visible name. `no_mangle`
+        // is matched as a bare token so `#[unsafe(no_mangle)]` and the older
+        // `#[no_mangle]` spelling are both caught.
+        const NAME_FIXING: [&str; 2] = ["no_mangle", "export_name"];
+
+        let mut found: alloc::vec::Vec<(std::string::String, std::string::String)> =
+            alloc::vec::Vec::new();
+
+        for (path, text) in crate_sources() {
+            if path.starts_with("src/ffi/") {
+                continue;
+            }
+            // Comments and string literals are blanked first: this file discusses
+            // `#[unsafe(no_mangle)]` at length in prose, and those mentions are
+            // not declarations.
+            let blanked = blank_comments_and_literals(&text);
+            let lines: alloc::vec::Vec<&str> = blanked.lines().collect();
+
+            for (index, line) in lines.iter().enumerate() {
+                let trimmed = line.trim();
+                if !trimmed.starts_with("#[") {
+                    continue;
+                }
+                if !NAME_FIXING.iter().any(|attr| trimmed.contains(attr)) {
+                    continue;
+                }
+                // The declaration is the next line that is neither blank nor a
+                // further attribute.
+                let signature = lines[index + 1..]
+                    .iter()
+                    .map(|next| next.trim())
+                    .find(|next| !next.is_empty() && !next.starts_with("#["))
+                    .unwrap_or_else(|| {
+                        panic!("{path} line {}: `{trimmed}` guards nothing", index + 1)
+                    });
+                let name = signature
+                    .split_once(" fn ")
+                    .map(|(_, rest)| rest)
+                    .or_else(|| signature.split_once("static ").map(|(_, rest)| rest))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{path} line {}: `{trimmed}` must guard an `fn` or `static`, \
+                             found `{signature}`",
+                            index + 1
+                        )
+                    })
+                    .trim_start()
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                assert!(
+                    !name.is_empty(),
+                    "{path} line {}: could not read the exported symbol name",
+                    index + 1
+                );
+                found.push((path.clone(), name));
+            }
+        }
+
+        let mut expected: alloc::vec::Vec<(std::string::String, std::string::String)> =
+            NON_FFI_UNMANGLED_SYMBOLS
+                .iter()
+                .map(|&(path, symbol, _)| (path.to_string(), symbol.to_string()))
+                .collect();
+        found.sort();
+        expected.sort();
+        assert_eq!(
+            found, expected,
+            "the set of unmangled symbols declared outside `src/ffi/**` changed. Every such \
+             symbol is published by the `cdylib` unless it is given internal linkage, which \
+             would make the exported surface differ between feature rows and widen the \
+             drop-in `libz` ABI. Either move the symbol into an `src/ffi/` shim module, where \
+             the FFI inventory governs it, or hide it and add it to NON_FFI_UNMANGLED_SYMBOLS."
+        );
+
+        // Property 2: each symbol is hidden, by a directive compiled under exactly
+        // the predicate that compiles its definition.
+        for (path, symbol, directive) in NON_FFI_UNMANGLED_SYMBOLS {
+            let text = crate_sources()
+                .into_iter()
+                .find_map(|(candidate, text)| (candidate == path).then_some(text))
+                .unwrap_or_else(|| panic!("{path} must exist"));
+            // The directive is searched for in the RAW text: it is an assembler
+            // string, so blanking literals would erase the very thing being
+            // located. `blank_comments_and_literals` replaces bytes in place and
+            // preserves length, so an offset found in the raw text is directly
+            // comparable to a range derived from the blanked text — which is what
+            // lets the gate membership below be checked without the surrounding
+            // prose (which discusses this directive) producing a false match.
+            let at = text.find(directive).unwrap_or_else(|| {
+                panic!(
+                    "{path} must carry `{directive}` so `{symbol}` gets internal linkage and \
+                     stays out of `.dynsym`; without it the std-off `cdylib` exports it as \
+                     FUNC GLOBAL DEFAULT and ELF interposition can select it"
+                )
+            });
+            let statement = text[..at]
+                .rfind("global_asm!")
+                .map(|from| &text[from..at])
+                .unwrap_or("");
+            assert!(
+                statement.trim_start_matches("global_asm!").starts_with('('),
+                "`{directive}` in {path} must be emitted through `global_asm!`, not merely \
+                 mentioned"
+            );
+            let blanked = blank_comments_and_literals(&text);
+            if path == "src/lib.rs" {
+                let runtime = no_std_support_range(&blanked);
+                assert!(
+                    runtime.contains(&at),
+                    "`{directive}` must live inside `mod no_std_support`, alongside the \
+                     definition of `{symbol}`, so it is compiled under exactly the predicate \
+                     that compiles it — outside that gate it either hides nothing or names a \
+                     symbol this build does not define"
+                );
+            }
+        }
+    }
+
     /// Every CI job whose gate is meaningful only on a particular toolchain,
     /// paired with the channel it must resolve to.
     ///
@@ -1358,8 +1581,8 @@ mod tests {
                 }
                 // Deliberately NOT sorted: in a `cfg_if!` chain the first matching
                 // arm wins, so source order is load-bearing and the fallback must
-                // come last. Asserting the sequence therefore checks strictly more
-                // than the previous set of independent attributes did.
+                // come last. Asserting the ordered sequence therefore pins the
+                // cascade itself, which per-arm value checks alone cannot do.
                 assert_eq!(
                     arms,
                     alloc::vec![

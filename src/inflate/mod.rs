@@ -3115,10 +3115,10 @@ mod tests {
     /// decoder — one whose history window and dynamic Huffman tables are already
     /// populated — not a shallow alias.
     ///
-    /// The previous version of this test decoded four bytes of a fixed-table
-    /// stream, copied, and asserted only that a state was installed and that
-    /// `total_out` matched, which a shallow copy sharing every buffer would also
-    /// have passed. This version:
+    /// Copying at a trivial point — a few bytes into a fixed-table stream — and
+    /// then checking only that a state was installed and that `total_out` matched
+    /// would be satisfied by a shallow copy that shared every buffer. The snapshot
+    /// is therefore taken mid-stream and the independence asserted directly:
     ///
     /// 1. decodes a dynamic-Huffman stream part-way, so `codes[]` holds real
     ///    tables, `lencode`/`distcode` are non-trivial offsets into that arena

@@ -2,19 +2,17 @@
 #
 # Governs every Rust source in the crate: the modules under `src/`, the
 # integration tests under `tests/`, the criterion benches under `benches/`, and
-# `build.rs`. It closes migration gap D11 ("lint and format behavior currently
-# depends on unpinned tool defaults") for the formatting half only. The lint half
-# belongs to a `clippy.toml`, which does NOT exist in this tree yet — clippy's
-# configurable thresholds are therefore still whatever the installed clippy
-# defaults to, so D11 is half-open. Whoever writes it should pin values the tree
-# already satisfies, exactly as THE GOVERNING RULE below requires of this file,
-# and it must remain packaged (see the `exclude` notes in `Cargo.toml`).
+# `build.rs`. It owns the formatting half of migration gap D11 ("lint and format
+# behavior currently depends on unpinned tool defaults"); `clippy.toml` owns the
+# lint half, and the pair closes D11. Both files are packaged with the crate (see
+# the `exclude` notes in `Cargo.toml`), and both pin values the tree already
+# satisfies, as THE GOVERNING RULE below requires.
 #
-# The defect being closed is drift, not style: until this file existed, the
-# repository's formatting was whatever a contributor's rustfmt happened to think
-# it should be. That is harmless right up to the release in which rustfmt changes
-# a default — at which point the next `cargo fmt` rewrites tens of thousands of
-# lines and the blocking `lint` gate fails on code nobody touched.
+# The defect this addresses is drift, not style: without a pinned configuration
+# the repository's formatting is whatever a contributor's rustfmt happens to
+# think it should be. That is harmless right up to the release in which rustfmt
+# changes a default — at which point the next `cargo fmt` rewrites tens of
+# thousands of lines and the blocking `lint` gate fails on code nobody touched.
 #
 #
 # THE GOVERNING RULE — READ BEFORE ADDING ANYTHING
@@ -182,8 +180,10 @@ match_arm_leading_pipes = "Never"
 
 # Always print the ABI, so `extern "C"` is never abbreviated to a bare `extern`.
 # Non-negotiable for this crate regardless of the default: `src/ffi/**` is the C
-# ABI boundary and the only module allowed to contain `unsafe`, where an implicit
-# ABI would be actively misleading to read.
+# ABI boundary, where an implicit ABI would be actively misleading to read.
+# `unsafe` is confined to that boundary plus the private freestanding
+# `no_std_support` runtime block in `src/lib.rs` — the two `#[allow(unsafe_code)]`
+# carve-outs under the crate's `#![deny(unsafe_code)]`.
 force_explicit_abi = true
 
 # When a signature must wrap, one parameter per line. This is what keeps the wide

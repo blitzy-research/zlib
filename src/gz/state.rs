@@ -343,9 +343,9 @@ pub struct GzState {
     pub(crate) reset: bool,
 
     /// Number of *compressed* bytes already produced by `deflate` but not yet
-    /// handed to the operating system, held at the **front** of
-    /// [`out_buf`](Self::out_buf): the pending window is exactly
-    /// `out_buf[0..out_pending]`.
+    /// handed to the operating system. Together with
+    /// [`out_start`](Self::out_start) it names the pending window exactly:
+    /// `out_buf[out_start .. out_start + out_pending]`.
     ///
     /// # Why this field exists
     ///
@@ -368,21 +368,45 @@ pub struct GzState {
     /// not yet written, the following `deflate` call would overwrite them, and
     /// the file would receive a spliced, undecodable DEFLATE stream.
     ///
-    /// # Why a single count rather than a cursor pair
+    /// # Why a cursor pair rather than a single front-anchored count
     ///
-    /// The pending window is kept **front-anchored**: a partial write compacts
-    /// the remainder down to `out_buf[0]` (see `write.rs`'s `drain_pending`).
-    /// That keeps one field instead of two and keeps this window independent of
-    /// the read path's [`next`](Self::next)/[`have`](Self::have) pair, at the
-    /// cost of a `copy_within` that is a no-op whenever the write completed in
-    /// full — the overwhelmingly common case, including every write to a regular
-    /// blocking file. Compaction moves bytes between buffer slots only; the byte
-    /// sequence delivered to the file is unchanged, so gzip output stays
-    /// byte-identical to reference zlib.
+    /// The window is addressed by an explicit start offset because that is what
+    /// makes a run of short writes cost `O(N)` in total, exactly as C's
+    /// `state->x.next += writ` does. Reducing it to a single count would force
+    /// every partial write to slide the unwritten remainder back down to
+    /// `out_buf[0]`, so a destination that accepts one byte at a time would copy
+    /// `(N-1) + (N-2) + … + 1` bytes to deliver `N` — quadratic work that a
+    /// flow-controlled pipe or socket can provoke from ordinary input. Advancing
+    /// an offset instead touches no bytes at all.
     ///
     /// `deflate` is never invoked while this is non-zero, so the engine always
     /// receives the whole `out_buf[..size]` scratch area.
     pub(crate) out_pending: usize,
+
+    /// Offset into [`out_buf`](Self::out_buf) of the first *compressed* byte the
+    /// operating system has not accepted yet — the write-side counterpart of the
+    /// read side's [`next`](Self::next), and the port of C's `state->x.next`
+    /// pointer as used by the write path (`gzwrite.c` L114-L127).
+    ///
+    /// # Invariants
+    ///
+    /// * The pending window is exactly
+    ///   `out_buf[out_start .. out_start + out_pending]`, which is always within
+    ///   bounds because [`out_pending`](Self::out_pending) only ever counts bytes
+    ///   `deflate` produced into `out_buf[..size]`.
+    /// * `out_pending == 0` implies `out_start == 0`: the drain loop re-anchors
+    ///   the window at the front the moment it empties, mirroring C's buffer
+    ///   reclaim (`strm->next_out = state->out; state->x.next = state->out;`,
+    ///   `gzwrite.c` L125-L128). Because of this, `deflate` — which is only ever
+    ///   called with an empty pending window — always receives the whole
+    ///   `out_buf[..size]` scratch area starting at index `0`, so the compressed
+    ///   byte sequence handed to the file is independent of how many short writes
+    ///   preceded it and gzip output stays byte-identical to reference zlib.
+    ///
+    /// Only `write.rs`'s drain loop advances this; it is reset to `0` there when
+    /// the window empties, by `gz_init` when the buffers are (re)allocated, and by
+    /// `open.rs`'s `gz_reset` when a stream starts over.
+    pub(crate) out_start: usize,
 
     // -- shared --------------------------------------------------------------
     /// The pending seek amount, in bytes (C `z_off64_t skip`): data to skip on
@@ -591,6 +615,7 @@ mod tests {
             strategy: 0,
             reset: false,
             out_pending: 0,
+            out_start: 0,
             skip: 0,
             err: ReturnCode::Ok,
             msg: None,
@@ -816,7 +841,8 @@ mod tests {
     /// [`TempGz::new`] move to the next candidate instead of following the link or
     /// deleting it. On Unix the `0o700` mode is handed to `mkdir(2)` itself, so the
     /// directory is never even briefly group- or world-accessible and there is no
-    /// `set_permissions` window to race (CWE-367).
+    /// `set_permissions` window to race. Both properties describe the moment of
+    /// creation; on non-Unix targets the mode is the platform default.
     fn create_private_dir(path: &Path) -> std::io::Result<()> {
         #[cfg(unix)]
         {
@@ -840,11 +866,16 @@ mod tests {
     /// clones of this repository sharing one `/tmp`.
     ///
     /// Creating the directory with create-new semantics is what makes the file
-    /// inside it safe. Nothing pre-existing is ever removed — an occupied
+    /// inside it safe to write. Nothing pre-existing is ever removed — an occupied
     /// candidate name is skipped rather than deleted — so a symlink or file planted
-    /// at a predictable path can neither be destroyed nor followed, and because the
-    /// enclosing directory is freshly created and owner-only, the payload name
-    /// within it cannot be pre-empted at all.
+    /// at a predictable path is neither destroyed nor followed. The payload name is
+    /// then predictable *within* a directory that did not exist a moment earlier
+    /// and, on Unix, was owner-only from `mkdir(2)` onwards; the file is opened
+    /// `create_new` regardless, so a name that somehow is taken fails loudly rather
+    /// than being truncated. These are creation-time properties: the guard holds
+    /// paths rather than open handles, so it makes no claim about the directory
+    /// still being the same object later, and on non-Unix targets the directory's
+    /// mode is whatever the platform applies.
     struct TempGz {
         dir: PathBuf,
         path: PathBuf,
@@ -895,10 +926,14 @@ mod tests {
 
     impl Drop for TempGz {
         fn drop(&mut self) {
-            // Safe to recurse: `dir` did not exist before `TempGz::new` created it
-            // with create-new semantics, so it cannot be a pre-existing path or a
-            // symlink into one. Best effort on every path, including an unwinding
-            // one: failing to clean up must never mask the original failure.
+            // The recursion rests on `dir` not having existed before `TempGz::new`
+            // created it with create-new semantics, so the removal set starts from a
+            // path this guard brought into existence rather than one it adopted, and
+            // on Unix from one no other user could enter. It does not rest on the
+            // path still resolving to that same directory, which a path-based guard
+            // cannot establish. Best effort on every route out, including an
+            // unwinding one: failing to clean up must never mask the original
+            // failure.
             let _ = std::fs::remove_file(&self.path);
             let _ = std::fs::remove_dir_all(&self.dir);
         }
@@ -907,9 +942,9 @@ mod tests {
     /// `safe_component` must collapse every traversal and separator form to a
     /// single harmless component.
     ///
-    /// The first case is the exact payload the review cited: with the raw value
-    /// interpolated, `slot/../../security_target` escaped the temporary directory
-    /// lexically. Sanitized, it can only ever name a child of that directory.
+    /// The first case is the traversal shape that matters: interpolated raw,
+    /// `slot/../../security_target` names a path two levels above the temporary
+    /// directory. Sanitized, it can only ever name a child of that directory.
     #[test]
     fn safe_component_neutralizes_traversal_and_separators() {
         for raw in [
@@ -1044,11 +1079,11 @@ mod tests {
     /// initializes the deflate engine on first use, exactly as a real `gzopen`
     /// would — matching C's `state->size = 0` sentinel (`gzguts.h` L172).
     fn drop_contract_write_state(path: &Path) -> Box<GzState> {
-        // `create_new(true)` rather than a truncating `File::create`: the file
-        // must not already exist, and if something is squatting on the name this
-        // must fail loudly instead of truncating it. `TempGz` guarantees the
-        // enclosing directory was just created owner-only, so the name cannot have
-        // been pre-empted (CWE-22 / CWE-367).
+        // `create_new(true)` rather than a truncating `File::create`: the file must
+        // not already exist, and if something is squatting on the name this must
+        // fail loudly instead of truncating it. That is the guarantee relied on
+        // here; `TempGz` additionally created the enclosing directory fresh and, on
+        // Unix, owner-only, which makes a squatter unlikely rather than impossible.
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1078,6 +1113,7 @@ mod tests {
             strategy: 0,
             reset: false,
             out_pending: 0,
+            out_start: 0,
             skip: 0,
             err: ReturnCode::Ok,
             msg: None,
@@ -1265,8 +1301,8 @@ mod tests {
         );
 
         // Count what was actually exercised rather than trusting the loop: this
-        // closes the gap where the table still straddles the predicate but the
-        // iteration skips a row.
+        // guards against the table straddling the predicate while the iteration
+        // skips a row.
         let mut buffered = 0_usize;
         let mut direct = 0_usize;
         for (tag, chunk) in SCENARIOS {

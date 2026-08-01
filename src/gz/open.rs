@@ -274,10 +274,12 @@ fn gz_reset(state: &mut GzState) {
         // For writing: no `deflateReset` is pending, and no compressed output is
         // waiting to be handed to the OS. C re-seeds the equivalent output cursor
         // in `gz_init` (`state->x.next = strm->next_out`, `gzwrite.c` L49-L55);
-        // clearing it here keeps the front-anchored `out_buf[0..out_pending]`
-        // window empty for a stream that is starting over.
+        // clearing both halves here leaves the pending window
+        // `out_buf[out_start .. out_start + out_pending]` empty and re-anchored at
+        // the front for a stream that is starting over.
         state.reset = false;
         state.out_pending = 0;
+        state.out_start = 0;
     }
 
     // Shared: no non-blocking retry pending, no seek request pending, no error,
@@ -419,6 +421,7 @@ fn gz_open(path: &Path, file: Option<File>, mode: &str) -> Result<Box<GzState>, 
         strategy: parsed.strategy,
         reset: false,
         out_pending: 0,
+        out_start: 0,
         // shared
         skip: 0,
         err: ReturnCode::Ok,
@@ -1117,6 +1120,7 @@ mod tests {
             strategy: Z_DEFAULT_STRATEGY,
             reset: false,
             out_pending: 0,
+            out_start: 0,
             skip: 0,
             err: ReturnCode::Ok,
             msg: None,

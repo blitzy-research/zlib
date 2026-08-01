@@ -42,10 +42,14 @@
 //! every match distance and makes the history wrap constantly. Covering them
 //! here turns them into an always-on gate that needs no C toolchain.
 //!
-//! Generators are bounded (via `Gen::new`) and, where explicit random data is
-//! used, seeded (`StdRng::seed_from_u64`) so the suite is deterministic and
-//! fast in CI. Everything binds strictly to the public `zlib_rs` API and
-//! contains no `unsafe`.
+//! QuickCheck generators are bounded (via `Gen::new`), which keeps every case
+//! small and the suite fast in CI, but bounded is not the same as reproducible:
+//! `Gen::new` seeds itself randomly, so the QuickCheck cases differ from run to
+//! run. Determinism belongs to the fixtures that build their data explicitly
+//! with `StdRng::seed_from_u64` — those replay identically on every run, which is
+//! why the corner cases that must be pinned live there rather than in a property.
+//! Everything binds strictly to the public `zlib_rs` API and contains no
+//! `unsafe`.
 
 // This is a pure black-box test over the safe public API; forbid `unsafe`
 // outright so the "zero unsafe" contract is machine-checked for this file.

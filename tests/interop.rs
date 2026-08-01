@@ -237,9 +237,10 @@ fn zlib_rs_deflate_full(
 /// Compress `data` with `zlib-rs` at the default memory level
 /// (`DEF_MEM_LEVEL == 8`), delegating to [`zlib_rs_deflate_full`].
 ///
-/// This is the shape the original oracle vectors ([`byte_identity::BI_VECTORS`]
-/// and [`byte_identity::BI_VECTORS_GZIP`]) were baked against, so it is kept as a
-/// distinct entry point rather than folded into its callers.
+/// This is the shape the five-field tier-1 vector tables
+/// ([`byte_identity::BI_VECTORS`] and [`byte_identity::BI_VECTORS_GZIP`]) are
+/// baked against — they carry no `memLevel` column — so it is kept as a distinct
+/// entry point rather than folded into its callers.
 fn zlib_rs_deflate_strategy(
     data: &[u8],
     level: i32,
@@ -1166,9 +1167,9 @@ mod byte_identity {
     /// run on `ubuntu-latest`. The rows are deliberately left as-is (weakening a
     /// passing assertion is forbidden by AAP §0.8.1 directive D-5); the
     /// assumption is documented here so that a future non-Unix runner fails
-    /// legibly instead of mysteriously. The newer gzip tables
+    /// legibly instead of mysteriously. The platform-neutral gzip tables
     /// ([`BI_GRID_GZIP`], [`BI_EXTREMES_GZIP`]) normalise that one byte through
-    /// [`normalise_gzip_os`] and are therefore platform-neutral.
+    /// [`normalise_gzip_os`] and therefore hold on every host.
     #[cfg(feature = "gzip")]
     const BI_VECTORS_GZIP: &str = "\
     0 -1 31 0 1f8b080000000000000303000000000000000000
@@ -1453,7 +1454,8 @@ Whenever the lazy dog dozed, the quick brown fox vaulted the picket fence. ";
     /// `ID1 ID2 CM FLG MTIME[4] XFL OS`).
     const GZIP_OS_FIELD_OFFSET: usize = 9;
 
-    /// The `OS_CODE` value the newer gzip tables are normalised to: 3, "Unix".
+    /// The `OS_CODE` value the platform-neutral gzip tables are normalised to:
+    /// 3, "Unix".
     const NORMALISED_OS_CODE: u8 = 0x03;
 
     /// Force the gzip `OS` byte of `stream` to [`NORMALISED_OS_CODE`] when
@@ -1462,11 +1464,11 @@ Whenever the lazy dog dozed, the quick brown fox vaulted the picket fence. ";
     /// `OS_CODE` is a compile-time platform choice — 3 on Unix-family targets, 10
     /// on Windows, 19 on non-Windows Apple (AAP §0.6.6) — so a gzip member is the
     /// one framing whose bytes legitimately differ between build hosts. Rather
-    /// than gate the new gzip assertions behind a platform predicate (which would
-    /// silently delete their coverage everywhere else), this normalises that
-    /// single header byte and asserts *everything else* exactly. The one byte
-    /// given up here is still pinned on Unix hosts by [`BI_VECTORS_GZIP`], whose
-    /// 75 rows are compared raw.
+    /// than gate the platform-neutral gzip assertions behind a platform predicate
+    /// (which would silently delete their coverage everywhere else), this
+    /// normalises that single header byte and asserts *everything else* exactly.
+    /// The one byte given up here is still pinned on Unix hosts by
+    /// [`BI_VECTORS_GZIP`], whose 75 rows are compared raw.
     fn normalise_gzip_os(mut stream: Vec<u8>, window_bits: i32) -> Vec<u8> {
         if (24..=31).contains(&window_bits) && stream.len() > GZIP_OS_FIELD_OFFSET {
             stream[GZIP_OS_FIELD_OFFSET] = NORMALISED_OS_CODE;
@@ -5670,10 +5672,11 @@ Whenever the lazy dog dozed, the quick brown fox vaulted the picket fence. ";
     4 9 31 9 4 6654:5db8c021
     ";
 
-    /// Full literal reference bytes at the `memLevel` corners the original
-    /// full-hex family never reached: 24 rows covering `memLevel` 1 and 9,
-    /// `windowBits` 15 / −15 / 9 / −9, levels 1 and 9, and strategies 0 / 2 / 3
-    /// over the short [`BI_INPUTS`] corpora 2, 3 and 4.
+    /// Full literal reference bytes at the `memLevel` corners, which the
+    /// five-field tier-1 tables ([`BI_VECTORS`], [`BI_VECTORS_GZIP`]) cannot
+    /// express because they carry no `memLevel` column: 24 rows covering
+    /// `memLevel` 1 and 9, `windowBits` 15 / −15 / 9 / −9, levels 1 and 9, and
+    /// strategies 0 / 2 / 3 over the short [`BI_INPUTS`] corpora 2, 3 and 4.
     ///
     /// Line format: `<input-index> <level> <windowBits> <memLevel> <strategy-id>
     /// <hex-expected>` — the six-field, `memLevel`-aware form, distinguishing it
@@ -5982,9 +5985,9 @@ Whenever the lazy dog dozed, the quick brown fox vaulted the picket fence. ";
     }
 
     /// Wide grid, raw DEFLATE at the 512-byte window (`windowBits = -9`): 825
-    /// digest rows on the same axes. This framing was absent from the original
-    /// vector set entirely, so these are the first assertions the crate has ever
-    /// carried for it.
+    /// digest rows on the same axes. The five-field tier-1 tables carry no
+    /// `windowBits = -9` rows, so the small-raw grid is where this framing's
+    /// byte-identity coverage lives.
     #[test]
     fn matches_reference_zlib_grid_small_raw_window() {
         assert_eq!(check_grid(BI_GRID, -9), GRID_ROWS_PER_FRAMING);

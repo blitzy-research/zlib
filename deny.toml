@@ -651,32 +651,20 @@ skip = [
     { crate = "rand_core@0.10.1", reason = "dev-only; follows rand 0.10.2 down the quickcheck path" },
     # getrandom 0.3.4 follows rand_core 0.9.5.
     { crate = "getrandom@0.4.3", reason = "dev-only; follows rand_core 0.10.1 down the quickcheck path" },
-    # r-efi is deliberately NOT skipped. The entry is kept below in deactivated
-    # form because its absence is a consequence of the `[graph].targets` list
-    # rather than an oversight, and that is worth being able to read here.
+    # `r-efi` is deliberately NOT skipped, and that absence is a consequence of
+    # the `[graph].targets` list rather than an oversight. Under `targets = []`
+    # both `r-efi` 5.3.0 and 6.0.0 would be in the graph -- they follow
+    # `getrandom` 0.3.4 and 0.4.3 as the UEFI backend -- and
+    # `multiple-versions` would report them as a fourth duplicate major
+    # requiring justification. Under the explicit target list they are pruned
+    # instead, because `getrandom` gates them on a custom cfg no listed triple
+    # can satisfy (see `[graph]`), so no duplicate remains to justify.
     #
-    # It would be needed under `targets = []`: both `r-efi` 5.3.0 and 6.0.0
-    # would then be in the graph -- they follow `getrandom` 0.3.4 and 0.4.3 as
-    # the UEFI backend -- and `multiple-versions` would report them as a fourth
-    # duplicate major requiring justification. Under the explicit target list
-    # they are pruned instead, because `getrandom` gates them on a custom cfg no
-    # triple can satisfy (see `[graph]`), so no duplicate remains to justify and
-    # the entry would match nothing.
-    #
-    # A skip that matches nothing is itself reported, as
-    # `warning[unmatched-skip]: skipped crate 'r-efi = =6.0.0' was not
-    # encountered`, and `[bans]` has no severity key that could downgrade it
-    # (the accepted keys are multiple-versions, multiple-versions-include-dev,
-    # highlight, deny, allow, allow-workspace, features,
-    # external-default-features, workspace-default-features, skip, skip-tree,
-    # wildcards, allow-wildcard-paths, allow-build-scripts, build,
-    # workspace-dependencies, and std-replacements). Leaving it active would
-    # therefore put a permanent warning in every run and break the project's
-    # zero-warning gate.
-    #
-    # Restore this line if `r-efi` ever becomes reachable under a listed triple
-    # in more than one version:
-    # { crate = "r-efi@6.0.0", reason = "dev-only, UEFI-target-gated; follows getrandom 0.4.3 down the quickcheck path" },
+    # A skip entry for a crate that is not in the graph would itself be
+    # reported, as `warning[unmatched-skip]`, and `[bans]` has no severity key
+    # that could downgrade it -- a permanent warning in every run, which the
+    # project's zero-warning gate forbids. An entry belongs here only if
+    # `r-efi` becomes reachable under a listed triple in more than one version.
 ]
 # `skip-tree` is intentionally empty. It suppresses duplicate detection for a
 # crate AND its entire transitive subtree, which is far broader than anything

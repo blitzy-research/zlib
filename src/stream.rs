@@ -71,11 +71,12 @@
 //!
 //! ## Implementing [`Allocator`] outside this crate
 //!
-//! [`Allocator`] has **one** required item — nothing. Both allocation entry
-//! points, [`allocate_zeroed`](Allocator::allocate_zeroed) and
-//! [`allocate_zeroed_items`](Allocator::allocate_zeroed_items), are *provided*
-//! methods that default to the hook path, so a downstream crate implements the
-//! trait by overriding whichever of the two it wants to serve and leaving
+//! [`Allocator`] has **no** required items. Both allocation entry points,
+//! [`allocate_zeroed`](Allocator::allocate_zeroed) and
+//! [`allocate_zeroed_items`](Allocator::allocate_zeroed_items), as well as
+//! [`hook`](Allocator::hook), are *provided* methods that default to the hook
+//! path, so a downstream crate implements the trait by overriding whichever of
+//! the two allocation methods it wants to serve and leaving
 //! [`hook`](Allocator::hook) at its inactive default:
 //!
 //! ```
@@ -110,21 +111,33 @@
 //! downstream implementation genuinely governs a stream's memory. Which method
 //! serves which C `ZALLOC` is tabulated on [`Allocator`] itself.
 //!
-//! ## Public-surface migration notes
+//! ## Three surface properties that are easy to trip over
 //!
-//! Three items on this module's public surface changed shape while the crate
-//! version stayed at `1.3.2`. The version is **not** a SemVer channel for the
-//! Rust API: it mirrors the upstream C release identity the ABI reports —
-//! `zlibVersion()` yields `"1.3.2.1-motley"` and `ZLIB_VERNUM` is `0x1321`
-//! (AAP §0.6.6) — and SemVer cannot express the four-component motley string, so
-//! the crate version is pinned to the C identity by design. These notes are the
-//! migration record in place of a version bump.
+//! The crate version is **not** a SemVer channel for the Rust API: it mirrors the
+//! upstream C release identity the ABI reports — `zlibVersion()` yields
+//! `"1.3.2.1-motley"` and `ZLIB_VERNUM` is `0x1321` (AAP §0.6.6) — and SemVer
+//! cannot express the four-component motley string, so the crate version is
+//! pinned to the C identity by design and says nothing about this module's Rust
+//! surface. Three properties of that surface are therefore worth stating outright:
 //!
-//! | Previously | Now | Why |
-//! |------------|-----|-----|
-//! | `AllocHook::new(zalloc, zfree, opaque)`, safe and public | [`crate::ffi::types::alloc_hook_from_parts`], `unsafe` and public | Building an *active* hook asserts a four-clause contract about two raw C function pointers (see that function's `# Safety`). A safe constructor could not check it, so the constructor belongs in the crate's only `unsafe` zone (AAP §0.6.2, directive D-6). This module keeps `#![deny(unsafe_code)]`. |
-//! | `impl Clone for AllocBuffer<T>` | [`AllocBuffer::try_clone`] | Cloning a foreign buffer re-enters the caller's `zalloc`, which may report out-of-memory. `Clone` cannot fail, so the infallible impl had to abort or silently switch allocators; a fallible method keeps the failure visible and preserves C's allocation count and failure timing (AAP §0.6.5). |
-//! | Any `T: Copy + Default` element | `T: Copy + Default + ZeroValid + 'static` | [`ZeroValid`] is a sealed marker asserting that an all-zero bit pattern is a valid `T`, which the foreign path relies on when it zeroes a caller-supplied region. It is implemented for the twelve integer primitives, covering every element type the engines use (`u8`, `u16`). Sealing keeps the assertion auditable inside this crate. |
+//! * **An *active* hook is constructed only inside the `unsafe` zone.**
+//!   [`AllocHook::none`] is the safe, inactive constructor;
+//!   [`crate::ffi::types::alloc_hook_from_parts`] is the `unsafe` one, because
+//!   building an active hook asserts a four-clause contract about two raw C
+//!   function pointers (see that function's `# Safety`) that no safe constructor
+//!   could check. It therefore belongs in the crate's only `unsafe` zone
+//!   (AAP §0.6.2, directive D-6), and this module keeps `#![deny(unsafe_code)]`.
+//! * **Duplicating a buffer is fallible.** [`AllocBuffer`] has no [`Clone`] impl;
+//!   [`AllocBuffer::try_clone`] is the way to copy one. Cloning a foreign buffer
+//!   re-enters the caller's `zalloc`, which may report out-of-memory, and an
+//!   infallible `Clone` could only abort or silently switch allocators. Returning
+//!   [`None`] keeps the failure visible and preserves C's allocation count and
+//!   failure timing (AAP §0.6.5).
+//! * **The element-type set is sealed.** Buffer elements are
+//!   `T: Copy + Default + ZeroValid + 'static`. [`ZeroValid`] is a sealed marker
+//!   implemented for the twelve integer primitives; the engines request `u8` and
+//!   `u16`. Sealing keeps the set fixed and auditable inside this crate — see that
+//!   trait for exactly what it does and does not assert.
 //!
 //! # Safety, `no_std`
 //!
@@ -179,8 +192,8 @@ use crate::inflate::state::InflateState;
 ///
 /// Because [`ZeroValid`] has a private supertrait, it can neither be named nor
 /// implemented from outside this crate. The set of element types that may be
-/// materialized from a caller-`zalloc`'d, byte-zeroed region is therefore fixed
-/// here and cannot be widened by a downstream crate.
+/// materialized from a caller-`zalloc`'d region is therefore fixed here and
+/// cannot be widened by a downstream crate.
 mod sealed {
     /// Private sealing marker; see [`super::ZeroValid`].
     pub trait ZeroValidSealed {}
@@ -193,22 +206,29 @@ mod sealed {
 ///
 /// [`AllocBuffer::try_zeroed`] may route a working buffer's storage through a
 /// caller-supplied C `zalloc` hook. The sanctioned `crate::ffi::alloc` bridge
-/// byte-zeroes that region and then hands it back as `&[T]` / `&mut [T]`.
-/// `T: Copy + Default` alone does **not** license that step:
+/// initializes that region by **writing a `T::default()` value into every slot**
+/// — `fill_default` over a `&mut [MaybeUninit<T>]`, never a memset of raw zero
+/// bytes — and only then hands it back as `&[T]` / `&mut [T]`. That step is
+/// therefore already correct for any `T: Copy + Default`, including a type whose
+/// all-zero bit pattern would be an invalid value, and it does not depend on this
+/// marker for its soundness.
 ///
-/// * [`Default::default`] may return a non-zero value, in which case a
-///   "zeroed" buffer would not hold the type's default at all; and, far worse,
-/// * a type with niches — any `enum`, `bool`, `char`, `NonZero*`, a reference,
-///   or a function pointer — can have an all-zero byte pattern that is an
-///   **invalid** value. A `#[repr(u8)] enum E { A = 1 }` with a hand-written
-///   `Default` is a two-line counterexample. Producing a `&[E]` over
-///   zeroed storage is immediate undefined behavior, and
-///   [`AllocBuffer::try_zeroed`] is a *safe* function, so that UB would be
-///   reachable without the caller ever writing `unsafe`.
+/// What the bound adds is **defence in depth**: it restricts the element types a
+/// foreign region may be materialized as to a small set audited inside this crate,
+/// so the two sanctioned remedies for the hazard — value initialization and a
+/// narrow element-type set — are both in force rather than one of them. Concretely
+/// it means that
 ///
-/// Requiring `T: ZeroValid` closes that hole at compile time on every call site,
-/// and sealing the trait prevents a downstream crate from adding an unsound
-/// implementation.
+/// * a change to the foreign path that reverted to zero-filling raw bytes would
+///   still be sound for every type the API admits, instead of becoming unsound at
+///   a distance; and
+/// * a downstream crate cannot widen the set, because [`ZeroValid`] is sealed
+///   behind a private supertrait — an `enum`, `bool`, `char`, `NonZero*`,
+///   reference or function-pointer element type is rejected at compile time on
+///   every call site, whatever its representation.
+///
+/// [`AllocBuffer::try_zeroed`] is a *safe* function, so keeping that guarantee
+/// structural rather than reviewer-enforced is what makes it durable.
 ///
 /// # Implementation contract
 ///
@@ -221,7 +241,9 @@ mod sealed {
 ///
 /// Every primitive integer type satisfies all three, and those are exactly the
 /// types implemented below. The compression and decompression engines only ever
-/// request `u8`, `u16`, and `u32` buffers.
+/// request `u8` and `u16` buffers; the wider set costs nothing and keeps the
+/// marker's contract stated in terms of the type property rather than of today's
+/// call sites.
 ///
 /// # Examples
 ///
@@ -235,8 +257,10 @@ mod sealed {
 /// assert_eq!(&words[..], &[0u16; 4]);
 /// ```
 ///
-/// A type whose all-zero bit pattern is **not** a valid value is rejected at
-/// compile time, so the unsound path is unreachable rather than merely untested:
+/// A type outside the sealed set is rejected at compile time. Sealing is what
+/// does the rejecting, so this holds for *every* downstream type regardless of its
+/// representation — the example below simply picks the case the marker's contract
+/// is named for:
 ///
 /// ```compile_fail
 /// # use zlib_rs::stream::{AllocBuffer, AllocHook};
@@ -252,8 +276,9 @@ mod sealed {
 ///     }
 /// }
 ///
-/// // `OneOnly` is `Copy + Default` but not `ZeroValid`: discriminant 0 is not a
-/// // valid `OneOnly`. This line fails to compile.
+/// // `OneOnly` is `Copy + Default` but cannot be `ZeroValid`, because the trait
+/// // is sealed and no downstream type may implement it. This line fails to
+/// // compile.
 /// let _ = AllocBuffer::<OneOnly>::try_zeroed(1, AllocHook::none());
 /// ```
 pub trait ZeroValid: sealed::ZeroValidSealed + Copy + Default {}
@@ -378,9 +403,12 @@ impl AllocHook {
     ///    is alive.
     /// 2. **zlib `zalloc` semantics.** `zalloc(opaque, items, size)` must
     ///    return either null (out of memory) or a pointer to at least
-    ///    `items * size` writable bytes, aligned for any element type the
-    ///    engines request (`u8`, `u16`, `u32`), and not aliased by any other
-    ///    live reference.
+    ///    `items * size` writable bytes, aligned for the element type of the
+    ///    buffer being reserved, and not aliased by any other live reference.
+    ///    The engines request `u8` and `u16`; the sealed [`ZeroValid`] set bounds
+    ///    what any other caller in this crate can ask for. A region that does not
+    ///    satisfy the alignment is returned through `zfree` and reported as an
+    ///    allocation failure rather than used.
     /// 3. **Matching deallocator.** `zfree` must be the deallocator paired with
     ///    that `zalloc`, and must accept any pointer that `zalloc` returned
     ///    together with the same `opaque`.
@@ -652,7 +680,7 @@ pub(crate) trait ForeignAlloc: Copy + Default + ZeroValid + 'static {
 /// [`Owned`](Self::Owned) arm builds them with `vec![T::default(); count]`; a
 /// foreign region is filled inside `crate::ffi::alloc` by *writing valid
 /// `T::default()` values*, which for the integer element types the engines
-/// request (`u8`, `u16`, `u32`, whose `Default` is `0`) is byte-for-byte the
+/// request (`u8` and `u16`, whose `Default` is `0`) is byte-for-byte the
 /// `zmemzero` that C `zcalloc` performs after its `zalloc`. Writing values rather
 /// than zeroing bytes is deliberate: the `Copy + Default` bound alone does not
 /// make an all-zero bit pattern a *valid* `T`. As an independent, compile-time
@@ -760,8 +788,9 @@ impl<T: Copy + Default + ZeroValid> AllocBuffer<T> {
         T: 'static,
     {
         let elem = core::mem::size_of::<T>();
-        // Zero-sized `T` has no meaningful buffer geometry; the engines only ever
-        // request `u8`/`u16`/`u32`, so this is unreachable in practice and is
+        // Zero-sized `T` has no meaningful buffer geometry. Every member of the
+        // sealed `ZeroValid` set is a non-zero-sized integer primitive (the engines
+        // request `u8` and `u16`), so this is unreachable in practice and is
         // rejected rather than silently mis-sized.
         if elem == 0 {
             return None;
@@ -975,10 +1004,10 @@ pub trait Allocator {
     /// value without running arbitrary drop or clone logic, and additionally to
     /// the sealed [`ZeroValid`] marker so the foreign path's element-type set is
     /// restricted at compile time; the buffer element types the engines request
-    /// are the plain integer types `u8`, `u16`, and `u32`, all of whose
-    /// [`Default`] is `0`. The bound is intentionally *not* relied on as a promise
-    /// that an all-zero bit pattern is a valid `T`: the foreign path initializes
-    /// by writing `T::default()` values.
+    /// are the plain integers `u8` and `u16`, whose [`Default`] is `0`. The bound
+    /// is intentionally *not* relied on as a promise that an all-zero bit pattern
+    /// is a valid `T`: the foreign path initializes by writing `T::default()`
+    /// values.
     ///
     /// # Failure
     ///
@@ -2204,10 +2233,11 @@ mod tests {
         assert_eq!(stats.allocs(), 0);
     }
 
-    /// Every element type the engines request is `ZeroValid`, so a byte-zeroed
-    /// foreign region holds `T::default()` in every slot — the property that
-    /// makes the boundary's zero-fill a correct initialization rather than a
-    /// reinterpretation of arbitrary bytes.
+    /// A foreign region holds `T::default()` in every slot, because the boundary
+    /// initializes it by *writing* that value rather than by reinterpreting
+    /// whatever bytes the hook returned. Asserted for the two element types the
+    /// engines request (`u8`, `u16`) and for `u32` as a further member of the
+    /// sealed [`ZeroValid`] set, all three of whose `Default` is `0`.
     #[test]
     fn zero_valid_element_types_are_default_initialized_through_the_hook() {
         let stats = crate::ffi::alloc::test_hook::HookStats::new();
@@ -2249,8 +2279,8 @@ mod tests {
     ///
     /// `vec![T::default(); count]` aborts the process when the request cannot be
     /// satisfied, whereas zlib reports a failed working-buffer allocation as
-    /// `Z_MEM_ERROR`. `try_zeroed` now reserves fallibly, so an unsatisfiable
-    /// request yields [`None`] and the caller can return `Z_MEM_ERROR` (AAP §0.6.5).
+    /// `Z_MEM_ERROR`. `try_zeroed` reserves fallibly, so an unsatisfiable request
+    /// yields [`None`] and the caller can return `Z_MEM_ERROR` (AAP §0.6.5).
     ///
     /// A `usize::MAX`-element request is used because it can never be satisfied
     /// on any supported target, making the assertion deterministic and

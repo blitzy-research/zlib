@@ -49,6 +49,49 @@
 //! untouched and yields `Z_STREAM_ERROR` rather than performing a
 //! layout-mismatched deallocation.
 //!
+//! # Defined rejections — deliberately part of the caller contract
+//!
+//! The uniform contract above is what a *well-formed* C caller owes this
+//! boundary. A C consumer, however, cannot be assumed well-formed. Reference
+//! zlib already answers *some* malformed calls with a defined error — its
+//! `inflateStateCheck` and the `inflate` entry test at `inflate.c` L474 — and
+//! this boundary deliberately extends the same treatment to the rest, so every
+//! case below is a diagnosable error instead of undefined behavior. The
+//! following inputs are therefore **explicitly inside** the contract of every
+//! non-initializing shim here: each is detected and rejected with
+//! `Z_STREAM_ERROR` (never a fabricated `Z_MEM_ERROR`, never a panic across the
+//! ABI), nothing is loaded through the offending pointer, and no allocation is
+//! created, freed, or reinterpreted.
+//!
+//! * **A null `z_streamp`.** Tested before any field is read.
+//! * **A zeroed or never-initialized `z_stream`.** Its `state` is null, which
+//!   [`peek_handle_kind`] reports as "no handle" without dereferencing it.
+//! * **A stream whose `*End` already ran.** Teardown nulls `state`, making this
+//!   indistinguishable from the previous case, which is exactly why a second
+//!   `inflateEnd` or `inflateBackEnd` is a defined `Z_STREAM_ERROR` and never a
+//!   double free.
+//! * **A stream carrying another engine's handle** — `inflateEnd` on a
+//!   `deflateInit2_` stream, `inflateBackEnd` on a plain inflate stream, or any
+//!   other crossing. The [`HandleKind`] tag at offset 0 is compared before the
+//!   opaque pointer is reinterpreted, so a cross-engine terminator can neither
+//!   deallocate with a mismatched `Layout` nor read another engine's fields.
+//!   This is a deliberate hardening **beyond** the C contract: reference zlib's
+//!   `inflateEnd` would cast the opaque `state` blindly, so portable C code must
+//!   still never do it — but against this implementation it is defined.
+//! * **Inconsistent buffer descriptors:** a null `next_out`, or a null `next_in`
+//!   paired with a non-zero `avail_in`. These fail `stream_buffers_valid` /
+//!   `input_ptr_valid` and are rejected *before* any slice is constructed.
+//! * **A null `in_func`/`out_func` passed to [`inflateBack`]**, and a null
+//!   `window` passed to [`inflateBackInit_`] — both checked, never called or
+//!   dereferenced.
+//!
+//! What stays the caller's obligation is only this: when a pointer is non-null
+//! and the call is one that actually uses it, the region it names must really be
+//! readable/writable for the length declared alongside it and must not overlap
+//! the other region, for the duration of the call. A pointer that the taken path
+//! never uses need not be valid — [`inflateBackInit_`] documents the one case
+//! where that distinction is observable.
+//!
 //! # `inflateBack` callback bridge
 //!
 //! zlib's `inflateBack` pulls input and pushes output through the C callbacks
@@ -689,6 +732,22 @@ pub unsafe extern "C" fn inflateInit_(
 /// reads and writes of `1 << windowBits` bytes, and must stay allocated and
 /// un-aliased until [`inflateBackEnd`] destroys the state. These are the
 /// obligations `zlib.h` already places on the argument (`zlib.h` L1682-L1699).
+///
+/// Those obligations bind **only on the accepting path**, and that is a
+/// deliberate part of the contract rather than an accident of the
+/// implementation. The argument guards run in a fixed order — version pair,
+/// then `strm`/`window` null, then the `8..=15` `windowBits` bound — and the
+/// region is first named only after all three have passed:
+///
+/// * A **null `window`** is a defined, rejected argument (`Z_STREAM_ERROR`). The
+///   pointer is compared, never dereferenced.
+/// * A **`windowBits` outside `8..=15`** is rejected before the window is
+///   touched, so the size obligation does not apply to such a call. Probing the
+///   rejected range with a buffer smaller than `1 << windowBits` — or with no
+///   buffer at all — is therefore sound and within contract.
+///
+/// Only a call that will be *accepted* must actually supply `1 << windowBits`
+/// live, un-aliased bytes that outlive the state.
 ///
 /// The region is zero-filled before use — see `crate::ffi::alloc`'s
 /// `borrow_caller_window` for why that is required and why it is unobservable to
@@ -2673,8 +2732,8 @@ mod tests {
         rc
     }
 
-    /// Finding #11 — each gzip header scalar must be published **only** by the
-    /// parser state that assigns it in C, never eagerly.
+    /// Each gzip header scalar is published **only** by the parser state that
+    /// assigns it in C, never eagerly.
     ///
     /// C writes into the caller's `gz_header` from inside `FLAGS` (`text`), `TIME`
     /// (`time`), `OS` (`xflags` and `os`, one statement pair under one guard) and
@@ -2752,8 +2811,8 @@ mod tests {
         assert_eq!(hdr.comment[HDR_COMMENT.len()], 0);
     }
 
-    /// Finding #8 — a stream that turns out **not** to carry a gzip header must
-    /// report C's `done == -1`, which a [`bool`] cannot express.
+    /// A stream that turns out **not** to carry a gzip header reports C's
+    /// `done == -1`, which a [`bool`] cannot express.
     ///
     /// With auto-detect framing (`windowBits = 47`) the decoder does not know
     /// which wrapper it has until the first two bytes arrive. When they are not
@@ -2805,7 +2864,7 @@ mod tests {
         }
     }
 
-    /// Finding #11 — a name or comment still arriving must stay **unterminated**.
+    /// A name or comment still arriving stays **unterminated**.
     ///
     /// C stores the field's NUL only when it actually decodes that byte
     /// (`inflate.c` L632-L637 / L654-L659), so a caller polling mid-field sees the
@@ -2850,9 +2909,9 @@ mod tests {
         assert_eq!(hdr.comment[HDR_COMMENT.len()], 0);
     }
 
-    /// Finding #11 — C counts the terminating NUL against `name_max`/`comm_max`
-    /// like any other decoded byte, so a name that *exactly* fills the buffer is
-    /// left unterminated.
+    /// C counts the terminating NUL against `name_max`/`comm_max` like any other
+    /// decoded byte, so a name that *exactly* fills the buffer is left
+    /// unterminated.
     ///
     /// `inflate.c` L632-L637 stores under `state->length < head->name_max` and
     /// increments `state->length` for the NUL too. With a nine-byte name:
@@ -2895,8 +2954,8 @@ mod tests {
         assert_eq!(hdr.head.extra_len, HDR_EXTRA.len() as c_uint);
     }
 
-    /// Finding #11 — an **absent** optional field must null the caller's pointer
-    /// and leave its buffer untouched.
+    /// An **absent** optional field nulls the caller's pointer and leaves its
+    /// buffer untouched.
     ///
     /// C assigns `head->extra = Z_NULL` (`inflate.c` L605-L606), `head->name =
     /// Z_NULL` (L643-L644) and `head->comment = Z_NULL` (L665-L666) on the
@@ -2988,7 +3047,7 @@ mod tests {
         }
     }
 
-    /// Finding #11 — the same schedule holds when the FHCRC bit is clear: the
+    /// The same schedule holds when the FHCRC bit is clear: the
     /// `HCRC` state's `head->hcrc = (flags >> 9) & 1; head->done = 1;` pair sits
     /// *outside* the `flags & 0x0200` guard (`inflate.c` L686-L689), so `hcrc` is
     /// published as `0` rather than left poisoned.

@@ -7,8 +7,8 @@
 //! green and un-`#[ignore]`d is required by **§0.7.2 plan-adopted standard S10**
 //! ("quality gates stay green and blocking") and by **§0.8.1 directive D-5**
 //! (test coverage is preserved and only ever increased). It reproduces the ten
-//! `example.c` helper functions as independent `#[test]`s driving the public
-//! [`zlib_rs`] API:
+//! `example.c` helper functions plus `main`'s version guard as independent
+//! `#[test]`s driving the public [`zlib_rs`] API:
 //!
 //! * [`version_check`] — the version guard from `example.c`'s `main`.
 //! * [`test_compress`] — one-call [`compress`] / [`uncompress`] round-trip.
