@@ -470,10 +470,25 @@ fn shape_constant(len: usize) -> Vec<u8> {
 }
 
 /// High-entropy pseudo-random bytes: effectively incompressible, so the
-/// stored-block fallback and the fruitless-search paths dominate. This is also
-/// the profile where compression throughput is furthest from the C baseline
-/// (AAP §0.8.3) — a fact this harness neither measures nor cares about, since it
-/// compares bytes and never time.
+/// stored-block fallback and the fruitless-search paths dominate. That is the
+/// whole reason this shape is in the grid — it reaches encoder paths the other
+/// four corpora never take.
+///
+/// Do NOT restate this shape as the profile with the largest throughput gap
+/// against C — an earlier revision of this comment did, and the measurement says
+/// the reverse. A per-profile comparison inverts the intuition: incompressible
+/// input is the profile *closest* to C, at roughly 82%–86%, because the match
+/// finder fails fast (`longest_match`'s two-byte prefilter rejects nearly every
+/// candidate) and block-type selection falls back to stored blocks, so both
+/// implementations do similarly little work per byte.
+/// The *compressible* profiles are the furthest, at roughly 58%–64%, where hash
+/// chains are genuinely walked and Huffman trees built. The aggregate
+/// "compression ≈ 85%, decompression 107%–127%" figure is the one AAP §0.8.3
+/// records, and it is attributed context rather than anything re-derived here.
+///
+/// All of which this harness neither measures nor cares about: it compares bytes
+/// and never time. The note exists only so the comment cannot be mistaken for a
+/// performance claim that the benchmarks contradict.
 fn shape_incompressible(len: usize) -> Vec<u8> {
     let mut rng = XorShift64::new(0x9E37_79B9_7F4A_7C15);
     (0..len).map(|_| rng.next_byte()).collect()

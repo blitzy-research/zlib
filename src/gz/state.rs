@@ -132,6 +132,13 @@ pub(crate) enum How {
 /// can observe a released handle. The [`Deref`](core::ops::Deref) impls document
 /// that as their panic condition; it is unreachable by construction and covered
 /// by tests.
+///
+/// The one other moment at which the handle is absent is *before* the useful
+/// life begins: [`pending`](Self::pending) exists so `gz_open` can allocate the
+/// state in C's order — struct first, then the path name, then the `open(2)` —
+/// and install the handle only once the file is actually open. That window is
+/// confined to `gz_open`'s own body and no [`Deref`](core::ops::Deref) occurs
+/// inside it.
 pub(crate) struct GzFile {
     /// The owned handle, or [`None`] once [`release`](Self::release) has taken it
     /// for an explicit close.
@@ -145,6 +152,25 @@ impl GzFile {
         Self {
             handle: Some(handle),
         }
+    }
+
+    /// Creates a wrapper with **no** handle yet, for the brief window inside
+    /// `gz_open` between allocating the state and opening the file.
+    ///
+    /// Reference zlib allocates `gz_state` *before* it opens anything
+    /// (`gzlib.c`: `malloc(sizeof(gz_state))`, then `malloc` for the path name,
+    /// then `open`), so a failure of either allocation returns `NULL` having
+    /// touched no file at all. Reproducing that order requires a state value that
+    /// can exist before its descriptor does — C simply leaves `state->fd`
+    /// uninitialised until the `open` succeeds, and this is the safe equivalent.
+    ///
+    /// The resulting value must have a real handle installed (by assigning
+    /// [`GzFile::new`]) before anything dereferences it; `gz_open` does so on the
+    /// only path that returns the state to a caller, so no live [`GzState`] is
+    /// ever observable in this condition.
+    #[inline]
+    pub(crate) const fn pending() -> Self {
+        Self { handle: None }
     }
 
     /// Hands the owned handle to the caller so it can perform an explicit,
@@ -548,15 +574,57 @@ impl GzState {
             return;
         }
 
-        // 6. Construct the "path: message" detail string.
-        let detail = format!("{}: {msg}", self.path);
+        // 6. Construct the "path: message" detail string — fallibly, because C
+        //    checks this very allocation and *downgrades the reported error* when
+        //    it fails:
+        //
+        //        if ((state->msg = malloc(strlen(state->path) + strlen(msg) + 3))
+        //                == NULL) {
+        //            state->err = Z_MEM_ERROR;
+        //            return;
+        //        }
+        //
+        //    (`gzlib.c`, `gz_error`.) `format!` would instead terminate the
+        //    process, which would be a particularly poor failure mode here: this
+        //    is the function every other error path calls to *report* itself, so
+        //    an abort would replace a diagnosable error with process death at the
+        //    exact moment the caller was about to be told what went wrong.
+        //
+        //    C's request is `strlen(path) + strlen(msg) + 3` — the two strings
+        //    plus `": "` plus the NUL. A Rust `String` carries no NUL, so the
+        //    exact requirement is two fewer than C's by one byte for the
+        //    terminator; `msg_c` below reserves that byte separately.
+        let detail_len = self.path.len() + 2 + msg.len();
+        let mut detail = String::new();
+        if detail.try_reserve_exact(detail_len).is_err() {
+            self.err = ReturnCode::MemError;
+            return;
+        }
+        // Infallible from here: the exact capacity is already reserved.
+        detail.push_str(&self.path);
+        detail.push_str(": ");
+        detail.push_str(msg);
+        debug_assert_eq!(detail.len(), detail_len);
 
         // Keep the FFI-facing NUL-terminated mirror in lockstep with `msg`. The
         // detail is `path` + `": "` + `msg`; a real gzip path and error detail
         // contain no interior NUL, so `CString::new` succeeds. Were an interior
         // NUL ever present, `.ok()` yields `None` and the FFI `gzerror` falls
         // back to the empty string rather than exposing a truncated pointer.
-        self.msg_c = CString::new(detail.as_bytes()).ok();
+        //
+        // The byte buffer is reserved with room for that terminator, so
+        // `CString::new` — which appends the NUL to the `Vec` it is given — does
+        // not reallocate and cannot abort. C makes one allocation for both roles
+        // because a C string *is* the message; this port needs the second buffer
+        // only because it also keeps a native `String`, and it is held to the same
+        // "check it, do not abort" rule.
+        let mut c_bytes: Vec<u8> = Vec::new();
+        if c_bytes.try_reserve_exact(detail_len + 1).is_err() {
+            self.err = ReturnCode::MemError;
+            return;
+        }
+        c_bytes.extend_from_slice(detail.as_bytes());
+        self.msg_c = CString::new(c_bytes).ok();
         self.msg = Some(detail);
     }
 

@@ -586,7 +586,7 @@ pub trait ForeignBuffer<T: Copy + Default + ZeroValid> {
 // Core-declared allocation capabilities — implemented by the `ffi` boundary
 // ---------------------------------------------------------------------------
 //
-// The AAP's layer ordering is strictly acyclic and one-way: `ffi` (layer 8) may
+// The AAP's layer ordering runs one way for this pair: `ffi` (layer 8) may
 // depend on `stream` (layer 5), never the reverse (AAP §0.3.1, §0.6.2). The two
 // primitives below need raw-pointer `unsafe`, which is permitted only inside
 // `src/ffi/**`, yet they are needed *by* this module. The resolution is

@@ -52,6 +52,7 @@ use std::io::{self, Write};
 use crate::constants::{DEF_MEM_LEVEL, FlushMode, MAX_WBITS, Strategy, Z_DEFLATED, Z_FINISH};
 use crate::deflate;
 use crate::error::{ReturnCode, ZlibError};
+use crate::gz::alloc_zeroed;
 use crate::gz::state::{GzFile, GzMode, GzState};
 
 /// Returns `true` if `state` is a live write stream with no *serious* pending
@@ -102,13 +103,36 @@ fn write_ready(state: &GzState) -> bool {
 /// `0` and marks the stream uninitialized.
 pub(crate) fn gz_init(state: &mut GzState) -> Result<(), ZlibError> {
     // Allocate the input buffer, double-sized for `gzprintf` (C L14-L19).
-    state.in_buf = vec![0u8; state.want << 1];
+    //
+    // `crate::gz::alloc_zeroed` rather than `vec![0u8; …]` because this length is
+    // caller-influenced and can legitimately be enormous: `gzbuffer` accepts any
+    // `want` up to `UINT_MAX >> 1` (matching C, which bounds the request and
+    // nothing more), so `want << 1` here can reach ~4 GiB from a single
+    // `gzbuffer(file, 0x7fff_ffff)` call. C answers an unsatisfiable request with
+    // `Z_MEM_ERROR` / "out of memory" and leaves the stream usable; `vec!` would
+    // abort the process instead, which a C caller cannot intercept. Nothing has
+    // been allocated yet at this point, so — exactly like C L16-L19, whose first
+    // failure return is not preceded by any `free` — there is nothing to roll
+    // back.
+    let Some(in_buf) = alloc_zeroed(state.want << 1) else {
+        state.error(ReturnCode::MemError, Some("out of memory"));
+        return Err(ZlibError::MemError);
+    };
+    state.in_buf = in_buf;
 
     // Only need an output buffer and a deflate engine when compressing
     // (C L22-L44); a `direct` stream writes straight to the file.
     if state.direct == 0 {
-        // Allocate the output buffer (C L23-L29).
-        state.out_buf = vec![0u8; state.want];
+        // Allocate the output buffer (C L23-L29). C frees the input buffer
+        // before reporting this one's failure (`free(state->in);` at C L25), so
+        // the rollback runs first here too — the allocation order, the count, and
+        // the reported code all stay identical to C.
+        let Some(out_buf) = alloc_zeroed(state.want) else {
+            gz_init_rollback(state);
+            state.error(ReturnCode::MemError, Some("out of memory"));
+            return Err(ZlibError::MemError);
+        };
+        state.out_buf = out_buf;
 
         // Set up for gzip compression. `MAX_WBITS + 16` selects gzip
         // header/trailer framing inside the engine (C L34-L36). The gzip
@@ -2377,6 +2401,129 @@ mod tests {
             !state.strm.is_deflate(),
             "no deflate engine for a transparent stream"
         );
+    }
+
+    /// The **first** `gz_init` allocation — C's `malloc(state->want << 1)` — must
+    /// report `Z_MEM_ERROR` / "out of memory" instead of aborting, and must leave
+    /// the stream in the uninitialized state so a caller can lower `want` and
+    /// retry.
+    ///
+    /// This is the abort the review found reachable from a legitimate API
+    /// sequence: `gzbuffer` accepts any size up to `UINT_MAX >> 1` (exactly as C
+    /// does — its only size check is the doubling-overflow test), so
+    /// `gzbuffer(file, 0x7fff_ffff)` followed by a write asks for ~4 GiB here.
+    ///
+    /// `want = usize::MAX / 2` makes `want << 1` equal `usize::MAX - 1`, which
+    /// exceeds the `isize::MAX` ceiling on any allocation and is therefore refused
+    /// by arithmetic — deterministic on 32-bit and 64-bit, instant, and with no
+    /// memory ever requested.
+    #[test]
+    fn gz_init_reports_mem_error_when_the_input_buffer_cannot_be_allocated() {
+        let path = TempFile::new("init_oom_in");
+        let mut state = new_write_state(&path, usize::MAX / 2, 6, 0, 0);
+
+        assert_eq!(
+            gz_init(&mut state),
+            Err(ZlibError::MemError),
+            "an unallocatable input buffer is C's `malloc` returning NULL"
+        );
+        assert_eq!(state.err, ReturnCode::MemError, "gzerror must report OOM");
+        // `GzState::error` deliberately allocates nothing for `MemError` — a
+        // detail string would need the very allocator that just failed — so the
+        // "out of memory" text comes from `gzerror`'s static branch, which is also
+        // where C's `gz_error` sources it (`gzlib.c`: `if (err == Z_MEM_ERROR) {
+        // state->msg = (char *)"out of memory"; return; }`).
+        assert!(
+            state.msg.is_none(),
+            "reporting OOM must not itself allocate a message"
+        );
+        assert_eq!(
+            crate::gz::gzerror(&state, None),
+            "out of memory",
+            "C reports this exact message (gzwrite.c L17 via gz_error)"
+        );
+        assert_eq!(state.size, 0, "the stream must stay uninitialized");
+        assert!(state.in_buf.is_empty(), "no input buffer was retained");
+        assert!(state.out_buf.is_empty(), "no output buffer was allocated");
+        assert!(
+            !state.strm.is_deflate(),
+            "the engine is never reached when the first allocation fails"
+        );
+    }
+
+    /// When the **second** allocation fails — C's `malloc(state->want)` for the
+    /// output buffer — C frees the input buffer first (`free(state->in);`,
+    /// `gzwrite.c` L25) and only then reports. The port must release it too, or a
+    /// stream that can never initialize would hold `2 * want` bytes for the rest
+    /// of its life on every rejected write.
+    ///
+    /// `want = usize::MAX / 2 + 2` reaches that path deterministically and, just
+    /// as importantly, makes the rollback *observable*. That value is
+    /// `2^(BITS-1) + 1`, so:
+    ///
+    /// * `want << 1` truncates to `2` — exactly as C's unsigned shift does — so the
+    ///   input buffer really is allocated, with a non-zero length; and
+    /// * `want` itself exceeds the `isize::MAX` allocation ceiling, so the output
+    ///   buffer is refused by arithmetic, with no memory ever requested.
+    ///
+    /// The non-zero input length is what gives the test its teeth: with
+    /// `want << 1` wrapping to `0` instead, `in_buf` would be empty either way and
+    /// the rollback assertion below would hold vacuously — it would pass against a
+    /// build with the rollback deleted.
+    #[test]
+    fn gz_init_rolls_back_the_input_buffer_when_the_output_buffer_cannot_be_allocated() {
+        let path = TempFile::new("init_oom_out");
+        let want = usize::MAX / 2 + 2;
+        // Pin the arithmetic the test depends on, so a future edit cannot quietly
+        // make this case vacuous again.
+        assert_eq!(
+            want << 1,
+            2,
+            "the input buffer must be allocated, non-empty"
+        );
+
+        let mut state = new_write_state(&path, want, 6, 0, 0);
+
+        assert_eq!(
+            gz_init(&mut state),
+            Err(ZlibError::MemError),
+            "an unallocatable output buffer is C's second `malloc` returning NULL"
+        );
+        assert_eq!(state.err, ReturnCode::MemError);
+        assert!(state.msg.is_none(), "reporting OOM must not allocate");
+        assert_eq!(crate::gz::gzerror(&state, None), "out of memory");
+        assert_eq!(state.size, 0, "the stream must stay uninitialized");
+        assert!(
+            state.in_buf.is_empty(),
+            "the input buffer must be released, mirroring C's `free(state->in)`"
+        );
+        assert!(state.out_buf.is_empty(), "nothing was retained for output");
+        assert!(!state.strm.is_deflate(), "the engine is never initialized");
+    }
+
+    /// A stream whose buffers could not be allocated must remain *usable*: the
+    /// write reports failure through the documented channels and a caller that
+    /// lowers `want` can initialize successfully afterwards. This is what makes
+    /// the deferred-allocation design (C parity for `gzbuffer`) recoverable rather
+    /// than merely non-fatal.
+    #[test]
+    fn a_stream_that_failed_to_initialize_can_be_retried_with_a_smaller_want() {
+        let path = TempFile::new("init_oom_retry");
+        let mut state = new_write_state(&path, usize::MAX / 2, 6, 0, 0);
+
+        assert_eq!(gz_init(&mut state), Err(ZlibError::MemError));
+        assert_eq!(state.err, ReturnCode::MemError);
+
+        // The recovery a real caller performs: shrink the request and clear the
+        // recorded error, exactly as `gzbuffer` + `gzclearerr` would.
+        state.want = 128;
+        state.clear_error();
+        gz_init(&mut state).expect("a satisfiable request initializes normally");
+
+        assert_eq!(state.in_buf.len(), 256, "input buffer is want << 1");
+        assert_eq!(state.out_buf.len(), 128, "output buffer is want");
+        assert_eq!(state.size, 128, "size marks the buffers as initialized");
+        assert!(state.strm.is_deflate(), "the engine came up on the retry");
     }
 
     #[test]

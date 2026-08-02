@@ -146,7 +146,9 @@ this as you have:
    tables with `cfg!(target_endian)`, and [`src/util/mod.rs`](src/util/mod.rs)
    selects the gzip header's `OS_CODE` per platform (10 on Windows, 19 on
    non-Windows Apple, 3 otherwise) — so a defect can be genuinely
-   platform-specific.
+   platform-specific. Both are decided **at compile time** from the triple you
+   built for, not probed at run time, which is why the triple itself is the
+   evidence we need rather than the machine you happened to run on.
 5. **The four encoder axes**, when compression is involved: `windowBits` (raw
    `-8..-15`, zlib `8..15`, gzip `+16`, auto-detect `+32`), `level`, `strategy`,
    and `memLevel`.
@@ -387,21 +389,49 @@ Both lockfiles are committed deliberately, because the crate ships
 `cdylib`/`staticlib` distributables and reproducible offline builds need exact
 resolved versions.
 
-**The gates.** Two `cargo-deny` policies govern that closure — [`deny.toml`](deny.toml)
-for the root graph and [`fuzz/deny.toml`](fuzz/deny.toml) for the detached fuzz
-workspace. Both declare `[advisories]`, `[licenses]`, `[bans]`, and `[sources]`,
-resolve with `all-features = true`, deny yanked crates, and bound advisory-database
-staleness at `maximum-db-staleness = "P7D"`. The root policy carries an **empty
-`ignore` list** — no advisory is waived — pins nine target triples so the audit
-covers the Windows, Apple, aarch64, bare-metal, and wasm configurations rather than
-only the host, and names `cc`, `bindgen`, `pkg-config`, `libz-sys`, and the
-bzip2/lzma/zstd/brotli families in `[bans] deny` so the zero-C-dependency and
-single-codec properties cannot erode by accident.
-[`.github/workflows/audit.yml`](.github/workflows/audit.yml) runs `cargo-audit`
-over **both** lockfiles plus the root `cargo-deny` policy on every push and pull
-request and on a daily schedule, and asserts that neither lockfile was rewritten;
-[`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml) runs the fuzz-workspace
-policy as a `supply-chain` job that **gates** fuzzing.
+**The gate.** A single `cargo-deny` policy governs that closure —
+[`deny.toml`](deny.toml) — evaluated twice, once per dependency graph. There is
+deliberately no sibling `fuzz/deny.toml`: a blocking supply-chain verdict must come
+from a policy reviewed on this repository's normal review surface, and a second
+policy file governing a blocking gate is a second place for the standard to drift.
+Both invocations name the file explicitly with `--config deny.toml`, because
+`cargo-deny` otherwise resolves configuration from the *target* manifest's
+workspace root and would fall back to built-in defaults for the fuzz graph — a
+fallback that looks exactly like a pass:
+
+```sh
+cargo deny --locked --config deny.toml check
+cargo deny --locked --manifest-path fuzz/Cargo.toml --config deny.toml check
+```
+
+The policy declares `[advisories]`, `[licenses]`, `[bans]`, and `[sources]`,
+resolves with `all-features = true`, denies yanked crates, and bounds
+advisory-database staleness at `maximum-db-staleness = "P7D"`. It carries an
+**empty `ignore` list** — no advisory is waived — leaves `[graph] targets` **empty**
+so every crate is evaluated for every platform (naming triples *prunes* the graph:
+measured, nine triples reduced coverage from 89 crates to 86, silently dropping the
+`spirv`-only and `uefi`-only leaves from licence and ban review), and names `cc`,
+`bindgen`, `pkg-config`, `libz-sys`, and the bzip2/lzma/zstd/brotli families in
+`[bans] deny` so the zero-C-dependency and single-codec properties cannot erode by
+accident. The two concessions the fuzz graph needs are scoped rather than relaxed:
+the `cc` ban carries `wrappers = ["libfuzzer-sys"]`, so every *other* path to a C
+toolchain is still an error, and `libfuzzer-sys`'s mandatory NCSA term is granted
+through a crate-scoped `[[licenses.exceptions]]` entry rather than added to the
+global allow list.
+[`.github/workflows/audit.yml`](.github/workflows/audit.yml) is the single owner of
+that gate. It runs `cargo-audit` over **both** lockfiles and evaluates the policy over
+**both** graphs — the root graph in its `cargo-deny` job and the detached fuzz graph in
+its `cargo-deny-fuzz` job — on every push and pull request and on a daily schedule
+(`cron: '0 5 * * *'`), and asserts that neither lockfile was rewritten. A fourth job,
+`policy-integrity`, reads the policy file and fails if any load-bearing key has drifted
+from the value reviewed here — or if a sibling `fuzz/deny.toml` ever reappears.
+
+[`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml) deliberately declares **no**
+`cargo-deny` job of its own, so fuzzing is not gated on a policy verdict inside its own
+run. That is a real trade and is recorded rather than glossed: what replaces the gate is
+breadth of coverage — `cargo-deny-fuzz` evaluates the policy on every push and pull
+request, which is far more often than the weekly fuzzing schedule fires, so the fuzz
+graph is checked strictly more, not less.
 
 **The finding that motivated all of that.** `rand 0.9.4` is the direct
 dev-dependency, pinned at or above the patched range for **RUSTSEC-2026-0097**.
@@ -414,11 +444,57 @@ consumers of the published crate — a dev-dependency is not part of a downstrea
 build graph. The gate exists precisely to catch this class of drift: a policy
 written against a single assumed `rand` version would be wrong on contact.
 
-**Four duplicate majors are expected.** `cargo deny check bans` reports `rand`
-(0.9.4 / 0.10.2), `rand_core` (0.9.5 / 0.10.1), `getrandom` (0.3.4 / 0.4.3), and
-`r-efi` (5.3.0 / 6.0.0) as duplicates. All four are dev-graph-only and are
-documented in [`deny.toml`](deny.toml); `multiple-versions` is set to `warn`
-rather than `deny` for exactly this reason. They are not a finding.
+**Duplicate majors are a hard error, with exactly four named exemptions.**
+[`deny.toml`](deny.toml)'s `[bans]` table sets `multiple-versions = "deny"` — *not*
+`warn` — together with `multiple-versions-include-dev = true`. Including the dev
+graph is load-bearing: with that key unset, `multiple-versions = "deny"` reports
+`bans ok` anyway, because every duplication in this project is dev-only. `warn`
+would have been the weaker choice on the other axis: it accepts *every* duplicate,
+including one introduced tomorrow by an unrelated dependency bump, and buries it in
+output nobody re-reads.
+
+Four duplications are legitimate, dev-dependency-only, and absent from all three
+shipped artifacts (`lib`, `cdylib`, `staticlib` contain only `cfg-if` and optionally
+`crc32fast`). They are exempted one at a time by exact-version `skip` entries:
+
+| `skip` entry | Why |
+|--------------|-----|
+| `rand@0.10.2` | Dev-only; transitive via `quickcheck 1.1.0`, while `rand 0.9.4` is the direct dev-dependency. Both are above the RUSTSEC-2026-0097 patched range |
+| `rand_core@0.10.1` | Dev-only; follows `rand 0.10.2` down the `quickcheck` path |
+| `getrandom@0.4.3` | Dev-only; follows `rand_core 0.10.1` down the same path |
+| `r-efi@6.0.0` | Dev-only; the UEFI random backend of `getrandom 0.4.3`, while `r-efi 5.3.0` follows `getrandom 0.3.4`. Unreachable on every supported platform — `getrandom` gates it on the custom `cfg` `getrandom_backend = "efi_rng"` — and its LGPL term is an `OR`-disjunct already satisfied permissively |
+
+Each entry names the **transitive** copy rather than the version this project
+declares, on two counts: the directly-declared `rand 0.9.4` stays under normal
+scrutiny, and because a `skip` matches an exact version, a future `quickcheck` bump
+leaves the entry unmatched and `cargo-deny` reports `warning[unmatched-skip]` —
+turning dependency drift into a visible prompt to re-review rather than a silent
+widening of the exemption. `skip-tree` is deliberately empty, because it would
+suppress an entire transitive subtree.
+
+**`r-efi` is the fourth entry as a direct consequence of `[graph] targets = []`.**
+With no triple filter, both `r-efi` 5.3.0 and 6.0.0 stay in the graph and are
+correctly reported as a fourth duplicate major, so they must be waived by name like
+the other three. An explicit triple list would instead have *pruned* them — and
+pruning is the weaker outcome, because a package nobody evaluates is not a package
+nobody ships. Empty `targets` is the deliberate choice: all 89 root packages are
+governed, and the waiver is recorded in writing rather than hidden by a filter.
+
+Measured on this tree, using the exact invocation CI runs:
+
+```sh
+cargo deny --locked --config deny.toml -L info check bans \
+  -A unused-wrapper -A license-exception-not-encountered
+# bans ok: 0 errors, 0 warnings, 5 notes
+```
+
+The notes are the acknowledged skips plus the `cc` wrapper scope; zero warnings and
+zero errors is the expected steady state, and **any fifth duplicate major is a hard
+error that fails the build** until somebody either removes it or approves it in
+writing. The skip list is additionally asserted as an exact four-entry set by the
+`policy-integrity` job in
+[`.github/workflows/audit.yml`](.github/workflows/audit.yml), so silently adding a
+fifth waiver fails CI just as loudly as the duplicate itself would.
 
 ---
 
@@ -438,11 +514,11 @@ Measured on this tree with a comment-excluded token scan:
 
 | Location | Unsafe-bearing code lines |
 |----------|---------------------------|
-| `src/ffi/` (the designated boundary) | **1,111** — `inflate.rs` 309, `deflate.rs` 226, `util.rs` 159, `gz.rs` 148, `types.rs` 113, `mod.rs` 101, `alloc.rs` 55 |
+| `src/ffi/` (the designated boundary) | **1,117** — `inflate.rs` 309, `deflate.rs` 230, `util.rs` 159, `gz.rs` 150, `types.rs` 113, `mod.rs` 101, `alloc.rs` 55 |
 | `src/deflate/`, `src/inflate/`, `src/checksum/`, `src/gz/`, `src/util/`, `src/error.rs`, `src/constants.rs`, `src/gz_header.rs` | **0** |
 | `src/stream.rs` | **2**, and both are `type` aliases only — `ZallocFn` and `ZfreeFn` merely *name* the C hook signatures the crate interoperates with. `grep -c "unsafe {"` on that file returns **0**, and the module carries its own `#![deny(unsafe_code)]` |
 
-Every `unsafe` block that does exist is justified in place: **383** `// SAFETY:`
+Every `unsafe` block that does exist is justified in place: **387** `// SAFETY:`
 comments across `src/`, with `#![warn(clippy::undocumented_unsafe_blocks)]` and
 `#![warn(missing_docs)]` promoted to hard errors by the `-D warnings` lint gate.
 Containment is checked four independent ways — the `deny` attribute, that lint
@@ -482,9 +558,9 @@ derivation: [Exported symbol reconciliation](README.md#exported-symbol-reconcili
 
 | Command | Result |
 |---------|--------|
-| `cargo test --locked` | **842 passed / 0 failed / 0 ignored** (688 unit, 127 integration, 27 doctests) |
-| `cargo test --locked --all-features` | **855 passed / 0 failed / 0 ignored** (adds the 13 live C-oracle tests) |
-| `cargo test --locked --no-default-features` | **626 passed / 0 failed / 0 ignored** |
+| `cargo test --locked` | **859 passed / 0 failed / 0 ignored** (704 unit, 128 integration, 27 doctests) |
+| `cargo test --locked --all-features` | **872 passed / 0 failed / 0 ignored** (adds the 13 live C-oracle tests) |
+| `cargo test --locked --no-default-features` | **633 passed / 0 failed / 0 ignored** |
 
 The **ignored-test count is zero in every configuration and stays zero**. A
 capability that cannot be exercised in a given build is expressed by a feature
@@ -526,7 +602,9 @@ workspace that the root build never pulls in.
 [`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml) builds every target and
 runs each on a weekly schedule (`cron: '0 3 * * 1'`) and on pull requests, with a
 per-target budget of **120 s on a pull request and 600 s otherwise**, at
-`-max_len=65536 -rss_limit_mb=2048`, behind the `cargo-deny` supply-chain gate.
+`-max_len=65536 -rss_limit_mb=2048`. Supply-chain policy over the fuzz graph is not
+enforced by that workflow: the root `deny.toml` is aimed at that graph by `audit.yml`'s
+`cargo-deny-fuzz` job on every push and pull request.
 Each target's corpus is persisted between runs, and crash artifacts are uploaded
 on failure. The fuzz crate builds with `overflow-checks = true`, so an arithmetic
 overflow is a finding rather than a wrap.
@@ -539,17 +617,28 @@ above, not by that total.
 ### Honest limitations
 
 Everything above describes coverage that exists; this section describes coverage
-that does not. `.github/workflows/ci.yml` runs **eleven jobs**, and the boundary
+that does not. `.github/workflows/ci.yml` runs **twelve jobs**, and the boundary
 sits here:
 
 - **Natively executed, full suite:** `ubuntu-latest` across five feature rows,
   plus **`windows-latest` (x86_64)** and **`macos-latest` (aarch64)**. The Windows
   row is the only place `OS_CODE = 10` and the `#[cfg(windows)]`-gated `gzopen_w`
-  are compiled *and* run; the macOS row is the only place that reaches
-  `OS_CODE = 19` and `O_NONBLOCK`'s BSD value.
+  are compiled *and* run: it executes
+  `ffi::gz::tests::wide_path_open_round_trip`, which opens a UTF-16 path through
+  `gzopen_w`, writes, closes, reopens, reads the payload back, and asserts both the
+  recovered bytes and the `gzerror` state — and a dedicated Windows-only step runs
+  that test by name and asserts exactly one test passed, so the claim cannot decay
+  into a compile-only check. The macOS row is the only place that reaches
+  `OS_CODE = 19` and `O_NONBLOCK`'s BSD value. Every row additionally asserts its
+  own `rustc -vV` host triple and `runner.arch`, so a mutable runner label that
+  changes architecture underneath us fails the job instead of quietly invalidating
+  this paragraph.
 - **Compile-verified only, never executed:** `aarch64-unknown-linux-gnu`,
   `i686-unknown-linux-gnu` (32-bit `usize`), and `s390x-unknown-linux-gnu`
-  (**big-endian**) are cross type-checked with `cargo check --all-targets`. So the
+  (**big-endian**) are cross type-checked with
+  `cargo check --locked --all-targets --all-features`, the `--all-features`
+  spelling being what pulls the `c_oracle` harness and the `inflate_strict` arms
+  into the check rather than skipping them. So the
   big-endian CRC braid arms and the 32-bit pointer-width arms are **compiled but
   not run**, and this document does not claim otherwise. A unit test does assert
   that the endian-selected table anchors match the active target's values on every
@@ -560,7 +649,7 @@ sits here:
   assertion that the freestanding runtime block — the libc-backed allocator, the
   abort panic handler, the personality shim — was genuinely compiled. **`no_std`
   has been validated on a hosted target and compile-verified for bare metal; it
-  has not been exercised on real embedded hardware.** 626 passing hosted tests do
+  has not been exercised on real embedded hardware.** 633 passing hosted tests do
   not prove an embedded target works.
 - **Human code review across the full Rust surface (≈ 57,000 lines under `src/`)
   is outstanding**, and it is the highest-severity remaining hardening item
@@ -584,7 +673,7 @@ The same boundary is drawn, job by job, in
 | [`README.md`](README.md) | Overview, feature matrix, measured evidence, the drop-in ABI, and the portability boundary |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution workflow, the blocking quality gates, and the MSRV policy |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release history for the Rust crate; `Security` entries record every fix |
-| [`deny.toml`](deny.toml) / [`fuzz/deny.toml`](fuzz/deny.toml) | The supply-chain policy for the root and fuzz graphs |
+| [`deny.toml`](deny.toml) | The single supply-chain policy, evaluated over both the root and fuzz graphs |
 | [`Cargo.toml`](Cargo.toml) | Crate identity, the feature contract, profiles, and the published-crate `exclude` list |
 | [`LICENSE`](LICENSE) | The zlib/libpng license, carried forward from upstream |
 

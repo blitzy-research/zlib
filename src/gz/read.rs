@@ -40,6 +40,7 @@
 
 use crate::constants::Z_NO_FLUSH;
 use crate::error::{ReturnCode, ZlibError};
+use crate::gz::alloc_zeroed;
 use crate::gz::state::{GzMode, GzState, How};
 use crate::inflate;
 use std::io::{self, BufRead, Read};
@@ -47,21 +48,6 @@ use std::io::{self, BufRead, Read};
 // ===========================================================================
 // Internal helpers.
 // ===========================================================================
-
-/// Allocates a zero-filled `Vec<u8>` of `len` bytes, returning [`None`] if the
-/// allocation fails.
-///
-/// Reference zlib's `gz_look` treats a `malloc` returning `NULL` as a
-/// recoverable [`ReturnCode::MemError`]. Rust's `vec![0; len]` aborts the process
-/// on allocation failure, which would *not* reproduce that behaviour, so this
-/// helper uses [`Vec::try_reserve_exact`] to fail gracefully and let the caller
-/// record the error.
-fn alloc_zeroed(len: usize) -> Option<Vec<u8>> {
-    let mut v: Vec<u8> = Vec::new();
-    v.try_reserve_exact(len).ok()?;
-    v.resize(len, 0);
-    Some(v)
-}
 
 /// Maps the error currently recorded on the state into a [`ZlibError`] for
 /// internal [`Result`](core::result::Result) propagation.

@@ -66,32 +66,50 @@ performance has been measured and is reported in the [Roadmap](#roadmap).
 ### Measured evidence
 
 Every figure in this README is a value observed by running the command beside it
-on this tree, never an estimate. Each row below was run with
-`RUSTUP_TOOLCHAIN=stable` — see [Installation](#installation) for why that prefix
-matters — on stable `rustc 1.97.1 (8bab26f4f 2026-07-14, LLVM 22.1.6)`,
-`x86_64-unknown-linux-gnu`, except the two MSRV rows.
+on this tree, never an estimate — **with one clearly marked exception, stated here
+so it is not discovered late.** The four throughput ratios *relative to C zlib*
+(compression ≈ 85%, decompression 107–127%, and the per-profile 82–86% / 58–64%
+band) are **attributed** figures carried from the migration's own measurement
+record. They are not re-derived by anything in this repository: the Criterion suite
+links no C library, and `tests/c_oracle.rs` is a *conformance* oracle for
+byte-identity, not a performance one. Every such ratio is labelled where it appears
+under [Roadmap](#roadmap); absolute Rust throughput, by contrast, is measurable
+here with `cargo bench --locked` and is reported as measured.
+
+Each row below was run with `RUSTUP_TOOLCHAIN=stable` — see
+[Installation](#installation) for why that prefix matters — on stable
+`rustc 1.97.1 (8bab26f4f 2026-07-14, LLVM 22.1.6)`, `x86_64-unknown-linux-gnu`,
+except the two MSRV rows.
 
 | Gate | Command | Result |
 |------|---------|--------|
-| Test suite (default features) | `cargo test --locked` | **842 passed / 0 failed / 0 ignored** |
-| Test suite (all features) | `cargo test --locked --all-features` | **855 passed / 0 failed / 0 ignored** |
-| Test suite (`no_std`) | `cargo test --locked --no-default-features` | **626 passed / 0 failed / 0 ignored** |
-| Test suite (`no-std` feature) | `cargo test --locked --no-default-features --features no-std` | **626 passed / 0 failed / 0 ignored** |
+| Test suite (default features) | `cargo test --locked` | **859 passed / 0 failed / 0 ignored** |
+| Test suite (all features) | `cargo test --locked --all-features` | **872 passed / 0 failed / 0 ignored** |
+| Test suite (`no_std`) | `cargo test --locked --no-default-features` | **633 passed / 0 failed / 0 ignored** |
+| Test suite (`no-std` feature) | `cargo test --locked --no-default-features --features no-std` | **633 passed / 0 failed / 0 ignored** |
 | Formatting | `cargo fmt --all -- --check` | exit 0 |
 | Lints | `cargo clippy --locked --all-targets --all-features -- -D warnings` | exit 0 |
-| Docs | `cargo doc --locked` | exit 0 |
+| API docs | `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features` | exit 0, 0 warnings |
+| Published docs | `mkdocs build --strict` | exit 0, 0 warnings |
 | MSRV build | `cargo +1.85.0 build --locked` | exit 0 |
 | MSRV type-check | `cargo +1.85.0 check --locked --all-targets` | exit 0 |
 | Exported C symbols | `nm -D --defined-only target/release/libzlib_rs.so` | **95**, all type `T` |
+| Packaged crate | `cargo package --locked --list` | **75** files; the unpacked archive re-runs its own suite at 859 |
 | Live byte-identity sweep | `cargo test --locked --features c-oracle --test c_oracle` | **3750/3750** and **50/50** byte-identical |
 
-The 842 default-feature tests decompose as **688** in-crate unit tests, **127**
-integration tests (`checksum` 23, `gzip_compat` 15, `inflate_coverage` 28,
+The 859 default-feature tests decompose as **704** in-crate unit tests, **128**
+integration tests (`checksum` 23, `gzip_compat` 15, `inflate_coverage` 29,
 `interop` 30, `regression` 12, `round_trip` 19), and **27** doctests.
 `--all-features` adds the 13 tests of the opt-in live C-oracle harness. Under
-`--no-default-features` the total is **505** unit + **96** integration + **25**
+`--no-default-features` the total is **511** unit + **97** integration + **25**
 doctests; the `gzip_compat` suite correctly reports 0 because the whole `gz*`
 file API is feature-gated off.
+
+CI does not merely run these commands — it parses every `test result:` line and
+fails the job on any failure, on any *ignored* test, or on a count below a
+per-row lower bound, because `cargo test` exits 0 when tests are skipped. A
+separate step rejects any real `#[ignore]` or `#[cfg_attr(…, ignore)]` attribute
+anywhere in `src`, `tests`, `benches`, `build.rs`, or `fuzz/fuzz_targets`.
 
 **The ignored-test count is zero in every configuration, and stays zero.** A
 capability that cannot be exercised in a given build is expressed by a
@@ -118,25 +136,83 @@ feature gate or a run-time probe that *passes with a printed notice*, never by
 
 ## Installation
 
-Add the crate with Cargo:
+> [!IMPORTANT]
+> **This crate is not published on crates.io, and the name `zlib-rs` there belongs to
+> an unrelated project.** Do **not** run `cargo add zlib-rs` and do **not** write
+> `zlib-rs = "1.3.2"` in a manifest — neither will get you this code. Depend on it by
+> Git URL or by path, as shown below.
+
+Two facts underlie that, and three commands establish them against the live registry:
 
 ```sh
-cargo add zlib-rs
+cargo search zlib-rs --limit 1
+#   zlib-rs = "0.6.6"    # A memory-safe zlib implementation written in rust
+cargo info zlib-rs@0.6.6 | grep repository
+#   repository: https://github.com/trifectatechfoundation/zlib-rs
+cargo info zlib-rs@1.3.2
+#   error: could not find `zlib-rs@1.3.2` in registry
+#          `https://github.com/rust-lang/crates.io-index`
 ```
 
-or add it to your `Cargo.toml` directly:
+The published `zlib-rs` 0.6.6 is an unrelated, independently developed crate from the
+Trifecta Tech Foundation — a separate memory-safe zlib effort, and not this code.
+Worse, the version requirement `"1.3.2"` cannot be satisfied by it at all, so the
+mistake surfaces either as a confusing resolution failure or, if the requirement is
+loosened, as a silent substitution of somebody else's implementation. This is textbook
+dependency confusion, and the only reliable defence is to name the source explicitly.
+
+The version in [`Cargo.toml`](Cargo.toml) is `1.3.2` because it tracks the C zlib
+release this crate reimplements — it is **not** a crates.io coordinate.
+[`CHANGELOG.md`](CHANGELOG.md) records that release as `1.3.2 — unreleased`,
+deliberately without a date, for the same reason.
+
+Depend on it by **source**, not by name. Point at the repository:
 
 ```toml
 [dependencies]
-zlib-rs = "1.3.2"
+zlib-rs = { git = "https://github.com/Blitzy-Sandbox/blitzy-zlib" }
 ```
 
-The crate name on crates.io is `zlib-rs`; the importable module path is
-`zlib_rs` (Cargo replaces `-` with `_`):
+Pin the revision for a reproducible build — recommended, and required if you rely
+on byte-identical output, since the match-finder heuristics that guarantee it are
+the code a floating branch would move underneath you:
+
+```toml
+[dependencies]
+zlib-rs = { git = "https://github.com/Blitzy-Sandbox/blitzy-zlib", rev = "<40-char commit SHA>" }
+```
+
+Or vendor the tree and use a path dependency:
+
+```toml
+[dependencies]
+zlib-rs = { path = "../blitzy-zlib" }
+```
+
+Either form supports the usual feature selection, for example
+`default-features = false, features = ["std", "gzip"]` — see
+[Feature flags](#feature-flags).
+
+In every form the package name stays `zlib-rs` and the importable module path is
+`zlib_rs`, because Cargo replaces `-` with `_`:
 
 ```rust,ignore
 use zlib_rs::{compress, uncompress};
 ```
+
+**C consumers do not use Cargo at all.** The drop-in replacement is the emitted
+`libzlib_rs.so` / `libzlib_rs.a`, linked against the retained `zlib.h`; see
+[Usage — C drop-in (FFI)](#usage--c-drop-in-ffi) for the build and link recipe. Nothing on crates.io is involved in that path.
+
+**On the name itself.** Renaming the package to sidestep the collision is
+deliberately *not* proposed: the name is load-bearing across this repository's
+plan and documentation, and while the crate is unpublished a rename would trade a
+documented, closed-form quirk for much larger churn. The collision has one further
+consequence worth knowing about — advisory scanners match by *name plus semver
+range* and consult neither the source nor the publisher, so this package is
+evaluated against the other project's advisory history. That is analysed in full,
+including what to do if a future advisory ever collides, in the
+`THE zlib-rs NAME COLLISION` section of [`deny.toml`](deny.toml).
 
 **Minimum Supported Rust Version (MSRV): `1.85.0`.** The crate targets the Rust
 **2024 edition**, which was stabilized in Rust 1.85.0 — so 1.85.0 is the tightest
@@ -154,9 +230,11 @@ A root [`rust-toolchain.toml`](rust-toolchain.toml) pins `channel = "1.85.0"`
 build resolves to the same compiler CI's MSRV job uses instead of floating to
 whatever stable happens to be installed. **A bare `cargo …` inside this
 repository therefore invokes the MSRV compiler.** To reach stable — which is what
-ten of CI's eleven jobs do — set `RUSTUP_TOOLCHAIN` or use a `+stable` prefix;
+eleven of CI's twelve jobs do — set `RUSTUP_TOOLCHAIN` or use a `+stable` prefix;
 `rustup`'s environment override outranks the toolchain file, which is exactly why
-CI's `dtolnay/rust-toolchain@stable` and `@nightly` steps still work:
+CI's `dtolnay/rust-toolchain` steps still select the channel they ask for. Those
+steps are pinned to a commit SHA and name their channel with an explicit
+`toolchain:` input rather than through an `@stable`/`@nightly` ref:
 
 ```sh
 # MSRV (the repository default)
@@ -387,7 +465,7 @@ floor's older LLVM comes out marginally smaller, as
 Build the shared and static objects:
 
 ```sh
-cargo build --release
+RUSTUP_TOOLCHAIN=stable cargo build --locked --release
 # target/release/libzlib_rs.so   (cdylib — the drop-in libz replacement)
 # target/release/libzlib_rs.a    (staticlib — for static linking)
 ```
@@ -422,7 +500,7 @@ node that program requires (measured 0, 4, and 9 lines for consumers requiring
 either way. Opting in silences it:
 
 ```sh
-ZLIB_RS_VERSION_SCRIPT=1 cargo build --release
+ZLIB_RS_VERSION_SCRIPT=1 RUSTUP_TOOLCHAIN=stable cargo build --locked --release
 ```
 
 `build.rs` then derives a version script from `zlib.map` and applies it to the
@@ -474,14 +552,14 @@ clearly marked capability notice, and **passes** — it is never `#[ignore]`d.
 To build a core-only, no-standard-library configuration, disable the defaults:
 
 ```sh
-cargo build --no-default-features
+RUSTUP_TOOLCHAIN=stable cargo build --locked --no-default-features
 ```
 
 To pick individual features explicitly, combine `--no-default-features` with
 `--features`:
 
 ```sh
-cargo build --no-default-features --features "std,gzip,simd"
+RUSTUP_TOOLCHAIN=stable cargo build --locked --no-default-features --features "std,gzip,simd"
 ```
 
 ## Building, testing, and benchmarking
@@ -491,30 +569,34 @@ The crate builds with a stock Cargo toolchain — **no CMake, `./configure`, or
 
 ```sh
 # Build (debug / optimized)
-cargo build
-cargo build --release
+RUSTUP_TOOLCHAIN=stable cargo build --locked
+RUSTUP_TOOLCHAIN=stable cargo build --locked --release
 
 # Run the full test suite (unit, integration, and doc tests)
-cargo test
+RUSTUP_TOOLCHAIN=stable cargo test --locked
 
 # Lint with Clippy, treating warnings as errors
-cargo clippy --all-targets --all-features -- -D warnings
+RUSTUP_TOOLCHAIN=stable cargo clippy --locked --all-targets --all-features -- -D warnings
 
-# Verify formatting
-cargo fmt --all -- --check
+# Verify formatting (cargo-fmt is a rustfmt wrapper and rejects --locked)
+RUSTUP_TOOLCHAIN=stable cargo fmt --all -- --check
 
 # Run the Criterion benchmarks
-cargo bench
+RUSTUP_TOOLCHAIN=stable cargo bench --locked
 ```
 
-Remember the toolchain pin from [Installation](#installation): a bare `cargo …`
-here resolves to MSRV 1.85.0, so prefix the gates with `RUSTUP_TOOLCHAIN=stable`
-(or `+stable`) to run them the way CI does.
+Both parts of every line above are deliberate. `RUSTUP_TOOLCHAIN=stable` is needed
+because of the toolchain pin described under [Installation](#installation) — a bare
+`cargo …` here resolves to MSRV 1.85.0, which is a supported configuration but not
+the one CI's gates run on. `--locked` keeps the two committed lockfiles
+authoritative, so running a gate can never rewrite them as a side effect. The one
+line without `--locked` is the formatting check, because `cargo-fmt` is a rustfmt
+wrapper rather than a build command and rejects the flag outright.
 
 ### The blocking quality gates
 
-These six are the gates that must stay green, and **all six currently exit 0** on
-this tree — the results are tabulated under
+These seven are the gates that must stay green, and **all seven currently exit 0**
+on this tree — the results are tabulated under
 [Measured evidence](#measured-evidence):
 
 ```sh
@@ -523,15 +605,28 @@ RUSTUP_TOOLCHAIN=stable cargo clippy --locked --all-targets --all-features -- -D
 RUSTUP_TOOLCHAIN=stable cargo build --locked
 RUSTUP_TOOLCHAIN=stable cargo test  --locked
 RUSTUP_TOOLCHAIN=stable cargo test  --locked --no-default-features
-RUSTUP_TOOLCHAIN=stable cargo doc   --locked
+RUSTUP_TOOLCHAIN=stable RUSTDOCFLAGS='-D warnings' \
+  cargo doc --locked --no-deps --all-features
+mkdocs build --strict
 ```
+
+The last two are what CI's `docs` job runs. Rustdoc warnings are **denied**, not
+merely printed, so a broken intra-doc link or a malformed doc attribute fails the
+build; and the published MkDocs site is built with `--strict`, which promotes a
+missing nav page or a dangling internal link to an error. The MkDocs environment
+is version-pinned in CI (Python 3.12, `mkdocs 1.6.1`, `mkdocs-techdocs-core
+1.7.0`, `mkdocs-mermaid2-plugin 1.2.3`) so the gate cannot change verdict because
+an upstream release shifted underneath it.
 
 No warning is downgraded, no lint is `allow`-ed to make a change land, and no test
 is `#[ignore]`d. `--all-features` on the Clippy line is load-bearing rather than
 decorative: without it Clippy never sees `tests/c_oracle.rs` (which carries
 `required-features`), the `inflate_strict` arms, or the `no_std` runtime block —
 precisely where a lint regression would hide longest, since no other job promotes
-warnings to errors. `--locked` keeps both lockfiles immutable.
+warnings to errors. `--locked` keeps both lockfiles immutable; it appears on five of
+the six lines and is absent from `cargo fmt` because `cargo-fmt` is a rustfmt wrapper
+rather than a build command and rejects the flag with
+`error: unexpected argument '--locked' found`.
 
 Lint and format behaviour is pinned rather than inherited from whatever tool
 version a contributor happens to have: [`clippy.toml`](clippy.toml) sets
@@ -554,18 +649,35 @@ Both lockfiles are committed deliberately, because the crate ships
 `cdylib`/`staticlib` distributables and reproducible offline builds need exact
 resolved versions.
 
-Two `cargo-deny` policies govern that closure — [`deny.toml`](deny.toml) for the
-root graph and [`fuzz/deny.toml`](fuzz/deny.toml) for the detached fuzz workspace
-(`cargo-deny` resolves configuration from the target manifest's workspace root, so
-each is picked up automatically). Both set `[advisories]`, `[licenses]`, `[bans]`,
-and `[sources]` with `all-features = true`, deny yanked crates, and bound advisory
-staleness; the root policy additionally pins nine target triples so the audit
-covers the Windows, Apple, aarch64, bare-metal, and wasm configurations rather
-than only the host. Both hold duplicate major versions to the same standard
-(`[bans] multiple-versions = "deny"`): the fuzz graph is measurably
-duplicate-free, while the root graph acknowledges the two `rand` majors that
-reach it through `quickcheck` with exact-version `skip` entries, so an
-*unreviewed* duplicate fails the build rather than merely printing a warning.
+One `cargo-deny` policy governs that closure — [`deny.toml`](deny.toml) —
+evaluated once per graph. There is deliberately no sibling `fuzz/deny.toml`, and
+both invocations name the policy explicitly, because `cargo-deny` resolves
+configuration from the *target* manifest's workspace root and would otherwise fall
+back to built-in defaults for the detached fuzz workspace:
+
+```sh
+cargo deny --locked --config deny.toml check
+cargo deny --locked --manifest-path fuzz/Cargo.toml --config deny.toml check
+```
+
+The policy sets `[advisories]`, `[licenses]`, `[bans]`, and `[sources]` with
+`all-features = true`, denies yanked crates, and bounds advisory staleness. Its
+`[graph] targets` list is deliberately **empty**, which is what makes all 89 root
+crates reachable by the licence and ban checks: naming triples *prunes* the graph,
+and nine triples were measured to cut coverage to 86, silently excluding the
+`spirv`-only and `uefi`-only leaves. Duplicate major versions are held to
+`[bans] multiple-versions = "deny"` together with
+`multiple-versions-include-dev = true` — the second key is load-bearing, because
+every duplication in this project is dev-only and the check would otherwise report
+`bans ok` regardless — and the four acknowledged duplicates are pinned to exact
+`crate@version` `skip` entries so an *unreviewed* duplicate fails the build rather
+than merely printing a warning. The two things the fuzz graph legitimately needs —
+a C-toolchain build dependency and an NCSA-licensed `libfuzzer-sys` — are scoped,
+not waived: `cc` stays banned but carries `wrappers = ["libfuzzer-sys"]`, and NCSA
+is granted crate-scoped rather than globally. Because one policy spans two graph
+shapes, each invocation allows exactly the "unused configuration" codes that the
+*other* graph enforces; both then report `0 errors, 0 warnings` across all four
+checks.
 
 [`.github/workflows/audit.yml`](.github/workflows/audit.yml) runs the gate on
 push, pull request, a daily schedule, and manual dispatch, as four independent
@@ -574,18 +686,22 @@ another's verdict:
 
 | Job | What it proves |
 | --- | --- |
-| `policy-integrity` | Both policy files still declare every governed table and hold every load-bearing key at its reviewed value. Guards against section-level erosion, which would otherwise pass vacuously. |
+| `policy-integrity` | `deny.toml` still declares every governed table and holds every load-bearing key at its reviewed value, and no sibling `fuzz/deny.toml` has reappeared. Guards against section-level erosion, which would otherwise pass vacuously. |
 | `cargo-audit` | No known advisory affects either lockfile — the root graph and the detached fuzz graph are both scanned. |
 | `cargo-deny` | The root graph satisfies all four categories: licences, advisories, bans, sources. |
-| `cargo-deny-fuzz` | The detached fuzz graph satisfies `fuzz/deny.toml`. |
+| `cargo-deny-fuzz` | The detached fuzz graph satisfies the same root `deny.toml`. |
 
-[`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml) additionally runs the
-fuzz-workspace policy as a `supply-chain` job that **gates** fuzzing
-(`needs: supply-chain`). That is not redundant with `cargo-deny-fuzz`: the
-`audit.yml` job exists for trigger coverage (this workflow has no `push`
-trigger), while the `fuzz.yml` job is what actually prevents an unaudited graph
-from being built and fuzzed, and a job in another workflow cannot serve as a
-`needs:` predecessor.
+Those four jobs are the **only** place either tool runs.
+[`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml) builds and fuzzes the
+harnesses and nothing else — it declares no `cargo-deny` job — so the
+supply-chain gate has exactly one home and the tool pin, the `--locked`
+discipline and the lockfile assertion cannot drift between two copies of it. The
+trade-off is recorded rather than glossed: because a job in another workflow
+cannot be a `needs:` predecessor, a policy verdict can no longer sequence *ahead
+of* a fuzzing campaign within one run. It still blocks the same pull request, as
+a sibling check, and `cargo-deny-fuzz` sees a strictly broader set of triggers
+(push, pull request, daily, manual) than a fuzz-workflow job could (`fuzz.yml`
+has no `push` trigger at all).
 
 Every invocation passes `--locked`, so a verdict always describes the pins that
 are actually committed rather than a graph resolved on the runner, and each job
@@ -626,10 +742,54 @@ src/
                       deflate, inflate, gz, util
 ```
 
-That is **40 modules** under `src/`, in a strictly acyclic layering —
+That is **40 modules** under `src/`, layered as
 `error`/`constants` → `util` → `checksum` → `stream`/`gz_header` →
-`{deflate, inflate}` → `gz` → `ffi` — that mirrors the C `#include` layering with
-no extra top-level modules. The CRC-32 lookup tables are not checked in: `build.rs`
+`{deflate, inflate}` → `gz` → `ffi`, mirroring the C `#include` layering with no
+extra top-level modules.
+
+**Where the layering bends — four upward references.** The ordering above is the
+architecture, and it is what keeps `deflate` and `inflate` strict peers (neither
+references the other). It is *not* a claim that the module graph is acyclic:
+measured from the source text, exactly **four** `use` sites point upward, and they
+are the reason three module pairs reference each other — `deflate`↔`stream`,
+`inflate`↔`stream`, and `deflate`↔`util`.
+
+```sh
+# The only upward `use` declarations in the crate — four lines, no more:
+grep -nE '^\s*(pub )?use crate::(deflate|inflate)' \
+     src/stream.rs src/util/compress.rs src/util/uncompress.rs
+#   src/stream.rs:179:          use crate::deflate::state::DeflateState;
+#   src/stream.rs:181:          use crate::inflate::state::InflateState;
+#   src/util/compress.rs:45:    use crate::deflate::{deflate, deflate_end, deflate_init};
+#   src/util/uncompress.rs:45:  use crate::inflate::{inflate, inflate_end, inflate_init};
+```
+
+The regex is anchored to the start of a line on purpose. An unanchored search for
+`crate::deflate\|crate::inflate` across the same three files returns ten further
+matches, every one of them inside a `//!`, `///`, or `//` comment — intra-doc links
+and prose, not dependencies.
+
+- [`src/stream.rs`](src/stream.rs) names `DeflateState` and `InflateState` because
+  `StreamState` — the Rust counterpart of C's `z_stream.state` — **owns** the engine
+  state as `Box<DeflateState>` / `Box<InflateState>`. C breaks the same relationship
+  with an opaque forward declaration (`struct internal_state FAR *state`); an owning
+  enum cannot, and that ownership is exactly what makes `deflateEnd` unforgettable.
+- [`src/util/compress.rs`](src/util/compress.rs) and
+  [`src/util/uncompress.rs`](src/util/uncompress.rs) call the engines, because
+  `compress.c` and `uncompr.c` call `deflate()` and `inflate()`. Those two
+  translation units are mapped under `src/util/`, while `zutil.h`'s `OS_CODE` and
+  `PRESET_DICT` live in `src/util/mod.rs` and are needed by `src/deflate/mod.rs` —
+  so both directions follow from the C-to-Rust file mapping rather than from a
+  layering mistake.
+
+Both are module *references*, not a build or initialisation cycle: a Rust crate is
+a single compilation unit, so intra-crate module paths are resolved together and
+impose no ordering constraint — unlike C, where the `#include` graph must be acyclic
+to compile at all. Nor does `unsafe` containment rest on the graph shape: it is
+enforced by `#![deny(unsafe_code)]` plus exactly two scoped carve-outs, as described
+under [How the `unsafe` boundary is enforced](#how-the-unsafe-boundary-is-enforced).
+
+The CRC-32 lookup tables are not checked in: `build.rs`
 regenerates them at build time in pure safe `std` Rust with no build-dependencies,
 replacing 9,446 lines of pre-generated C tables with a verifiable algorithm whose
 output CI asserts is byte-reproducible across two independent builds.
@@ -769,13 +929,21 @@ a C call site.
 ### Portability: what CI actually exercises
 
 Platform claims deserve platform coverage, so here is the boundary, drawn honestly.
-`.github/workflows/ci.yml` runs **eleven jobs**:
+`.github/workflows/ci.yml` runs **twelve jobs**:
 
 - **Natively executed, full test suite:** `ubuntu-latest` across five feature rows
   (default, `--all-features`, `std,gzip,gz-io`, `+simd`, and `--no-default-features`
   build-only), plus **`windows-latest` (x86_64)** and **`macos-latest` (aarch64)**.
-  The Windows row is what exercises `OS_CODE = 10` and the `#[cfg(windows)]`-gated
-  `gzopen_w`; the macOS row exercises `OS_CODE = 19` and aarch64.
+  Every row asserts its own host triple via `rustc -vV` and its own `runner.arch`,
+  so a runner label that silently changes architecture fails the job instead of
+  quietly weakening the claim. The Windows row is what exercises `OS_CODE = 10`
+  and the `#[cfg(windows)]`-gated `gzopen_w`: it not only compiles that symbol but
+  **executes** `ffi::gz::tests::wide_path_open_round_trip`, which opens a
+  UTF-16 path through `gzopen_w`, writes, closes, reopens, reads back, and asserts
+  both the recovered bytes and the `gzerror` state — and a dedicated Windows-only
+  step runs that test **by name** and asserts exactly one test passed, so the
+  coverage cannot regress into a mere compile check. The macOS row exercises
+  `OS_CODE = 19` and aarch64.
 - **Cross type-checked, not natively run:** `aarch64-unknown-linux-gnu`,
   `i686-unknown-linux-gnu` (32-bit), and `s390x-unknown-linux-gnu`
   (**big-endian**). The `build-script-tests` job additionally type-checks the
@@ -789,14 +957,19 @@ Platform claims deserve platform coverage, so here is the boundary, drawn honest
   `--no-default-features` and `--features no-std` configurations, with an assertion
   that the freestanding runtime block was genuinely compiled.
 - **Also gated:** the C-ABI linkage contract on four feature rows, the `unsafe`
-  boundary, MSRV 1.85.0, benchmark compilation, and `cargo package` verification.
+  boundary, MSRV 1.85.0, benchmark compilation, `cargo package` verification, and a
+  blocking `docs` job that runs rustdoc with `RUSTDOCFLAGS: -D warnings` and builds
+  the published MkDocs site with `--strict` in a version-pinned Python environment.
 
 So: a 32-bit, big-endian, or bare-metal build is **compile-verified**, not
 runtime-verified, and this README does not claim otherwise. The two mechanisms that
-make the distinction matter are concrete — `src/checksum/crc32.rs` chooses its
-braid tables with `cfg!(target_endian)`, and `src/util/mod.rs` selects the gzip
-header's `OS_CODE` per platform (10 on Windows, 19 on non-Windows Apple, 3
-otherwise).
+make the distinction matter are concrete, and both are resolved **at compile time**
+from the target triple rather than probed at run time — `src/checksum/crc32.rs`
+chooses its braid tables with `cfg!(target_endian)` (both arms are compiled and
+type-checked; only the selected one reaches codegen), and `src/util/mod.rs` selects
+the gzip header's `OS_CODE` per platform (10 on Windows, 19 on non-Windows Apple, 3
+otherwise). Reference C zlib probes endianness at execution time instead; that
+divergence is documented and cannot change a checksum.
 
 ## Roadmap
 
@@ -811,9 +984,9 @@ that were previously tracked as open items are now closed:
   reference library compiled from the retained in-tree C sources. See
   [Compatibility and RFCs](#compatibility-and-rfcs) for the full grid.
 - **`no_std` test coverage (done).** The full test suite compiles and passes
-  under `cargo test --no-default-features` (and `--features no-std`) — **626
-  tests, 0 failed, 0 ignored** — and CI runs it as a blocking gate, plus a
-  bare-metal `thumbv7em-none-eabihf` build job.
+  under `cargo test --locked --no-default-features` (and `--features no-std`) —
+  **633 tests, 0 failed, 0 ignored** in both rows — and CI runs both as blocking
+  gates, plus a bare-metal `thumbv7em-none-eabihf` build job.
 - **Cross-platform CI (done).** Native Windows and macOS rows run the real suite;
   aarch64, 32-bit x86, and big-endian s390x are cross type-checked. The residual
   limits are stated precisely under
@@ -821,7 +994,17 @@ that were previously tracked as open items are now closed:
 - **Fuzzing (done).** A detached `cargo-fuzz` crate under `fuzz/` ships targets
   for inflate, deflate round-trip, gzip parsing, checksums, and the FFI
   boundary; `.github/workflows/fuzz.yml` builds every target and runs each for a
-  bounded budget on a weekly schedule, behind a `cargo-deny` supply-chain gate.
+  bounded budget on a weekly schedule. That workflow builds and fuzzes only; the
+  fuzz graph's `cargo-deny` policy is enforced by `audit.yml`, on every push and
+  pull request.
+  Because the workspace is detached, the root `cargo fmt --all` and
+  `cargo clippy --all-targets` gates cannot reach it — so that workflow also runs
+  a nightly `fmt --check` and Clippy with `-D warnings` against
+  `fuzz/Cargo.toml`, at default features and again at `--no-default-features`,
+  plus a `--no-default-features` build asserting all five harness binaries still
+  link. The 11 committed seeds in `fuzz/seeds/fuzz_inflate/` are passed to
+  libFuzzer as read-only corpus inputs after the writable cached corpus, so the
+  deterministic seed sweep runs even on a cold cache.
 
 Remaining, workload-dependent work:
 
@@ -862,15 +1045,18 @@ Remaining, workload-dependent work:
 
   ```sh
   # scalar braid (no crc32fast in the graph)
-  cargo bench --bench checksum_bench --no-default-features --features std,gzip,gz-io
-  # crc32fast hot path
-  cargo bench --bench checksum_bench --no-default-features --features std,gzip,gz-io,simd
+  RUSTUP_TOOLCHAIN=stable cargo bench --locked --bench checksum_bench \
+      --no-default-features --features std,gzip,gz-io
+  # simd-enabled build (inspect the printed crc32_backend value)
+  RUSTUP_TOOLCHAIN=stable cargo bench --locked --bench checksum_bench \
+      --no-default-features --features std,gzip,gz-io,simd
   ```
 
   **The hard rule on optimisation.** Any candidate compression speed-up must clear
   the byte-identity gate before it is considered viable, because the very
   heuristics that cost throughput are the ones that determine the output bytes: the
-  chain-length halving at `good_match`, the `nice_match` early break, and the
+  chain-length **quartering** at `good_match` (`chain_length >>= 2`, not a halving),
+  the `nice_match` early break, and the
   `TOO_FAR` lazy-match filter. *A faster match finder that emits different tokens
   is a regression, not an improvement, no matter what the benchmark says.*
   Permissible optimisation is limited to work that provably cannot change the token
@@ -879,8 +1065,11 @@ Remaining, workload-dependent work:
 
   The three Criterion harnesses are `benches/deflate_bench.rs`,
   `benches/inflate_bench.rs`, and `benches/checksum_bench.rs`. The deflate harness
-  carries an explicit **incompressible-input profile** so that the gap is measured
-  rather than inferred, every case validates its own output before it is timed, and
+  carries an explicit **incompressible-input profile** so that the slowest *absolute*
+  Rust workload is measured rather than assumed — that profile is, per the ratios
+  above, simultaneously the one *closest* to C, and this harness links no C library
+  so it cannot produce a ratio at all — every case validates its own output before it
+  is timed, and
   the noise thresholds are set above the run-to-run spread actually observed on the
   measuring host rather than at Criterion's unusable 1% default. That folder
   measures; it does not authorise.
@@ -891,8 +1080,9 @@ Issues and pull requests are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) has t
 full workflow — the quality gates, the MSRV policy, and what a reviewable change
 looks like here. In short: every gate listed under
 [The blocking quality gates](#the-blocking-quality-gates) must pass, including
-`cargo fmt --all -- --check` and
-`cargo clippy --all-targets --all-features -- -D warnings`.
+`RUSTUP_TOOLCHAIN=stable cargo fmt --all -- --check` and
+`RUSTUP_TOOLCHAIN=stable cargo clippy --locked --all-targets --all-features -- -D warnings`
+— run them in exactly that form, for the reasons given there.
 
 Two rules are worth stating up front because they are not negotiable:
 

@@ -1182,8 +1182,10 @@ mod byte_identity {
     /// `windows-latest` and `macos-latest` rows of the `build-test` matrix
     /// (AAP gap D3) run this gate for real instead of failing on a fixture
     /// artifact. `the_gzip_vector_family_holds_for_every_platform_os_code`
-    /// exercises all three values from a single host so the Windows and Apple
-    /// behaviour is proved rather than assumed.
+    /// substitutes all three values from a single host, which shows the fixture
+    /// helper retargets correctly and that no other byte of the stream moves with
+    /// it; the Windows and Apple *behaviour* is established by those native rows
+    /// actually running, not by the substitution.
     #[cfg(feature = "gzip")]
     const BI_VECTORS_GZIP: &str = "\
     0 -1 31 0 1f8b080000000000000303000000000000000000
@@ -1334,10 +1336,12 @@ mod byte_identity {
     //
     // `OS_CODE` is the one compile-time platform choice that reaches the wire
     // (AAP §0.6.6), so it is the one axis the tier-1 tables cannot bake. The
-    // three tests below cover it completely from a single host: the retargeting
+    // three tests below make it testable from a single host: the retargeting
     // helper is exercised for every value the cascade can select, the whole
     // 75-row gzip family is replayed against every value, and the host value is
-    // diffed against the library's own independent derivation.
+    // diffed against the library's own independent derivation. What they do NOT
+    // do is execute the cascade for a foreign target — that is what the native
+    // Windows and macOS rows are for.
     // =======================================================================
 
     /// [`retarget_gzip_os`] rewrites exactly one byte of a gzip-framed expectation
@@ -1396,14 +1400,17 @@ mod byte_identity {
     /// The whole [`BI_VECTORS_GZIP`] family holds for **every** platform
     /// `OS_CODE`, not just this host's.
     ///
-    /// This is the executable stand-in for a `windows-latest` / `macos-latest`
-    /// run. The `OS` byte is the only part of a gzip member that depends on the
-    /// build host — `src/deflate` writes it with a single `put_byte(OS_CODE)` and
-    /// nothing else in the stream reads it — so substituting that byte in the
-    /// produced stream reproduces exactly what a host with that `OS_CODE` would
-    /// have emitted. Retargeting the expectation with the same value and then
-    /// comparing all 75 rows in full therefore proves those two matrix rows pass,
-    /// from a Linux runner, for all three values the cascade can select.
+    /// The `OS` byte is the only part of a gzip member that depends on the build
+    /// host — `src/deflate` writes it with a single `put_byte(OS_CODE)` and nothing
+    /// else in the stream reads it — so substituting that byte in the produced
+    /// stream models what a host with that `OS_CODE` would have emitted.
+    /// Retargeting the expectation with the same value and then comparing all 75
+    /// rows in full establishes two things from a Linux runner: that the fixture
+    /// retargeting is correct, and that every other byte of every row is invariant
+    /// under the substitution, for all three values the cascade can select. It does
+    /// not execute the `cfg` cascade for a foreign target, so it is a companion to
+    /// the native `windows-latest` / `macos-latest` rows rather than a substitute
+    /// for them.
     ///
     /// It is deliberately a *superset* of [`matches_reference_zlib_gzip_framing`]
     /// rather than a replacement: that test still runs the unmodified produced

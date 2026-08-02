@@ -314,12 +314,87 @@ fn gz_reset(state: &mut GzState) {
 /// # Errors
 ///
 /// * The mode string is invalid (see [`parse_mode`]) — [`ReturnCode::StreamError`].
+/// * Either of the two allocations C performs before opening anything — the state
+///   itself and the retained path name — cannot be satisfied —
+///   [`ReturnCode::MemError`]. Both are attempted *before* the file is opened, so
+///   this failure creates, truncates or claims nothing (see the allocation-order
+///   note in the body).
 /// * The underlying open fails — [`ReturnCode::ErrNo`] (the C errno path).
 fn gz_open(path: &Path, file: Option<File>, mode: &str) -> Result<Box<GzState>, ReturnCode> {
     // Parse and validate the mode string before touching the file system
     // (gzlib.c L150-197). An invalid mode short-circuits to an error, mirroring
     // the C "return NULL".
-    let parsed = parse_mode(mode)?;
+    let parsed = match parse_mode(mode) {
+        Ok(parsed) => parsed,
+        Err(code) => return Err(abandon_adopted(file, code)),
+    };
+
+    // ---------------------------------------------------------------------
+    // Allocate before touching the file system — C's order exactly.
+    //
+    // Reference zlib's `gz_open` performs its two allocations FIRST and opens
+    // the file LAST: `malloc(sizeof(gz_state))`, then the mode parse, then
+    // `malloc(len + 1)` for the path name, and only then `open(path, oflag,
+    // 0666)`. Each allocation failure returns `NULL` after freeing what came
+    // before it, having created, truncated or `O_EXCL`-claimed nothing.
+    //
+    // That ordering is observable and worth preserving precisely: `"wb"` opens
+    // with `O_CREAT | O_TRUNC`, so allocating after the open would let an
+    // out-of-memory condition destroy the contents of a file the caller still
+    // holds — a *data-loss* difference from C, not merely a different error
+    // code. Both allocations are therefore fallible and both precede the open.
+    // ---------------------------------------------------------------------
+
+    // 1. The state itself (C's `malloc(sizeof(gz_state))`). `GzFile::pending()`
+    //    stands in for C's as-yet-unassigned `state->fd`, and the path starts
+    //    empty because C's `state->path` is likewise still unset here. The real
+    //    handle is installed below, once the file is open.
+    let Some(mut state) = crate::stream::try_box(GzState {
+        // exposed window
+        have: 0,
+        next: 0,
+        pos: 0,
+        // identity / configuration
+        mode: parsed.mode,
+        file: GzFile::pending(),
+        path: String::new(),
+        size: 0,
+        want: GZBUFSIZE,
+        in_buf: Vec::new(),
+        out_buf: Vec::new(),
+        direct: parsed.direct,
+        // reading only
+        how: How::Look,
+        junk: -1,
+        again: false,
+        in_next: 0,
+        in_avail: 0,
+        start: 0,
+        eof: false,
+        past: false,
+        // writing only
+        level: parsed.level,
+        strategy: parsed.strategy,
+        reset: false,
+        out_pending: 0,
+        out_start: 0,
+        // shared
+        skip: 0,
+        err: ReturnCode::Ok,
+        msg: None,
+        msg_c: None,
+        strm: crate::stream::ZStream::new(),
+    }) else {
+        return Err(abandon_adopted(file, ReturnCode::MemError));
+    };
+
+    // 2. The path name kept for error messages (C's `malloc(len + 1)` plus the
+    //    `strcpy`/`wcstombs`). C frees the state before returning `NULL` here;
+    //    the `Box` does that by dropping as this function returns.
+    let Some(path_string) = try_path_string(path) else {
+        return Err(abandon_adopted(file, ReturnCode::MemError));
+    };
+    state.path = path_string;
 
     // Open (or adopt) the underlying descriptor, mapping the C `oflag`
     // combination onto `OpenOptions` (gzlib.c L228-262).
@@ -369,72 +444,123 @@ fn gz_open(path: &Path, file: Option<File>, mode: &str) -> Result<Box<GzState>, 
     // Append fix-up (gzlib.c L272-278): seek to end-of-file so subsequent offset
     // queries stay correct, then treat the stream as a plain writer from here on
     // (the transient `Append` mode never persists on a live `GzState`). The seek
-    // result is ignored, matching the C `(void)LSEEK(...)`.
-    let effective_mode = if parsed.mode == GzMode::Append {
+    // result is ignored, matching the C `(void)LSEEK(...)`. C mutates
+    // `state->mode` in place at this point, and so does this port.
+    if parsed.mode == GzMode::Append {
         let _ = handle.seek(SeekFrom::End(0));
-        GzMode::Write
-    } else {
-        parsed.mode
-    };
+        state.mode = GzMode::Write;
+    }
 
     // Read start anchor (gzlib.c L280-285): remember the current position as the
     // rewind anchor for `gzrewind`/`gzseek`. A non-seekable input (e.g. a pipe)
-    // leaves the anchor at `0`.
-    let start = if effective_mode == GzMode::Read {
-        handle
+    // leaves the anchor at `0`. The append fix-up above has already rewritten
+    // `Append` to `Write`, so this tests the effective mode exactly as C's
+    // `if (state->mode == GZ_READ)` does after its own fix-up.
+    if state.mode == GzMode::Read {
+        state.start = handle
             .stream_position()
             .ok()
             .and_then(|pos| i64::try_from(pos).ok())
-            .unwrap_or(0)
-    } else {
-        0
-    };
+            .unwrap_or(0);
+    }
 
-    // Materialise the state with the C `gz_open` initial values (gzlib.c
-    // L150-175), overlaid with the parsed configuration. `gz_reset` below then
-    // establishes the per-direction runtime fields.
-    let mut state = Box::new(GzState {
-        // exposed window
-        have: 0,
-        next: 0,
-        pos: 0,
-        // identity / configuration
-        mode: effective_mode,
-        file: GzFile::new(handle),
-        path: path.display().to_string(),
-        size: 0,
-        want: GZBUFSIZE,
-        in_buf: Vec::new(),
-        out_buf: Vec::new(),
-        direct: parsed.direct,
-        // reading only
-        how: How::Look,
-        junk: -1,
-        again: false,
-        in_next: 0,
-        in_avail: 0,
-        start,
-        eof: false,
-        past: false,
-        // writing only
-        level: parsed.level,
-        strategy: parsed.strategy,
-        reset: false,
-        out_pending: 0,
-        out_start: 0,
-        // shared
-        skip: 0,
-        err: ReturnCode::Ok,
-        msg: None,
-        msg_c: None,
-        strm: crate::stream::ZStream::new(),
-    });
+    // Install the descriptor (C's `state->fd = ...`). From here the state is
+    // complete and every `Deref` on `state.file` is valid.
+    state.file = GzFile::new(handle);
 
     // Establish the runtime state (clears the window, error, and pending seek;
     // leaves `start`/`want`/configuration intact). gzlib.c L287.
     gz_reset(&mut state);
 
     Ok(state)
+}
+
+/// Returns `code` after giving up any descriptor `gz_open` had adopted —
+/// **without closing it**.
+///
+/// # Why a failing `gzdopen` must not close the caller's descriptor
+///
+/// In C the adopted descriptor reaches `gz_open` as a plain `int` and is only
+/// stored into `state->fd` once the `open`/adopt step is reached. Every earlier
+/// failure — a rejected mode, `malloc(sizeof(gz_state))` returning `NULL`,
+/// `malloc(len + 1)` for the path name returning `NULL` — therefore returns
+/// `NULL` with the caller's descriptor still open, and `gzdopen`'s own
+/// `malloc` failure does the same (`gzlib.c`: `if (fd == -1 || (path = malloc(…))
+/// == NULL) return NULL;`). No `gzdopen` failure anywhere in reference zlib
+/// closes the descriptor it was handed; ownership stays with the caller, who is
+/// free to retry or to `close` it.
+///
+/// Rust would do the opposite by default. The adopted [`File`] *owns* its
+/// descriptor, so simply returning `Err` runs its destructor and closes a
+/// descriptor the caller still believes it owns — which is worse than a wrong
+/// error code: a subsequent `close`, `read`, or `write` by the caller would
+/// operate on a freed descriptor number that the OS may already have reissued.
+///
+/// [`core::mem::forget`] dissolves the wrapper without running the close,
+/// leaving the descriptor exactly as the caller passed it. It is a safe function
+/// and needs no platform-specific raw-descriptor extraction, so this layer keeps
+/// its zero-`unsafe` guarantee (AAP §0.8.1 D-6). The apparent "leak" is only of
+/// the [`File`] wrapper, which owns no heap allocation; the descriptor is not
+/// leaked at all, because ownership returns to the caller — precisely the C
+/// contract.
+#[inline]
+fn abandon_adopted(file: Option<File>, code: ReturnCode) -> ReturnCode {
+    if let Some(adopted) = file {
+        core::mem::forget(adopted);
+    }
+    code
+}
+
+/// Renders `path` for the state's error-message field, returning [`None`] if the
+/// allocation cannot be satisfied — the fallible equivalent of C's
+/// `state->path = malloc(len + 1)` plus its `NULL` check.
+///
+/// # Why not `path.display().to_string()`
+///
+/// [`std::path::Display`] is rendered through [`ToString`], which allocates
+/// infallibly and **aborts the process** if the allocation fails. C checks that
+/// `malloc` and returns `NULL`, so an abort here would replace a recoverable
+/// `gzopen` failure with process death (AAP §0.6.5).
+///
+/// # Byte-for-byte equivalence with the replaced expression
+///
+/// The output must not change, because it is what `gzerror` reports. On unix a
+/// path is an arbitrary byte string that need not be UTF-8, and
+/// `Path::display()` renders invalid sequences the same way
+/// [`String::from_utf8_lossy`] does — each maximal invalid subsequence becomes
+/// one U+FFFD REPLACEMENT CHARACTER. [`std::str::Utf8Chunks`] exposes exactly
+/// that decomposition: for every chunk, the valid prefix followed by U+FFFD if
+/// (and only if) that chunk had invalid bytes. Iterating chunks and pushing
+/// those two pieces therefore reproduces `display().to_string()` exactly, while
+/// every growth step goes through [`String::try_reserve`].
+///
+/// C's path name is the raw byte string with no transformation at all; the lossy
+/// rendering is this port's pre-existing, deliberate choice (a Rust `String` is
+/// UTF-8 by definition) and is preserved unchanged here. Only the failure
+/// behavior differs from the code this replaces.
+fn try_path_string(path: &Path) -> Option<String> {
+    let raw = path.as_os_str().as_encoded_bytes();
+
+    let mut out = String::new();
+    // One reservation for the common all-valid-UTF-8 case; the loop below still
+    // reserves for anything it appends, so a short reservation here is only a
+    // performance detail, never a correctness one.
+    out.try_reserve(raw.len()).ok()?;
+
+    for chunk in raw.utf8_chunks() {
+        let valid = chunk.valid();
+        out.try_reserve(valid.len()).ok()?;
+        out.push_str(valid);
+
+        if !chunk.invalid().is_empty() {
+            // `char::REPLACEMENT_CHARACTER` is 3 bytes in UTF-8.
+            out.try_reserve(char::REPLACEMENT_CHARACTER.len_utf8())
+                .ok()?;
+            out.push(char::REPLACEMENT_CHARACTER);
+        }
+    }
+
+    Some(out)
 }
 
 // ===========================================================================
@@ -490,26 +616,59 @@ pub fn gzopen64<P: AsRef<Path>>(path: P, mode: &str) -> Result<Box<GzState>, Ret
 /// ([`ReturnCode::StreamError`]); the append fix-up seek is best-effort and does
 /// not fail the call.
 pub fn gzdopen(file: File, mode: &str) -> Result<Box<GzState>, ReturnCode> {
-    let name = fd_path(&file);
+    // C's `gzdopen` allocates this name itself and bails out before calling
+    // `gz_open` if that allocation fails: `if (fd == -1 || (path = malloc(7 + 3 *
+    // sizeof(int))) == NULL) return NULL;`. It returns `NULL` without closing the
+    // descriptor, so `abandon_adopted` hands `fd` back to the caller intact.
+    let Some(name) = fd_path(&file) else {
+        return Err(abandon_adopted(Some(file), ReturnCode::MemError));
+    };
     gz_open(Path::new(&name), Some(file), mode)
 }
 
-/// Builds the synthetic `<fd:N>` error-message name for [`gzdopen`].
+/// Capacity reserved for the synthetic `<fd:N>` name, mirroring C's
+/// `malloc(7 + 3 * sizeof(int))`.
 ///
-/// On unix the OS descriptor number is included (matching the C
-/// `<fd:%d>` format); on other platforms the descriptor number is not portably
-/// available here, so the generic `<fd>` placeholder is used.
+/// C sizes the buffer from `sizeof(int)` rather than from the value, and 19 bytes
+/// covers the widest possible rendering: `"<fd:"` (4) plus `i32::MIN` as
+/// `"-2147483648"` (11) plus `">"` (1) is 16. Reserving the full C figure up
+/// front means the formatting below cannot trigger a reallocation, which is what
+/// makes it infallible after the one fallible reservation.
+const FD_PATH_CAPACITY: usize = 7 + 3 * core::mem::size_of::<core::ffi::c_int>();
+
+/// Builds the synthetic `<fd:N>` error-message name for [`gzdopen`], returning
+/// [`None`] if the allocation cannot be satisfied.
+///
+/// On unix the OS descriptor number is included (matching the C `<fd:%d>`
+/// format); on other platforms the descriptor number is not portably available
+/// here, so the generic `<fd>` placeholder is used.
+///
+/// The result is fallible because C checks the corresponding `malloc` and returns
+/// `NULL` on failure; `format!` would abort the process instead (AAP §0.6.5).
 #[cfg(unix)]
-fn fd_path(file: &File) -> String {
+fn fd_path(file: &File) -> Option<String> {
+    use core::fmt::Write as _;
     use std::os::unix::io::AsRawFd;
-    format!("<fd:{}>", file.as_raw_fd())
+
+    let mut name = String::new();
+    name.try_reserve_exact(FD_PATH_CAPACITY).ok()?;
+
+    // Infallible: `FD_PATH_CAPACITY` exceeds the longest possible rendering, so
+    // no `push_str` inside the formatter can reallocate, and `fmt::Write for
+    // String` has no other failure mode — its `write_str` returns `Ok` always.
+    let _ = write!(name, "<fd:{}>", file.as_raw_fd());
+    Some(name)
 }
 
 /// Non-unix fallback for [`fd_path`]: the descriptor number is not portably
-/// available, so a generic placeholder is used.
+/// available, so a generic placeholder is used. Fallible for the same reason as
+/// the unix form, so both platforms report an exhausted allocator identically.
 #[cfg(not(unix))]
-fn fd_path(_file: &File) -> String {
-    String::from("<fd>")
+fn fd_path(_file: &File) -> Option<String> {
+    let mut name = String::new();
+    name.try_reserve_exact(FD_PATH_CAPACITY).ok()?;
+    name.push_str("<fd>");
+    Some(name)
 }
 
 // ===========================================================================
@@ -529,6 +688,28 @@ fn fd_path(_file: &File) -> String {
 /// have already been allocated (`size` `!= 0`), or when `size`
 /// is so large it cannot be doubled without overflow. A `size` below `8` is
 /// raised to `8` (the minimum the algorithms require) rather than rejected.
+///
+/// # A large request is accepted here and reported later — deliberately
+///
+/// The only size-related rejection C performs is the doubling-overflow test, so
+/// any `size` up to `UINT_MAX >> 1` is *accepted*, including values whose buffers
+/// cannot possibly be allocated. `gzbuffer(file, 0x7fff_ffff)` returns `0`, and
+/// the ~2 GiB output buffer plus ~4 GiB doubled input buffer are requested later,
+/// on the first read or write, when `gz_look`/`gz_init` allocate lazily. This
+/// port keeps that timing exactly rather than pre-rejecting the request: moving
+/// the rejection here would make a `gzbuffer` call fail that succeeds in C, and
+/// the amount of memory available at the time of the deferred allocation is not
+/// knowable now in any case.
+///
+/// What the deferred failure must *not* do is abort. Both lazy allocators go
+/// through the crate-internal fallible `alloc_zeroed` helper and report an
+/// unsatisfiable request as `Z_MEM_ERROR` / "out of memory" on the state,
+/// exactly as C does when its
+/// `malloc` returns `NULL`: the read or write returns its failure value,
+/// `gzerror` reports the code and message, the stream stays usable, and `size`
+/// remains `0` so a later call may try again. A caller may therefore recover by
+/// lowering `want` with another `gzbuffer` and retrying — which is only possible
+/// because nothing was allocated and nothing aborted.
 #[must_use]
 pub fn gzbuffer(state: &mut GzState, mut size: u32) -> i32 {
     // Only meaningful on a live reader or writer (rejects `GZ_NONE`).
@@ -1495,6 +1676,61 @@ mod tests {
         assert_eq!(msg, "test: bad data");
     }
 
+    /// The detail string and its FFI-facing `CString` mirror must stay exactly
+    /// `"<path>: <msg>"`, byte for byte and in lockstep.
+    ///
+    /// `GzState::error` builds both by hand — reserving the exact capacity, then
+    /// pushing the three pieces — rather than with `format!`, so that an exhausted
+    /// allocator can be *reported* (C's `gz_error` checks its `malloc` and
+    /// downgrades `state->err` to `Z_MEM_ERROR`) instead of aborting the process.
+    /// This test pins the rendering that hand construction has to reproduce,
+    /// including the mirror's NUL terminator, which `src/ffi/gz.rs` hands to C as
+    /// the `gzerror` message pointer.
+    #[test]
+    fn error_builds_the_detail_and_its_c_mirror_in_lockstep() {
+        let mut s = test_state(GzMode::Read);
+        s.error(ReturnCode::DataError, Some("bad data"));
+
+        assert_eq!(s.msg.as_deref(), Some("test: bad data"));
+        assert_eq!(
+            s.msg.as_deref().map(str::len),
+            Some("test".len() + 2 + "bad data".len()),
+            "the reserved length must equal the rendered length"
+        );
+        assert_eq!(
+            s.msg_c.as_ref().map(|c| c.as_bytes()),
+            Some(&b"test: bad data"[..]),
+            "the C mirror must carry the same bytes"
+        );
+        assert_eq!(
+            s.msg_c.as_ref().map(|c| c.as_bytes_with_nul()),
+            Some(&b"test: bad data\0"[..]),
+            "the C mirror must be NUL-terminated for the FFI gzerror"
+        );
+
+        // An empty detail is still rendered as "path: ", matching C's
+        // unconditional `"%s%s%s"` of path, ": " and msg.
+        s.error(ReturnCode::DataError, Some(""));
+        assert_eq!(s.msg.as_deref(), Some("test: "));
+        assert_eq!(
+            s.msg_c.as_ref().map(|c| c.as_bytes_with_nul()),
+            Some(&b"test: \0"[..])
+        );
+
+        // Replacing the error must replace both halves together, never leaving a
+        // stale mirror behind for C to read.
+        s.error(ReturnCode::StreamError, Some("later"));
+        assert_eq!(s.msg.as_deref(), Some("test: later"));
+        assert_eq!(
+            s.msg_c.as_ref().map(|c| c.as_bytes()),
+            Some(&b"test: later"[..])
+        );
+
+        // Clearing drops both.
+        s.error(ReturnCode::Ok, None);
+        assert!(s.msg.is_none() && s.msg_c.is_none());
+    }
+
     #[test]
     fn gzerror_reports_out_of_memory_literal() {
         let mut s = test_state(GzMode::Read);
@@ -1607,5 +1843,193 @@ mod tests {
         );
         drop(st);
         let _ = std::fs::remove_file(&path);
+    }
+    // -----------------------------------------------------------------------
+    // Allocation-failure parity for the two `gz_open` allocations
+    // (AAP §0.6.5). C allocates the state and the retained path name BEFORE it
+    // opens anything, so neither failure may abort and neither may have created
+    // or truncated a file.
+    // -----------------------------------------------------------------------
+
+    /// `try_path_string` replaced `path.display().to_string()`, so it must render
+    /// byte-for-byte identically — the value is what `gzerror` reports.
+    ///
+    /// Both branches of the lossy decoder are covered: a plain UTF-8 path, and (on
+    /// unix, where a path is an arbitrary byte string) a path containing an
+    /// invalid sequence, which must collapse to exactly one U+FFFD per maximal
+    /// invalid subsequence just as `Display` does.
+    #[test]
+    fn try_path_string_matches_display_to_string() {
+        for p in [
+            "",
+            "/tmp/plain.gz",
+            "relative/name.gz",
+            "with spaces and-punctuation!.gz",
+            "unicode-\u{00e9}\u{4e2d}\u{6587}-\u{1f600}.gz",
+        ] {
+            let path = Path::new(p);
+            assert_eq!(
+                try_path_string(path).expect("a short path always allocates"),
+                path.display().to_string(),
+                "rendering of {p:?} must not change"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+
+            // Each case pairs valid bytes with invalid ones so the chunk iterator
+            // has to interleave `push_str` and the replacement character.
+            for raw in [
+                &b"/tmp/\xff.gz"[..],
+                &b"\xff"[..],
+                &b"\xff\xfe\xfd"[..],
+                &b"a\xffb\xffc"[..],
+                &b"/tmp/\xe2\x82.gz"[..],
+                &b"\xf0\x9f\x98\x80\xff"[..],
+            ] {
+                let path = Path::new(OsStr::from_bytes(raw));
+                assert_eq!(
+                    try_path_string(path).expect("a short path always allocates"),
+                    path.display().to_string(),
+                    "lossy rendering of {raw:?} must match Display exactly"
+                );
+            }
+        }
+    }
+
+    /// The `<fd:N>` name must be unchanged, and the one reservation it makes must
+    /// be large enough that the formatting after it cannot reallocate — otherwise
+    /// the "fallible once, then infallible" reasoning in `fd_path` would not hold.
+    #[test]
+    fn fd_path_is_unchanged_and_its_reservation_covers_every_descriptor() {
+        // `"<fd:"` (4) + the widest `i32` rendering, `"-2147483648"` (11) + `">"`
+        // (1). C reserves `7 + 3 * sizeof(int)`, which is at least as large.
+        const WIDEST_FD_NAME: usize = 16;
+
+        // Checked at compile time: if the reservation ever stopped covering the
+        // widest name, `fd_path`'s "one fallible reservation, then infallible
+        // formatting" reasoning would break, and no runtime test could be relied
+        // on to reach the descriptor value that exposes it.
+        const { assert!(FD_PATH_CAPACITY >= WIDEST_FD_NAME) };
+
+        assert_eq!(
+            format!("<fd:{}>", i32::MIN).len(),
+            WIDEST_FD_NAME,
+            "the widest rendering must still be {WIDEST_FD_NAME} bytes"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let file = File::open("/dev/null").expect("open /dev/null");
+            let name = fd_path(&file).expect("a 19-byte reservation always succeeds");
+            assert_eq!(name, format!("<fd:{}>", file.as_raw_fd()));
+        }
+        #[cfg(not(unix))]
+        {
+            let file = File::open(std::env::current_exe().expect("exe path"))
+                .expect("open the test binary");
+            assert_eq!(fd_path(&file).expect("reservation succeeds"), "<fd>");
+        }
+    }
+
+    /// A failing `gzdopen` must hand the caller's descriptor back **open**.
+    ///
+    /// In C the adopted `fd` is stored into `state->fd` only at the open/adopt
+    /// step, so every earlier `return NULL` — a rejected mode, or either `malloc`
+    /// failing — leaves the descriptor untouched and owned by the caller. Rust
+    /// would close it by default, because the adopted `File` owns it; `gz_open`
+    /// therefore routes every pre-open failure through `abandon_adopted`.
+    ///
+    /// Observed without `unsafe` via a POSIX guarantee: `open` returns the
+    /// **lowest-numbered** unused descriptor. If the failed `gzdopen` had closed
+    /// the adopted descriptor, the next `open` would immediately reclaim that
+    /// number. Seeing a different number proves the descriptor is still open.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_gzdopen_leaves_the_callers_descriptor_open() {
+        use std::os::unix::io::AsRawFd;
+
+        let adopted = File::open("/dev/null").expect("open /dev/null");
+        let adopted_fd = adopted.as_raw_fd();
+
+        // `"q"` names no direction, so `parse_mode` rejects it — the pre-open
+        // failure path that is reachable deterministically.
+        assert_eq!(
+            gzdopen(adopted, "q").err(),
+            Some(ReturnCode::StreamError),
+            "a mode with no direction must be rejected"
+        );
+
+        // The descriptor was deliberately leaked rather than closed, so this
+        // `open` must NOT be handed the same number back.
+        let probe = File::open("/dev/null").expect("open /dev/null again");
+        assert_ne!(
+            probe.as_raw_fd(),
+            adopted_fd,
+            "fd {adopted_fd} was closed by the failed gzdopen; C leaves it open"
+        );
+    }
+
+    /// `gz_open`'s two allocations precede the `open(2)`, so a write-mode open of
+    /// an existing file cannot destroy its contents before those allocations have
+    /// succeeded.
+    ///
+    /// The ordering itself is what protects the file (an out-of-memory condition
+    /// cannot be forced deterministically without an allocator hook), so this test
+    /// pins the two observable consequences of the reordering: the success path
+    /// still truncates exactly as before, and a *pre-open* rejection leaves the
+    /// existing contents completely intact.
+    #[test]
+    fn a_pre_open_failure_leaves_an_existing_file_untouched() {
+        // A caller-private directory created with `create_dir` (never
+        // `create_dir_all`): it fails rather than adopting a name another user may
+        // have planted, and on unix it is mode 0700 from the instant it exists, so
+        // there is no window in which the payload below could be enumerated or
+        // replaced (CWE-377/CWE-59/CWE-367) — the same discipline the write-side
+        // tests apply.
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "zlib_rs_gzopen_order_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(&dir)
+            .expect("exclusively create a private directory");
+        let path = dir.join("payload.gz");
+        std::fs::write(&path, b"PRECIOUS").expect("seed the file");
+
+        // A mode with no direction is rejected before any `OpenOptions::open`.
+        assert_eq!(
+            gzopen(&path, "q").err(),
+            Some(ReturnCode::StreamError),
+            "a mode with no direction must be rejected"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read back"),
+            b"PRECIOUS",
+            "a failure before the open must not have truncated the file"
+        );
+
+        // Control: the success path still applies O_TRUNC, proving the assertion
+        // above is about ordering and not about `"wb"` having stopped truncating.
+        let st = gzopen(&path, "wb").expect("wb opens");
+        drop(st);
+        assert!(
+            std::fs::read(&path).expect("read back").is_empty(),
+            "the success path must still truncate"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

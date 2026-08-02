@@ -1274,20 +1274,23 @@ mod tests {
         );
     }
 
-    /// The `zlib.map` skip may only fire in a tree where the *whole* retained C
-    /// baseline is absent — i.e. inside an unpacked `.crate`.
+    /// The `zlib.map` skip may only fire in a tree where the retained C baseline
+    /// is absent — i.e. inside an unpacked `.crate`.
     ///
     /// This is what stops the skip from silently swallowing coverage in the
     /// repository. `zlib.map` and the C sources are excluded from the published
-    /// crate by the same `[Cargo.toml:exclude]` contract and are therefore
-    /// present or absent together; if any C source is here, the script must be
-    /// here too, and the two reconciliation tests above must have asserted in
-    /// full rather than printed a notice.
+    /// crate by the same `[Cargo.toml:exclude]` contract and are therefore present
+    /// or absent together. Rather than walk the whole baseline, this check samples
+    /// representative sentinels: if any sentinel is present, the script must be
+    /// here too, and the two reconciliation tests above must have asserted in full
+    /// rather than printed a notice.
     #[test]
     fn the_zlib_map_skip_can_only_happen_where_the_whole_c_baseline_is_absent() {
-        // Three of the retained C translation units and the API header. Each is
-        // matched by an `exclude` pattern (`*.c` / `*.h`), so `cargo package`
-        // drops all of them together with `zlib.map` (`*.map`).
+        // The sentinels — three of the retained C translation units plus the API
+        // header. Each is matched by an `exclude` pattern (`*.c` / `*.h`), so
+        // `cargo package` drops all of them together with `zlib.map` (`*.map`);
+        // sampling is therefore enough to tell a repository tree from a packaged
+        // one.
         const C_BASELINE: [&str; 4] = ["deflate.c", "inflate.c", "trees.c", "zlib.h"];
 
         let baseline_present: std::vec::Vec<&str> = C_BASELINE
@@ -1612,16 +1615,18 @@ mod tests {
         //
         // `[profile.release]` sets `codegen-units = 1`, so the whole crate is
         // optimized as a single unit and LLVM's function merging collapses two
-        // exports whose machine code is byte-identical onto one address. That is reachable only for the ABI
-        // *width twins* — the motley `_z` exports (`compress_z`, `compress2_z`,
-        // `compressBound_z`, `deflateBound_z`, `uncompress_z`, `uncompress2_z`,
-        // `adler32_z`, `crc32_z`) and the large-file `*64` exports — because on an
-        // LP64 target `uLong`, `z_size_t`, `z_off_t` and `z_off64_t` are all the
-        // same machine type, which leaves a twin pair with identical bodies. A C
-        // zlib linked with `--icf=all` folds exactly the same pairs, and nothing in
-        // the ABI is weakened: each name still resolves and each is still callable
-        // through its own declared signature, which the coercion guards above prove
-        // independently. No zlib contract lets a caller compare function addresses.
+        // exports whose machine code is byte-identical onto one address. That is
+        // reachable only for the ABI *width twins* — the motley `_z` exports
+        // (`compress_z`, `compress2_z`, `compressBound_z`, `deflateBound_z`,
+        // `uncompress_z`, `uncompress2_z`, `adler32_z`, `crc32_z`) and the
+        // large-file `*64` exports — because on an LP64 target `uLong`,
+        // `z_size_t`, `z_off_t` and `z_off64_t` are all the same machine type,
+        // which leaves a twin pair with identical bodies. A C zlib linked with
+        // `--icf=all` folds exactly the same pairs, and nothing in the ABI is
+        // weakened: each name still resolves and each is still callable through
+        // its own declared signature, which the coercion guards above prove
+        // independently. No zlib contract lets a caller compare function
+        // addresses.
         //
         // Any OTHER pair sharing an address is the aliasing defect this check
         // exists to catch — a shim pointed at the wrong implementation, say

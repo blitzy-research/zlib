@@ -1001,6 +1001,14 @@ pub unsafe extern "C" fn deflateGetDictionary(
 /// calls. A `NULL` header clears any previously set header (restoring the
 /// default), exactly as passing `Z_NULL` does in C.
 ///
+/// Because that deep copy is an allocation C does not perform, it adds one return
+/// value C cannot produce here: `Z_MEM_ERROR`, when the caller's `extra`, `name`
+/// or `comment` cannot be copied. The alternative — allocating infallibly — would
+/// abort the process on a condition zlib reports as an ordinary error, so the
+/// extra code is the faithful choice (AAP §0.6.5). It is returned only on genuine
+/// allocator exhaustion, nothing is installed when it happens, and the stream
+/// keeps whatever header it already had.
+///
 /// # Safety
 ///
 /// `strm` must be null or a valid `z_stream` initialized by `deflateInit*`.
@@ -1025,7 +1033,19 @@ pub unsafe extern "C" fn deflateSetHeader(strm: z_streamp, head: gz_headerp) -> 
             };
             // SAFETY: `head` is null or points at a valid `gz_header` whose
             // field-declared buffers remain valid for this call.
-            let header = unsafe { gz_header_to_idiomatic(head) };
+            //
+            // The deep copy is fallible because its three buffers are sized by
+            // the caller (`extra_len`, and the `name`/`comment` NUL positions).
+            // C stores the caller's pointers and allocates nothing here, so it
+            // has no corresponding failure; the copy is this shim's own doing and
+            // an exhausted allocator must therefore be reported the way zlib
+            // reports exhaustion everywhere else — `Z_MEM_ERROR` — rather than
+            // aborting the process. Nothing has been installed at this point, so
+            // the stream keeps whatever header it already had and the caller may
+            // retry.
+            let Ok(header) = (unsafe { gz_header_to_idiomatic(head) }) else {
+                return Z_MEM_ERROR;
+            };
             code_of(engine::deflate_set_header(zs, header))
         }
         #[cfg(not(feature = "gzip"))]
@@ -2251,6 +2271,123 @@ mod tests {
             Z_STREAM_ERROR
         );
         assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+    }
+
+    /// `deflateSetHeader` with a **populated** header must deep-copy every
+    /// caller-owned field and return `Z_OK`, and the fields must reach the wire.
+    ///
+    /// The deep copy is the shim's own allocation (C merely stores the caller's
+    /// pointers), which is why `gz_header_to_idiomatic` is fallible and why this
+    /// entry point can answer `Z_MEM_ERROR` where C cannot. That makes the
+    /// *success* path worth pinning explicitly: every other `deflateSetHeader`
+    /// test passes `NULL`, so without this one the copy could stop copying — or
+    /// start reporting failure spuriously — with nothing to catch it.
+    ///
+    /// Copying (rather than retaining the caller's pointers) is also load-bearing
+    /// for memory safety: the source buffers are dropped before `deflate` runs,
+    /// so a shim that stored pointers would read freed memory here.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn set_header_deep_copies_a_populated_header_and_emits_it() {
+        let mut strm = zeroed_stream();
+        let rc = unsafe {
+            deflateInit2_(
+                &mut strm,
+                6,
+                Z_DEFLATED,
+                31,
+                DEF_MEM_LEVEL,
+                Z_DEFAULT_STRATEGY,
+                ver(),
+                size_of::<z_stream>() as c_int,
+            )
+        };
+        assert_eq!(rc, Z_OK);
+
+        let compressed = {
+            // Scoped so every caller-owned buffer is dropped before `deflate`.
+            let mut extra = std::vec![0xA5u8, 0x5A, 0x11, 0x22];
+            let mut name = std::vec![
+                b'p', b'a', b'y', b'l', b'o', b'a', b'd', b'.', b'b', b'i', b'n', 0
+            ];
+            let mut comment = std::vec![b'a', b' ', b'c', b'o', b'm', b'm', b'e', b'n', b't', 0];
+
+            let mut head = crate::ffi::types::gz_header {
+                text: 1,
+                time: 0x5EED_1234,
+                xflags: 0,
+                os: 3,
+                extra: extra.as_mut_ptr(),
+                extra_len: extra.len() as c_uint,
+                extra_max: 0,
+                name: name.as_mut_ptr(),
+                name_max: 0,
+                comment: comment.as_mut_ptr(),
+                comm_max: 0,
+                hcrc: 0,
+                done: 0,
+            };
+
+            // SAFETY: `strm` is a live gzip-wrapped deflate stream and `head`'s
+            // buffers are valid for the duration of the call.
+            assert_eq!(
+                unsafe { deflateSetHeader(&mut strm, &mut head) },
+                Z_OK,
+                "a populated header on a gzip stream must be accepted"
+            );
+
+            let input = b"deep-copied gzip header fields".repeat(4);
+            let mut out = std::vec![0u8; 512];
+            strm.next_in = input.as_ptr();
+            strm.avail_in = input.len() as c_uint;
+            strm.next_out = out.as_mut_ptr();
+            strm.avail_out = out.len() as c_uint;
+            // SAFETY: both cursors point at live buffers sized by the fields set
+            // above.
+            assert_eq!(unsafe { deflate(&mut strm, Z_FINISH) }, Z_STREAM_END);
+            let produced = out.len() - strm.avail_out as usize;
+            out.truncate(produced);
+
+            // Prove the copies are independent of the caller's storage: scribble
+            // over every source buffer, then let them drop at the end of the
+            // scope. A shim that retained pointers would already have read this.
+            extra.fill(0);
+            name.fill(0);
+            comment.fill(0);
+            out
+        };
+
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+
+        // The emitted member must carry FEXTRA|FNAME|FCOMMENT and the exact bytes.
+        assert_eq!(&compressed[..2], &[0x1f, 0x8b], "gzip magic");
+        let flg = compressed[3];
+        assert_ne!(flg & 0x04, 0, "FEXTRA must be advertised");
+        assert_ne!(flg & 0x08, 0, "FNAME must be advertised");
+        assert_ne!(flg & 0x10, 0, "FCOMMENT must be advertised");
+        assert_ne!(flg & 0x01, 0, "FTEXT must be advertised for text: 1");
+
+        // Header layout: 10 fixed bytes, then XLEN (2, little-endian) + extra.
+        assert_eq!(&compressed[4..8], &0x5EED_1234u32.to_le_bytes(), "MTIME");
+        assert_eq!(compressed[9], 3, "OS byte is the caller's `os`");
+        assert_eq!(&compressed[10..12], &4u16.to_le_bytes(), "XLEN");
+        assert_eq!(
+            &compressed[12..16],
+            &[0xA5, 0x5A, 0x11, 0x22],
+            "extra bytes"
+        );
+        let rest = &compressed[16..];
+        let name_end = rest
+            .iter()
+            .position(|&b| b == 0)
+            .expect("NUL-terminated name");
+        assert_eq!(&rest[..name_end], b"payload.bin", "FNAME");
+        let after_name = &rest[name_end + 1..];
+        let cmt_end = after_name
+            .iter()
+            .position(|&b| b == 0)
+            .expect("NUL-terminated comment");
+        assert_eq!(&after_name[..cmt_end], b"a comment", "FCOMMENT");
     }
 
     #[cfg(feature = "gzip")]

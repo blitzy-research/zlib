@@ -15,7 +15,7 @@ of the published crate through the `exclude` list in `Cargo.toml`.
 | --- | --- |
 | **Baseline** | zlib `1.3.2.1-motley`, `ZLIB_VERNUM 0x1321`. `zlibVersion()` reports that full four-component string; the Cargo package version is `1.3.2`, because SemVer admits no fourth component. |
 | **Memory safety** | `unsafe` is confined to the `ffi` boundary. All eight core module groups — `deflate`, `inflate`, `checksum`, `gz`, `util`, `error`, `constants`, `gz_header` — measure **zero** executable `unsafe`. |
-| **Structure** | **40** modules in a strictly acyclic **seven-layer** tree mirroring the C `#include` layering: `error` / `constants` → `util` → `checksum` → `stream` / `gz_header` → `{deflate, inflate}` → `gz` → `ffi`. It replaces **26** C translation units and headers, **23,107** lines of C exposing **119** `ZEXTERN` entry points. |
+| **Structure** | **40** modules in a **seven-layer** tree mirroring the C `#include` layering: `error` / `constants` → `util` → `checksum` → `stream` / `gz_header` → `{deflate, inflate}` → `gz` → `ffi`. `deflate` and `inflate` are strict peers. The layering is the architecture rather than a claim of acyclicity: **four** `use` sites point upward — `stream` names the two engine states it owns, and the two one-call wrappers call the engines as `compress.c` / `uncompr.c` do — so `deflate`↔`stream`, `inflate`↔`stream`, and `deflate`↔`util` reference each other. A Rust crate is one compilation unit, so those are module references, not a build cycle ([details](technical-specifications.md#031-refactored-structure-planning)). It replaces **26** C translation units and headers, **23,107** lines of C exposing **119** `ZEXTERN` entry points. |
 | **Byte-identity** | Proven at **50/50** and **3,750/3,750** configurations against a reference C zlib built from this repository's own C sources. |
 | **C ABI** | **95** exported symbols; **54/54** of `zlib.map`'s `global:` symbols present and **0/10** of its `local:` symbols leaked. |
 | **Formats** | All **10** compression levels, **5** strategies, and **7** flush modes. |
@@ -88,10 +88,14 @@ Five, each deliberate and none a defect:
 
 Platform claims deserve platform coverage, so here is the boundary drawn honestly. The test suite is **natively
 executed** on `ubuntu-latest` across five feature rows, on `windows-latest` (x86_64 — the only place `gzopen_w`
-is compiled and `OS_CODE` is 10), and on `macos-latest` (aarch64, where `OS_CODE` is 19). The aarch64, 32-bit
-`i686`, and big-endian `s390x` Linux triples are **cross type-checked**, and the bare-metal
-`thumbv7em-none-eabihf` target is **built** in both `no_std` configurations. A 32-bit, big-endian, or bare-metal
-build is therefore compile-verified rather than runtime-verified, and this page does not claim otherwise.
+is compiled and `OS_CODE` is 10), and on `macos-latest` (aarch64, where `OS_CODE` is 19). On the Windows row
+`gzopen_w` is not merely compiled: `ffi::gz::tests::wide_path_open_round_trip` opens a UTF-16 path through it,
+writes, closes, reopens, and reads the payload back, and a dedicated step runs that test by name so the coverage
+cannot decay into a signature check. Each row also asserts its own `rustc -vV` host triple and `runner.arch`. The
+aarch64, 32-bit `i686`, and big-endian `s390x` Linux triples are **cross type-checked** (with `--all-features`,
+so the `c_oracle` harness and `inflate_strict` arms are included), and the bare-metal `thumbv7em-none-eabihf`
+target is **built** in both `no_std` configurations. A 32-bit, big-endian, or bare-metal build is therefore
+compile-verified rather than runtime-verified, and this page does not claim otherwise.
 
 ## Where to go next
 

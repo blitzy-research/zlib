@@ -1,26 +1,63 @@
-# MkDocs configuration for the published `blitzy-zlib` documentation site.
+# MkDocs configuration for the zlib-rs documentation site.
 #
-# This file is also the Backstage TechDocs entry point: `catalog-info.yaml`
-# annotates the component with `backstage.io/techdocs-ref: dir:.`, so TechDocs
-# builds this project from the repository root using the `docs_dir` declared
-# below. That annotation is not ours to change, so this configuration honours
-# the contract rather than fighting it.
-
-# DOCUMENTATION ROOT — DO NOT REPOINT THIS AT `docs/`.
+# ---------------------------------------------------------------------------
+# `docs_dir: doc` IS CANONICAL -- AND IT IS LOAD-BEARING, NOT A TYPO
+# ---------------------------------------------------------------------------
+# MkDocs defaults `docs_dir` to `docs/`. This project deliberately overrides it
+# to the singular `doc/`, because `doc/` is where the documentation actually
+# lives: it is the directory the retained C baseline already shipped, holding the
+# normative format specifications this rewrite implements -- `rfc1950.txt`
+# (zlib), `rfc1951.txt` (DEFLATE), `rfc1952.txt` (gzip), plus `algorithm.txt` and
+# `txtvsbin.txt`. Keeping the authored pages beside the specifications they
+# implement is the point; splitting them across two directories was the defect.
 #
-# The repository carries two similarly named directories and only ONE of them
-# is the build root. `doc/` is canonical and holds all three published pages.
-# The sibling `docs/` holds a single redirect stub and is NOT part of this
-# MkDocs project.
+# Every path in `nav` below resolves relative to `docs_dir`, so `index.md` means
+# `doc/index.md`, and so on. Backstage TechDocs builds through this same file --
+# `catalog-info.yaml` sets `backstage.io/techdocs-ref: dir:.` -- so both the
+# MkDocs site and the TechDocs component publish `doc/`, from one source of
+# truth. Repointing `docs_dir` at `docs/` would silently drop all three authored
+# pages AND orphan the RFC texts.
 #
 # Flipping this value looks like a one-word tidy-up and is not.
-# `project-guide.md` (~58 KB) and `technical-specifications.md` (~185 KB) exist
-# ONLY under `doc/`, so pointing at `docs/` would unpublish the two largest
-# documents in the repository in order to rescue a 2 KB stub — trading one
-# orphan for two far worse ones. It would also silently contradict
-# `Cargo.toml`, whose `exclude` commentary records that this site builds
-# exactly `doc/index.md`, `doc/project-guide.md`, and
-# `doc/technical-specifications.md`.
+# `project-guide.md` and `technical-specifications.md` exist ONLY under `doc/`,
+# so pointing at `docs/` would unpublish the two largest documents in the
+# repository in order to rescue a small stub -- trading one orphan for two far
+# worse ones. It would also silently contradict `Cargo.toml`, whose `exclude`
+# commentary records that this site builds exactly `doc/index.md`,
+# `doc/project-guide.md`, and `doc/technical-specifications.md`.
+#
+# ---------------------------------------------------------------------------
+# WHY `docs/index.md` EXISTS AND IS NOT IN `nav`
+# ---------------------------------------------------------------------------
+# There is a second, single-file `docs/` directory containing only `index.md`.
+# Its absence from `nav` is intentional and must stay that way: no file under
+# `docs/` is reachable from either the MkDocs or the TechDocs build.
+#
+# That page used to carry its own copy of the project description, which
+# duplicated `doc/index.md` -- and the two copies had already drifted apart.
+# The duplication was resolved by making `docs/index.md` a pure signpost: it now
+# holds no project detail of its own, states that `doc/` is the published root,
+# and links to `doc/index.md` as canonical. With nothing duplicated there, there
+# is nothing left to drift.
+#
+# It is kept rather than deleted so that anyone landing on the conventional
+# `docs/` path -- from a tool, a stale link, or habit -- is redirected instead of
+# meeting a dead end. Two rules follow, and both matter:
+#
+#   1. Do NOT add `docs/index.md` to `nav`, and do NOT change `docs_dir` to
+#      `docs`. Either change resurrects the two-landing-page split this
+#      arrangement exists to prevent.
+#   2. Do NOT restore project substance to `docs/index.md`. Documentation
+#      changes belong in `doc/`, next to the page they affect.
+#
+# ---------------------------------------------------------------------------
+# THE KEYS BELOW ARE INTENTIONALLY UNCHANGED
+# ---------------------------------------------------------------------------
+# `docs_dir`, `nav`, and `plugins` are already correct and are deliberately left
+# byte-for-byte as they were. `techdocs-core` supplies the Backstage-compatible
+# theme and Markdown extension set; `mermaid2` renders the architecture and
+# layering diagrams embedded in the pages below -- the module dependency graph in
+# particular -- so removing it degrades those pages to raw fenced code.
 docs_dir: doc
 
 # Must stay equal to `catalog-info.yaml`'s `metadata.name`. Renaming it breaks

@@ -12,13 +12,17 @@
 # root carries a `rust-toolchain.toml` pinning the crate's MSRV — a STABLE
 # toolchain — and rustup resolves that file (precedence rank 4) by searching
 # UPWARD from the working directory, ahead of the default toolchain (rank 5). So
-# a shell sitting in `fuzz/` inherits the pin, and so does a CI job: installing
-# nightly with `dtolnay/rust-toolchain@nightly` sets the DEFAULT toolchain and
-# does NOT export `RUSTUP_TOOLCHAIN`, and the toolchain file outranks it. Either
-# way an unprefixed `cargo fuzz build` or `cargo fuzz run` fails with "the option
-# `Z` is only accepted on the nightly compiler". Use
+# a shell sitting in `fuzz/` inherits the pin, and so does a CI job: installing a
+# nightly through `dtolnay/rust-toolchain` sets the DEFAULT toolchain and does NOT
+# export `RUSTUP_TOOLCHAIN`, and the toolchain file outranks it. Either way an
+# unprefixed `cargo fuzz build` or `cargo fuzz run` fails with "the option `Z` is
+# only accepted on the nightly compiler". Use
 # `cargo +nightly fuzz build|list|run <target>` and
 # `cargo +nightly fmt --all -- --check` here.
+#
+# CI pins the exact nightly it uses, and names it on every invocation. Reproducing
+# a CI result locally means naming the same one - `.github/workflows/fuzz.yml`
+# carries the date on its install step and asserts it before building anything.
 #
 # The `cargo-fuzz` job in `.github/workflows/fuzz.yml` says it twice, for the same
 # reason every job in `ci.yml` does: a `+nightly` shorthand on every cargo

@@ -10,29 +10,20 @@
 //! incompressible) are varied. The larger, match-heavy inputs drive the
 //! `inflate_fast` hot path.
 //!
-//! Measured position — external evidence recorded in the plan, not a figure this
-//! harness produces, and the only C-relative throughput figures quoted anywhere
-//! in this file: decompression runs at 107%-127% of reference C zlib, so it is at
-//! or above parity, while compression runs at approximately 85% of it (AAP 0.8.3,
-//! "Performance Expectations"). Compression is therefore the interesting side,
-//! and it is measured separately in `benches/deflate_bench.rs`; nothing timed
-//! here is a compression figure.
+//! Measured position, recorded as external context rather than produced here:
+//! decompression runs at 107%-127% of reference C zlib, so it is at or above
+//! parity, while compression runs at approximately 85% of it (AAP 0.8.3,
+//! "Performance Expectations"). Compression is measured separately in
+//! `benches/deflate_bench.rs`; nothing timed here is a compression figure. A
+//! per-profile comparison against a reference C build put these decode cases at
+//! 104%-125%, which brackets the quoted range.
 //!
-//! Of the two, the decompression figure is the one that has survived contact with
-//! measurement: a per-profile comparison against a reference C build put these
-//! cases at 104%-125%, which brackets the quoted 107%-127%. The compression
-//! figure is an aggregate and must not be read as localising the shortfall to any
-//! particular input profile — the same comparison inverted the intuitive story,
-//! and `benches/deflate_bench.rs` carries the corrected per-profile distribution.
-//!
-//! What this file itself measures is `zlib-rs` alone: it links no C library and
-//! runs no reference implementation, so every number it prints describes how fast
-//! this crate turns compressed bytes back into payload bytes, and is useful for
-//! comparing this crate against itself across levels, profiles, and commits. The
-//! C-relative percentages above come from AAP 0.8.3; they are not produced by a
-//! run of this harness, and the repository has no automated in-tree performance
-//! oracle that could re-check them on demand. Treat them as attributed context
-//! rather than as a property this suite verifies.
+//! This file links no C library and runs no reference implementation, and the
+//! repository has no automated in-tree performance oracle that could re-check the
+//! percentages above on demand — treat them as attributed context rather than as a
+//! property this suite verifies. Every number a run prints describes how fast this
+//! crate turns compressed bytes back into payload bytes, useful for comparing the
+//! crate against itself across levels, profiles, and commits.
 //!
 //! # Every case validates its own output before it is timed
 //!
@@ -43,64 +34,37 @@
 //! and byte-for-byte equality with the original payload. Only then is the timed
 //! closure registered, and Criterion never folds that check into a sample.
 //!
-//! Per AAP 0.8.3 no throughput target was ever specified and this is explicitly
-//! not a performance refactor, so the percentages above are evidence rather than
-//! a goal. Nothing measured here authorises a change to the compression
-//! heuristics either: a faster match finder that emits different tokens is a
-//! regression, not an improvement, no matter what the benchmark says. The
-//! official zlib test vectors are operationalised by `tests/regression.rs`,
-//! `tests/round_trip.rs`, `tests/inflate_coverage.rs`, and
-//! `tests/gzip_compat.rs` — never by a benchmark.
-//!
-//! This folder MEASURES; it does not AUTHORISE. Performance is a constraint on
-//! the migration, not its objective, so no timing taken here is on its own a
-//! licence to change anything under `src/` (AAP 0.8.3). In particular
-//! `deflate_to_vec` below calls `compress2` purely as benchmark *setup*, to
-//! obtain a stream for the decoder to consume: it is not a byte-identity check,
-//! and byte-identity against reference zlib is owned exclusively by
-//! `tests/interop.rs`.
+//! This folder MEASURES; it does not AUTHORISE. Performance is a constraint on the
+//! migration, not its objective, so no timing taken here is on its own a licence to
+//! change anything under `src/` (AAP 0.8.3) — least of all the compression
+//! heuristics: a faster match finder that emits different tokens is a regression,
+//! not an improvement, no matter what the benchmark says. In particular
+//! `deflate_to_vec` below calls `compress2` purely as benchmark *setup*, to obtain
+//! a stream for the decoder to consume; it is not a byte-identity check.
+//! Byte-identity is owned exclusively by `tests/interop.rs`, and the official zlib
+//! test vectors by `tests/regression.rs`, `tests/round_trip.rs`,
+//! `tests/inflate_coverage.rs`, and `tests/gzip_compat.rs` — never by a benchmark.
 //!
 //! # Measurement configuration: noise threshold
 //!
-//! Criterion's default `noise_threshold` is 0.01, and its verdict rule is a plain
-//! comparison of the change confidence interval against that value: "regressed"
-//! iff both bounds exceed `+noise`, "improved" iff both fall below `-noise`,
-//! otherwise "within noise" (`src/report.rs`, `compare_to_threshold`). One
-//! percent is well below what this workload actually reproduces run to run — the
-//! `uncompress` cases here measured a coefficient of variation of 5.25% on the
-//! CI-class host that motivated this setting — so an unchanged binary earns
-//! "Performance has regressed" purely from scheduling noise.
-//!
-//! [`NOISE_THRESHOLD`] is therefore set above the measured variation of these
+//! Criterion's default `noise_threshold` of 1% is well below what this workload
+//! reproduces run to run on an unpinned, non-isolated CI-class host, so an
+//! unchanged binary earns "Performance has regressed" purely from scheduling noise.
+//! [`NOISE_THRESHOLD`] is therefore set above the observed variation of these
 //! cases. The policy is shared with `benches/deflate_bench.rs` and
 //! `benches/checksum_bench.rs`: pick a threshold that exceeds the largest
-//! run-to-run drift observed for the workload on an unchanged binary — 0.05 where
-//! that drift stays within roughly 3%, and 0.10 where it reaches the 5%-8% band
-//! these decompression cases and the incompressible compression cases occupy.
-//! `benches/deflate_bench.rs` carries the full derivation, including why
-//! `--noise-threshold` on the command line cannot override a value set on the
-//! group.
+//! run-to-run drift seen for the workload on an unchanged binary — 0.05 where that
+//! drift stays within a few percent, and 0.10 for the noisier band these decode
+//! cases and the incompressible compression cases occupy. A group setting always
+//! wins over the corresponding CLI flag, so `--noise-threshold` cannot override it.
 //!
-//! Sampling mode is deliberately left at Criterion's `Auto` default here. Every
-//! case in this file decodes 64 KiB in well under a millisecond, so Linear
-//! sampling reaches an iteration step of `d >= 1`, never prints the "Unable to
-//! complete 100 samples" warning that the ~1.8 ms compression cases in
-//! `deflate_bench.rs` had to switch to `Flat` to silence, and keeps the
-//! regression-slope estimate that is the more accurate one at this magnitude.
-//!
-//! # Operating this harness
-//!
-//! The pinned harness (`criterion = "0.5.1"`, AAP 0.5.1) has several behaviours
-//! that can silently invalidate a measurement or a CI gate and that cannot be
-//! fixed from this repository — among them: a filter that matches nothing exits 0
-//! having measured nothing; invoking the bench binary by path without `--bench`
-//! runs in Test mode and collects no data; an unwritable `CRITERION_HOME` still
-//! exits 0; invalid numeric arguments such as `--sample-size 9` abort with status
-//! 101; `--help` is unavailable while `--version` prints no version; and
-//! `Gnuplot not found, using plotters backend` is expected and harmless.
-//! `benches/checksum_bench.rs` holds the authoritative list with the exact
-//! assertion sites, exit codes, and CI mitigations. Read it before wiring any of
-//! these benchmarks into an automated gate.
+//! Sampling mode is deliberately left at Criterion's `Auto` default. Every case
+//! here decodes 64 KiB in well under a millisecond, so Linear sampling keeps a
+//! workable iteration step and retains the regression-slope estimate, which is the
+//! more accurate one at this magnitude; `deflate_bench.rs` explains why its own
+//! millisecond-scale cases had to switch to `Flat` instead. For criterion's own CLI
+//! and reporting behaviour, consult the pinned harness's documentation
+//! (`criterion = "0.5.1"`).
 //!
 //! Registered in `Cargo.toml` as `[[bench]] name = "inflate_bench"` with
 //! `harness = false`. No `[[bench]]` block carries a `path` key, so Cargo

@@ -91,6 +91,52 @@
 pub(crate) const GZBUFSIZE: usize = 8192;
 
 // ---------------------------------------------------------------------------
+// Shared fallible-allocation helper.
+// ---------------------------------------------------------------------------
+
+/// Allocates a zero-filled `Vec<u8>` of `len` bytes, returning [`None`] if the
+/// allocation cannot be satisfied.
+///
+/// # Why this exists
+///
+/// Every gz buffer in reference zlib comes from `malloc`, and a `NULL` return is
+/// a *recoverable* condition that the C code reports as `Z_MEM_ERROR` /
+/// "out of memory" (`gzread.c` L295-L305 in `gz_look`, `gzwrite.c` L14-L29 in
+/// `gz_init`). Rust's `vec![0u8; len]` has no such path. It terminates the
+/// process in both of its failure modes: a `len` beyond the `isize::MAX` byte
+/// ceiling panics with "capacity overflow", and a `len` the allocator merely
+/// cannot satisfy calls `handle_alloc_error`, which aborts. Since both crate
+/// profiles set `panic = "abort"`, neither is even catchable. Terminating is not
+/// a stricter version of returning `Z_MEM_ERROR`; it is a different, observable
+/// behavior that a C caller cannot intercept, so using `vec!` for a
+/// caller-influenced size would break the allocation-failure parity the port is
+/// required to preserve (AAP §0.6.5).
+///
+/// The size is caller-influenced in exactly the way that matters: `gzbuffer`
+/// accepts any `want` up to `UINT_MAX >> 1` — which is correct C parity, since C
+/// validates the request only against that bound — and the buffers are then
+/// sized `want` and `want << 1`. A legitimate `gzbuffer(file, 0x7fff_ffff)`
+/// therefore asks for ~2 GiB + ~4 GiB on the next write. Reference zlib answers
+/// that with `Z_MEM_ERROR`; so must this port.
+///
+/// [`Vec::try_reserve_exact`] provides the fallible half. The subsequent
+/// [`Vec::resize`] cannot itself fail: the exact capacity is already reserved,
+/// so `resize` only writes zeroes into memory this call already owns.
+///
+/// # Placement
+///
+/// It lives at the module root because both halves of the layer need it — the
+/// read driver for the `gz_look` buffers and the write driver for the `gz_init`
+/// buffers — and a single definition keeps the two paths bit-for-bit consistent
+/// in how they fail.
+pub(crate) fn alloc_zeroed(len: usize) -> Option<Vec<u8>> {
+    let mut v: Vec<u8> = Vec::new();
+    v.try_reserve_exact(len).ok()?;
+    v.resize(len, 0);
+    Some(v)
+}
+
+// ---------------------------------------------------------------------------
 // Submodule declarations.
 //
 // These are intentionally PRIVATE: the public API is assembled from the
@@ -193,6 +239,40 @@ mod tests {
     #[test]
     fn gzbufsize_matches_c_define() {
         assert_eq!(super::GZBUFSIZE, 8192);
+    }
+
+    /// The shared buffer allocator must *report* an unsatisfiable request rather
+    /// than aborting, because that is the difference between reproducing C's
+    /// `Z_MEM_ERROR` and killing the caller's process (AAP §0.6.5).
+    ///
+    /// The failing length is chosen so the rejection is a **capacity overflow**,
+    /// decided by arithmetic before the allocator is consulted: `usize::MAX - 1`
+    /// exceeds the `isize::MAX` byte ceiling every Rust allocation is bounded by,
+    /// so the call returns in microseconds and no memory is ever requested. A
+    /// test that instead asked for a merely enormous-but-representable size (a
+    /// few GiB, say) would be non-deterministic — under Linux overcommit it can
+    /// *succeed* — and could get the test runner OOM-killed rather than failed.
+    #[test]
+    fn alloc_zeroed_reports_failure_instead_of_aborting() {
+        // Succeeds and is genuinely zero-filled at the requested length.
+        let ok = super::alloc_zeroed(super::GZBUFSIZE).expect("a normal request succeeds");
+        assert_eq!(ok.len(), super::GZBUFSIZE);
+        assert!(ok.iter().all(|&b| b == 0), "the buffer must be zero-filled");
+
+        // A zero-length request is legal and yields an empty buffer — the shape
+        // `gz_init` produces for a `direct` stream's unused output buffer.
+        assert_eq!(
+            super::alloc_zeroed(0)
+                .expect("a zero-length request succeeds")
+                .len(),
+            0
+        );
+
+        // Unsatisfiable by arithmetic, on 32-bit and 64-bit alike.
+        assert!(
+            super::alloc_zeroed(usize::MAX - 1).is_none(),
+            "an unallocatable length must return None, not abort"
+        );
     }
 
     /// Compile-time proof that the curated re-export façade resolves: importing

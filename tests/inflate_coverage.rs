@@ -72,6 +72,14 @@
 //! budget covering the state but not the window fails the subsequent
 //! `inflate`), exactly as in C.
 //!
+//! C reaches that same lazily-allocated window through a *third* entry point —
+//! `inflateSetDictionary`, which loads the dictionary via `updatewindow` — and
+//! pins `Z_MEM_ERROR` there too, then resumes from the failure by poking the
+//! private `state->mode`.
+//! [`set_dictionary_window_allocation_failure_is_a_mem_error`] ports that leg in
+//! full: the refusal itself, the latched `MEM` mode the poke exists to undo, and
+//! the accept-and-decode path on a stream that reaches `DICT` legitimately.
+//!
 //! ## Honestly-handled gap (never faked)
 //!
 //! One `infcover.c` behaviour reaches into private engine internals and is *not*
@@ -111,10 +119,10 @@ use core::ptr;
 use zlib_rs::GzHeader;
 use zlib_rs::checksum::adler32;
 use zlib_rs::constants::{DEF_MEM_LEVEL, Strategy, Z_DEFLATED, Z_FINISH, Z_NO_FLUSH, Z_TREES};
-use zlib_rs::deflate::{DeflateState, deflate, deflate_end, deflate_init2};
+use zlib_rs::deflate::{DeflateState, deflate, deflate_end, deflate_init2, deflate_set_dictionary};
 use zlib_rs::ffi::{
     inflate as ffi_inflate, inflateBack, inflateBackEnd, inflateBackInit_, inflateCopy, inflateEnd,
-    inflateInit_, inflateInit2_, z_stream,
+    inflateInit_, inflateInit2_, inflateSetDictionary, z_stream,
 };
 use zlib_rs::inflate::back::{InFunc, OutFunc, inflate_back, inflate_back_end, inflate_back_init};
 #[cfg(feature = "gzip")]
@@ -239,6 +247,22 @@ impl OutFunc for SinkReject {
     }
 }
 
+/// C `in_func` that supplies no input, the analogue of `infcover.c`'s
+/// `pull(desc == Z_NULL)` early return.
+///
+/// Used only where the callback must exist for the call to get past
+/// `inflateBack`'s "both callbacks are required" guard, and must never actually
+/// run — a state-validation rejection happens first.
+unsafe extern "C" fn back_pull_none(_desc: *mut c_void, _buf: *mut *const u8) -> c_uint {
+    0
+}
+
+/// C `out_func` that reports success without touching the buffer, the analogue of
+/// `infcover.c`'s `push(desc == Z_NULL)`.
+unsafe extern "C" fn back_push_ok(_desc: *mut c_void, _buf: *mut u8, _len: c_uint) -> c_int {
+    0
+}
+
 // ===========================================================================
 // Drivers
 // ===========================================================================
@@ -317,12 +341,13 @@ fn inf(hex: &str, what: &str, step: usize, win: i32, len: usize, err: ReturnCode
         }
 
         if outcome.code == ReturnCode::NeedDict {
-            // Reachable portion of C's NEED_DICT coverage. (C additionally forces
-            // Z_MEM_ERROR under an allocation limit and then poke-restores the
-            // private `state->mode = DICT`; forcing `Z_MEM_ERROR` is covered
-            // separately by `mem_limit_forces_mem_error`, but the private-state
-            // poke that resumes decoding from it is not expressible over the
-            // public API, so only the publicly reachable steps are reproduced.)
+            // Reachable portion of C's NEED_DICT coverage. C additionally caps its
+            // allocator to force `inflateSetDictionary` itself into Z_MEM_ERROR
+            // and then poke-restores the private `state->mode = DICT` to resume;
+            // that whole leg — including the state the poke papers over — is
+            // pinned by `set_dictionary_window_allocation_failure_is_a_mem_error`,
+            // because the cap has to be installed through the C ABI allocator
+            // hooks that this idiomatic driver deliberately does not use.
             //
             // A dictionary whose Adler-32 mismatches the requested id → DataError.
             assert_eq!(
@@ -722,13 +747,70 @@ fn cover_back() {
         assert_eq!(inflate_back_end(state), ReturnCode::Ok);
     }
 
-    // Forced *mode* error (Z_STREAM_ERROR): NOT reproducible here. C forces it by
-    // having its `pull` callback poke `((inflate_state*)strm.state)->mode = SYNC`,
-    // an otherwise-impossible internal state. The idiomatic `InFunc` trait only
-    // yields input bytes and cannot touch private engine state, and forging it
-    // with `unsafe` is expressly forbidden. Equivalent coverage of the bad-state
-    // guard in `inflate_back` is provided as a `#[cfg(test)]` unit test in
-    // `src/inflate/back.rs` (owned by the `src/inflate/` module).
+    // Forced *mode* error (Z_STREAM_ERROR). C forces it by having its `pull`
+    // callback poke `((inflate_state*)strm.state)->mode = SYNC` — "force an
+    // otherwise impossible situation" (`infcover.c` L459) — and then asserts
+    // `inflateBack` returns Z_STREAM_ERROR (`infcover.c` L496-L497).
+    //
+    // That exact poke is not expressible from here: the idiomatic `InFunc` trait
+    // only yields input bytes and cannot touch private engine state, and forging
+    // it with `unsafe` is expressly forbidden. The assertion is therefore made in
+    // two complementary places, and BOTH exist:
+    //
+    //   * the unserviceable-mode arm itself is asserted by the unit test
+    //     `inflate::back::tests::unsupported_mode_is_stream_error` in
+    //     `src/inflate/back.rs`, which assigns SYNC (and every other mode that
+    //     back-inflate cannot service) to a real initialized state and drives the
+    //     private `drive()` machine directly, in safe Rust;
+    //   * the publicly reachable half is asserted right here: a stream whose state
+    //     belongs to a DIFFERENT engine is a state `inflateBack` cannot service,
+    //     and the C ABI must reject it with Z_STREAM_ERROR rather than
+    //     misinterpreting the handle.
+    {
+        let mut strm = zeroed_stream();
+        // SAFETY: `strm` is a valid caller-owned `z_stream`; `c"1"` is a valid
+        // version string whose first byte matches the library version, and the
+        // reported size is the true `sizeof(z_stream)`.
+        let init = unsafe {
+            inflateInit2_(
+                &mut strm,
+                15,
+                c"1".as_ptr(),
+                core::mem::size_of::<z_stream>() as c_int,
+            )
+        };
+        assert_eq!(
+            init,
+            ReturnCode::Ok.as_c_int(),
+            "inflateInit2_ must succeed"
+        );
+
+        // SAFETY: `strm` holds a live *inflate* handle, not an inflateBack one.
+        // The shim validates the handle tag before touching engine state, so the
+        // callbacks are never invoked and nothing is misinterpreted.
+        let ret = unsafe {
+            inflateBack(
+                &mut strm,
+                Some(back_pull_none),
+                ptr::null_mut(),
+                Some(back_push_ok),
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(
+            ret,
+            ReturnCode::StreamError.as_c_int(),
+            "inflateBack over a state it cannot service must return Z_STREAM_ERROR",
+        );
+
+        // SAFETY: `strm` was initialized by `inflateInit2_` and is still live;
+        // the rejected `inflateBack` call consumed nothing.
+        assert_eq!(
+            unsafe { inflateEnd(&mut strm) },
+            ReturnCode::Ok.as_c_int(),
+            "the inflate handle must survive the rejected inflateBack call",
+        );
+    }
 
     // Built-in memory routines: plain init/end.
     let state = inflate_back_init(15).expect("inflate_back_init(15)");
@@ -1593,6 +1675,356 @@ fn mem_limit_forces_mem_error() {
         // state reservation through `zfree`.
         let end = unsafe { inflateEnd(&mut strm) };
         assert_eq!(end, ReturnCode::Ok.as_c_int(), "inflateEnd must succeed");
+    }
+}
+
+/// Compresses `payload` with a preset dictionary at `windowBits = 15`, returning
+/// the zlib stream (whose header carries `FDICT` and the dictionary id) together
+/// with that id — C `test_dict_deflate`'s `dictId = c_stream.adler`.
+fn compress_with_dictionary(payload: &[u8], dictionary: &[u8]) -> (Vec<u8>, u32) {
+    let mut strm = ZStream::new();
+    assert_eq!(
+        rc(deflate_init2(
+            &mut strm,
+            6,
+            Z_DEFLATED,
+            15,
+            DEF_MEM_LEVEL,
+            Strategy::Default,
+        )),
+        ReturnCode::Ok,
+        "deflate_init2 for the dictionary fixture",
+    );
+    assert_eq!(
+        rc(deflate_set_dictionary(&mut strm, dictionary)),
+        ReturnCode::Ok,
+        "deflate_set_dictionary must be accepted before any input",
+    );
+    // C reads the dictionary id out of `adler` immediately after the call.
+    let dict_id = strm.adler;
+
+    let mut out = vec![0u8; payload.len() + payload.len() / 2 + 1_024];
+    let outcome = deflate(&mut strm, payload, &mut out, Z_FINISH);
+    assert_eq!(
+        outcome.code,
+        ReturnCode::StreamEnd,
+        "the dictionary fixture must finish in one call",
+    );
+    assert_eq!(outcome.consumed, payload.len());
+    out.truncate(outcome.produced);
+    assert_eq!(rc(deflate_end(&mut strm)), ReturnCode::Ok);
+    (out, dict_id)
+}
+
+/// Port of the forced-`Z_MEM_ERROR` step inside `infcover.c`'s `NEED_DICT`
+/// branch (`infcover.c` L323-L332) — the third allocation site C drives into
+/// `Z_MEM_ERROR`, and the only one reached through `inflateSetDictionary`.
+///
+/// When `inflate` asks for a dictionary, C tightens the limit to a single byte
+/// and then installs one:
+///
+/// ```text
+///     ret = inflateSetDictionary(&strm, in, 1);   assert(ret == Z_DATA_ERROR);
+///     mem_limit(&strm, 1);
+///     ret = inflateSetDictionary(&strm, out, 0);  assert(ret == Z_MEM_ERROR);
+///     mem_limit(&strm, 0);
+///     ((struct inflate_state *)strm.state)->mode = DICT;
+///     ret = inflateSetDictionary(&strm, out, 0);  assert(ret == Z_OK);
+///     ret = inflate(&strm, Z_NO_FLUSH);           assert(ret == Z_BUF_ERROR);
+/// ```
+///
+/// `inflateSetDictionary` loads the dictionary through `updatewindow`, which
+/// allocates the sliding window whenever it is still null (`inflate.c`
+/// L259-L263), so a budget covering the state but not the window turns the
+/// dictionary load itself into `Z_MEM_ERROR` and latches `state->mode = MEM`
+/// (C L1211-L1214). Neither [`mem_limit_forces_mem_error`] (the state
+/// reservation and the *decode-path* window) nor
+/// [`window_allocation_failure_keeps_the_bytes_but_not_the_totals`] (the
+/// `inf_leave` window) passes through that call, so it is pinned here.
+///
+/// The one step C takes that an integration test cannot is the `mode = DICT`
+/// poke on L330. It exists only because C's own preceding failure latched
+/// `mode = MEM`, and private state is not writable from here — so what the poke
+/// papers over is asserted instead: after the refusal the mode really is `MEM`,
+/// which is why a repeat `inflateSetDictionary` is rejected with
+/// `Z_STREAM_ERROR` and a resumed `inflate` reports `Z_MEM_ERROR` (C
+/// `case MEM: return Z_MEM_ERROR;`). C's L331-L332 success leg is then
+/// reproduced on a stream that reaches `DICT` legitimately, once through the C
+/// ABI on C's own fixture and once through the idiomatic API on a real
+/// dictionary-compressed payload that must decode byte-exactly.
+#[test]
+fn set_dictionary_window_allocation_failure_is_a_mem_error() {
+    // Reserved through the caller's `zalloc` by `inflateInit2_`.
+    const STATE_SIZE: usize = zlib_rs::inflate::InflateState::C_LAYOUT_SIZE;
+    // `windowBits = 8` => the 256-byte window `updatewindow` allocates lazily.
+    const WINDOW_8: usize = 1 << 8;
+    // C's `inf("8 b8 0 0 0 1", "need dictionary", 0, 8, 0, Z_NEED_DICT)` fixture:
+    // CMF `0x08` (CM 8, CINFO 0 => a 256-byte window), FLG `0xb8` (FDICT set,
+    // and `0x08b8 % 31 == 0`), then the big-endian dictionary id `1` — which is
+    // `adler32` of the *empty* dictionary, so C's zero-length `out` is the
+    // correct dictionary for this stream.
+    const NEED_DICT_ID_ONE: [u8; 6] = [0x08, 0xb8, 0x00, 0x00, 0x00, 0x01];
+
+    // --- C ABI: the tight budget refuses the dictionary window ---------------
+    {
+        let cap = MemCap {
+            // Enough for the state reservation, one byte short of the window, so
+            // the allocation inside `updatewindow` is the request that fails —
+            // C's `mem_limit(&strm, 1)`.
+            budget: Cell::new(STATE_SIZE + WINDOW_8 - 1),
+        };
+
+        let mut strm = zeroed_stream();
+        strm.zalloc = Some(cap_alloc);
+        strm.zfree = Some(cap_free);
+        strm.opaque = (&cap as *const MemCap) as *mut c_void;
+
+        // SAFETY: `strm` is a valid, caller-owned `z_stream` with a live capped
+        // allocator installed; `c"1"` is a valid version whose first byte matches
+        // the library version, and the reported size is the true
+        // `sizeof(z_stream)`.
+        let init = unsafe {
+            inflateInit2_(
+                &mut strm,
+                8,
+                c"1".as_ptr(),
+                core::mem::size_of::<z_stream>() as c_int,
+            )
+        };
+        assert_eq!(
+            init,
+            ReturnCode::Ok.as_c_int(),
+            "a budget covering the state must let inflateInit2_ succeed",
+        );
+
+        let mut out = [0u8; 1];
+        strm.next_in = NEED_DICT_ID_ONE.as_ptr();
+        strm.avail_in = NEED_DICT_ID_ONE.len() as c_uint;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+
+        // SAFETY: `strm` holds a valid inflate state and its cursors describe the
+        // live local buffers with matching `avail_*` counts.
+        let ret = unsafe { ffi_inflate(&mut strm, Z_NO_FLUSH) };
+        assert_eq!(
+            ret,
+            ReturnCode::NeedDict.as_c_int(),
+            "the FDICT header must stop the decode with Z_NEED_DICT",
+        );
+        assert_eq!(
+            strm.adler, 1,
+            "the requested dictionary id reaches the caller through adler",
+        );
+
+        // C L324-L325: a one-byte dictionary whose Adler-32 is not the requested
+        // id. The identifier is checked *before* `updatewindow` runs, so even
+        // under the tight budget this is Z_DATA_ERROR and not Z_MEM_ERROR — a
+        // port that allocated first would report the wrong code here.
+        // SAFETY: `strm` holds a valid inflate state and the fixture provides at
+        // least the one byte named by the length argument.
+        let wrong = unsafe { inflateSetDictionary(&mut strm, NEED_DICT_ID_ONE.as_ptr(), 1) };
+        assert_eq!(
+            wrong,
+            ReturnCode::DataError.as_c_int(),
+            "a mismatched dictionary id must be rejected before any allocation",
+        );
+
+        // C L326-L329: the *correct* (empty) dictionary now passes the id check
+        // and reaches `updatewindow`, whose window allocation the budget refuses.
+        // SAFETY: `strm` holds a valid inflate state; a zero length reads nothing
+        // through the pointer, exactly as C's `inflateSetDictionary(&strm, out, 0)`.
+        let capped = unsafe { inflateSetDictionary(&mut strm, out.as_ptr(), 0) };
+        assert_eq!(
+            capped,
+            ReturnCode::MemError.as_c_int(),
+            "a refused dictionary window must surface Z_MEM_ERROR (inflate.c L1211-L1214)",
+        );
+
+        // The failure latched `mode = MEM`, which is precisely why C has to poke
+        // `mode = DICT` before retrying: the stream is no longer awaiting a
+        // dictionary, so the guard `wrap != 0 && mode != DICT` rejects a repeat.
+        // SAFETY: as above — a valid inflate state and a zero-length dictionary.
+        let again = unsafe { inflateSetDictionary(&mut strm, out.as_ptr(), 0) };
+        assert_eq!(
+            again,
+            ReturnCode::StreamError.as_c_int(),
+            "once mode == MEM the stream is not awaiting a dictionary any more",
+        );
+
+        // C `case MEM: return Z_MEM_ERROR;` — a resumed decode reports the latched
+        // failure and advances nothing.
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+        // SAFETY: `strm` holds a valid inflate state; `avail_in` is 0 and
+        // `next_out` points at the live local buffer.
+        let resumed = unsafe { ffi_inflate(&mut strm, Z_NO_FLUSH) };
+        assert_eq!(
+            resumed,
+            ReturnCode::MemError.as_c_int(),
+            "a stream latched in MEM mode must keep reporting Z_MEM_ERROR",
+        );
+        assert_eq!(
+            strm.avail_out,
+            out.len() as c_uint,
+            "the MEM arm returns without the RESTORE() epilogue, so nothing advances",
+        );
+
+        // SAFETY: `strm` was initialized by `inflateInit2_` and still owns its
+        // state; `inflateEnd` refunds the capped state reservation through `zfree`.
+        let end = unsafe { inflateEnd(&mut strm) };
+        assert_eq!(end, ReturnCode::Ok.as_c_int(), "inflateEnd must succeed");
+    }
+
+    // --- C ABI: C L330-L332, on a stream that reaches DICT legitimately ------
+    {
+        let cap = MemCap {
+            // C's `mem_limit(&strm, 0)`: the window now fits.
+            budget: Cell::new(STATE_SIZE + WINDOW_8),
+        };
+
+        let mut strm = zeroed_stream();
+        strm.zalloc = Some(cap_alloc);
+        strm.zfree = Some(cap_free);
+        strm.opaque = (&cap as *const MemCap) as *mut c_void;
+
+        // SAFETY: as in the first scenario — a valid caller-owned `z_stream` with
+        // a live capped allocator, a matching version byte, and the true size.
+        let init = unsafe {
+            inflateInit2_(
+                &mut strm,
+                8,
+                c"1".as_ptr(),
+                core::mem::size_of::<z_stream>() as c_int,
+            )
+        };
+        assert_eq!(
+            init,
+            ReturnCode::Ok.as_c_int(),
+            "inflateInit2_ must succeed"
+        );
+
+        let mut out = [0u8; 1];
+        strm.next_in = NEED_DICT_ID_ONE.as_ptr();
+        strm.avail_in = NEED_DICT_ID_ONE.len() as c_uint;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+
+        // SAFETY: valid inflate state, cursors describing the live buffers.
+        let ret = unsafe { ffi_inflate(&mut strm, Z_NO_FLUSH) };
+        assert_eq!(ret, ReturnCode::NeedDict.as_c_int(), "Z_NEED_DICT");
+
+        // C L331: with memory available the same empty dictionary is accepted.
+        // SAFETY: valid inflate state; a zero length reads nothing.
+        let loaded = unsafe { inflateSetDictionary(&mut strm, out.as_ptr(), 0) };
+        assert_eq!(
+            loaded,
+            ReturnCode::Ok.as_c_int(),
+            "the correct dictionary must be accepted once the window fits",
+        );
+
+        // C L332: the fixture carries no compressed payload and `avail_in` is
+        // spent, so the resumed decode makes no progress => Z_BUF_ERROR.
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+        // SAFETY: valid inflate state; `avail_in` is 0 and `next_out` is live.
+        let resumed = unsafe { ffi_inflate(&mut strm, Z_NO_FLUSH) };
+        assert_eq!(
+            resumed,
+            ReturnCode::BufError.as_c_int(),
+            "no input and no progress after the dictionary load => Z_BUF_ERROR",
+        );
+
+        // SAFETY: `strm` was initialized by `inflateInit2_` and still owns its
+        // state; the window and state reservations are refunded through `zfree`.
+        let end = unsafe { inflateEnd(&mut strm) };
+        assert_eq!(end, ReturnCode::Ok.as_c_int(), "inflateEnd must succeed");
+    }
+
+    // --- Idiomatic API: the same refusal, then a real dictionary decode ------
+    {
+        // A dictionary the payload genuinely re-uses, so the decode really
+        // depends on it rather than merely tolerating it.
+        const DICTIONARY: &[u8] = b"the quick brown fox jumps over the lazy dog";
+        const PAYLOAD: &[u8] =
+            b"the quick brown fox jumps over the lazy dog, and the lazy dog naps on";
+        let (compressed, dict_id) = compress_with_dictionary(PAYLOAD, DICTIONARY);
+        let state_size = zlib_rs::inflate::InflateState::C_LAYOUT_SIZE;
+        // `windowBits = 15` => a 32 KiB window, requested as C's
+        // `ZALLOC(strm, 1U << wbits, sizeof(unsigned char))`.
+        let window_15 = 1usize << 15;
+
+        // Budget between the state and the window: the dictionary load is refused.
+        let mut strm =
+            ZStream::with_allocator(ExternalAllocator::with_budget(state_size + window_15 - 1));
+        assert_eq!(rc(inflate_init2(&mut strm, 15)), ReturnCode::Ok);
+        let mut out = vec![0u8; PAYLOAD.len() + 64];
+        let header = inflate(&mut strm, &compressed, &mut out, Z_NO_FLUSH);
+        assert_eq!(
+            header.code,
+            ReturnCode::NeedDict,
+            "an FDICT stream must ask for its dictionary",
+        );
+        assert_eq!(
+            strm.adler, dict_id,
+            "the encoder's dictionary id must be the one the decoder requests",
+        );
+        assert_eq!(
+            inflate_set_dictionary(&mut strm, DICTIONARY),
+            Err(ZlibError::MemError),
+            "a refused dictionary window must surface MemError through the safe API too",
+        );
+        assert!(
+            strm.allocator().count_of(window_15, 1) >= 1,
+            "the dictionary load must request the window through the allocator",
+        );
+        assert_eq!(
+            inflate_set_dictionary(&mut strm, DICTIONARY),
+            Err(ZlibError::StreamError),
+            "the latched MEM mode is no longer awaiting a dictionary",
+        );
+        let resumed = inflate(
+            &mut strm,
+            &compressed[header.consumed..],
+            &mut out,
+            Z_NO_FLUSH,
+        );
+        assert_eq!(
+            resumed.code,
+            ReturnCode::MemError,
+            "the resumed decode reports the latched allocation failure",
+        );
+        assert_eq!(resumed.consumed, 0, "the MEM arm consumes nothing");
+        assert_eq!(resumed.produced, 0, "the MEM arm produces nothing");
+        assert_eq!(rc(inflate_end(&mut strm)), ReturnCode::Ok);
+
+        // With memory available the very same stream decodes byte-exactly.
+        let mut strm = ZStream::with_allocator(ExternalAllocator::unlimited());
+        assert_eq!(rc(inflate_init2(&mut strm, 15)), ReturnCode::Ok);
+        let header = inflate(&mut strm, &compressed, &mut out, Z_NO_FLUSH);
+        assert_eq!(header.code, ReturnCode::NeedDict);
+        assert_eq!(header.produced, 0, "the header alone produces no output");
+        assert_eq!(
+            rc(inflate_set_dictionary(&mut strm, DICTIONARY)),
+            ReturnCode::Ok,
+            "the matching dictionary must be accepted",
+        );
+        let rest = inflate(
+            &mut strm,
+            &compressed[header.consumed..],
+            &mut out,
+            Z_FINISH,
+        );
+        assert_eq!(
+            rest.code,
+            ReturnCode::StreamEnd,
+            "the decode must complete once the dictionary is installed",
+        );
+        assert_eq!(
+            &out[..rest.produced],
+            PAYLOAD,
+            "a dictionary-compressed payload must be recovered byte-for-byte",
+        );
+        assert_eq!(rc(inflate_end(&mut strm)), ReturnCode::Ok);
     }
 }
 

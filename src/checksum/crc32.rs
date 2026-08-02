@@ -38,9 +38,10 @@
 //!   over `CRC_TABLE` still handles short inputs and the trailing bytes. It
 //!   needs no external crate and is the guaranteed-correct baseline; the
 //!   equivalence of the braided and byte-wise results is asserted by tests over
-//!   every length and every word offset. It backs every `--no-default-features`
-//!   and every `no_std` build, and it is also the fallback whenever the
-//!   accelerated path is not reachable.
+//!   every length and every word offset. It backs every build with the `simd`
+//!   feature off, and it is the fallback whenever the accelerated path is not
+//!   reachable — including a `no_std` build with `simd` on whose target neither
+//!   detects nor compiles in the required CPU features.
 //!
 //! ## Reachability: why the `simd` feature is not by itself the selector
 //!
@@ -64,8 +65,13 @@
 //! 2. This module tests reachability itself, mirroring `crc32fast`'s own gate
 //!    conditions, and keeps the braid whenever the accelerated path would not be
 //!    selected — including on architectures for which `crc32fast` has no
-//!    specialized backend at all. That makes the invariant unconditional:
-//!    **enabling `simd` is never slower than omitting it.**
+//!    specialized backend at all. That is what stops `simd` from silently
+//!    substituting `crc32fast`'s software table for this module's braid.
+//!
+//! Which backend a given build actually runs is reported by [`crc32_backend`].
+//! Relative throughput is a property of the target and the CPU, so compare the
+//! two feature rows with `benches/checksum_bench.rs` on the machine that matters
+//! rather than assuming an ordering.
 //!
 //! Because both paths are bit-exact, this selection cannot change a single
 //! emitted byte; only the instruction mix does.
@@ -274,9 +280,10 @@ pub enum Crc32Backend {
     /// The braided, word-at-a-time scalar port of `crc32.c`'s `#ifdef W` fast
     /// path, contained entirely in this module.
     ///
-    /// Always the answer when the `simd` feature is off (including every
-    /// `no_std` build), and also the answer when `simd` is on but `crc32fast`'s
-    /// hardware backend is unreachable on this target or CPU.
+    /// Always the answer when the `simd` feature is off, and also the answer
+    /// when `simd` is on but `crc32fast`'s hardware backend is unreachable on
+    /// this target or CPU — which a `no_std` build reaches only when the
+    /// required CPU features were not compiled in.
     Braid,
     /// The `crc32fast` crate's hardware-accelerated backend (x86 `pclmulqdq` or
     /// the AArch64 CRC instructions).
@@ -335,18 +342,20 @@ pub fn crc32_backend() -> Crc32Backend {
 // (`Cargo.toml`), so gating the run-time arms on `feature = "std"` tests exactly
 // the condition that decides which `State::new` body was compiled.
 //
-// Mirroring can only ever be conservative: if a future `crc32fast` narrowed its
-// gate, this predicate could claim acceleration that is not taken, and the
-// consequence is a throughput difference — never a wrong checksum, because the
-// two paths are bit-exact equivalents. The `Cargo.lock` pin keeps the mirrored
-// version fixed, and `crc32fast`'s AArch64 backend additionally needs its own
-// `stable_arm_crc32_intrinsics` cfg, which its build script sets for every
-// rustc from 1.80 onwards — always true at this crate's 1.85.0 MSRV.
+// Mirroring can drift in either direction: if a future `crc32fast` widened or
+// narrowed its gate, this predicate could miss an acceleration that is available
+// or claim one that is not taken. Either way the checksum stays correct, because
+// the two paths are bit-exact equivalents; what a mismatch costs is a
+// misreported `Crc32Backend` and a throughput difference. The `Cargo.lock` pin
+// keeps the mirrored version fixed, and `crc32fast`'s AArch64 backend
+// additionally needs its own `stable_arm_crc32_intrinsics` cfg, which its build
+// script sets for every rustc from 1.80 onwards — always true at this crate's
+// 1.85.0 MSRV.
 //
-// Only the x86_64 arms are exercised by this project's CI (all jobs run on
-// `ubuntu-latest`); the AArch64 and other-architecture arms are written to
-// `crc32fast`'s source and remain unmeasured here, which is stated rather than
-// implied (AAP §0.7.2 standard S8).
+// Only the x86_64 arms run on a natively-executed CI target; the AArch64 and
+// other-architecture arms are cross-type-checked, so they compile against
+// `crc32fast`'s source but are never measured. `CONTRIBUTING.md` ("Platform
+// honesty") records which targets are executed and which are only checked.
 cfg_if::cfg_if! {
     if #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))] {
         /// x86/x86-64 with `std`: run-time CPU probe, matching `crc32fast`'s
@@ -379,8 +388,8 @@ cfg_if::cfg_if! {
         }
     } else {
         /// Architectures for which `crc32fast` has no specialized backend: its
-        /// `State::new` can only return `None`, so the braid is always the
-        /// faster and simpler choice.
+        /// `State::new` can only return `None`, so there is no acceleration to
+        /// select and the braid is the only path available.
         fn accelerated_backend_is_reachable() -> bool {
             false
         }
@@ -407,8 +416,8 @@ fn crc32_bulk(crc: u32, buf: &[u8]) -> u32 {
     }
 }
 
-/// Scalar bulk CRC-32 (active when the `simd` feature is disabled, including
-/// every `no_std` build).
+/// Scalar bulk CRC-32 (the only bulk path compiled when the `simd` feature is
+/// disabled, whether or not the build is `no_std`).
 ///
 /// Delegates to the braided, word-at-a-time implementation in [`braid`], which
 /// is the port of the `#ifdef W` fast path in `crc32.c`. That routine falls back

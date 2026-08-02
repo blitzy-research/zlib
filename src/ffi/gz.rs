@@ -43,9 +43,17 @@
 //! performs every mode-grammar rejection and every `malloc` before storing the
 //! descriptor in `state->fd` (`gzlib.c` L150-L197 and L206-L210 precede L263), so
 //! **no** `gzdopen` failure closes the caller's descriptor. This shim matches
-//! that: the mode is pre-validated before `File::from_raw_fd`, and an allocation
-//! failure after adoption releases the descriptor with `into_raw_fd` instead of
-//! closing it.
+//! that: the mode is pre-validated before `File::from_raw_fd`, and every
+//! allocation failure after adoption releases the descriptor rather than closing
+//! it. There are two such points and each has its own release mechanism:
+//!
+//! * *Inside* the gz layer — the `<fd:N>` name, the state box, and the retained
+//!   path name are all allocated before the file is opened, and a failure of any
+//!   of them dissolves the adopted `File` with `core::mem::forget`, which needs no
+//!   `unsafe` and keeps that layer's zero-`unsafe` guarantee.
+//! * *Here*, if the opaque handle allocation fails after the state was built
+//!   successfully — the descriptor is lifted out with `into_raw_fd`, which
+//!   likewise ends Rust ownership without closing.
 //!
 //! # `gzgetc` / `gzgetc_` — live `gzFile_s` prefix
 //!
@@ -869,10 +877,18 @@ pub unsafe extern "C" fn gzdopen(fd: c_int, mode: *const c_char) -> gzFile {
 #[cfg(feature = "gz-io")]
 #[cfg(unix)]
 fn dopen_state(result: Result<Box<GzState>, ReturnCode>) -> gzFile {
-    // The mode was pre-validated and the descriptor already adopted, so `Err`
-    // here is unreachable in practice. Should it ever occur, the `GzState` was
-    // never constructed and the transient `File` has already been dropped by
-    // `gz_open`, so there is nothing left to release.
+    // The mode was pre-validated, so a mode rejection cannot reach here; an
+    // exhausted allocator can, because `gzdopen`/`gz_open` allocate the `<fd:N>`
+    // name, the state, and the retained path name before opening anything.
+    //
+    // On every one of those paths the descriptor is handed BACK to the caller
+    // unclosed — `gz_open`'s `abandon_adopted` dissolves the adopted `File`
+    // with `core::mem::forget` rather than dropping it — which is precisely C's
+    // contract: no `gzdopen` failure in reference zlib closes the descriptor it
+    // was given (`gzlib.c` assigns `state->fd` only at the open/adopt step, so
+    // every earlier `return NULL` leaves `fd` untouched). There is therefore
+    // nothing for this function to release, and returning `NULL` here leaves the
+    // caller owning exactly what it owned before the call.
     let Ok(mut state) = result else {
         return ptr::null_mut();
     };
@@ -2817,6 +2833,117 @@ mod tests {
                 gz::gzclose_r_release(claimed.expect("reader was claimed").state);
             assert_eq!(finish_close(status, released), Z_OK);
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `gzopen_w` — the Windows-only wide-character open — must actually *work*,
+    /// not merely link.
+    ///
+    /// C declares it under `#if defined(_WIN32) && !defined(Z_SOLO)`
+    /// (`zlib.h` L2041-L2042) and this port gates it with `#[cfg(windows)]`, so
+    /// on a Linux or macOS row the symbol is correctly absent and no test there
+    /// can reach it. That left the Windows row as the only place the wide path is
+    /// compiled *and* — until this test — the only exported entry point that was
+    /// never executed anywhere: a `gzopen_w` that returned `NULL`
+    /// unconditionally, or that decoded the UTF-16 code units into a different
+    /// name than the caller asked for, would still have satisfied a
+    /// compile-and-signature check (AAP §0.7.2 S8 — platform claims require
+    /// platform coverage).
+    ///
+    /// The round trip is written through a wide path holding non-ASCII code
+    /// units, so `OsString::from_wide` has to reconstruct the name exactly; the
+    /// file the wide units *name* is then confirmed to exist and to hold a
+    /// well-formed gzip member using `std` and the independent reference decoder,
+    /// i.e. without trusting `gzopen_w` to verify itself. The same wide path is
+    /// re-opened for reading and required to return the payload byte-for-byte
+    /// with `gzerror` clean, EOF set, and a successful close in each direction.
+    /// The null-argument guards are exercised last, because C's `gzopen_w` must
+    /// refuse them rather than dereference.
+    #[cfg(windows)]
+    #[test]
+    fn wide_path_open_round_trip() {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        // Non-ASCII code units make the UTF-16 decode load-bearing.
+        let mut path = std::env::temp_dir();
+        path.push(std::format!(
+            "zlibrs_ffi_gz_wide_\u{e9}\u{4e2d}_{}.gz",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        // C's `const wchar_t *` is NUL-terminated; `encode_wide` is not.
+        let wide: std::vec::Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(core::iter::once(0))
+            .collect();
+
+        let data = b"wide-path gzip payload\nsecond line with more bytes\n";
+        // SAFETY: every call below receives a NUL-terminated wide path, a
+        // NUL-terminated mode literal, and handles returned by `gzopen_w` itself;
+        // the buffers named by the read/write calls are live locals whose lengths
+        // match the counts passed alongside them.
+        unsafe {
+            // ---- write through the wide path
+            let wf = gzopen_w(wide.as_ptr(), c"wb".as_ptr());
+            assert!(!wf.is_null(), "gzopen_w for write returned NULL");
+            assert_eq!(
+                gzwrite(wf, data.as_ptr() as voidpc, data.len() as c_uint),
+                data.len() as c_int,
+                "every byte must be accepted through a wide-path handle"
+            );
+            let mut errnum: c_int = Z_STREAM_ERROR;
+            let msg = gzerror(wf, &raw mut errnum);
+            assert_eq!(errnum, Z_OK, "a healthy wide-path writer reports Z_OK");
+            assert!(!msg.is_null() && CStr::from_ptr(msg).to_bytes().is_empty());
+            assert_eq!(gzclose_w(wf), Z_OK, "the wide-path member must finalize");
+        }
+
+        // The wide units named *this* file, and it holds a complete gzip member —
+        // both established without going back through `gzopen_w`.
+        assert!(
+            path.exists(),
+            "gzopen_w must create the file its wide path names"
+        );
+        assert_eq!(decode_gzip_file(&path), data.to_vec());
+
+        // SAFETY: as above — the same NUL-terminated wide path and mode literals,
+        // a handle from `gzopen_w`, and live local buffers with matching counts.
+        unsafe {
+            // ---- read back through the wide path
+            let rf = gzopen_w(wide.as_ptr(), c"rb".as_ptr());
+            assert!(!rf.is_null(), "gzopen_w for read returned NULL");
+            let mut buf = std::vec![0u8; data.len()];
+            assert_eq!(
+                gzread(rf, buf.as_mut_ptr() as voidp, buf.len() as c_uint),
+                data.len() as c_int
+            );
+            assert_eq!(
+                &buf[..],
+                &data[..],
+                "a wide-path round trip must be byte-exact"
+            );
+            // Reading past the end yields 0 and sets the EOF indicator.
+            let mut extra = [0u8; 1];
+            assert_eq!(gzread(rf, extra.as_mut_ptr() as voidp, 1), 0);
+            assert_eq!(gzeof(rf), 1);
+            let mut errnum: c_int = Z_STREAM_ERROR;
+            let msg = gzerror(rf, &raw mut errnum);
+            assert_eq!(errnum, Z_OK, "a clean read must not latch an error");
+            assert!(!msg.is_null() && CStr::from_ptr(msg).to_bytes().is_empty());
+            assert_eq!(gzclose_r(rf), Z_OK);
+
+            // ---- null guards: refused, never dereferenced
+            assert!(
+                gzopen_w(ptr::null(), c"rb".as_ptr()).is_null(),
+                "a null wide path must be refused"
+            );
+            assert!(
+                gzopen_w(wide.as_ptr(), ptr::null()).is_null(),
+                "a null mode must be refused"
+            );
+        }
+
         let _ = std::fs::remove_file(&path);
     }
 }

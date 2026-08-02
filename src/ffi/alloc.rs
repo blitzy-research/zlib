@@ -832,10 +832,9 @@ pub(crate) unsafe extern "C" fn default_zfree(_opaque: *mut c_void, address: *mu
 // `crate::stream` (layer 5) declares the two capabilities below and this module
 // (layer 8) implements them. That is the whole mechanism by which the safe core
 // obtains fallible boxing and caller-hook-backed buffers without naming a single
-// `crate::ffi` item: the dependency edge runs `ffi -> stream` only, preserving
-// the AAP's strictly acyclic, one-way layer ordering (AAP §0.3.1, §0.6.2) while
-// keeping every raw-pointer operation inside the designated unsafe boundary
-// (AAP §0.7.2 standard S2).
+// `crate::ffi` item: the dependency edge for this pair runs `ffi -> stream` only
+// and never the reverse (AAP §0.3.1, §0.6.2), while keeping every raw-pointer
+// operation inside the designated unsafe boundary (AAP §0.7.2 standard S2).
 //
 // Both traits are `pub(crate)`, so these blanket implementations are the only
 // ones that can ever exist and no downstream crate can substitute a different

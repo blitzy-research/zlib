@@ -58,6 +58,7 @@ use core::ffi::{c_char, c_int, c_long, c_uchar, c_uint, c_ulong, c_void};
 use core::{ptr, slice};
 
 use alloc::boxed::Box;
+use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
 
 use crate::gz_header::{GzHeader, HeaderPublication};
@@ -1144,14 +1145,40 @@ pub fn set_msg(strm: &mut z_stream, msg: *const c_char) {
 
 // --- `gz_header` conversion ------------------------------------------------
 
+/// Copies a slice into a freshly allocated `Vec<u8>`, reporting an exhausted
+/// allocator instead of aborting.
+///
+/// `slice::to_vec` allocates infallibly: on failure it calls
+/// `handle_alloc_error`, which aborts the process. Every use below copies a
+/// **caller-sized** buffer — a `gz_header`'s `extra` field is sized by the
+/// caller's `extra_len`, and `name`/`comment` by wherever the caller's NUL
+/// happens to be — so the size is not bounded by anything this crate controls.
+/// Reference zlib never aborts for such an input, and neither may this shim
+/// (AAP §0.6.5): the failure has to travel back as `Z_MEM_ERROR`.
+///
+/// [`Vec::try_reserve_exact`] provides the fallible allocation; the subsequent
+/// `extend_from_slice` cannot fail because the exact capacity is already present.
+fn try_copy_bytes(bytes: &[u8]) -> Result<Vec<u8>, TryReserveError> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(bytes.len())?;
+    out.extend_from_slice(bytes);
+    Ok(out)
+}
+
 /// Reads a NUL-terminated C string starting at `ptr` into an owned byte vector,
-/// **excluding** the terminating NUL.
+/// **excluding** the terminating NUL, or reports an exhausted allocator.
+///
+/// # Errors
+///
+/// Returns [`TryReserveError`] when the copy cannot be allocated. The length is
+/// determined by the caller's data — the scan runs to the caller's NUL — so this
+/// is a genuine, reachable condition and not a theoretical one.
 ///
 /// # Safety
 ///
 /// `ptr` must be non-null and point at a NUL-terminated sequence of bytes that
 /// stays valid for the duration of the read.
-unsafe fn cstr_bytes(ptr: *const c_uchar) -> Vec<u8> {
+unsafe fn cstr_bytes(ptr: *const c_uchar) -> Result<Vec<u8>, TryReserveError> {
     let mut len = 0usize;
     // SAFETY: per the contract, `ptr` points at a NUL-terminated string, so
     // every `ptr.add(len)` up to and including the terminator is readable.
@@ -1159,27 +1186,41 @@ unsafe fn cstr_bytes(ptr: *const c_uchar) -> Vec<u8> {
         len += 1;
     }
     // SAFETY: bytes `ptr[0..len]` precede the NUL and are therefore readable.
-    unsafe { slice::from_raw_parts(ptr, len) }.to_vec()
+    try_copy_bytes(unsafe { slice::from_raw_parts(ptr, len) })
 }
 
 /// Converts a raw [`gz_header`] (as passed to `deflateSetHeader`) into the
-/// idiomatic [`GzHeader`], or [`None`] when `head`
-/// is null.
+/// idiomatic [`GzHeader`], or `Ok(None)` when `head` is null.
 ///
 /// The [`extra`](gz_header::extra) field is copied using its
 /// [`extra_len`](gz_header::extra_len); [`name`](gz_header::name) and
 /// [`comment`](gz_header::comment) are read as NUL-terminated C strings (the
 /// terminator is dropped). C `int` booleans map to Rust [`bool`].
 ///
+/// # Errors
+///
+/// Returns [`TryReserveError`] if any of the three copies cannot be allocated.
+/// All three are sized entirely by the caller — `extra` by its `extra_len`, the
+/// two strings by their NUL positions — so an exhausted allocator here is a
+/// reachable outcome of a well-formed call, and one that reference zlib reports
+/// as `Z_MEM_ERROR` rather than dying on. Callers must map this to
+/// `Z_MEM_ERROR`; see `deflateSetHeader`.
+///
+/// Nothing is retained on the error path: the partially built copies are dropped
+/// as this function returns, and the stream is left exactly as it was — matching
+/// C's `deflateSetHeader`, which validates and only then takes ownership of the
+/// caller's pointers.
+///
 /// # Safety
 ///
 /// `head` must be null or point at a valid [`gz_header`]. When its `extra`
 /// pointer is non-null it must be readable for `extra_len` bytes; when `name`/
 /// `comment` are non-null they must be NUL-terminated.
-#[must_use]
-pub unsafe fn gz_header_to_idiomatic(head: *const gz_header) -> Option<GzHeader> {
+pub unsafe fn gz_header_to_idiomatic(
+    head: *const gz_header,
+) -> Result<Option<GzHeader>, TryReserveError> {
     if head.is_null() {
-        return None;
+        return Ok(None);
     }
     // SAFETY: `head` is non-null and, per the contract, points at a valid
     // `gz_header`.
@@ -1190,22 +1231,23 @@ pub unsafe fn gz_header_to_idiomatic(head: *const gz_header) -> Option<GzHeader>
     } else {
         // SAFETY: a non-null `extra` is readable for `extra_len` bytes
         // (deflateSetHeader contract).
-        Some(unsafe { slice::from_raw_parts(h.extra, h.extra_len as usize) }.to_vec())
+        let raw = unsafe { slice::from_raw_parts(h.extra, h.extra_len as usize) };
+        Some(try_copy_bytes(raw)?)
     };
     let name = if h.name.is_null() {
         None
     } else {
         // SAFETY: a non-null `name` is a NUL-terminated C string.
-        Some(unsafe { cstr_bytes(h.name) })
+        Some(unsafe { cstr_bytes(h.name) }?)
     };
     let comment = if h.comment.is_null() {
         None
     } else {
         // SAFETY: a non-null `comment` is a NUL-terminated C string.
-        Some(unsafe { cstr_bytes(h.comment) })
+        Some(unsafe { cstr_bytes(h.comment) }?)
     };
 
-    Some(GzHeader {
+    Ok(Some(GzHeader {
         text: h.text != 0,
         time: h.time as u32,
         // `xflags`/`os` are C `int` (== `i32`), assigned directly.
@@ -1225,7 +1267,7 @@ pub unsafe fn gz_header_to_idiomatic(head: *const gz_header) -> Option<GzHeader>
         extra_max: h.extra_max,
         name_max: h.name_max,
         comm_max: h.comm_max,
-    })
+    }))
 }
 
 /// Writes an idiomatic [`GzHeader`] back into a caller-provided raw
@@ -2799,7 +2841,9 @@ mod tests {
 
         // SAFETY: `src` is fully initialized; `extra` is readable for
         // `extra_len` bytes and `name`/`comment` are NUL-terminated.
-        let idi = unsafe { gz_header_to_idiomatic(&src) }.expect("non-null header");
+        let idi = unsafe { gz_header_to_idiomatic(&src) }
+            .expect("the three copies are tiny and cannot exhaust the allocator")
+            .expect("non-null header");
         assert!(idi.text);
         assert_eq!(idi.time, 0x1234_5678);
         assert_eq!(idi.xflags, 7);
@@ -2849,7 +2893,11 @@ mod tests {
     #[test]
     fn gz_header_null_is_none() {
         // SAFETY: the null case is handled without dereferencing.
-        assert!(unsafe { gz_header_to_idiomatic(ptr::null()) }.is_none());
+        assert!(
+            unsafe { gz_header_to_idiomatic(ptr::null()) }
+                .expect("the null case allocates nothing and cannot fail")
+                .is_none()
+        );
         let hdr = GzHeader::new();
         // SAFETY: writing through null is an explicit no-op.
         unsafe { write_gz_header_from_idiomatic(ptr::null_mut(), &hdr) };

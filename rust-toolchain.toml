@@ -55,50 +55,77 @@
 #     `rustup toolchain install <ref> … --profile minimal --no-self-update`
 #     followed by `rustup default <ref>`; it does NOT export
 #     `RUSTUP_TOOLCHAIN`. So a workflow job that must run on a channel OTHER
-#     than the pin below has to say so at rank 1 or 2 — and EVERY job in this
-#     repository does, via a job-level `env: RUSTUP_TOOLCHAIN:`. Keep it that
+#     than the pin below has to say so at rank 1 or 2 — and EVERY JOB THAT RUNS
+#     RUST TOOLING does, via a job-level `env: RUSTUP_TOOLCHAIN:`. Keep it that
 #     way when adding a job: the action's `@<channel>` label alone does NOT
 #     select the compiler here.
+#
+#     The scope of that claim is deliberately "every job that runs Rust tooling",
+#     not "every job". Of the 17 jobs across the three workflows, 16 invoke
+#     `cargo`/`rustc`/`rustup` and all 16 carry the override; the seventeenth,
+#     `audit.yml`'s `policy-integrity`, runs no Rust binary at all — it is a pure
+#     `python3` structural check over `deny.toml` and the workflow files, which
+#     also asserts that no sibling `fuzz/deny.toml` has reappeared, and it
+#     installs no toolchain. It therefore correctly sets no
+#     `RUSTUP_TOOLCHAIN`, and adding one would imply a dependency it does not have.
 #
 #       * `.github/workflows/ci.yml` `msrv` — `RUSTUP_TOOLCHAIN: 1.85.0`. It
 #         agrees with this file, but is stated anyway: the job's guarantee is
 #         "builds on exactly the declared MSRV", so the version it runs belongs
 #         in the job, not inherited from a file it does not own.
 #       * `.github/workflows/ci.yml` `build-test`, `no-std-tests`, `lint`,
-#         `benches`, `build-script-tests`, `unsafe-boundary`, `c-abi-linkage` —
-#         `RUSTUP_TOOLCHAIN: stable`. Without it each of them resolves to the
-#         pin: most would still PASS (the crate is MSRV-clean — see the measured
-#         results below) while silently ceasing to cover current stable, and
-#         `lint` would run the floor's clippy instead of stable's, which is
-#         strictly weaker. See "THE LINT GATE RUNS AT CURRENT STABLE".
-#         Each of those jobs also asserts its resolved toolchain with
+#         `benches`, `build-script-tests`, `unsafe-boundary`, `c-abi-linkage`,
+#         `cross-targets`, `bare-metal-no-std`, `package-verify` — the other ten
+#         of ci.yml's eleven jobs, all `RUSTUP_TOOLCHAIN: stable`. Without it each
+#         of them resolves to the pin: most would still PASS (the crate is
+#         MSRV-clean — see the measured results below) while silently ceasing to
+#         cover current stable, and `lint` would run the floor's clippy instead of
+#         stable's, which is strictly weaker. See "THE LINT GATE RUNS AT CURRENT
+#         STABLE". Each of those jobs also asserts its resolved toolchain with
 #         `rustc --version --verbose` plus `rustup show active-toolchain` and
 #         exits 1 on a mismatch, so losing an override fails the job loudly
 #         instead of quietly downgrading a gate.
+#       * `.github/workflows/audit.yml` `cargo-audit`, `cargo-deny`,
+#         `cargo-deny-fuzz` — `RUSTUP_TOOLCHAIN: stable`. Each builds its tool
+#         from source with `cargo install <tool> --locked`, and neither
+#         `cargo-audit` nor `cargo-deny` is guaranteed to compile on the MSRV
+#         floor, so the pin is what they must NOT inherit.
 #       * `.github/workflows/fuzz.yml` `cargo-fuzz` — `RUSTUP_TOOLCHAIN:
 #         nightly`. `cargo-fuzz` needs nightly for the `-Z` sanitizer/coverage
 #         instrumentation it injects, and it resolves its toolchain from the
 #         repository root, so this file reaches the detached `fuzz/` workspace
 #         too. Without the override, `cargo install cargo-fuzz`, `cargo fuzz
 #         build`, and `cargo fuzz run` all execute on the pin and fail with
-#         "1 nightly option were parsed". Locally: `cargo +nightly fuzz …`.
+#         "1 nightly option were parsed". Locally: `cargo +nightly fuzz …`, or
+#         `RUSTUP_TOOLCHAIN=nightly cargo fuzz build`.
 #         Measured, from the repository root: a bare `cargo fuzz build` fails
 #         with `error: 1 nightly option were parsed` before any harness is
 #         produced, while `RUSTUP_TOOLCHAIN=nightly cargo fuzz build` succeeds.
-#         The `supply-chain` job in the same workflow runs cargo-deny on the
-#         fuzz graph and pins `stable` for the same reason in reverse.
+#         That job is the ONLY job in `fuzz.yml`; supply-chain policy over the
+#         fuzz graph lives in `audit.yml`'s `cargo-deny-fuzz`, not there.
 #
 #     Each of those jobs states its channel TWICE, and the two can never
 #     disagree because they name the same value. The job-level `RUSTUP_TOOLCHAIN`
 #     (rank 2) is what reaches NESTED cargo invocations — a subcommand that
 #     shells out to `cargo`, as `cargo-fuzz` does, inherits it — and it governs
 #     the `rustup` and bare-`rustc` calls that carry no shorthand, so a step
-#     added later cannot quietly fall back to this pin. On top of that, every
-#     `cargo` and `rustc` call in both workflows carries a `+stable` /
-#     `+1.85.0` / `+nightly` shorthand, which is RANK 1 — the highest precedence
-#     there is, beating this file, any directory override, and `RUSTUP_TOOLCHAIN`
-#     itself — and which is visible in the CI log beside the command it governs.
-#     Keep both in step with the `@<ref>` the job installs.
+#     added later cannot quietly fall back to this pin.
+#
+#     `ci.yml` and `audit.yml` additionally spell a `+stable` / `+1.85.0`
+#     shorthand on their `cargo` and `rustc` calls, which is RANK 1 — the highest
+#     precedence there is, beating this file, any directory override, and
+#     `RUSTUP_TOOLCHAIN` itself — and which is visible in the CI log beside the
+#     command it governs. Where a job states its channel that way, keep the
+#     shorthand in step with the `@<ref>` the job installs.
+#
+#     `fuzz.yml` deliberately does NOT, and the asymmetry is the point rather than
+#     an oversight. `cargo fuzz` SHELLS OUT to `cargo build` for each harness, and
+#     a rank-1 prefix governs only the process it is written on — it is not
+#     inherited by that nested child, whereas the rank-2 `RUSTUP_TOOLCHAIN` env var
+#     is. Prefixing `cargo fuzz` would therefore pin the wrapper while leaving the
+#     builds it spawns to resolve on their own, which is the failure the env var
+#     already prevents. So that workflow relies on the job-level override alone and
+#     proves it held with the assertion step described below.
 #
 #     Each job also ASSERTS its active toolchain before doing any work, with a
 #     `case "$(rustup show active-toolchain)"` guard that fails the job on a
@@ -188,8 +215,8 @@
 # failed stable's.
 #
 # The direction of that asymmetry is why the CI `lint` job must state its
-# toolchain rather than inherit it. Without an explicit override the job is
-# LABELLED `dtolnay/rust-toolchain@stable` while actually executing the pinned
+# toolchain rather than inherit it. Without an explicit override the job merely
+# ASKS `dtolnay/rust-toolchain` for stable while actually executing the pinned
 # floor's clippy — the action sets `rustup default`, which this file outranks —
 # so the "current stable lint" gate becomes an MSRV lint gate, and a stable-only
 # diagnostic reaches the default branch unnoticed. Every job in

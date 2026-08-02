@@ -1007,26 +1007,8 @@ pub fn inflate_back<I: InFunc, O: OutFunc>(
         sink: out_func,
     };
 
-    // C L225-L560: run the block/symbol state machine. Each handler returns
-    // `Err(code)` to leave immediately (a failed callback), or `Ok(())` after
-    // updating `state.mode` (possibly to `Done`/`Bad`).
-    let ret: ReturnCode = loop {
-        let step = match state.mode {
-            InflateMode::Type => do_type(&mut ctx, state),
-            InflateMode::Stored => do_stored(&mut ctx, state),
-            InflateMode::Table => do_table(&mut ctx, state),
-            InflateMode::Len => do_len(&mut ctx, state),
-            // C L545-L548: DONE.
-            InflateMode::Done => break ReturnCode::StreamEnd,
-            // C L550-L551: BAD (a format error; `strm->msg` was set in C).
-            InflateMode::Bad => break ReturnCode::DataError,
-            // No other mode is reachable in back-inflate.
-            _ => break ReturnCode::StreamError,
-        };
-        if let Err(code) = step {
-            break code;
-        }
-    };
+    // C L225-L560: run the block/symbol state machine.
+    let ret: ReturnCode = drive(&mut ctx, state);
 
     // Report the unconsumed tail of the last provider chunk (C `have`) so an FFI
     // adapter can restore `next_in`/`avail_in` exactly like C `inf_leave`
@@ -1037,6 +1019,53 @@ pub fn inflate_back<I: InFunc, O: OutFunc>(
 
     // C L561-L569: flush the tail of the window and return.
     inf_leave(&mut ctx, state, ret)
+}
+
+/// Runs the back-inflate block/symbol state machine to completion
+/// (`infback.c` L225-L560), returning the code C would carry into `inf_leave`.
+///
+/// Each handler returns `Err(code)` to leave immediately (a failed callback), or
+/// `Ok(())` after updating `state.mode` — possibly to `Done` or `Bad`.
+///
+/// # Why this is a separate function
+///
+/// The final `_` arm is C's "impossible" mode arm: `infback.c`'s `switch` has no
+/// `default`, so a mode outside `{TYPE, STORED, TABLE, LEN, DONE, BAD}` falls
+/// out of the loop and returns `Z_STREAM_ERROR` (`infback.c` L553-L559, `ret`
+/// still holding its `Z_STREAM_ERROR` initialisation). `test/infcover.c`
+/// deliberately reaches it: its `pull` callback receives the `z_stream` as its
+/// descriptor and pokes `((struct inflate_state *)strm->state)->mode = SYNC`
+/// mid-decode (`infcover.c` L459), then asserts `inflateBack` returns
+/// `Z_STREAM_ERROR` (`infcover.c` L496-L497).
+///
+/// That poke is not expressible over this port's API by design — [`InFunc`]
+/// yields input bytes and cannot reach private engine state, and forging it with
+/// `unsafe` is forbidden in this module (AAP §0.6.2). Splitting the loop out is
+/// what makes the arm reachable from a *safe* test instead: the module's own
+/// `unsupported_mode_is_stream_error` test builds a real initialised state,
+/// assigns an otherwise-impossible mode, and drives the machine directly, which
+/// is the same observation the C driver makes by different means.
+fn drive<I: InFunc, O: OutFunc>(
+    ctx: &mut BackCtx<'_, I, O>,
+    state: &mut InflateState,
+) -> ReturnCode {
+    loop {
+        let step = match state.mode {
+            InflateMode::Type => do_type(ctx, state),
+            InflateMode::Stored => do_stored(ctx, state),
+            InflateMode::Table => do_table(ctx, state),
+            InflateMode::Len => do_len(ctx, state),
+            // C L545-L548: DONE.
+            InflateMode::Done => break ReturnCode::StreamEnd,
+            // C L550-L551: BAD (a format error; `strm->msg` was set in C).
+            InflateMode::Bad => break ReturnCode::DataError,
+            // No other mode is reachable in back-inflate.
+            _ => break ReturnCode::StreamError,
+        };
+        if let Err(code) = step {
+            break code;
+        }
+    }
 }
 
 /// Finish a back-inflate session (C `inflateBackEnd`, `infback.c` L562-L579).
@@ -1304,6 +1333,70 @@ mod tests {
         let mut sink = AlwaysErrOut;
         let rc = inflate_back(&mut state, &mut src, &mut sink);
         assert_eq!(rc, ReturnCode::BufError);
+    }
+
+    /// Port of `test/infcover.c`'s forced-mode assertion (`infcover.c` L459 and
+    /// L496-L497): a mode the back-inflate machine cannot service yields
+    /// `Z_STREAM_ERROR`.
+    ///
+    /// The C driver reaches this by having its `pull` callback poke
+    /// `((struct inflate_state *)strm->state)->mode = SYNC` through the stream it
+    /// receives as the input descriptor — "force an otherwise impossible
+    /// situation", as the C comment puts it. This port's [`InFunc`] cannot do
+    /// that (it yields bytes and never sees engine state), and forging it with
+    /// `unsafe` is forbidden here, so the same observation is made directly on
+    /// [`drive`]: build a real initialised state, assign the impossible mode, and
+    /// run the machine.
+    ///
+    /// `Sync` is asserted first because it is exactly the mode C forces. The
+    /// remaining modes are the ones a *wrapper* decode passes through and
+    /// back-inflate never can (it is raw-only); every one of them must land in
+    /// the same arm, so a future `match` that grew a wrong handler for one of
+    /// them cannot pass this test.
+    #[test]
+    fn unsupported_mode_is_stream_error() {
+        for mode in [
+            InflateMode::Sync,
+            InflateMode::Head,
+            InflateMode::Dict,
+            InflateMode::Mem,
+            InflateMode::Check,
+            InflateMode::Length,
+        ] {
+            let mut state = inflate_back_init(15).expect("inflate_back_init(15)");
+            let data = FIXED_VEC;
+            let mut src = SliceIn {
+                data: &data,
+                done: false,
+            };
+            let mut sink = VecOut { data: Vec::new() };
+            let wsize = state.wsize as usize;
+            let mut ctx = BackCtx {
+                inb: Vec::new(),
+                next: 0,
+                hold: 0,
+                bits: 0,
+                put: 0,
+                left: wsize,
+                wsize,
+                src: &mut src,
+                sink: &mut sink,
+            };
+
+            state.mode = mode;
+            assert_eq!(
+                drive(&mut ctx, &mut state),
+                ReturnCode::StreamError,
+                "mode {mode:?} is not serviceable by inflate_back and must \
+                 return Z_STREAM_ERROR, as infcover.c asserts for SYNC",
+            );
+            // C leaves the forced mode in place; nothing consumed it.
+            assert_eq!(state.mode, mode, "drive must not rewrite an unusable mode");
+            assert!(
+                sink.data.is_empty(),
+                "no output may be produced from an unusable mode",
+            );
+        }
     }
 
     #[test]

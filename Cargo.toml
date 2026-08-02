@@ -61,25 +61,42 @@ build = "build.rs"
 # component at any depth, which is why `README.md` (the `readme = ` target) is
 # unaffected by it.
 #
-# ACCEPTANCE GATE for this list: `cargo package --list`. Run it after ANY edit
-# here and confirm (a) no `*.c`/`*.h`/`*.map`/`*.in`/`*.cmakein`, no upstream C
-# docs, and no engagement material appear, and (b) `src/`, `tests/`, `benches/`,
-# `build.rs`, `README.md`, `LICENSE`, `Cargo.toml`, and `Cargo.lock` all still
-# do. That check is what keeps this list from silently regressing.
+# ACCEPTANCE GATE for this list is AUTOMATED, not a manual habit. The
+# `package-verify` job in `.github/workflows/ci.yml` runs
+# `cargo +stable package --locked --list` and then asserts BOTH directions
+# against that listing: 19 anchored MUST-NOT-SHIP patterns (no
+# `*.c`/`*.h`/`*.map`/`*.in`/`*.cmakein`, no upstream C docs, no legacy platform
+# tree, no `contrib`/`examples`/`test` directory, no engagement material) and 17
+# MUST-SHIP patterns. It then packages for real and runs the UNPACKED archive's
+# own `cargo test`, so an `exclude` entry that removes something the crate reads
+# fails there rather than in a consumer's build. Still run `cargo package --list`
+# locally after ANY edit here — but the listing is now checked for you, which is
+# what keeps this list from silently regressing.
 #
-# NEVER add to this list — these ARE the crate: `src/**`, `tests/**`,
-# `benches/**`, `build.rs`, `Cargo.toml`, `Cargo.lock`, `README.md`, `LICENSE`,
-# `deny.toml`, `clippy.toml`, `rustfmt.toml`, `rust-toolchain.toml`.
+# NEVER add to this list — these ARE the crate, and every one of them is an
+# asserted MUST-SHIP pattern in that job: `src/**`, `tests/**`, `benches/**`,
+# `build.rs`, `Cargo.toml`, `Cargo.lock`, `README.md`, `LICENSE`, `deny.toml`,
+# `clippy.toml`, `rustfmt.toml`, `rust-toolchain.toml`, `.cargo/config.toml`,
+# `.github/workflows/ci.yml`, `CHANGELOG.md`, `SECURITY.md`, `CONTRIBUTING.md`.
 #
-# The same prohibition applies in advance to three artifacts the migration plan
-# calls for that DO NOT EXIST in this tree yet: `CHANGELOG.md` (AAP gap D5), and
-# `SECURITY.md` and `CONTRIBUTING.md` (gap D6). They are named here so that
-# whoever writes them does not have to rediscover the rule: each belongs in the
-# published crate, so none of them may ever be added below. Note especially that
-# the `test/**`
-# entry below is the *C driver* directory (`test/example.c`, `test/infcover.c`,
-# `test/minigzip.c`) and is a DIFFERENT path from the Rust integration suite
-# `tests/**`, which must remain packaged. Do not conflate the two.
+# The last five of those are not documentation polish. `.cargo/config.toml`,
+# `.github/workflows/ci.yml` and `rust-toolchain.toml` are read by the packaged
+# crate's OWN test suite (`the_lint_job_runs_the_documented_clippy_gate`,
+# `every_toolchain_specific_ci_job_pins_and_asserts_its_toolchain`,
+# `every_graph_resolving_ci_command_is_locked`, and the toolchain-pin test), so
+# excluding one turns that suite red on a missing path; `clippy.toml` and
+# `rustfmt.toml` are what make a downstream `-D warnings` run the same gate this
+# repository passes; and `deny.toml` is what lets an auditor reproduce the
+# supply-chain verdict from the crate alone. `CHANGELOG.md`, `SECURITY.md` and
+# `CONTRIBUTING.md` all exist in this tree and ship today (they closed AAP gaps
+# D5 and D6); they must never be added below, and `cargo package --list`
+# confirms all three are present in the archive -- the `package-verify` CI job
+# is what keeps that true.
+#
+# Note especially that the `test/**` entry below is the *C driver* directory
+# (`test/example.c`, `test/infcover.c`, `test/minigzip.c`) and is a DIFFERENT
+# path from the Rust integration suite `tests/**`, which must remain packaged.
+# Do not conflate the two.
 exclude = [
     "*.c",
     "*.h",
@@ -111,9 +128,16 @@ exclude = [
     # Upstream C documentation. `README.md` — this crate's `readme = ` target —
     # is deliberately NOT in this group: the bare `README` and `ChangeLog` names
     # below are the *upstream C* files, and a bare name matches a path component
-    # without matching a `.md` suffix. The Rust-facing `CHANGELOG.md` that would
-    # supersede `ChangeLog` for crate consumers does not exist yet (AAP gap D5);
-    # when it is written it must stay out of this group as well.
+    # without matching a `.md` suffix. That distinction is load-bearing now that
+    # the Rust-facing `CHANGELOG.md` exists: it is the crate's own release
+    # history (AAP gap D5, closed), it supersedes `ChangeLog` for crate
+    # consumers, and it must stay OUT of this group -- which the bare `ChangeLog`
+    # entry below already guarantees, since it cannot match a `.md` suffix. It is
+    # also an asserted MUST-SHIP pattern in the `package-verify` job, so a
+    # regression that excluded it would fail CI rather than ship quietly. The two
+    # files coexist: `ChangeLog` is the C baseline's history and is excluded,
+    # `CHANGELOG.md` is this crate's and is shipped. Adding a `*.md` pattern or a
+    # `CHANGELOG*` entry to this group would remove the wrong one of the pair.
     "ChangeLog",
     "FAQ",
     "INDEX",
@@ -154,31 +178,18 @@ crate-type = ["lib", "cdylib", "staticlib"]
 # Ergonomic multi-branch conditional compilation — replaces the C `#if`/`#ifdef`
 # preprocessor nests. Pure Rust; adds no C dependency.
 cfg-if = "1.0.4"
-# SIMD-accelerated CRC-32 backing the `checksum::crc32` hot path. `optional` so
-# it is pulled in only by the `simd` feature; `default-features = false` keeps
-# it `no_std`-compatible when the crate's own `std` feature is disabled.
+# Optional hardware CRC-32 backend for `checksum::crc32`; pulled into the graph
+# only by the `simd` feature. `default-features = false` drops `crc32fast`'s own
+# `std` feature so the crate can still be linked freestanding.
 #
-# `default-features = false` is NOT the whole story, and getting the rest of it
-# wrong silently DE-optimizes the shipped library. `crc32fast`'s only default
-# feature is its own `std`, and that feature is what chooses between two
-# different bodies of `specialized::…::State::new`:
-#
-#   * with    `crc32fast/std` -> `is_x86_feature_detected!("pclmulqdq"/"sse2"/
-#     "sse4.1")` (or `is_aarch64_feature_detected!("crc")`), a RUN-TIME probe;
-#   * without `crc32fast/std` -> `cfg!(target_feature = …)`, a COMPILE-TIME test
-#     that is false on a stock `x86_64-unknown-linux-gnu` build (only `sse2` is
-#     baseline there), so `State::new` returns `None`, the carry-less-multiply
-#     code is compiled but NEVER selected, and execution silently falls back to
-#     `crc32fast`'s software table — which is measurably SLOWER than this
-#     crate's own braided scalar path.
-#
-# So the dependency must stay `default-features = false` (for `no_std`) while the
-# crate's OWN `std` feature re-enables `crc32fast/std`; that is what the weak
-# `crc32fast?/std` entry under `[features] std` below does. Without it, enabling
-# the default-on `simd` feature makes CRC-32 slower than omitting it, and
-# `cargo bench`/`cargo test` hide the defect because the `flate2`
-# dev-dependency pulls in `crc32fast/default` and Cargo feature unification then
-# turns `crc32fast/std` on for those builds only.
+# That flag alone is not sufficient. `crc32fast/std` decides which body of
+# `specialized::…::State::new` is compiled: with it, a RUN-TIME
+# `is_x86_feature_detected!` / `is_aarch64_feature_detected!` probe; without it, a
+# COMPILE-TIME `cfg!(target_feature = …)` test, which is false on a stock
+# `x86_64-unknown-linux-gnu` build (only `sse2` is baseline there) so `State::new`
+# returns `None` and execution uses `crc32fast`'s own software table instead of
+# its accelerated code. The crate's own `std` feature therefore re-enables it
+# through the weak `crc32fast?/std` entry under `[features]` below.
 crc32fast = { version = "1.5.0", optional = true, default-features = false }
 
 [dev-dependencies]
@@ -197,35 +208,28 @@ rand = "0.9.4"
 
 [features]
 # The default build is a full, std-backed zlib replacement: gzip framing, the
-# gzip file-I/O layer, and the SIMD CRC-32 hot path.
+# gzip file-I/O layer, and the optional hardware CRC-32 backend.
 default = ["std", "gzip", "gz-io", "simd"]
 # Standard-library build: enables `std::io`/`std::fs` for the gz layer and the
 # `catch_unwind` panic guards at the FFI boundary. When this feature is OFF the
 # crate is `#![no_std]` + `alloc` (built via `--no-default-features`).
 #
-# It also forwards to `crc32fast/std` — through the WEAK `?` form, which is
-# load-bearing in both directions:
+# The `crc32fast?/std` forward is weak on purpose. `?` enables that feature only
+# if some other entry (i.e. `simd`) has already pulled the optional dependency in,
+# so `--no-default-features --features std` keeps the runtime closure at `cfg-if`
+# alone. With both on, the shipped library gets `crc32fast`'s run-time CPU probe
+# rather than the compile-time `cfg!(target_feature = …)` test, which makes the
+# effective `crc32fast` configuration identical across the release, test, and
+# bench builds — the dev-dependency graph (`flate2` -> `crc32fast/default`)
+# unifies `crc32fast/std` on for the latter two regardless.
 #
-#   * `crc32fast?/std` enables that feature only if some OTHER entry has already
-#     pulled the optional dependency in (i.e. `simd`). It never pulls
-#     `crc32fast` into the graph itself, so `--no-default-features --features
-#     std` keeps the runtime closure at `cfg-if` alone, exactly as before.
-#   * Enabling it is what gives the SHIPPED library `crc32fast`'s run-time CPU
-#     probe instead of a compile-time `cfg!(target_feature = …)` test that is
-#     false on a stock x86_64 target. Without this forward, `cargo build
-#     --release` (the artifact consumers link) silently used `crc32fast`'s
-#     software table — slower than this crate's own braided scalar path — while
-#     `cargo bench`/`cargo test` measured the accelerated path, because their
-#     dev-dependency graph (`flate2` -> `crc32fast/default`) unified the feature
-#     on. That divergence is now closed: the effective `crc32fast`
-#     configuration is identical in the bench, test, and release builds.
-#
-# A `no_std` build (`--no-default-features [--features simd]`) still gets
-# `crc32fast` WITHOUT its `std` feature, which is the only configuration in
-# which it can be linked freestanding; `src/checksum/crc32.rs` detects that the
-# accelerated path is unreachable there and keeps its own braid, so the `simd`
-# feature can never be slower than omitting it. Features are resolution inputs
-# only, so this line cannot alter either lockfile.
+# A `no_std` build (`--no-default-features [--features simd]`) links `crc32fast`
+# without its `std` feature, so reachability is decided by the compile-time
+# target-feature test rather than a run-time probe: false on a stock target, true
+# when the caller compiles the required features in. Either way
+# `src/checksum/crc32.rs` reports the outcome through `crc32_backend()` and uses
+# its own braid whenever the accelerated path is not selected. Features are
+# resolution inputs only, so this line cannot alter either lockfile.
 std = ["crc32fast?/std"]
 # gzip framing within deflate/inflate (maps the C `#ifdef GZIP`).
 gzip = []
@@ -239,14 +243,17 @@ gz-io = ["std", "gzip"]
 # `#![cfg_attr(all(not(feature = "std"), not(test), panic = "abort"), no_std)]`
 # in `src/lib.rs`: the crate is genuinely `#![no_std]` for the shipped artifact
 # (`cargo build --no-default-features`, which the profiles compile with
-# `panic = "abort"`), while `cargo test --no-default-features` keeps `std`
-# linked so the libtest harness builds — yet still exercises every
-# `not(feature = "std")` code path because the `std` feature gates stay off.
-# The full test suite therefore compiles and PASSES under
+# `panic = "abort"`), while `cargo test --no-default-features` keeps `std` linked
+# so the libtest harness builds. Those tests exercise the `not(feature = "std")`
+# code paths EXCEPT `mod no_std_support`, whose `not(test)` term excludes it under
+# a harness — the std-off library builds are what compile that block. The full
+# test suite compiles and PASSES under
 # `cargo test --no-default-features [--features no-std]`; this flag remains a
 # convenience marker documenting intent for a core-only build.
 no-std = []
-# SIMD-accelerated CRC-32 hot path via the optional `crc32fast` dependency.
+# Makes the hardware CRC-32 backend available by pulling in the optional
+# `crc32fast` dependency. It puts the crate in the graph; whether its accelerated
+# code is then selected is a target/CPU question that `crc32_backend()` reports.
 #
 # Deliberately just `dep:crc32fast`, NOT `["dep:crc32fast", "crc32fast/std"]`:
 # spelling the `std` forward here would force `crc32fast`'s `std` feature on in a
@@ -351,29 +358,14 @@ opt-level = 3
 # `codegen-units = 1` is the whole-crate optimization this crate can actually
 # have, and it is deliberately NOT accompanied by an `lto` key.
 #
-# NO `lto` KEY - DO NOT ADD ONE. `[lib] crate-type` above emits `lib` (rlib)
-# alongside `cdylib` and `staticlib`, and Cargo builds all three from ONE rustc
-# invocation. rustc cannot run LTO for a unit that also emits an rlib, so Cargo
-# silently DROPS any LTO-enabling value rather than reporting it. Measured on
-# this tree by reading the `--crate-name zlib_rs` command line out of
-# `cargo build --release --verbose` while overriding the profile through
-# `CARGO_PROFILE_RELEASE_LTO`:
-#
-#     lto = true / "fat" / "thin" / false  ->  no `-C lto` flag at all
-#     lto = "off"                          ->  `-C lto=off`
-#
-# i.e. only the DISABLING value is ever forwarded. `lto = true` therefore read as
-# a request that never happened, and no job noticed - a declared optimization
-# that silently does nothing is worse than an honest absence, because it invites
-# performance reasoning from a flag that is not there. A control crate with
-# `crate-type = ["cdylib", "staticlib"]` (no rlib) and the same setting DOES
-# receive `-C lto`, which isolates the cause to the rlib in the triple.
-#
-# Dropping `lib` to buy LTO back is not available: the three-artifact triple is a
-# requirement of the migration (Rust consumers need the rlib; the C drop-in needs
-# the other two), and `benches/`, `tests/` and every Rust consumer link the rlib.
-# The flags that DO reach rustc here are `-C opt-level=3`, `-C codegen-units=1`
-# and `-C panic=abort`, all three verified present on that same command line.
+# NO `lto` KEY — DO NOT ADD ONE. `[lib] crate-type` emits `lib` (rlib) alongside
+# `cdylib` and `staticlib`, and Cargo builds all three from one rustc invocation.
+# rustc cannot run LTO for a unit that also emits an rlib, so Cargo silently drops
+# any LTO-enabling value instead of reporting it: an `lto` key here would be an
+# inert declaration that invites performance reasoning from a flag that never
+# reached the compiler. Dropping `lib` to buy LTO back is not an option — the
+# three-artifact triple is a migration requirement, and `benches/`, `tests/` and
+# every Rust consumer link the rlib.
 #
 # `src/lib.rs`'s `the_release_profile_declares_no_inert_lto_setting` fails the
 # build if an `lto` key reappears while `lib` is still in the crate-type list, so

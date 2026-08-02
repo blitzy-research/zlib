@@ -1065,20 +1065,46 @@ pub(crate) fn inflate_tracked<A: Allocator>(
                         // While fewer than `extra_max` bytes have been stored,
                         // the Vec's length equals the C `len = extra_len -
                         // length` write offset, so appending matches C exactly.
+                        //
+                        // The growth is fallible. C writes straight into the
+                        // caller's fixed buffer and cannot fail here at all, but
+                        // this port accumulates into an owned `Vec` first, and
+                        // that `Vec` is bounded only by the caller's `extra_max`
+                        // — a `c_uint`, so up to 4 GiB. An infallible
+                        // `extend_from_slice` would turn an exhausted allocator
+                        // into a process abort on a path C cannot fail on, so the
+                        // request is reserved first and exhaustion is reported as
+                        // `Z_MEM_ERROR` instead (AAP §0.6.5).
+                        let mut capture_oom = false;
                         if let Some(head) = state.head.as_mut() {
                             let extra_max = head.extra_max as usize;
                             if let Some(extra) = head.extra.as_mut() {
                                 if extra.len() < extra_max {
                                     let room = extra_max - extra.len();
                                     let n = core::cmp::min(copy, room);
-                                    extra.extend_from_slice(&io.input[io.next..io.next + n]);
-                                    // C wrote those `n` bytes at `head->extra +
-                                    // (extra_len - length)`, which is exactly the
-                                    // Vec offset they landed at; the boundary
-                                    // recovers it as `extra.len() - stored`.
-                                    header_pub.extra_stored += n;
+                                    if extra.try_reserve(n).is_err() {
+                                        capture_oom = true;
+                                    } else {
+                                        extra.extend_from_slice(&io.input[io.next..io.next + n]);
+                                        // C wrote those `n` bytes at `head->extra
+                                        // + (extra_len - length)`, which is
+                                        // exactly the Vec offset they landed at;
+                                        // the boundary recovers it as
+                                        // `extra.len() - stored`.
+                                        header_pub.extra_stored += n;
+                                    }
                                 }
                             }
+                        }
+                        if capture_oom {
+                            // Enter the permanent `MEM` state and let the
+                            // `InflateMode::Mem` arm perform C's
+                            // `case MEM: return Z_MEM_ERROR;`. The input cursor,
+                            // `state.length`, and the header CRC are all still
+                            // unadvanced, which is exactly what C's
+                            // return-without-`RESTORE()` leaves behind.
+                            state.mode = InflateMode::Mem;
+                            continue 'inf_leave;
                         }
                         if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 {
                             state.check = crc32(state.check, &io.input[io.next..io.next + copy]);
@@ -1102,6 +1128,10 @@ pub(crate) fn inflate_tracked<A: Allocator>(
                     }
                     let mut copy = 0usize;
                     let mut last_byte: u8;
+                    // Set when the caller-bounded `name` buffer cannot grow; see
+                    // the `Extra` arm for why this growth has to be fallible
+                    // (`name_max` is a `c_uint`, and C allocates nothing here).
+                    let mut capture_oom = false;
                     loop {
                         last_byte = io.input[io.next + copy];
                         copy += 1;
@@ -1119,6 +1149,8 @@ pub(crate) fn inflate_tracked<A: Allocator>(
                                 if name.len() < name_max {
                                     if last_byte == 0 {
                                         header_pub.name_terminated = true;
+                                    } else if name.try_reserve(1).is_err() {
+                                        capture_oom = true;
                                     } else {
                                         name.push(last_byte);
                                         header_pub.name_stored += 1;
@@ -1126,9 +1158,15 @@ pub(crate) fn inflate_tracked<A: Allocator>(
                                 }
                             }
                         }
-                        if last_byte == 0 || copy >= io.have() {
+                        if capture_oom || last_byte == 0 || copy >= io.have() {
                             break;
                         }
+                    }
+                    if capture_oom {
+                        // C's `case MEM: return Z_MEM_ERROR;` via the terminal
+                        // arm, with the input cursor and header CRC unadvanced.
+                        state.mode = InflateMode::Mem;
+                        continue 'inf_leave;
                     }
                     if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 {
                         state.check = crc32(state.check, &io.input[io.next..io.next + copy]);
@@ -1153,6 +1191,8 @@ pub(crate) fn inflate_tracked<A: Allocator>(
                     }
                     let mut copy = 0usize;
                     let mut last_byte: u8;
+                    // Same fallible-growth reasoning as `Extra`/`Name` above.
+                    let mut capture_oom = false;
                     loop {
                         last_byte = io.input[io.next + copy];
                         copy += 1;
@@ -1166,6 +1206,8 @@ pub(crate) fn inflate_tracked<A: Allocator>(
                                 if comment.len() < comm_max {
                                     if last_byte == 0 {
                                         header_pub.comment_terminated = true;
+                                    } else if comment.try_reserve(1).is_err() {
+                                        capture_oom = true;
                                     } else {
                                         comment.push(last_byte);
                                         header_pub.comment_stored += 1;
@@ -1173,9 +1215,15 @@ pub(crate) fn inflate_tracked<A: Allocator>(
                                 }
                             }
                         }
-                        if last_byte == 0 || copy >= io.have() {
+                        if capture_oom || last_byte == 0 || copy >= io.have() {
                             break;
                         }
+                    }
+                    if capture_oom {
+                        // C's `case MEM: return Z_MEM_ERROR;` via the terminal
+                        // arm, with the input cursor and header CRC unadvanced.
+                        state.mode = InflateMode::Mem;
+                        continue 'inf_leave;
                     }
                     if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 {
                         state.check = crc32(state.check, &io.input[io.next..io.next + copy]);
@@ -1914,10 +1962,20 @@ pub(crate) fn inflate_tracked<A: Allocator>(
             }
             InflateMode::Mem => {
                 // C `case MEM: return Z_MEM_ERROR;` — an immediate return with
-                // no epilogue. Unreachable in this port because window
-                // allocation never fails, but retained for exhaustiveness and
-                // FFI parity. The stream cursors are left unadvanced, matching
+                // no epilogue. The stream cursors are left unadvanced, matching
                 // C skipping `RESTORE()`.
+                //
+                // Reached two ways, both of them live. Within a single call, the
+                // gzip header-capture arms (`Extra`/`Name`/`Comment`) jump here
+                // when a caller-bounded `extra`/`name`/`comment` buffer cannot
+                // grow. Across calls, `MEM` is permanent: a window allocation
+                // that failed record it on the way out, so every later
+                // `inflate` on that stream re-enters here and keeps returning
+                // `Z_MEM_ERROR` - exactly the C behavior, since C's
+                // `state->mode` is equally sticky. That window allocation is
+                // fallible whenever it is served by a caller-supplied hook or a
+                // custom `Allocator` that refuses it, both at `inf_leave` below
+                // and inside [`inflate_set_dictionary`].
                 strm.set_inflate_state(state);
                 return TrackedInflateOutcome::committed(ReturnCode::MemError, 0, 0, header_pub);
             }
@@ -2087,8 +2145,13 @@ pub fn inflate_get_dictionary<A: Allocator>(
 ///
 /// # Errors
 /// * [`ZlibError::StreamError`] — no inflate state, or a wrapped stream not
-///   awaiting a dictionary.
+///   awaiting a dictionary. A stream whose mode was already latched to
+///   [`InflateMode::Mem`] by a failed load reports this on a retry, which is why
+///   C's `infcover.c` has to restore `mode = DICT` before trying again.
 /// * [`ZlibError::DataError`] — the dictionary's Adler-32 id does not match.
+/// * [`ZlibError::MemError`] — the sliding window is not allocated yet and the
+///   stream's allocator refused it, matching C's `updatewindow` failure clause
+///   (`inflate.c` L1211-L1214). The mode is latched to [`InflateMode::Mem`].
 pub fn inflate_set_dictionary<A: Allocator>(
     strm: &mut ZStream<A>,
     dictionary: &[u8],

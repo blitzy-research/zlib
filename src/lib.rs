@@ -1392,10 +1392,14 @@ mod tests {
     /// of these jobs silently runs on 1.85.0 instead of its intended channel —
     /// the stable rows would still pass while quietly not covering stable, and
     /// `cargo fuzz build` would fail outright because cargo-fuzz needs nightly.
-    const TOOLCHAIN_JOBS: [(&str, &str, &str); 9] = [
+    const TOOLCHAIN_JOBS: [(&str, &str, &str); 10] = [
         (".github/workflows/ci.yml", "build-test", "stable"),
         (".github/workflows/ci.yml", "no-std-tests", "stable"),
         (".github/workflows/ci.yml", "lint", "stable"),
+        // rustdoc's diagnostic set moves with the compiler, so `-D warnings` on
+        // the MSRV floor's rustdoc is a different gate from the one this project
+        // documents as blocking.
+        (".github/workflows/ci.yml", "docs", "stable"),
         (".github/workflows/ci.yml", "msrv", "1.85.0"),
         (".github/workflows/ci.yml", "benches", "stable"),
         (".github/workflows/ci.yml", "build-script-tests", "stable"),
@@ -1473,6 +1477,456 @@ mod tests {
                 "{workflow} job `{job}`'s toolchain assertion must `exit 1` on \
                  mismatch, or it cannot fail the job"
             );
+        }
+    }
+
+    /// Workflow files whose supply-chain invariants the tests below enforce.
+    ///
+    /// Every entry is held to three properties: each `uses:` names a full commit
+    /// SHA, each `actions/checkout` drops its credentials, and each
+    /// `dtolnay/rust-toolchain` states its channel explicitly. Enumerating the
+    /// files here rather than scanning the directory keeps the contract
+    /// reviewable, and is also what makes the census self-maintaining: the counts
+    /// derive from the files themselves, so a hand-written tally cannot go stale.
+    ///
+    /// The list is exhaustive over `.github/workflows/`, and
+    /// [`every_workflow_file_is_covered_by_the_supply_chain_contract`] proves it,
+    /// so a newly added workflow cannot escape the contract by simply not being
+    /// mentioned here.
+    const SUPPLY_CHAIN_WORKFLOWS: [&str; 3] = [
+        ".github/workflows/audit.yml",
+        ".github/workflows/ci.yml",
+        ".github/workflows/fuzz.yml",
+    ];
+
+    /// The action census, per workflow: `(workflow, checkout, toolchain, cache,
+    /// upload-artifact)`.
+    ///
+    /// `audit.yml`'s header states these totals in prose, and a hand-maintained
+    /// tally is exactly what went stale before (it claimed 13 checkout and 12
+    /// toolchain uses against an actual 17 and 16). Asserting the numbers here
+    /// means the prose cannot drift again without a red test, and it also catches
+    /// the quieter direction of drift: an action added to a job that nobody
+    /// reviewed as an action change.
+    const ACTION_CENSUS: [(&str, usize, usize, usize, usize); 3] = [
+        (".github/workflows/audit.yml", 4, 3, 0, 0),
+        (".github/workflows/ci.yml", 12, 12, 0, 1),
+        (".github/workflows/fuzz.yml", 1, 1, 5, 1),
+    ];
+
+    /// Every tool a workflow installs into CI, with the version it is pinned to.
+    ///
+    /// These are executables that run with full access to the checked-out tree, so
+    /// they are dependencies in every sense that matters even though no manifest
+    /// mentions them. `cargo-fuzz` is listed because it must stay pinned: it was
+    /// previously installed unversioned, which meant every run built and executed
+    /// whatever crates.io served at that moment.
+    const CI_INSTALLED_TOOLS: [(&str, &str); 3] = [
+        ("cargo-audit", "0.22.2"),
+        ("cargo-deny", "0.20.2"),
+        ("cargo-fuzz", "0.13.2"),
+    ];
+
+    /// First-party Cargo subcommands that RESOLVE the dependency graph and accept
+    /// `--locked`.
+    ///
+    /// `fmt` is deliberately absent: it accepts no such flag. So is `fuzz` — a
+    /// third-party subcommand that forwards no lockfile flag, which is why
+    /// `fuzz.yml` brackets it with a `cargo metadata --locked` preflight and a
+    /// lockfile assertion instead of a flag it cannot pass.
+    const RESOLVING_SUBCOMMANDS: [&str; 12] = [
+        "build", "test", "check", "clippy", "bench", "doc", "package", "metadata", "tree", "rustc",
+        "run", "install",
+    ];
+
+    /// Reads a workflow file relative to the repository root.
+    fn read_workflow(workflow: &str) -> alloc::string::String {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(root.join(workflow))
+            .unwrap_or_else(|e| panic!("{workflow} must be readable: {e}"))
+    }
+
+    /// Every `cargo` subcommand invoked on one shell line, tolerating a
+    /// `+channel` prefix (`cargo +stable test …`) and several commands chained on
+    /// one line (`cargo build && cargo test`).
+    ///
+    /// Version and help queries — `cargo clippy --version`, `cargo fmt --help` —
+    /// are excluded, because they resolve nothing and are used throughout these
+    /// workflows to record the tool versions a job actually ran on. The test is
+    /// deliberately narrow: only a query flag in the FIRST argument position
+    /// disqualifies an invocation, so `cargo install <crate> --version <v>` is
+    /// still held to the `--locked` requirement.
+    fn cargo_subcommands(line: &str) -> alloc::vec::Vec<&str> {
+        let mut out = alloc::vec::Vec::new();
+        for (at, _) in line.match_indices("cargo ") {
+            // `cargo` must sit in command position, not inside another word such
+            // as `CARGO_HOME` or a path like `.cargo/config.toml`.
+            if at > 0
+                && !matches!(
+                    line.as_bytes()[at - 1],
+                    b' ' | b'\t' | b'|' | b'(' | b'&' | b';' | b'`'
+                )
+            {
+                continue;
+            }
+            // A command name quoted inside `echo`/`printf` is log text, not an
+            // invocation: these workflows narrate the command they are about to
+            // run, and narration resolves nothing. The segment is delimited by the
+            // nearest preceding shell separator so `echo x && cargo build` still
+            // sees the real invocation.
+            let head = &line[..at];
+            let segment = head
+                .rfind(['|', '&', ';', '(', '`'])
+                .map_or(head, |cut| &head[cut + 1..]);
+            if matches!(
+                segment
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .trim_start_matches('"'),
+                "echo" | "printf"
+            ) {
+                continue;
+            }
+            let mut tokens = line[at + "cargo ".len()..].split_whitespace();
+            let Some(first) = tokens.next() else { continue };
+            let subcommand = if first.starts_with('+') {
+                tokens.next()
+            } else {
+                Some(first)
+            };
+            let Some(subcommand) = subcommand else {
+                continue;
+            };
+            if matches!(tokens.next(), Some("--version" | "-V" | "--help" | "-h")) {
+                continue;
+            }
+            out.push(subcommand);
+        }
+        out
+    }
+
+    /// Names of every job declared in a workflow.
+    ///
+    /// Jobs are the only two-space-indented mapping keys under `jobs:` — the same
+    /// rule [`workflow_job_block`] relies on. Comment lines are skipped, because a
+    /// comment shaped `  # something:` would otherwise read as a job key.
+    fn workflow_job_names(workflow: &str) -> alloc::vec::Vec<alloc::string::String> {
+        let text = read_workflow(workflow);
+        let mut names = alloc::vec::Vec::new();
+        let mut in_jobs = false;
+        for line in text.lines() {
+            if line.starts_with("jobs:") {
+                in_jobs = true;
+                continue;
+            }
+            if !in_jobs || line.trim_start().starts_with('#') {
+                continue;
+            }
+            if line.starts_with("  ") && !line.starts_with("   ") && line.trim_end().ends_with(':')
+            {
+                names.push(line.trim().trim_end_matches(':').into());
+            }
+        }
+        names
+    }
+
+    /// Every third-party action must be pinned to a full commit SHA, every
+    /// checkout must drop its credentials, and every toolchain install must name
+    /// its channel.
+    ///
+    /// A tag or branch ref (`@v4`, `@stable`) is MUTABLE: whoever can move it —
+    /// the action's maintainers, or anyone who compromises that account — runs
+    /// arbitrary code inside this repository's jobs, with whatever the job token
+    /// grants. `ci.yml` runs on `pull_request`, so it already executes
+    /// fork-controlled source; the actions themselves must not be a second
+    /// unreviewed input. A SHA is content-addressed and cannot be moved.
+    ///
+    /// `actions/checkout` writes the job token into `.git/config` unless told not
+    /// to. No job here performs an authenticated git operation, so persisting it
+    /// only leaves a credential for a later step to find.
+    ///
+    /// The `toolchain:` requirement is a direct consequence of SHA-pinning
+    /// `dtolnay/rust-toolchain`: that action derives its default channel from
+    /// `github.action_ref`, so a pin to a commit — which is not a channel name —
+    /// leaves the input unset, and the pinned revision declares it `required`.
+    /// Every call site must therefore state its channel explicitly.
+    #[test]
+    fn every_workflow_action_is_pinned_to_an_immutable_commit_sha() {
+        for workflow in SUPPLY_CHAIN_WORKFLOWS {
+            let text = read_workflow(workflow);
+            let lines: alloc::vec::Vec<&str> = text.lines().collect();
+            let mut checkouts = 0usize;
+            let mut toolchains = 0usize;
+            let mut caches = 0usize;
+            let mut uploads = 0usize;
+
+            for (index, line) in lines.iter().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with('#') {
+                    continue;
+                }
+                let Some(rest) = trimmed.strip_prefix("uses: ") else {
+                    continue;
+                };
+                let number = index + 1;
+                let spec = rest.trim();
+                let (reference, annotation) = match spec.split_once(" #") {
+                    Some((reference, annotation)) => (reference.trim(), annotation.trim()),
+                    None => (spec, ""),
+                };
+                let (action, sha) = reference
+                    .split_once('@')
+                    .unwrap_or_else(|| panic!("{workflow}:{number}: `{spec}` names no ref"));
+                assert!(
+                    sha.len() == 40
+                        && sha
+                            .bytes()
+                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+                    "{workflow}:{number}: `{action}` resolves through `{sha}`, which is not a \
+                     full 40-character lowercase commit SHA. Tag and branch refs are mutable, \
+                     so pinning to one delegates code execution in this workflow to whoever \
+                     can move it."
+                );
+                assert!(
+                    !annotation.is_empty(),
+                    "{workflow}:{number}: the pin for `{action}` must carry a trailing \
+                     `# <version>` comment, otherwise no reviewer can tell which release the \
+                     SHA denotes or when it was last reviewed"
+                );
+
+                // The remainder of this step: `uses:` steps carry only `name`,
+                // `if` and `with`, so the scan ends at the next step's `- `.
+                let mut body = alloc::string::String::new();
+                for follower in lines[index + 1..]
+                    .iter()
+                    .take_while(|line| !line.trim_start().starts_with("- "))
+                {
+                    body.push_str(follower);
+                    body.push('\n');
+                }
+
+                if action.ends_with("actions/checkout") {
+                    checkouts += 1;
+                    assert!(
+                        body.contains("persist-credentials: false"),
+                        "{workflow}:{number}: this `actions/checkout` must set \
+                         `persist-credentials: false`. The default writes the job token into \
+                         `.git/config`, where every later step - including anything a \
+                         dependency's build script runs - can read it."
+                    );
+                }
+                if action.ends_with("actions/cache") {
+                    caches += 1;
+                }
+                if action.ends_with("actions/upload-artifact") {
+                    uploads += 1;
+                }
+                if action.contains("rust-toolchain") {
+                    toolchains += 1;
+                    assert!(
+                        body.lines()
+                            .any(|line| line.trim_start().starts_with("toolchain:")),
+                        "{workflow}:{number}: a SHA-pinned `dtolnay/rust-toolchain` must pass \
+                         an explicit `toolchain:` input. Pinned to a commit there is no \
+                         `github.action_ref` channel to fall back on, and the input is \
+                         declared `required`."
+                    );
+                }
+            }
+
+            // A file with no matches would satisfy every assertion above
+            // vacuously, so the census is asserted exactly rather than assumed.
+            let (_, expected_checkouts, expected_toolchains, expected_caches, expected_uploads) =
+                ACTION_CENSUS
+                    .into_iter()
+                    .find(|&(file, ..)| file == workflow)
+                    .unwrap_or_else(|| panic!("{workflow} must appear in ACTION_CENSUS"));
+            assert_eq!(
+                (checkouts, toolchains, caches, uploads),
+                (
+                    expected_checkouts,
+                    expected_toolchains,
+                    expected_caches,
+                    expected_uploads
+                ),
+                "{workflow} declares (checkout, toolchain, cache, upload-artifact) = \
+                 ({checkouts}, {toolchains}, {caches}, {uploads}), but the census records \
+                 ({expected_checkouts}, {expected_toolchains}, {expected_caches}, \
+                 {expected_uploads}). Update ACTION_CENSUS and the totals in audit.yml's \
+                 ACTION PINNING section together - an action added without that review is \
+                 an unreviewed code-execution site."
+            );
+        }
+    }
+
+    /// The census must cover every workflow file that exists, not merely every
+    /// file someone remembered to list.
+    ///
+    /// Without this, the contract above is opt-in: a new workflow that pinned
+    /// nothing and persisted its credentials would pass simply by being absent
+    /// from [`SUPPLY_CHAIN_WORKFLOWS`].
+    #[test]
+    fn every_workflow_file_is_covered_by_the_supply_chain_contract() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut found: alloc::vec::Vec<alloc::string::String> =
+            std::fs::read_dir(root.join(".github/workflows"))
+                .expect(".github/workflows must be readable")
+                .map(|entry| entry.expect("directory entry must be readable").file_name())
+                .map(|name| alloc::format!(".github/workflows/{}", name.to_string_lossy()))
+                .filter(|name| name.ends_with(".yml") || name.ends_with(".yaml"))
+                .collect();
+        found.sort();
+        let mut covered: alloc::vec::Vec<alloc::string::String> =
+            SUPPLY_CHAIN_WORKFLOWS.iter().map(|&f| f.into()).collect();
+        covered.sort();
+        assert_eq!(
+            found, covered,
+            "every workflow under .github/workflows must be listed in \
+             SUPPLY_CHAIN_WORKFLOWS (and in ACTION_CENSUS), or the SHA-pinning, \
+             credential-dropping and `--locked` contracts silently do not apply to it"
+        );
+        let mut census: alloc::vec::Vec<alloc::string::String> = ACTION_CENSUS
+            .iter()
+            .map(|&(file, ..)| file.into())
+            .collect();
+        census.sort();
+        assert_eq!(
+            found, census,
+            "ACTION_CENSUS must have one row per workflow file"
+        );
+    }
+
+    /// Every tool this repository installs into CI is version-pinned, fetched
+    /// against a verified checksum, built from an audited dependency graph, and
+    /// asserted after installation.
+    ///
+    /// A CI-installed tool runs with full access to the checked-out tree and to
+    /// whatever the job token grants, so an unpinned `cargo install <tool>`
+    /// executes whatever the registry serves at that moment. Two further holes are
+    /// less obvious and are both closed here. Fetching the crate by hand bypasses
+    /// the checksum verification `cargo install` performs internally, so the
+    /// download is checked against the sparse index explicitly. And `--locked`
+    /// builds the tool's OWN published lockfile, which for two of these three
+    /// tools was measured to contain advisory-affected dependencies - so the
+    /// graph is refreshed with reviewed `--precise` overrides and then audited,
+    /// rather than merely pinned.
+    #[test]
+    fn every_ci_installed_tool_is_pinned_verified_and_audited() {
+        let mut installs_seen = 0usize;
+        for workflow in SUPPLY_CHAIN_WORKFLOWS {
+            let text = read_workflow(workflow);
+
+            for (index, line) in text.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with('#') || !trimmed.contains("cargo") {
+                    continue;
+                }
+                if !cargo_subcommands(trimmed).contains(&"install") {
+                    continue;
+                }
+                installs_seen += 1;
+                assert!(
+                    trimmed.contains("--path") && trimmed.contains("--locked"),
+                    "{workflow}:{}: a CI tool install must build from a local, \
+                     checksum-verified, dependency-refreshed tree (`--path … --locked`). \
+                     A registry install cannot be audited before it is built: {trimmed}",
+                    index + 1
+                );
+            }
+
+            for (tool, version) in CI_INSTALLED_TOOLS {
+                // Only the files that actually install the tool are held to the
+                // rest of the contract.
+                if !text.contains(&alloc::format!("name={tool}")) {
+                    continue;
+                }
+                for needle in [
+                    alloc::format!("version={version}"),
+                    alloc::format!("expected='{version}'"),
+                ] {
+                    assert!(
+                        text.contains(&needle),
+                        "{workflow} installs {tool} but does not contain `{needle}`: the \
+                         version must be pinned AND asserted after installation, or a \
+                         cached or pre-installed binary silently replaces it"
+                    );
+                }
+                assert!(
+                    text.contains("index.crates.io") && text.contains("sha256sum -c"),
+                    "{workflow} installs {tool} from a hand-fetched tarball, so it must \
+                     verify that download against the sparse index checksum - Cargo's own \
+                     verification does not apply to a `curl` download"
+                );
+                assert!(
+                    text.contains("check advisories") || text.contains("audit --deny warnings"),
+                    "{workflow} installs {tool} but never audits a tool dependency graph. \
+                     Two of the three pinned tools ship advisory-affected published \
+                     lockfiles, so the graph must be audited, not merely pinned"
+                );
+            }
+        }
+        assert!(
+            installs_seen >= CI_INSTALLED_TOOLS.len(),
+            "expected at least {} CI tool installs across the workflows, found \
+             {installs_seen} - has an install step been removed or renamed?",
+            CI_INSTALLED_TOOLS.len()
+        );
+    }
+
+    /// Every workflow command that resolves the dependency graph must pass
+    /// `--locked`, and every job that runs one must prove the lockfile survived.
+    ///
+    /// Without `--locked` Cargo may re-resolve and REWRITE `Cargo.lock`, after
+    /// which the job builds, tests or lints a dependency set no commit contains.
+    /// That is not a theoretical concern for this crate: it emits `cdylib` and
+    /// `staticlib` artifacts and commits its lockfile precisely so the shipped
+    /// dependency closure is the reviewed one.
+    ///
+    /// The flag alone is not sufficient evidence, because a single command that
+    /// loses it leaves no trace in the log. Hence the second half: any job that
+    /// resolves must also assert `git status --porcelain Cargo.lock` is empty.
+    #[test]
+    fn every_dependency_resolving_workflow_command_is_locked() {
+        for workflow in SUPPLY_CHAIN_WORKFLOWS {
+            let text = read_workflow(workflow);
+            for (index, line) in text.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with('#') {
+                    continue;
+                }
+                for subcommand in cargo_subcommands(trimmed) {
+                    if !RESOLVING_SUBCOMMANDS.contains(&subcommand) {
+                        continue;
+                    }
+                    assert!(
+                        trimmed.contains("--locked"),
+                        "{workflow}:{}: `cargo {subcommand}` resolves the dependency graph \
+                         and must pass `--locked`, or it may rewrite Cargo.lock and evaluate \
+                         this gate against a resolution no commit contains: {trimmed}",
+                        index + 1
+                    );
+                }
+            }
+
+            for job in workflow_job_names(workflow) {
+                let block = workflow_job_block(workflow, &job);
+                let resolves = block.lines().any(|line| {
+                    let trimmed = line.trim_start();
+                    !trimmed.starts_with('#')
+                        && cargo_subcommands(trimmed)
+                            .iter()
+                            .any(|subcommand| RESOLVING_SUBCOMMANDS.contains(subcommand))
+                });
+                if resolves {
+                    assert!(
+                        block.contains("git status --porcelain Cargo.lock"),
+                        "{workflow} job `{job}` resolves the dependency graph, so it must \
+                         assert `Cargo.lock` is unchanged before it finishes. A rewritten \
+                         lockfile is the one build-input change that leaves no other trace."
+                    );
+                }
+            }
         }
     }
 
@@ -1597,29 +2051,64 @@ mod tests {
     }
 
     /// The CI `lint` job must run the clippy gate the repository documents,
-    /// `--all-features` included.
+    /// `--locked` and `--all-features` included. The rustdoc half of the same
+    /// contract lives in the dedicated `docs` job and is asserted there.
     ///
-    /// Without `--all-features` clippy silently skips every feature-gated unit:
+    /// Without `--all-features` clippy silently skips feature-gated units:
     /// `tests/c_oracle.rs` is not linted at all (it carries `required-features =
-    /// ["c-oracle"]`), and neither are the `inflate_strict` arms or the `no_std`
-    /// runtime block. `lint` is the only job in the workflow that promotes
-    /// warnings to errors, so a lint regression in any of them would have nowhere
-    /// else to surface. `.cargo/config.toml` states this exact gate twice, which
-    /// is what made the narrower CI spelling a documentation drift as well as a
-    /// coverage gap.
+    /// ["c-oracle"]`), and neither are the `inflate_strict` arms. `lint` is the
+    /// only job in the workflow that promotes warnings to errors, so a lint
+    /// regression in either would have nowhere else to surface.
+    ///
+    /// What `--all-features` cannot cover is the freestanding `no_std_support`
+    /// block: enabling every feature turns `std` on, and that block's predicate
+    /// requires `not(feature = "std")`. The std-off library builds are what
+    /// compile it — see the `no_std library (build only)` matrix row and the
+    /// `bare-metal-no-std` job.
+    ///
+    /// Without `--locked` the gate is reproducible only by luck: an ordinary
+    /// `cargo clippy` is free to re-resolve the graph and rewrite `Cargo.lock`,
+    /// so the tree that gets linted need not be the tree the lockfile pins — and
+    /// a lockfile the run itself mutated is exactly what
+    /// [`Self::the_release_profile_declares_no_inert_lto_setting`]'s sibling
+    /// gates and the `package-verify` job assume has not happened. Every
+    /// graph-resolving cargo invocation in `ci.yml` therefore carries `--locked`;
+    /// `cargo fmt` is the sole exception, because it resolves no dependencies.
+    ///
+    /// `.cargo/config.toml` documents this exact gate as well, and the assertion
+    /// is made against it too: a spelling that drifts in either place is a
+    /// documentation defect as well as a coverage gap.
+    ///
+    /// The rustdoc gate is asserted too, in the separate `docs` job that owns it:
+    /// `#![warn(missing_docs)]` and every intra-doc link in the public API are
+    /// enforced only when rustdoc actually runs with warnings promoted to errors,
+    /// and `cargo doc` alone prints the same diagnostics and still exits 0 — so
+    /// `RUSTDOCFLAGS: -D warnings` is what makes it gate at all.
     #[test]
     fn the_lint_job_runs_the_documented_clippy_gate() {
+        const CLIPPY_GATE: &str = "clippy --locked --all-targets --all-features -- -D warnings";
         let block = workflow_job_block(".github/workflows/ci.yml", "lint");
         assert!(
-            block.contains("clippy --all-targets --all-features -- -D warnings"),
-            "the ci.yml `lint` job must run `cargo clippy --all-targets \
-             --all-features -- -D warnings`; without `--all-features` the \
-             feature-gated surface (tests/c_oracle.rs, the inflate_strict arms, \
-             the no_std runtime block) is never linted anywhere"
+            block.contains(CLIPPY_GATE),
+            "the ci.yml `lint` job must run `cargo {CLIPPY_GATE}`; without \
+             `--all-features` the feature-gated surface (tests/c_oracle.rs and \
+             the inflate_strict arms) is never linted anywhere; the std-off \
+             rows are what cover the no_std runtime block, which this row \
+             cannot reach because `--all-features` turns `std` on. Without \
+             `--locked` the linted graph need not be the pinned one"
         );
         assert!(
             block.contains("fmt --all -- --check"),
             "the ci.yml `lint` job must also run `cargo fmt --all -- --check`"
+        );
+
+        // A resolving job must also PROVE it honoured the committed resolution: a
+        // rewritten lockfile is the one build-input change that leaves no other
+        // trace in the log.
+        assert!(
+            block.contains("git status --porcelain Cargo.lock"),
+            "the ci.yml `lint` job must assert `Cargo.lock` is unchanged at job \
+             end, so a command that lost its `--locked` flag cannot pass silently"
         );
 
         // The gate the workflow runs and the gate the repository documents must be
@@ -1628,9 +2117,132 @@ mod tests {
         let cargo_config = std::fs::read_to_string(root.join(".cargo/config.toml"))
             .expect(".cargo/config.toml must be readable");
         assert!(
-            cargo_config.contains("clippy --all-targets --all-features -- -D warnings"),
+            cargo_config.contains(CLIPPY_GATE),
             ".cargo/config.toml must keep documenting the same clippy gate the \
-             `lint` job runs"
+             `lint` job runs, `--locked` included"
+        );
+        // The rustdoc gate lives in the dedicated `docs` job (which also builds the
+        // MkDocs site in strict mode), so it is asserted against that job's block.
+        // `RUSTDOCFLAGS: -D warnings` is what makes it blocking; `cargo doc` alone
+        // would print the same diagnostics and still exit 0.
+        let docs = workflow_job_block(".github/workflows/ci.yml", "docs");
+        assert!(
+            docs.contains("doc --locked --no-deps"),
+            "the ci.yml `docs` job must run `cargo doc --locked --no-deps`, or \
+             `#![warn(missing_docs)]` and every intra-doc link in the public API \
+             are enforced nowhere in CI"
+        );
+        assert!(
+            docs.contains("RUSTDOCFLAGS: -D warnings"),
+            "the ci.yml `docs` job's rustdoc step must set \
+             `RUSTDOCFLAGS: -D warnings`; without it `cargo doc` prints its \
+             warnings and still exits 0, so the gate would not gate"
+        );
+    }
+
+    /// Every cargo invocation in `ci.yml` that resolves the dependency graph must
+    /// pass `--locked`.
+    ///
+    /// `--locked` is what makes a CI result attributable to the committed
+    /// `Cargo.lock`. Without it cargo may re-resolve and rewrite the lockfile
+    /// mid-run, so a green build can be green against a graph nobody reviewed and
+    /// nobody can reproduce — and a later step that reads `Cargo.lock` (the
+    /// failure-only upload, `package-verify`, the audit workflow's policy jobs)
+    /// then reads a file this run invented.
+    ///
+    /// `cargo fmt` is deliberately exempt: it parses source text and touches no
+    /// dependency graph, so `--locked` would be noise. So is any invocation
+    /// carrying `--version`, which is a toolchain probe (`cargo --version`,
+    /// `cargo fmt --version`, `cargo clippy --version`) rather than a build — note
+    /// that the probe has to be recognised by its *argument*, because
+    /// `cargo clippy --version` presents `clippy` as its subcommand. Everything
+    /// else — `build`, `test`, `check`, `clippy`, `bench`, `doc`, `package` — is
+    /// required to carry it.
+    ///
+    /// The scan resolves each line into shell command segments before looking for
+    /// `cargo`, because the word also appears inside quoted prose such as
+    /// `echo "--- cargo package --list (…) ---"`. Splitting on the separators after
+    /// which a new command begins, and then requiring `cargo` to be the segment's
+    /// *command word*, keeps a mention from being mistaken for an invocation while
+    /// still catching a real invocation nested in a command substitution.
+    #[test]
+    fn every_graph_resolving_ci_command_is_locked() {
+        const EXEMPT_SUBCOMMANDS: [&str; 1] = ["fmt"];
+        const RESOLVING: [&str; 7] = [
+            "build", "test", "check", "clippy", "bench", "doc", "package",
+        ];
+        const SEPARATORS: [&str; 6] = ["&&", "||", "|", ";", "$(", ")"];
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
+            .expect("ci.yml must be readable");
+
+        // Environment assignments (`RUSTUP_TOOLCHAIN=stable cargo …`) and shell
+        // noise stand in front of the command word without being the command.
+        let is_command_prefix = |word: &&str| {
+            matches!(*word, "!" | "sudo" | "env" | "time" | "then" | "do")
+                || word.split_once('=').is_some_and(|(name, _)| {
+                    !name.is_empty()
+                        && name
+                            .chars()
+                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                })
+        };
+
+        let mut checked = 0usize;
+        for (index, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            // Comments describe commands; they are prose, not invocations.
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            let mut segments = std::string::String::from(trimmed);
+            for separator in SEPARATORS {
+                segments = segments.replace(separator, "\n");
+            }
+            for segment in segments.split('\n') {
+                let segment = segment.trim();
+                let segment = segment.strip_prefix("run:").unwrap_or(segment).trim();
+                let mut words = segment
+                    .split_whitespace()
+                    .map(|word| word.trim_matches(['"', '\'']))
+                    .skip_while(is_command_prefix);
+                if words.next() != Some("cargo") {
+                    continue;
+                }
+                // A `--version` argument makes the invocation a toolchain probe: it
+                // prints a version string and exits without reading `Cargo.toml`,
+                // so there is no dependency graph to lock.
+                if segment.split_whitespace().any(|word| word == "--version") {
+                    continue;
+                }
+                // The subcommand is the first argument that is not a `+toolchain`
+                // shorthand.
+                let Some(first) = words.next() else { continue };
+                let subcommand = if first.starts_with('+') {
+                    match words.next() {
+                        Some(next) => next,
+                        None => continue,
+                    }
+                } else {
+                    first
+                };
+                if EXEMPT_SUBCOMMANDS.contains(&subcommand) || !RESOLVING.contains(&subcommand) {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    segment.contains("--locked"),
+                    "ci.yml:{} runs `cargo {subcommand}` without `--locked`: {trimmed}",
+                    index + 1
+                );
+            }
+        }
+        assert!(
+            checked >= 20,
+            "expected at least 20 graph-resolving ci.yml commands to be inspected \
+             (24 exist today), saw {checked} — the scan stopped matching, so it is \
+             no longer a gate"
         );
     }
 
@@ -1639,10 +2251,13 @@ mod tests {
     ///
     /// This has to be a *source-level* guard because no value assertion can catch
     /// the defect it protects against. `OS_CODE` is `3` on Linux, so a module that
-    /// re-declares its own `const OS_CODE: u8 = 3` agrees with the canonical
-    /// constant on every currently exercised CI target while silently emitting `3`
+    /// re-declares its own `const OS_CODE: u8 = 3` still agrees with the canonical
+    /// constant wherever the comparison itself runs, while silently emitting `3`
     /// where reference zlib emits `10` on Windows (`zutil.h` L156-L158) or `19` on
-    /// Apple (L168-L170). Counting declarations catches that on every platform.
+    /// Apple (L168-L170). A value check performed on one host cannot detect that
+    /// divergence, because that host does not build the target the divergence
+    /// appears on. Counting declarations does, from any host, whichever platforms
+    /// CI happens to run.
     #[test]
     fn os_code_is_declared_in_exactly_one_module() {
         let mut declaring: alloc::vec::Vec<(std::string::String, usize)> = alloc::vec::Vec::new();

@@ -3,19 +3,18 @@
 //! Measures Adler-32 and CRC-32 throughput across a range of buffer sizes.
 //!
 //! Selecting the CRC-32 code path: `simd` is a member of the crate's `default`
-//! feature set (`default = ["std", "gzip", "gz-io", "simd"]`), so a plain
-//! `cargo bench` already measures the `crc32fast`-backed SIMD hot path, and
-//! adding `--features simd` on top of the defaults resolves to the identical
-//! feature set — it rebuilds the same binary and compares nothing. Reaching the
-//! scalar fallback therefore requires `--no-default-features`. The two commands
-//! below are the "gzip + gz-io" and "simd" rows of the `build-test` matrix in
-//! `.github/workflows/ci.yml`: they differ in exactly that one feature, and both
-//! are built and tested on every push.
+//! feature set, so a plain `cargo bench` already measures the `crc32fast`-backed
+//! configuration, and adding `--features simd` on top of the defaults resolves to
+//! the identical feature set — it rebuilds the same binary and compares nothing.
+//! Reaching the scalar fallback therefore requires `--no-default-features`. The
+//! two commands below are the "gzip + gz-io" and "simd" rows of the `build-test`
+//! matrix in `.github/workflows/ci.yml`: they differ in exactly that one feature.
 //!
 //! - scalar fallback — the braided, word-at-a-time port, with no `crc32fast` in
 //!   the crate's own dependency graph:
 //!   `cargo bench --bench checksum_bench --no-default-features --features std,gzip,gz-io`
-//! - SIMD-accelerated — the `crc32fast` hot path:
+//! - `simd` enabled — `crc32fast` in the graph; the printed backend reports
+//!   whether its accelerated code is actually selected here:
 //!   `cargo bench --bench checksum_bench --no-default-features --features std,gzip,gz-io,simd`
 //!
 //! Run them in that order and criterion reports the second against the first,
@@ -23,9 +22,9 @@
 //! checksums for every input, so only the timing differs; no figure for that
 //! difference is quoted anywhere in this file, because it is CPU- and
 //! build-dependent and the re-runnable commands above are the evidence rather
-//! than a constant baked into a comment (plan-adopted standard S1, AAP 0.7.2).
-//! A benchmark result is likewise never on its own a licence to change `src/`
-//! (AAP 0.8.3): this folder measures, it does not authorise.
+//! than a constant baked into a comment. A benchmark result is likewise never on
+//! its own a licence to change `src/`: this folder measures, it does not
+//! authorise.
 //!
 //! The distinction is CRC-32-only. `src/checksum/crc32.rs` dispatches its private
 //! `crc32_bulk` helper to `crc32fast::Hasher` or to the braided, word-at-a-time
@@ -42,20 +41,22 @@
 //! that is what chooses between a run-time `is_x86_feature_detected!` probe and a
 //! compile-time `cfg!(target_feature = ...)` test that is false on a stock
 //! `x86_64` target. Two consequences follow, and both are the reason this file
-//! now reports the backend instead of naming it in a comment:
+//! reports the backend instead of naming it in a comment:
 //!
 //! 1. `cargo bench` and `cargo test` pull in dev-dependencies, and `flate2` asks
 //!    for `crc32fast/default` (= its `std`). Cargo feature unification then turns
 //!    that on for the WHOLE bench build — even though nothing in the crate's own
 //!    graph requested it. A benchmark can therefore time a configuration no
-//!    consumer of `cargo build --release` ever has, over-reporting CRC-32
-//!    throughput several-fold.
+//!    consumer of `cargo build --release` ever has.
 //! 2. That divergence is closed at the manifest level: the crate's `std` feature
 //!    forwards to `crc32fast?/std`, so the effective `crc32fast` configuration is
-//!    now identical in the bench, test, and release builds. `src/checksum/crc32.rs`
+//!    identical in the bench, test, and release builds. `src/checksum/crc32.rs`
 //!    additionally probes reachability itself and keeps its own braid whenever the
-//!    accelerated path would not be selected, so `simd` can never be slower than
-//!    omitting it.
+//!    accelerated path would not be selected, so enabling `simd` never silently
+//!    substitutes `crc32fast`'s software table for that braid. Which of the two
+//!    then runs — and hence which is faster on this machine — is exactly what the
+//!    printed backend records; benchmark both rows rather than assuming an
+//!    ordering.
 //!
 //! Feature wiring is invisible in a benchmark log, so the guard below prints
 //! `crc32_backend()` and asserts it is consistent with the compiled feature set.
@@ -66,73 +67,12 @@
 //! and the artifact are built by different commands, and only the printed backend
 //! makes the comparison auditable.
 //!
-//! # Operating this harness: upstream criterion 0.5.1 behaviours to know
-//!
-//! These are properties of the pinned harness (`criterion = "0.5.1"`, AAP 0.5.1),
-//! not of this crate, and none of them can be fixed here. They are recorded
-//! because each one can silently invalidate a measurement or a CI gate. This is
-//! the authoritative list; `benches/deflate_bench.rs` and
-//! `benches/inflate_bench.rs` point here.
-//!
-//! - **Running the binary directly without `--bench` measures nothing.**
-//!   criterion decides its mode as
-//!   `match (bench_flag, test_flag) { (true, true) => test, (true, false) =>
-//!   benchmark, (false, _) => test }` (`src/lib.rs`), so the *absence* of
-//!   `--bench` forces Test mode: every case executes exactly once, prints
-//!   `Testing <id>` / `Success`, writes no `estimates.json`, and exits 0. `cargo
-//!   bench` supplies `--bench` and `cargo test --benches` deliberately does not.
-//!   Anything invoking `target/release/deps/<bench>-<hash>` by path — a profiler,
-//!   a `perf` wrapper, a hand-rolled CI step — must pass `--bench` explicitly or
-//!   it silently collects no data at all.
-//! - **A filter that matches nothing exits 0 having measured nothing.** A typo
-//!   (`-- crc32_typo`), an over-narrow `--exact`, or `--ignored` all produce an
-//!   empty run with status 0 and no "0 benchmarks matched" notice. Measured: a
-//!   non-matching filter in benchmark mode wrote 0 `new/estimates.json` files and
-//!   still exited 0. A CI regression gate must therefore pin ids with `--exact`
-//!   *and* assert that the expected number of `new/estimates.json` files was
-//!   produced; a green run is not by itself evidence that anything ran. Note that
-//!   `--exact` needs the *full* id: `--exact crc32/1024` yields one estimates
-//!   file, while `--exact crc32` — a group name rather than an id — matches
-//!   nothing and yields zero.
-//! - **An unwritable criterion home still exits 0.** Point `CRITERION_HOME` at a
-//!   path that cannot hold a directory and criterion prints one
-//!   `Criterion.rs ERROR: error: Failed to access file …` line per artifact it
-//!   fails to write (measured: six lines for a single id, covering the directory,
-//!   `tukey.json`, `sample.json`, and the rest), reports timings normally, and
-//!   exits 0. A job that persists reports must check that the tree it expected
-//!   actually exists rather than trusting the status code.
-//! - **Invalid numeric CLI arguments abort inside the harness.**
-//!   `--sample-size 9` trips `assertion failed: num_size >= 10` at
-//!   `criterion-0.5.1/src/lib.rs:1096`, and `--warm-up-time 0` and
-//!   `--measurement-time 0` trip `assertion failed: dur.as_nanos() > 0` at
-//!   `:1101` and `:1107`. These are unconditional `assert!`s, not
-//!   `debug_assert!`s, so they fire in the release-profile bench binary too, and
-//!   the process exits 101. That is an argument-validation limitation upstream,
-//!   not a defect in the benchmarks; pass values inside the documented ranges.
-//!   The exit code is 101 rather than a SIGABRT 134 because Cargo forces the
-//!   `unwind` panic strategy for bench targets even though both profiles set
-//!   `panic = "abort"`, so these surface as ordinary panics.
-//! - **`--help` is unavailable and `--version` prints no version.** criterion
-//!   depends on `clap` with `default-features = false`, so `-h`/`--help` is
-//!   rejected with status 2. `-V`/`--version` is declared `hide(true)` with
-//!   `num_args(0)` and is then never read, so it is a no-op that leaves the run
-//!   to proceed in whatever mode the remaining flags imply: a full measurement
-//!   under `cargo bench -- --version`, or a Test-mode pass when the binary is
-//!   invoked directly. Either way no version string is emitted. Consult
-//!   criterion's documentation for the option list rather than the binary.
-//! - **`Gnuplot not found, using plotters backend` is expected.** `gnuplot` is
-//!   not a dependency of this project; `plotters` is pinned in `Cargo.lock`,
-//!   generates the complete report tree including the SVGs, and the notice is
-//!   purely informational. Forcing the issue with `--plotting-backend gnuplot`
-//!   panics at `criterion-0.5.1/src/lib.rs:503` with "Gnuplot plotting backend
-//!   was requested, but gnuplot is not available" and exits 101. Use `--noplot` if
-//!   the intent is to skip plotting: it exits 0, writes no SVGs, and still records
-//!   `estimates.json`.
-//! - **Group settings in these files outrank the CLI.** criterion resolves a
-//!   case's configuration as "group setting, else Criterion/CLI setting", so a
-//!   `--measurement-time`, `--sample-size`, or `--noise-threshold` passed on the
-//!   command line is ignored for any group that sets it here. Change the constant
-//!   in the file if the policy itself is wrong.
+//! Group settings in this file outrank the criterion CLI: criterion resolves a
+//! case's configuration as "group setting, else Criterion/CLI setting", so a
+//! `--measurement-time`, `--sample-size`, or `--noise-threshold` passed on the
+//! command line is ignored for any group that sets it below. Change the constant
+//! here if the policy itself is wrong. For criterion's own CLI and reporting
+//! behaviour, consult the pinned harness's documentation (`criterion = "0.5.1"`).
 //!
 //! Registered in `Cargo.toml` as `[[bench]] name = "checksum_bench"` with
 //! `harness = false`, so this file supplies its own entry point via

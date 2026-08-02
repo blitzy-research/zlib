@@ -8,53 +8,36 @@
 //! measurement rather than a property of the workload, so normalising by it
 //! would make two levels on the same input incomparable.
 //!
-//! Measured position — external evidence recorded in the plan, not a figure this
-//! harness produces, and the only C-relative throughput figures quoted anywhere
-//! in this file: compression runs at approximately 85% of reference C zlib, while
-//! decompression runs at 107%-127% of it (AAP 0.8.3, "Performance
-//! Expectations"). Decompression is therefore at or above parity and compression
-//! is the interesting side.
-//!
-//! Those two numbers are AAP-recorded historical context. They are aggregates,
-//! they were not produced by this harness, and — importantly — they do NOT
-//! localise the compression shortfall. An earlier revision of this header
-//! asserted that the shortfall was "concentrated in the incompressible-input
-//! path, where the match finder does the most fruitless work". That claim was
-//! plausible but wrong, and a per-profile measurement against a reference C build
-//! inverted it: the incompressible profile is the CLOSEST to C, at roughly
-//! 82%-86% of its throughput, while the compressible profiles are the FURTHEST,
-//! at roughly 58%-64%. The reasoning behind the old claim had the mechanism
-//! backwards. On incompressible input the match finder fails FAST rather than
-//! working hard: `longest_match`'s two-byte prefilter rejects almost every
-//! candidate before the comparison loop is entered, and `_tr_flush_block` then
-//! selects stored blocks because the dynamic tree cannot pay for itself, so both
-//! implementations end up doing similar and rather little work per byte. It is on
-//! compressible input — where hash chains are genuinely walked, lazy matching is
-//! evaluated, and Huffman trees are built and emitted — that the gap opens up.
-//! (Decompression's measured 104%-125% does bracket the quoted 107%-127%, so that
-//! figure survives contact with measurement.)
+//! Measured position, recorded as external context rather than produced here:
+//! compression runs at approximately 85% of reference C zlib and decompression at
+//! 107%-127% of it (AAP 0.8.3, "Performance Expectations"). Those aggregates do
+//! not localise the compression shortfall, and a per-profile measurement against a
+//! reference C build places it opposite to where the aggregate invites one to look:
+//! the incompressible profile is the CLOSEST to C at roughly 82%-86%, while
+//! compressible profiles are the FURTHEST at roughly 58%-64%. On incompressible
+//! input the match finder fails FAST rather than working hard — `longest_match`'s
+//! two-byte prefilter rejects almost every candidate before the comparison loop,
+//! and `_tr_flush_block` then selects stored blocks because the dynamic tree cannot
+//! pay for itself — so both implementations do similar and rather little work per
+//! byte. The gap opens on compressible input, where hash chains are genuinely
+//! walked, lazy matching is evaluated, and Huffman trees are built and emitted.
 //!
 //! Treat every C-relative percentage in this file as provisional. This harness
-//! links no C library and cannot produce one (see the paragraph below), and the
-//! repository has no automated in-tree performance oracle — that is an
-//! acknowledged gap (AAP 0.10.1 D9, which covers a *conformance* oracle for
-//! byte-identity; no performance counterpart exists even in plan). Until such a
-//! harness exists, a C-relative claim made here is a claim this repository cannot
-//! re-check on demand, which is exactly why the numbers above are attributed
-//! rather than asserted, and why `bench_incompressible_guard` below is justified
-//! by what it makes falsifiable rather than by a percentage.
+//! links no C library, runs no reference implementation, and the repository has no
+//! automated in-tree performance oracle, so a C-relative claim made here cannot be
+//! re-checked on demand — which is why the numbers above are attributed rather than
+//! asserted. Every figure a run of this file prints is a Rust-only
+//! level-and-profile throughput number, useful for comparing this crate against
+//! itself across levels, inputs and commits.
 //!
-//! What this file itself measures is `zlib-rs` alone: it links no C library and
-//! runs no reference implementation, so every number it prints is a Rust-only
-//! level-and-profile throughput figure, useful for comparing this crate against
-//! itself across levels, inputs and commits. The C-relative percentages above
-//! come from AAP 0.8.3; they are not produced by a run of this harness.
-//!
-//! This folder MEASURES; it does not AUTHORISE. Performance is a constraint on
-//! the migration, not its objective, so no timing taken here is on its own a
-//! licence to change anything under `src/` (AAP 0.8.3). Byte-identity against
-//! reference zlib is owned exclusively by `tests/interop.rs`; the full
-//! obligation is spelled out on `bench_incompressible_guard`.
+//! This folder MEASURES; it does not AUTHORISE. Performance is a constraint on the
+//! migration, not its objective, so no timing taken here is on its own a licence to
+//! change anything under `src/` (AAP 0.8.3). A candidate speed-up is viable only if
+//! it provably cannot change the token stream — bounds-check elision,
+//! memory-access patterns, inlining, and buffer-copy strategy — and only after
+//! clearing the byte-identity gate, which is owned exclusively by the tier-1
+//! oracle vectors in `tests/interop.rs`. The full obligation is spelled out on
+//! `bench_incompressible_guard`.
 //!
 //! # Every case validates its own output before it is timed
 //!
@@ -67,119 +50,45 @@
 //! Only then is the timed closure registered. The check costs one compression
 //! plus one decompression per case and Criterion never folds it into a sample.
 //!
-//! Per AAP 0.8.3 no throughput target was ever specified for this migration and
-//! this is explicitly not a performance refactor, so the percentages above are
-//! evidence about where the code stands rather than a goal to optimise toward.
-//! A candidate speed-up is viable only if it provably cannot change the token
-//! stream — bounds-check elision, memory-access patterns, inlining, and
-//! buffer-copy strategy — and only after clearing the byte-identity gate, which
-//! is owned exclusively by the tier-1 oracle vectors in `tests/interop.rs`.
-//!
 //! Strategy scope: `compress2` selects only the compression *level*. Strategy
 //! selection (`Z_FILTERED`, `Z_HUFFMAN_ONLY`, `Z_RLE`, `Z_FIXED`) is reached
-//! through the streaming API, and that surface is public and stable today —
-//! `zlib_rs::deflate` exports `deflate_init2`, `deflate`, `deflate_params`, and
-//! `deflate_end`, which `tests/interop.rs` already drives to build the raw and
-//! gzip framings. Strategy sweeps are nonetheless deliberately OUT OF SCOPE for
-//! this file: AAP 0.4.1.8 asks it for the ten-level sweep plus an
-//! incompressible-input profile, and for nothing beyond that. The distinct data
-//! profiles below already stress the match-finder behavior the strategies
-//! target.
+//! through the streaming API and is deliberately OUT OF SCOPE here — AAP 0.4.1.8
+//! asks this file for the ten-level sweep plus an incompressible-input profile and
+//! nothing beyond that, and the distinct data profiles below already stress the
+//! match-finder behaviour the strategies target.
 //!
 //! # Measurement configuration: sampling mode and noise threshold
 //!
-//! Two Criterion defaults are wrong for this file's workload, and both are
-//! overridden explicitly with the derivation recorded here so the numbers can be
-//! re-derived rather than guessed at when the workload or the host changes.
+//! Two Criterion defaults are wrong for this workload and are overridden below.
 //!
-//! ## Sampling mode — why the ~1.8 ms cases use `Flat`
+//! **Sampling mode.** The millisecond-scale cases (the incompressible 64 KiB
+//! profiles) use `SamplingMode::Flat`. Criterion's default `Auto` picks Linear,
+//! whose per-sample iteration step collapses to 1 at that magnitude; the run then
+//! costs `total_runs * met` regardless of the stated budget and emits
+//! `Warning: Unable to complete 100 samples`. Raising `measurement_time` does not
+//! fix it — the warning-free window spans only a factor of 2 in the per-iteration
+//! time, so a modestly slower host falls straight back out of it. Flat holds the
+//! iteration count constant, finishes inside the budget, and keeps all 100
+//! samples. The only thing it gives up is the regression slope, which exists to
+//! cancel timer overhead of order tens of nanoseconds and is therefore irrelevant
+//! against a millisecond iteration; every other statistic and the entire
+//! change-detection comparison are computed identically. The sub-millisecond cases
+//! keep `Auto`, where the slope genuinely is the better estimator.
 //!
-//! Criterion's default `SamplingMode::Auto` selects Linear for every case here.
-//! Linear derives its per-sample iteration step as
-//! `d = ceil(measurement_time / met / total_runs).max(1)`, where
-//! `total_runs = n * (n + 1) / 2` = 5050 for the default 100 samples and `met` is
-//! the mean execution time observed during warm-up
-//! (criterion-0.5.1 `src/lib.rs`, `ActualSamplingMode::iteration_counts`). It
-//! prints `Warning: Unable to complete 100 samples in 5.0s` on exactly one
-//! condition — `d == 1` — and it then runs for `5050 * met` no matter what the
-//! budget said. The incompressible 64 KiB cases measure `met` at roughly 1.8 ms,
-//! so `d = ceil(5e9 / 1.8e6 / 5050) = ceil(0.55) = 1`: the warning fires and the
-//! case overruns its nominal 5 s budget to about 9.1 s.
+//! **Noise threshold.** Criterion's default of 1% is below what this workload
+//! reproduces run to run on an unpinned, non-isolated CI-class host, where two
+//! runs of a bit-identical binary can differ by several percent and CPU contention
+//! by far more. `NOISE_THRESHOLD_FAST` and `NOISE_THRESHOLD_SLOW` below are
+//! therefore set above the observed spread of the cases they apply to — high
+//! enough to stop reporting noise as a verdict, and far below the magnitude of any
+//! optimisation worth taking. A verdict is still only a hint: a real before/after
+//! claim needs repeated runs with `--save-baseline` / `--baseline`.
 //!
-//! Raising `measurement_time` is the wrong remedy. Reaching `d == 2` requires
-//! `measurement_time > 5050 * met`, i.e. beyond 9.09 s, and the case then
-//! actually runs `5050 * 2 * met` ~ 18.2 s — double what it costs today — while
-//! the warning-free window is only `(9.09 s, 18.18 s]`. That window spans a
-//! factor of exactly 2 in `met`, so a host merely 32% slower than this one falls
-//! back to `d == 1` and the warning returns. On a 4-CPU quota where contention
-//! has been measured to move these timings by far more than 32%, that is not a
-//! fix, it is a coin flip.
-//!
-//! `SamplingMode::Flat` is Criterion's own first suggestion in the warning text
-//! and is the correct answer for a millisecond-scale iteration. Flat holds the
-//! iteration count constant at `ceil((measurement_time / n) / met).max(1)` and
-//! warns only when that value is 1 — that is, only once `met` reaches
-//! `measurement_time / n` = 50 ms. At `met` ~ 1.8 ms Flat takes 28 iterations per
-//! sample, finishes *inside* its 5 s budget at about 5.04 s (so it is also
-//! faster than the Linear overrun it replaces), keeps all 100 samples, and holds
-//! a ~27.8x margin before the warning could return.
-//!
-//! What Flat gives up is only the slope estimate: criterion computes
-//! `estimates.slope` for Linear alone (`src/analysis/mod.rs`), so the reported
-//! interval becomes the mean rather than the regression slope. That trade is free
-//! at this magnitude. The slope exists to cancel constant per-sample timer
-//! overhead of order tens of nanoseconds, which is ~0.003% of a 1.8 ms iteration;
-//! and mean, median, MAD, standard deviation and the entire change-detection
-//! comparison are computed identically either way. Flat's uniform samples are in
-//! fact the better-conditioned design here, since Linear's samples range from 1
-//! to 100 iterations and so differ in relative noise by two orders of magnitude.
-//!
-//! The sub-millisecond cases keep `Auto`: they satisfy `d >= 1` comfortably, they
-//! do not warn, and for them the slope genuinely is the more accurate estimator.
-//!
-//! ## Noise threshold — why 1% is unusable on this host
-//!
-//! Criterion's default `noise_threshold` is 0.01, and the verdict rule is a plain
-//! comparison of the change confidence interval against it: "regressed" iff both
-//! bounds exceed `+noise`, "improved" iff both fall below `-noise`, otherwise
-//! "within noise" (`src/report.rs`, `compare_to_threshold`). One percent is far
-//! below what this workload reproduces run to run. Measured on the CI-class host
-//! that motivated this configuration: coefficient of variation 1.49% for
-//! `deflate_profiles/level6/text`, 1.58% and 2.08% for incompressible levels 1
-//! and 9, and a spread across five isolated repeats of 3.30% at level 1 and 7.81%
-//! at level 6. Two consecutive runs of a bit-identical binary reported
-//! "+3.76% regressed" and then "-2.66%"; under deliberate CPU contention the same
-//! unchanged binary reported +120% to +136%.
-//!
-//! `NOISE_THRESHOLD_FAST` and `NOISE_THRESHOLD_SLOW` below are therefore set
-//! above the measured spread of the cases they apply to. This buys signal rather
-//! than blindness: a change larger than the threshold is still reported, and both
-//! values sit far below the magnitude of any optimisation that would be worth
-//! taking. A verdict remains only a hint — this host has no frequency pinning and
-//! no CPU isolation, so a single-run verdict inside the noise band must be
-//! discounted, and a real before/after claim needs repeated runs with
-//! `--save-baseline` / `--baseline` rather than one incidental comparison.
-//!
-//! Note that `--noise-threshold` on the command line CANNOT override these
-//! values. `to_complete` resolves every field with `unwrap_or(defaults.field)`
-//! (`src/benchmark.rs`), so a value set on the group always wins over the
-//! process-level default the CLI flag feeds. The same call is made once per
-//! registered case inside `run_bench` (`src/benchmark_group.rs`), which is what
-//! makes the per-case configuration in `bench_profiles` below work at all.
-//!
-//! # Operating this harness
-//!
-//! The pinned harness (`criterion = "0.5.1"`, AAP 0.5.1) has several behaviours
-//! that can silently invalidate a measurement or a CI gate and that cannot be
-//! fixed from this repository — among them: a filter that matches nothing exits 0
-//! having measured nothing; invoking the bench binary by path without `--bench`
-//! runs in Test mode and collects no data; an unwritable `CRITERION_HOME` still
-//! exits 0; invalid numeric arguments such as `--sample-size 9` abort with status
-//! 101; `--help` is unavailable while `--version` prints no version; and
-//! `Gnuplot not found, using plotters backend` is expected and harmless.
-//! `benches/checksum_bench.rs` holds the authoritative list with the exact
-//! assertion sites, exit codes, and CI mitigations. Read it before wiring any of
-//! these benchmarks into an automated gate.
+//! A group setting always wins over the corresponding Criterion CLI flag, so
+//! `--sample-size`, `--measurement-time` and `--noise-threshold` cannot override
+//! the values configured below; change the constants if the policy is wrong. For
+//! criterion's own CLI and reporting behaviour, consult the pinned harness's
+//! documentation (`criterion = "0.5.1"`).
 //!
 //! Registered in `Cargo.toml` as `[[bench]] name = "deflate_bench"` with
 //! `harness = false`. No `[[bench]]` block carries a `path` key, so Cargo
