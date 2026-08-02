@@ -28,15 +28,29 @@
 # and an NCSA-licensed libFuzzer runtime that the crate proper must never acquire.
 # Both commands must run, and both must pass:
 #
-#     cargo deny check                                   # these 89 packages
-#     cargo deny --manifest-path fuzz/Cargo.toml check    # the other 13
+#     cargo deny --locked check                                   # these 89
+#     cargo deny --locked --manifest-path fuzz/Cargo.toml check    # the other 13
+#
+# `--locked` is not optional on either one. Without it cargo-deny re-resolves the
+# graph and may REWRITE the lockfile it was asked to audit, so the verdict is
+# computed against whatever is newest at run time rather than against the
+# committed pins -- and it reports `ok` while doing so. Measured on the fuzz
+# graph: a manifest carrying a loose requirement the lock does not yet contain
+# made the un-`--locked` invocation rewrite `fuzz/Cargo.lock` and still print
+# "advisories ok, bans ok, licenses ok, sources ok". With `--locked` the same
+# fixture fails loudly ("cannot update the lock file ... because --locked was
+# passed") and the lockfile is left untouched. Every CI invocation of either
+# command passes it, and each job additionally re-asserts from the outside that
+# neither lockfile moved.
 #
 # The second one needs no `--config` flag: cargo-deny resolves its configuration
 # next to the manifest it is pointed at, and `fuzz/` is its own workspace root, so
 # `fuzz/deny.toml` is discovered automatically. That file is a genuine policy, not
-# a rubber stamp. It is STRICTER than this one on duplicate versions (`deny` rather
-# than `warn`, affordable because the fuzz graph is measurably duplicate-free while
-# this one legitimately carries two `rand` majors), and it diverges in exactly four
+# a rubber stamp. Both files now hold duplicate versions to the SAME standard
+# (`multiple-versions = "deny"`) -- this one used to say `warn`, which meant the
+# larger half of the closure was governed more weakly than the smaller half; see
+# the `[bans]` section below for the measurement that closed that gap. It still
+# diverges from this file in exactly four
 # places, each forced by the graph and documented there: `cc` is denied but scoped
 # with `wrappers = ["libfuzzer-sys"]` rather than banned outright; `NCSA` is
 # permitted through a crate-scoped `[[licenses.exceptions]]` entry, because
@@ -46,18 +60,55 @@
 # nothing in that graph uses it. Verified: both invocations report
 # "advisories ok, bans ok, licenses ok, sources ok".
 #
-# CONSUMERS
-# ---------
-#   * The fuzz invocation IS wired into CI today: the `supply-chain` job in
-#     `.github/workflows/fuzz.yml` runs it, and the `cargo-fuzz` job `needs` it,
-#     so the harnesses are never built against an unaudited graph.
-#   * The ROOT invocation is NOT yet wired into any job -- `.github/workflows/ci.yml`
-#     runs neither cargo-deny nor cargo-audit, and `.github/workflows/audit.yml`
-#     (AAP gap D2) does not exist. That is the open half of D2, and it is the
-#     blocking gate this file is the rulebook for. Whoever adds it MUST wire up
-#     BOTH commands above and fail if either fails; a job that runs only one of
-#     them silently leaves the other graph ungoverned and makes D1's own claim
-#     false again. Until then, run `cargo deny check` by hand.
+# CONSUMERS -- WHO RUNS THIS FILE, AND WHEN
+# -----------------------------------------
+# Both invocations are wired into CI, both are blocking, and both pass
+# `--locked`. That is the acceptance criterion for D1, and it is met -- but it is
+# met ACROSS TWO WORKFLOWS rather than inside one, so read all four bullets
+# before concluding that a graph is covered.
+#
+#   * ROOT policy (this file) -- `.github/workflows/audit.yml`, job `cargo-deny`.
+#     Four separately named steps, one per category, so the job log attributes a
+#     failure without anyone having to read the output. Triggers: `push`,
+#     `pull_request`, `workflow_dispatch`, and a DAILY `schedule` at 05:00 UTC.
+#     The daily run is what makes the advisory half meaningful at all: the
+#     RustSec database changes without any commit here, so a push-only audit
+#     cannot notice a newly published advisory. Daily also keeps
+#     `maximum-db-staleness = "P7D"` below comfortably satisfied.
+#   * FUZZ policy (`fuzz/deny.toml`) -- wired TWICE, deliberately, because the
+#     two invocations answer different questions:
+#       - `.github/workflows/audit.yml`, job `cargo-deny-fuzz`. This is the one
+#         that gives the fuzz graph the SAME trigger coverage as the root graph
+#         (push / PR / daily / manual). Without it, a direct push touching
+#         `fuzz/Cargo.toml`, `fuzz/Cargo.lock`, or `fuzz/deny.toml` would get
+#         advisory coverage from `cargo audit --file fuzz/Cargo.lock` but no
+#         licence, ban, or source evaluation until the next pull request or the
+#         weekly cron -- a blind window of up to seven days.
+#       - `.github/workflows/fuzz.yml`, job `supply-chain`, which the
+#         `cargo-fuzz` job `needs:`. This one exists to GATE fuzzing, so the
+#         harnesses are never built against an unaudited graph. It is not
+#         redundant with the above: removing it would let a fuzz run proceed on
+#         an unevaluated graph, and removing the `audit.yml` job would reopen
+#         the seven-day window. Keep both.
+#   * ADVISORIES over the full 102-package closure -- `.github/workflows/audit.yml`,
+#     job `cargo-audit`, which scans BOTH lockfiles (`cargo audit` reads a
+#     lockfile directly and consults no policy file, so `--file fuzz/Cargo.lock`
+#     is unambiguous). That job is the only `cargo-audit` run in the repository.
+#   * THIS FILE'S OWN STRUCTURAL INTEGRITY -- `.github/workflows/audit.yml`, job
+#     `policy-integrity`. It parses this file and `fuzz/deny.toml` and fails if
+#     any governed table or load-bearing key is missing or weakened. That job
+#     exists because of a measured hole: with this file PRESENT but its `[bans]`
+#     or `[sources]` table deleted, `cargo deny check bans` / `check sources`
+#     return exit 0 with zero notes and NO diagnostic, since the
+#     `unused-allowed-source` / `unused-allowed-org` guards live inside the very
+#     table whose removal they would need to catch. Total deletion of the file
+#     IS caught (the licence check fails), but section-level erosion was not.
+#     If you legitimately change a policy value below, that job's expectation
+#     table has to change with it -- deliberately, in the same reviewable diff.
+#
+# `.github/workflows/ci.yml` still runs neither tool, and that division is
+# intentional: ci.yml builds and tests the crate, audit.yml governs the closure.
+#
 #   * `CONTRIBUTING.md` (AAP gap D6) is where the full list of quality gates
 #     belongs; it does not exist yet.
 #   * To report a vulnerability in THIS crate rather than in a dependency, a
@@ -121,9 +172,9 @@
 #     triples in `[graph].targets` -- which is what governing this half of the
 #     closure has to mean. (89 is the number of packages `Cargo.lock` PINS; 86 is
 #     how many of them any governed target actually resolves.)
-#   * With `[bans] multiple-versions-include-dev` at its default, even
-#     `multiple-versions = "deny"` reports `bans ok`, because all three
-#     duplicate majors in this graph are dev-only and therefore invisible.
+#   * With `[bans] multiple-versions-include-dev` at its default, even the
+#     `multiple-versions = "deny"` this file sets reports `bans ok`, because all
+#     three duplicate majors in this graph are dev-only and therefore invisible.
 #
 # Do not remove either setting. Without them this file looks like governance
 # while enforcing almost nothing.
@@ -256,10 +307,47 @@ feature-depth = 1
 #   * Some resolved versions sit EXACTLY at their advisory's patched boundary, so
 #     any downgrade trips the gate. That is a large part of why `Cargo.lock` is
 #     committed and why this check is meant to block.
-#   * Our package name collides with an unrelated published crate also called
-#     `zlib-rs`, which carries its own advisory. Our version is far above that
-#     advisory's patched floor so it does not match -- but do not be surprised to
-#     see the name in the database.
+#   * OUR OWN PACKAGE NAME COLLIDES WITH AN UNRELATED PUBLISHED CRATE. See the
+#     dedicated note below; it is the one advisory-matching quirk in this project
+#     that a reader is likely to misdiagnose.
+#
+# THE `zlib-rs` NAME COLLISION -- KNOWN, ACCEPTED, AND NOT SUPPRESSED
+# -------------------------------------------------------------------
+# `Cargo.toml` declares `name = "zlib-rs"`, `version = "1.3.2"`. An unrelated
+# crate of the SAME NAME is published on crates.io by a different project, and it
+# carries its own advisory history -- RUSTSEC-2024-0401, patched in `>= 0.4.0`.
+#
+# This matters because of HOW advisory matching works. Both cargo-audit and
+# cargo-deny match a package to an advisory by NAME plus semver range; neither
+# consults the source, the repository URL, or the publisher. Our workspace root
+# therefore gets evaluated against a third party's advisory history, purely
+# because the names coincide. Two consequences follow, and they point in opposite
+# directions:
+#
+#   1. FALSE POSITIVE (possible, not present). `1.3.2` is far above `0.4.0`, so
+#      RUSTSEC-2024-0401 does not match today and no report is produced -- this
+#      was confirmed by scanning the local database against every name in the
+#      closure. But a FUTURE advisory filed against the other `zlib-rs` whose
+#      affected range happens to cover `1.3.2` would fail this gate for a defect
+#      in code that is not ours. If that ever happens: read the advisory, confirm
+#      from its `package` / `url` metadata that it targets the other crate, and
+#      only then record an `[advisories] ignore` entry carrying all three
+#      justifications the ignore-list rules below demand -- including that it is a
+#      name collision rather than an exemption for a real finding. Do NOT silence
+#      it on a command line, and do NOT relax `unused-ignored-advisory`.
+#   2. FALSE NEGATIVE (structural, permanent, and the more important one). A
+#      genuine defect in THIS crate would never be matched by the RustSec
+#      database, because nothing in that database describes this package. No
+#      configuration of this file can change that. Vulnerability reporting for
+#      this crate therefore has to go through a human channel -- the `SECURITY.md`
+#      disclosure policy (AAP gap D6, still to be written) -- and this gate must
+#      never be read as evidence that this crate itself is advisory-clean. It is
+#      evidence about our DEPENDENCIES only.
+#
+# Renaming the package to avoid the collision is deliberately NOT proposed here:
+# the crate is not published, the name is load-bearing in the AAP and across the
+# documentation, and a rename would trade a documented quirk for a much larger
+# churn. Recording the quirk precisely is the correct engineering response.
 [advisories]
 # The canonical RustSec database. Pinned explicitly rather than relying on the
 # default so the trust root of this check is visible in review (plan-adopted
@@ -495,21 +583,55 @@ registries = []
 # CRITICAL -- do not remove `multiple-versions-include-dev`.
 #
 # cargo-deny 0.20 excludes dev-dependencies from duplicate detection by default.
-# Measured on this repository: with it unset, even `multiple-versions = "deny"`
-# reports `bans ok` -- every duplication below is INVISIBLE and the `skip`
-# entries are dead configuration that only *looks* like governance. With it set,
-# exactly `getrandom`, `rand`, and `rand_core` surface under the declared
-# `[graph].targets`, which is the true state of the graph.
-multiple-versions = "warn"
+# Measured on this repository: with it unset, even the `multiple-versions = "deny"`
+# set immediately below reports `bans ok` -- every duplication is INVISIBLE and the
+# `skip` entries are dead configuration that only *looks* like governance. With it
+# set, exactly `getrandom`, `rand`, and `rand_core` surface under the declared
+# `[graph].targets`, which is the true state of the graph. The two keys are a pair:
+# escalating the level without this one governs nothing.
+multiple-versions = "deny"
 multiple-versions-include-dev = true
 #
-# `warn` rather than `deny` is deliberate. Duplicate majors here are legitimate,
-# entirely dev-only, and outside our control -- they arise because a transitive
-# dev-dependency tracks a different major of the `rand` family than we declare
-# directly. Duplication is a size and build-time concern, not a security defect,
-# so the blocking signal in this policy is reserved for advisories, licenses,
-# and sources. A newly appearing duplicate surfaces as a warning for review
-# instead of halting the security audit over a dev-graph churn event.
+# `deny`, NOT `warn` -- and the difference is the whole point of this setting.
+#
+# This file previously said `warn`, on the reasoning that duplicate majors here
+# are dev-only, legitimate, and outside our control, so blocking on them would
+# halt a security audit over a dev-graph churn event. That reasoning had a hole,
+# and the hole was measured rather than argued: with `warn`, an UNAPPROVED new
+# duplicate major -- one that no `skip` entry below acknowledges -- surfaces as
+# `warning[duplicate]` and the job still exits 0 and still reports GREEN. Adding
+# `rand_core = "0.6"` to `[dev-dependencies]` produced exactly that:
+# `bans ok: 0 errors, 2 warnings, 3 notes`, exit 0, on a graph that had grown two
+# unreviewed duplicate majors. Nothing in `.github/workflows/audit.yml` escalates
+# warnings, by deliberate design -- the policy lives in this file and a CLI `-D`
+# override there would silently diverge from what a reviewer reads here -- so
+# `warn` meant the root half of the closure was governed to a strictly weaker
+# standard than the fuzz half, which has always said `deny`.
+#
+# `deny` costs nothing today, and that was verified BEFORE the change rather than
+# assumed: with this value set to `deny`, `cargo deny --locked check bans` reports
+# `bans ok: 0 errors, 0 warnings, 3 notes` and exits 0. The three notes are the
+# three acknowledged `skip` entries below, which cover the real graph exactly --
+# one per duplicate major, each pinned to an exact version.
+#
+# What this means in practice when a duplicate DOES appear:
+#
+#   * `bans` fails, with `error[duplicate]` naming the crate and printing both
+#     inclusion paths (`highlight = "all"` below makes that output actionable).
+#   * The response is a deliberate, reviewable edit -- either fix the graph, or
+#     add ONE exact-version `skip` entry with a reason, in the form the three
+#     existing entries use. It is never a downgrade of this key back to `warn`.
+#   * Because a `skip` matches an exact version, the acknowledgement expires by
+#     construction: the next bump of the crate that carries the duplicate makes
+#     the entry unmatched, which cargo-deny reports as `warning[unmatched-skip]`.
+#     Note that an unmatched skip is a WARNING and therefore still exit 0 -- it is
+#     a prompt to re-review, not a gate -- so treat a stale skip as something to
+#     clean up when it appears rather than something CI will force you to.
+#
+# Duplication really is a size and build-time concern rather than a security
+# defect, and that is still true. But "not a security defect" is an argument for
+# how urgently to act on the report, not an argument for the report to be
+# unobservable in a green build.
 #
 # Lint level for a `*` version requirement. `deny` upholds the plan's
 # supply-chain standard that no dependency is ever specified as `latest` or with
@@ -632,9 +754,13 @@ deny = [
 #
 # All three duplications below are legitimate, dev-dependency-only, and absent
 # from every shipped artifact (`lib`, `cdylib`, `staticlib`), which contain only
-# `cfg-if` and optionally `crc32fast`. They are skipped so the `warn` channel
-# stays signal rather than three permanent lines of noise -- an unacknowledged
-# recurring warning trains reviewers to ignore the check.
+# `cfg-if` and optionally `crc32fast`. Each is acknowledged here rather than left
+# to fail, which is what makes `multiple-versions = "deny"` above affordable: the
+# three entries cover the real graph exactly, so the check passes with three
+# `note[skipped]` lines and zero warnings. Every OTHER duplicate -- anything these
+# three entries do not name -- is now a hard error rather than a warning nobody
+# reads. That is the trade: acknowledge the known three precisely, and block on
+# the unknown fourth.
 #
 # Each entry names the TRANSITIVE copy, the one we do not control, rather than
 # the version we declare ourselves. That is deliberate on two counts: the

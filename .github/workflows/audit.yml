@@ -32,10 +32,18 @@
 # outlived its reason becomes an error in its own right.
 #
 # Jobs:
-#   cargo-audit   RustSec advisory scan of BOTH lockfiles (89 + 13 = 102
-#                 packages); the only cargo-audit run in the repository
-#   cargo-deny    root `deny.toml` policy over the root graph: licenses,
-#                 advisories, bans and sources, one named step each
+#   policy-integrity   structural self-assertion over `deny.toml` and
+#                      `fuzz/deny.toml`; needs no Rust toolchain
+#   cargo-audit        RustSec advisory scan of BOTH lockfiles (89 + 13 = 102
+#                      packages); the only cargo-audit run in the repository
+#   cargo-deny         root `deny.toml` policy over the root graph: licenses,
+#                      advisories, bans and sources, one named step each
+#   cargo-deny-fuzz    `fuzz/deny.toml` policy over the detached fuzz graph, so
+#                      that half of the closure gets the same trigger coverage
+#
+# All four jobs are independent - none declares `needs:` - so they run in
+# parallel and a red build points at one tool, one policy, or one graph without
+# waiting on the others.
 #
 # Action versions are standardized on @v4 across this repository's Cargo CI.
 # No native toolchain is required: both tools resolve a dependency graph and
@@ -77,10 +85,11 @@
 #                                     (overridden by '.../rust-toolchain.toml')
 #     rustc --version               -> rustc 1.85.0
 #
-# So a bare `cargo install cargo-audit --locked` placed after an `@stable` step
-# would build on 1.85.0. Both audit tools are ordinary Rust programs whose own
-# MSRV is their business, not this project's; there is no reason for this
-# crate's MSRV floor to constrain which advisory scanner can be built.
+# So an install written without the `+stable` prefix - however carefully its
+# `--version` and `--locked` flags are chosen - would still build on 1.85.0. Both
+# audit tools are ordinary Rust programs whose own MSRV is their business, not
+# this project's; there is no reason for this crate's MSRV floor to constrain
+# which advisory scanner can be built.
 #
 # Each job below therefore states its intent TWICE, and the two can never
 # disagree because they name the same channel:
@@ -118,19 +127,42 @@
 # consults no policy file, so scoping it to the fuzz lock is unambiguous and
 # carries no configuration-resolution question.
 #
-# POLICY over the fuzz graph is deliberately NOT duplicated here. `cargo-deny`
-# resolves its configuration from the TARGET manifest's workspace root, so
-# `--manifest-path fuzz/Cargo.toml` discovers the dedicated sibling policy
-# `fuzz/deny.toml` - and that invocation already exists, as the `supply-chain`
-# job in `fuzz.yml` which the fuzzing job `needs:`. Re-running it here against
-# the ROOT policy would be wrong rather than merely redundant: root `deny.toml`
-# bans `cc` OUTRIGHT, because the crate proper takes no C-toolchain build
-# dependency and `build.rs` is pure `std`. The fuzz graph, by contrast,
-# legitimately contains `cc`, `jobserver`, `shlex` and `find-msvc-tools` for the
-# libFuzzer runtime shim, plus an NCSA-licensed `libfuzzer-sys`.
-# `fuzz/deny.toml` permits precisely those and the root policy does not, by
-# design. Aiming the root policy at the fuzz graph would therefore report a
-# policy mismatch as though it were a supply-chain defect.
+# POLICY over the fuzz graph is covered here too, by the `cargo-deny-fuzz` job,
+# and getting the nuance right matters because an earlier revision of this file
+# deliberately omitted it and was wrong to.
+#
+# The thing that would genuinely be wrong is aiming the ROOT policy at the fuzz
+# graph. Root `deny.toml` bans `cc` OUTRIGHT, because the crate proper takes no
+# C-toolchain build dependency and `build.rs` is pure `std`. The fuzz graph, by
+# contrast, legitimately contains `cc`, `jobserver`, `shlex` and
+# `find-msvc-tools` for the libFuzzer runtime shim, plus an NCSA-licensed
+# `libfuzzer-sys`. `fuzz/deny.toml` permits precisely those and the root policy
+# does not, by design; pointing the root rulebook at the fuzz graph would report
+# a policy mismatch as though it were a supply-chain defect.
+#
+# But that is an argument against `--config deny.toml`, not against scanning the
+# fuzz graph at all. `cargo-deny` resolves its configuration from the TARGET
+# manifest's workspace root, so `--manifest-path fuzz/Cargo.toml` discovers
+# `fuzz/deny.toml` automatically - the sibling policy, not this one. Verified in
+# the run log by `-L info`, which prints `using config from fuzz/deny.toml`.
+#
+# Why that job has to live HERE, even though `fuzz.yml`'s `supply-chain` job runs
+# the same command: TRIGGER COVERAGE. `fuzz.yml` fires on `pull_request`,
+# `workflow_dispatch` and a WEEKLY cron (Mondays 03:00 UTC) - it has no `push`
+# trigger, and it should not acquire one, because its `cargo-fuzz` job `needs:`
+# the policy job and a fuzzing campaign is a ~50-minute affair that has no
+# business running on every branch push. Without `cargo-deny-fuzz` here, a direct
+# push touching `fuzz/Cargo.toml`, `fuzz/Cargo.lock` or `fuzz/deny.toml` would
+# get advisory coverage from the `--file fuzz/Cargo.lock` step above, and NO
+# licence, ban, or source evaluation for up to seven days.
+#
+# The two invocations are therefore complementary, not redundant, and neither may
+# be deleted as a duplicate:
+#
+#   * `audit.yml` / `cargo-deny-fuzz` - push, PR, DAILY, manual. Answers "is the
+#     fuzz graph still policy-clean?" on the same cadence as the root graph.
+#   * `fuzz.yml` / `supply-chain`     - PR, weekly, manual. GATES fuzzing, so no
+#     harness is ever built from an unaudited graph.
 #
 # WHAT A FAILURE HERE MEANS
 # =========================
@@ -143,11 +175,18 @@
 #     re-resolves dependencies, or does anything else whose side effect is
 #     regenerating a lockfile, and both jobs end by asserting that neither
 #     lockfile moved.
-#   * `cargo deny check bans` reports duplicate major versions as NOTES, not
-#     errors, because root `deny.toml` sets `multiple-versions = "warn"` and
-#     lists the dev-only pairs individually under `skip`. Those notes are the
-#     designed behaviour; nothing in this file escalates them, and no step here
-#     performs duplicate detection of its own.
+#   * `cargo deny check bans` reports the three ACKNOWLEDGED duplicate majors as
+#     `note[skipped]` lines, because root `deny.toml` lists each of them
+#     individually under `skip` with an exact `crate@version` pin. Those notes
+#     are the designed behaviour. Any OTHER duplicate is a hard `error[duplicate]`
+#     and fails the step, because that policy now sets
+#     `multiple-versions = "deny"` - it previously said `warn`, which meant an
+#     unapproved duplicate major on the 89-package root graph exited 0 and
+#     reported GREEN while the 13-package fuzz graph blocked on the same class of
+#     drift. Nothing in this file escalates or downgrades anything: no `-D`, `-W`
+#     or `-A` appears on any command line, and no step here performs duplicate
+#     detection of its own. The severity lives in `deny.toml`, where a reviewer
+#     reads it.
 #
 # The specific drift this gate is shaped to catch: two `rand` majors coexist in
 # the root graph. `rand 0.9.4` is the DIRECT dev-dependency and carries the
@@ -156,7 +195,118 @@
 # a floor on the direct requirement says nothing about the transitive one. The
 # same split then propagates down `rand_core`, `getrandom` and `r-efi`. Only a
 # gate that resolves the real graph, on a schedule, can tell those apart, which
-# is what the two jobs below do.
+# is what the jobs below do.
+#
+# TOOL VERSIONS ARE PINNED, AND THE PIN IS ASSERTED
+# =================================================
+# `cargo install <tool> --locked` pins the TOOL'S OWN lockfile. It does NOT pin
+# which version of the tool you get: `cargo install` resolves the newest publish
+# on crates.io at run time. That is a reproducibility hole in a gate whose
+# rulebook declares a schema version - `deny.toml`'s "SCHEMA VERSION" section
+# states that every key in it "was probed against 0.20.2 and accepted with zero
+# schema errors and zero deprecation diagnostics", and warns not to assume the
+# file still parses cleanly after an upgrade. A floating install could therefore
+# turn a policy-parse regression into a hard CI failure or, far worse, into a
+# silently different interpretation of the same policy text.
+#
+# So both installs below name an exact `--version`, and the following step
+# ASSERTS the version that actually resolved instead of merely printing it. The
+# two numbers are:
+#
+#     cargo-deny   0.20.2   <- the version `deny.toml` and `fuzz/deny.toml` were
+#                              authored and probed against
+#     cargo-audit  0.22.2   <- current at the time this gate was validated
+#
+# TO UPGRADE EITHER TOOL, in this order:
+#   1. bump the `--version` here (and in `fuzz.yml`, which pins cargo-deny too),
+#   2. run `cargo deny --locked check all` and `cargo deny --locked
+#      --manifest-path fuzz/Cargo.toml check` locally and READ STDERR - a new
+#      major may deprecate or re-scope a key,
+#   3. update `deny.toml`'s SCHEMA VERSION note to the version you validated,
+#   4. keep the two files in step. A pin that disagrees with the note it points
+#      at is worse than no pin, because it reads as verified when it is not.
+# `cargo-fuzz` in `fuzz.yml` is deliberately NOT pinned; the reason is recorded
+# there, next to that install.
+#
+# WHY THREE STEPS CARRY AN `if:` - AND WHY THAT IS NOT A MASKING CONSTRUCT
+# =======================================================================
+# GitHub skips every remaining step in a job once one step fails. In a job whose
+# steps are four INDEPENDENT policy questions, that turns a failure in the first
+# question into silence about the other three: a licence rejection used to
+# prevent the ADVISORY step from running at all, so the run told you nothing
+# about whether the graph was vulnerable. That is a coverage defect, and the
+# `if: ${{ !cancelled() }}` guards below are its fix.
+#
+# Read those guards precisely, because `if:` is also the shape a genuine
+# gate-neutralisation takes:
+#
+#   * WHAT THEY DO: run the step even when an EARLIER step in the same job has
+#     already failed.
+#   * WHAT THEY DO NOT DO: they do not touch the guarded step's own exit code.
+#     A guarded step that fails still fails, and still turns the job red. Nothing
+#     here converts a non-zero exit into a pass.
+#   * WHY `!cancelled()` AND NOT `always()`: a cancelled run must stop. With
+#     `always()` a superseded run would keep grinding through the remaining
+#     checks after `cancel-in-progress` had already killed it.
+#   * WHAT REMAINS FORBIDDEN, absolutely: `continue-on-error` at job or step
+#     level, `|| true`, `set +e`, a trailing `exit 0`, `2>/dev/null` on a tool
+#     invocation, and the weakening flags `--stale`, `-n` / `--no-fetch`,
+#     `--ignore` and `-A`. None appears anywhere in this file. Any `if:` here
+#     other than the exact `${{ !cancelled() }}` form should be read as a defect.
+#
+# The alternative was to collapse the four steps into one `cargo deny check`,
+# which does run all four categories in a single invocation and reports every
+# verdict even when one fails (measured against a deliberately failing licence
+# fixture: `advisories ok, bans ok, licenses FAILED, sources ok`, exit 4). That
+# was rejected because the four named steps are what let the GitHub UI attribute
+# a failure to one policy section without anyone opening the log. The guards keep
+# the attribution AND get the full pass.
+#
+# ACTION PINNING - A DELIBERATE, REPOSITORY-WIDE CONVENTION
+# ========================================================
+# `actions/checkout@v4` and `dtolnay/rust-toolchain@stable` are MUTABLE refs: a
+# tag can be moved and a branch advances by design. In a workflow whose whole
+# purpose is supply-chain assurance that deserves to be stated rather than left
+# implicit. It is a convention shared with `ci.yml` and `fuzz.yml` - across the
+# three files there are 13 `actions/checkout@v4`, 12 `dtolnay/rust-toolchain@*`,
+# 5 `actions/cache@v4` and 2 `actions/upload-artifact@v4` uses, none SHA-pinned -
+# so this file is consistent with the repository rather than uniquely lax.
+#
+# Moving to SHA pins is a bigger change than it looks, and must be done to all
+# three workflows at once or not at all:
+#
+#   * `dtolnay/rust-toolchain` derives its DEFAULT toolchain from
+#     `github.action_ref` - that is precisely how `@stable`, `@nightly` and
+#     `@1.85.0` select what they select. Replacing the ref with a commit SHA
+#     makes the requested toolchain the SHA itself, so every one of the 12 call
+#     sites must simultaneously gain an explicit `with: toolchain:` input. A
+#     partial conversion breaks the build.
+#   * Every SHA must be verified against the upstream repository at the moment of
+#     pinning. A SHA copied from anywhere else is a worse trust root than the tag
+#     it replaced, because it looks authoritative and cannot be eyeballed.
+#
+# Until that is done as one reviewed change, the residual exposure is recorded
+# here honestly: this workflow trusts `actions/checkout` and
+# `dtolnay/rust-toolchain` at tag/branch granularity.
+#
+# NO TOOL OR DATABASE CACHING - INTENTIONAL, DO NOT "OPTIMISE" IT IN
+# =================================================================
+# There is no `actions/cache` step anywhere in this file, and that is a decision
+# rather than an omission. Both tools are compiled from source on every run and
+# the RustSec database is fetched fresh on every run. The cost is real: two
+# `cargo install` builds per run, on a schedule that fires daily.
+#
+# What it buys is that neither a stale tool nor a stale advisory database can
+# ever produce a verdict here. A cached advisory DB is the classic way a security
+# gate degrades into a gate that always passes, and root `deny.toml`'s
+# `maximum-db-staleness = "P7D"` is the backstop for exactly that failure - a
+# backstop that a cache would be constantly pressing against. A cached tool
+# binary would additionally defeat the `--version` pins above, since the pin is
+# enforced at install time.
+#
+# If build minutes ever become the binding constraint, cache the CARGO REGISTRY
+# INDEX (which is content-addressed and cannot go stale in a way that changes a
+# verdict) - never the tool binaries and never `~/.cargo/advisory-db`.
 
 name: Audit
 
@@ -203,10 +353,225 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Structural self-assertion over both cargo-deny policies.
+  #
+  # WHY THIS JOB EXISTS - a measured hole, not a theoretical one.
+  # `cargo deny` reads a policy file and evaluates what it finds. It does NOT
+  # require the file to contain anything. Measured on this repository: with
+  # `deny.toml` PRESENT but its `[bans]` table deleted, `cargo deny check bans`
+  # returns exit 0 with `0 errors, 0 warnings, 0 notes` and NO diagnostic
+  # whatsoever, and `-L info` still prints the reassuring `using config from
+  # .../deny.toml`. The same is true of `[sources]`. The reason is structural: the
+  # `unused-allowed-source` and `unused-allowed-org` guards that would notice an
+  # eroded source policy live INSIDE the very table whose deletion they would have
+  # to catch. Deleting the whole file IS caught, because the licence check then
+  # fails against built-in defaults - but section-level erosion was a silent
+  # vacuous pass, and a supply-chain gate that can be disarmed by deleting four
+  # lines of TOML is not a gate.
+  #
+  # So this job asserts the POLICY TEXT independently of the tool that consumes
+  # it: every governed table must be present, and every load-bearing key must
+  # still hold the value it was reviewed with. It deliberately needs no Rust
+  # toolchain and no network, so it is the fastest signal in the workflow and
+  # cannot be blocked by a registry or advisory-database problem.
+  #
+  # WHEN YOU LEGITIMATELY CHANGE A POLICY VALUE: change the expectation here in
+  # the same commit. That coupling is the point - a policy relaxation becomes a
+  # two-file diff a reviewer cannot miss, instead of a one-word edit.
+  policy-integrity:
+    name: policy integrity (deny.toml self-assertion)
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Fetch the tree. `deny.toml` and `fuzz/deny.toml` are the only inputs;
+      #    nothing is resolved, installed, compiled or fetched.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Parse both policies with `tomllib` (Python 3.11+, present on
+      #    ubuntu-latest) and assert the governed structure. TOML parsing rather
+      #    than grep is deliberate: a grep for `multiple-versions = "deny"` would
+      #    be satisfied by a commented-out line, by an occurrence in the wrong
+      #    table, or by prose, and this file is heavily commented.
+      #
+      #    The expectations below are the values the QA-verified policy holds.
+      #    Anything missing, or weakened, fails with a `::error::` naming the
+      #    exact key.
+      - name: Assert both cargo-deny policies are structurally intact
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys
+
+          if sys.version_info < (3, 11):
+              print("::error::python >= 3.11 is required for tomllib; got "
+                    f"{sys.version.split()[0]}")
+              raise SystemExit(1)
+
+          import tomllib
+
+          # Every governed table must exist in BOTH policies. A missing table is
+          # the silent-vacuous-pass case this job exists to catch.
+          REQUIRED_TABLES = ("graph", "advisories", "licenses", "bans", "sources")
+
+          # (table, key, expected) triples that must hold in BOTH policies. These
+          # are the settings whose weakening would quietly reduce coverage.
+          SHARED = [
+              ("graph", "all-features", True),
+              ("advisories", "db-urls", ["https://github.com/rustsec/advisory-db"]),
+              ("advisories", "unmaintained", "all"),
+              ("advisories", "unsound", "all"),
+              ("advisories", "yanked", "deny"),
+              ("advisories", "disable-yank-checking", False),
+              ("advisories", "maximum-db-staleness", "P7D"),
+              ("advisories", "ignore", []),
+              ("advisories", "unused-ignored-advisory", "deny"),
+              ("licenses", "include-dev", True),
+              ("licenses", "include-build", True),
+              ("licenses", "unused-allowed-license", "deny"),
+              ("bans", "multiple-versions", "deny"),
+              ("bans", "multiple-versions-include-dev", True),
+              ("bans", "wildcards", "deny"),
+              ("bans", "skip-tree", []),
+              ("sources", "unknown-registry", "deny"),
+              ("sources", "unknown-git", "deny"),
+              ("sources", "allow-registry",
+               ["https://github.com/rust-lang/crates.io-index"]),
+              ("sources", "allow-git", []),
+              ("sources", "required-git-spec", "rev"),
+              ("sources", "unused-allowed-source", "deny"),
+              ("sources", "unused-allowed-org", "deny"),
+          ]
+
+          # Settings that legitimately differ between the two graphs. Asserting
+          # them per-file is what stops a fuzz-only concession leaking into the
+          # published dependency graph.
+          PER_FILE = {
+              "deny.toml": [
+                  # The crate proper must never gain a wildcard-path exemption.
+                  ("bans", "allow-wildcard-paths", False),
+                  # No per-crate licence carve-out is needed at the root.
+                  ("licenses", "exceptions", []),
+                  ("licenses", "allow", ["Apache-2.0", "MIT", "Unicode-3.0", "Zlib"]),
+              ],
+              "fuzz/deny.toml": [
+                  # Forced by `zlib-rs { path = ".." }` with no version.
+                  ("bans", "allow-wildcard-paths", True),
+                  # The fuzz graph is duplicate-free, so nothing may be skipped.
+                  ("bans", "skip", []),
+                  ("licenses", "allow", ["Apache-2.0", "MIT", "Zlib"]),
+              ],
+          }
+
+          # Architectural bans that must be denied by BOTH policies by name. These
+          # encode project scope boundaries: no C toolchain in the crate proper, no
+          # C zlib linked back in, no competing codec, no TLS stack.
+          REQUIRED_DENIES = [
+              "cc", "bindgen", "pkg-config",
+              "libz-sys", "libz-ng-sys", "cloudflare-zlib-sys",
+              "bzip2", "bzip2-sys", "lzma-sys", "xz2",
+              "zstd", "zstd-sys", "brotli", "brotli-decompressor",
+              "openssl", "openssl-sys",
+          ]
+
+          failures = []
+
+          def check(path, table, key, expected, actual_holder):
+              if key not in actual_holder:
+                  failures.append(f"{path}: [{table}] is missing the key "
+                                  f"`{key}` (expected {expected!r})")
+                  return
+              actual = actual_holder[key]
+              if isinstance(expected, list):
+                  ok = sorted(map(str, actual)) == sorted(map(str, expected))
+              else:
+                  ok = actual == expected and type(actual) is type(expected)
+              if not ok:
+                  failures.append(f"{path}: [{table}] {key} = {actual!r}, "
+                                  f"expected {expected!r}")
+
+          for path in ("deny.toml", "fuzz/deny.toml"):
+              try:
+                  with open(path, "rb") as handle:
+                      policy = tomllib.load(handle)
+              except FileNotFoundError:
+                  failures.append(f"{path}: the policy file is missing entirely")
+                  continue
+              except tomllib.TOMLDecodeError as exc:
+                  failures.append(f"{path}: is not valid TOML: {exc}")
+                  continue
+
+              for table in REQUIRED_TABLES:
+                  if table not in policy:
+                      failures.append(f"{path}: the [{table}] table is absent, so "
+                                      f"`cargo deny check {table}` would evaluate "
+                                      f"nothing and pass vacuously")
+
+              for table, key, expected in SHARED + PER_FILE[path]:
+                  if table in policy:
+                      check(path, table, key, expected, policy[table])
+
+              # `[licenses.private] ignore` may exempt unpublished workspace
+              # members, so it must stay scoped to that and nothing else.
+              private = policy.get("licenses", {}).get("private", {})
+              if private.get("registries", None) != []:
+                  failures.append(f"{path}: [licenses.private] registries must be "
+                                  f"an empty list; got "
+                                  f"{private.get('registries')!r}")
+
+              # No organisation-wide git trust on any forge.
+              for forge in ("github", "gitlab", "bitbucket"):
+                  granted = policy.get("sources", {}).get("allow-org", {}).get(forge, [])
+                  if granted != []:
+                      failures.append(f"{path}: [sources.allow-org] {forge} must be "
+                                      f"empty; got {granted!r}")
+
+              # Architectural bans, by crate name.
+              denied = {entry["crate"] for entry in policy.get("bans", {}).get("deny", [])
+                        if isinstance(entry, dict) and "crate" in entry}
+              for crate in REQUIRED_DENIES:
+                  if crate not in denied:
+                      failures.append(f"{path}: [bans] deny no longer lists "
+                                      f"`{crate}`")
+
+              # Every duplicate-version acknowledgement must be pinned to an
+              # exact version, so it expires on the next bump instead of becoming
+              # an open-ended exemption.
+              for entry in policy.get("bans", {}).get("skip", []):
+                  spec = entry.get("crate", "") if isinstance(entry, dict) else str(entry)
+                  if "@" not in spec:
+                      failures.append(f"{path}: [bans] skip entry `{spec}` is not "
+                                      f"pinned to an exact version")
+                  if isinstance(entry, dict) and not entry.get("reason"):
+                      failures.append(f"{path}: [bans] skip entry `{spec}` carries "
+                                      f"no reason")
+
+              # `cc` may exist in the fuzz graph, but ONLY as libfuzzer-sys's build
+              # dependency. A blanket allowance there would let any path acquire it.
+              if path == "fuzz/deny.toml":
+                  for entry in policy.get("bans", {}).get("deny", []):
+                      if isinstance(entry, dict) and entry.get("crate") == "cc":
+                          if entry.get("wrappers") != ["libfuzzer-sys"]:
+                              failures.append(
+                                  "fuzz/deny.toml: [bans] the `cc` entry must be "
+                                  "scoped with wrappers = [\"libfuzzer-sys\"]; got "
+                                  f"{entry.get('wrappers')!r}")
+
+          if failures:
+              for failure in failures:
+                  print(f"::error::{failure}")
+              print(f"{len(failures)} policy-integrity assertion(s) failed. Either "
+                    "the policy was weakened, or this job's expectations are out of "
+                    "date -- update whichever is actually wrong, in the same commit.")
+              raise SystemExit(1)
+
+          print("deny.toml and fuzz/deny.toml declare every governed table and "
+                "hold every load-bearing key at its reviewed value")
+          PY
+
   # RustSec advisory scan of both lockfiles. This is the only `cargo-audit` run
   # in the repository, and the only place `fuzz/Cargo.lock` is checked for
-  # advisories. It carries no `needs:` on the policy job below, so the two run
-  # in parallel and a red build points at one tool without waiting on the other.
+  # advisories. It carries no `needs:` on any other job, so all four run in
+  # parallel and a red build points at one tool without waiting on the others.
   cargo-audit:
     name: cargo-audit (RustSec advisories)
     runs-on: ubuntu-latest
@@ -245,19 +610,33 @@ jobs:
                " The RUSTUP_TOOLCHAIN override was lost and rust-toolchain.toml won."; exit 1 ;;
           esac
 
-      # 4. Install the cargo-audit subcommand. `--locked` keeps the install
-      #    reproducible against cargo-audit's own lockfile, matching the
-      #    cargo-fuzz and cargo-deny install idiom in `fuzz.yml`. cargo-audit is
-      #    a CI-installed tool and must never become a manifest dependency.
+      # 4. Install the cargo-audit subcommand, PINNED. `--version` fixes which
+      #    version of the tool runs; `--locked` fixes what that version was built
+      #    from. Both are needed and they are not interchangeable - see "TOOL
+      #    VERSIONS ARE PINNED" in the header for why an unpinned install is a
+      #    reproducibility hole in a gate like this. cargo-audit is a CI-installed
+      #    tool and must never become a manifest dependency.
       - name: Install cargo-audit
-        run: cargo +stable install cargo-audit --locked
+        run: cargo +stable install cargo-audit --version 0.22.2 --locked
 
-      # 5. Record which binary actually ran. `cargo install` resolves the latest
-      #    publish at run time, so the version is not knowable from this file;
-      #    printing it makes the run log - rather than this comment - the record
-      #    of what evaluated the closure.
-      - name: Record the cargo-audit version
-        run: cargo +stable audit --version
+      # 5. ASSERT the version, do not merely print it. A pin that is never checked
+      #    is a comment: if a runner ever serves a cached or pre-installed binary,
+      #    or the pin above is edited without the rest of the gate being
+      #    revalidated, this fails loudly instead of silently evaluating the
+      #    closure with a different tool. The version still appears in the log,
+      #    which is what makes the run - not this file - the record of what ran.
+      - name: Assert the pinned cargo-audit version
+        run: |
+          set -euo pipefail
+          expected='0.22.2'
+          cargo +stable audit --version
+          actual="$(cargo +stable audit --version | awk '{ print $NF }')"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::expected cargo-audit ${expected} but resolved ${actual}."\
+                 " The --version pin on the install step above did not take effect."
+            exit 1
+          fi
+          echo "cargo-audit ${actual} matches the pin"
 
       # 6. Root closure: the 89 packages in `Cargo.lock`. `--deny warnings`
       #    escalates unmaintained, unsound and yanked notices to failures, which
@@ -285,7 +664,13 @@ jobs:
       #    shim (`cc`, `jobserver`, `shlex`, `find-msvc-tools`) is simply scanned
       #    for advisories like any other package - the ban that applies to the
       #    crate proper is a cargo-deny policy matter and does not arise here.
+      #
+      #    The `if:` guard makes this step run even when the root scan above
+      #    failed, so one advisory in the 89 never hides the state of the other
+      #    13. It does not weaken this step: a finding here still fails the job.
+      #    See "WHY THREE STEPS CARRY AN `if:`" in the header.
       - name: Audit the detached fuzz dependency graph
+        if: ${{ !cancelled() }}
         run: cargo +stable audit --deny warnings --file fuzz/Cargo.lock
 
       # 8. Neither invocation above has any business writing a lockfile, and a
@@ -293,7 +678,13 @@ jobs:
       #    `ci.yml` resolves. This asserts the invariant rather than assuming it.
       #    `fuzz/Cargo.lock` in particular belongs to a detached workspace that
       #    nothing in this file should be modifying at all.
+      #
+      #    Guarded for the same reason, and here the reason is sharper: the case
+      #    where you MOST want to know whether a lockfile moved is the run where
+      #    a scan failed. Skipping this on failure would drop the evidence exactly
+      #    when it matters.
       - name: Assert both lockfiles are unchanged
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           dirty="$(git status --porcelain Cargo.lock fuzz/Cargo.lock)"
@@ -347,17 +738,37 @@ jobs:
                " The RUSTUP_TOOLCHAIN override was lost and rust-toolchain.toml won."; exit 1 ;;
           esac
 
-      # 4. Install the cargo-deny subcommand. `--locked` keeps the install
-      #    reproducible against cargo-deny's own lockfile, matching the idiom in
-      #    `fuzz.yml`. Like cargo-audit, cargo-deny is a CI-installed tool and
-      #    must never become a manifest dependency.
+      # 4. Install the cargo-deny subcommand, PINNED to the version both policy
+      #    files were authored and probed against. This pin is the one that
+      #    matters most in the whole workflow: cargo-deny 0.20 REMOVED
+      #    `[advisories] vulnerability`, `notice` and `severity-threshold`, turned
+      #    `unsound` and `unmaintained` from lint levels into scope enums, and
+      #    dropped an entire generation of `[licenses]` keys. A future major could
+      #    do the same again - and the dangerous outcome is not a hard parse
+      #    failure but a silently different reading of the same policy text.
+      #    `deny.toml`'s SCHEMA VERSION section is the other half of this pin;
+      #    keep the two in step. Like cargo-audit, cargo-deny is a CI-installed
+      #    tool and must never become a manifest dependency.
       - name: Install cargo-deny
-        run: cargo +stable install cargo-deny --locked
+        run: cargo +stable install cargo-deny --version 0.20.2 --locked
 
-      # 5. Record which binary actually ran, so the log rather than this comment
-      #    is the record of which policy-schema version evaluated `deny.toml`.
-      - name: Record the cargo-deny version
-        run: cargo +stable deny --version
+      # 5. ASSERT the pinned version, and log it. This is what makes the claim in
+      #    `deny.toml` ("every key was probed against 0.20.2") true of the binary
+      #    that actually evaluates the file, rather than true of whatever the
+      #    author happened to have installed.
+      - name: Assert the pinned cargo-deny version
+        run: |
+          set -euo pipefail
+          expected='0.20.2'
+          cargo +stable deny --version
+          actual="$(cargo +stable deny --version | awk '{ print $NF }')"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::expected cargo-deny ${expected} but resolved ${actual}."\
+                 " deny.toml's SCHEMA VERSION note was validated against ${expected};"\
+                 " re-validate the policy before changing the pin."
+            exit 1
+          fi
+          echo "cargo-deny ${actual} matches the pin and deny.toml's SCHEMA VERSION note"
 
       # 6. The four checks below share two flags, explained once here:
       #
@@ -378,9 +789,16 @@ jobs:
       #    lives in `deny.toml` and is reviewed there; a CLI override here would
       #    silently diverge from the file every reviewer reads.
       #
+      #    Every step after this one carries `if: ${{ !cancelled() }}`, so all
+      #    four policy questions are answered by every run instead of the first
+      #    failure silencing the rest. That guard does NOT weaken any step - each
+      #    still fails the job on a non-zero exit. Read "WHY THREE STEPS CARRY AN
+      #    `if:`" in the header before touching it.
+      #
       #    Licences first, because it is the check least likely to depend on
       #    anything outside the tree: it reads `deny.toml`'s allow-list against
-      #    the resolved graph.
+      #    the resolved graph. (Order no longer decides what gets reported, but it
+      #    still decides what a reader sees first.)
       - name: Check licenses
         run: cargo +stable deny --locked -L info check licenses
 
@@ -391,21 +809,28 @@ jobs:
       #    reporting a false clean. Severity comes entirely from the file:
       #    vulnerabilities, unmaintained and unsound advisories are denied there,
       #    and `ignore` is empty.
+      #
+      #    This is the step the guard was added FOR. A licence rejection above
+      #    used to skip it entirely, so a run could go red for a licensing reason
+      #    while saying nothing at all about whether the graph was vulnerable.
       - name: Check advisories
+        if: ${{ !cancelled() }}
         run: cargo +stable deny --locked -L info check advisories
 
       # 8. Bans. Two distinct policies are enforced by this one step, both from
       #    `deny.toml`: the architectural bans (no C-toolchain build dependency
       #    for the crate proper, no C zlib linked back in, no competing
-      #    compression codec) and duplicate-version reporting.
+      #    compression codec) and duplicate-version detection.
       #
-      #    Duplicate majors are expected and do NOT fail this step:
-      #    `multiple-versions = "warn"` plus individual `skip` entries mean the
-      #    dev-only pairs - the two `rand` majors and the `rand_core` /
-      #    `getrandom` / `r-efi` chains that follow them - surface as notes with
-      #    their inclusion paths. That is the designed behaviour, and this file
-      #    adds no flag that would turn those notes into errors.
+      #    The three ACKNOWLEDGED duplicate majors do not fail this step: each has
+      #    an exact-version `skip` entry in `deny.toml`, so the dev-only `rand` /
+      #    `rand_core` / `getrandom` chains surface as `note[skipped]` lines with
+      #    their inclusion paths. Any duplicate those entries do not name IS a
+      #    failure, because that policy sets `multiple-versions = "deny"`. This
+      #    file adds no flag that changes either outcome - the severity is the
+      #    policy's to state.
       - name: Check bans
+        if: ${{ !cancelled() }}
         run: cargo +stable deny --locked -L info check bans
 
       # 9. Sources. `deny.toml` denies unknown registries and unknown git
@@ -413,19 +838,132 @@ jobs:
       #    dependency quietly re-pointed at a git revision or a private
       #    registry.
       - name: Check sources
+        if: ${{ !cancelled() }}
         run: cargo +stable deny --locked -L info check sources
 
       # 10. The same lockfile-immutability assertion as the audit job. `--locked`
       #     above already asserts it inside cargo-deny; this re-checks it from
       #     the outside, so a tool that ever stopped honouring the flag cannot
-      #     take the invariant down with it.
+      #     take the invariant down with it. Guarded, because a failed policy run
+      #     is precisely when you want to know whether the lockfile also moved.
       - name: Assert both lockfiles are unchanged
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           dirty="$(git status --porcelain Cargo.lock fuzz/Cargo.lock)"
           if [ -n "$dirty" ]; then
             echo "::error::the policy check modified a lockfile, which would silently"\
                  " change what every other job resolves: $dirty"
+            exit 1
+          fi
+          echo "Cargo.lock and fuzz/Cargo.lock are unchanged"
+
+  # Policy evaluation against `fuzz/deny.toml`, over the DETACHED fuzz crate
+  # graph. This is the job that closes the trigger-coverage gap: `fuzz.yml`'s
+  # `supply-chain` job runs the same command but only on pull_request, weekly
+  # cron and manual dispatch, so before this job existed a direct push touching
+  # `fuzz/Cargo.toml`, `fuzz/Cargo.lock` or `fuzz/deny.toml` got advisory
+  # coverage from the cargo-audit job above and NO licence, ban or source
+  # evaluation for up to seven days. Both jobs are kept: this one gives cadence,
+  # the one in `fuzz.yml` gates the fuzzing campaign. See "SCOPE" in the header.
+  cargo-deny-fuzz:
+    name: cargo-deny (fuzz workspace policy)
+    runs-on: ubuntu-latest
+    # Current stable, for the same reason as every other job here.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      # 1. Fetch the tree. `fuzz/deny.toml`, `fuzz/Cargo.toml` and
+      #    `fuzz/Cargo.lock` are the inputs. Nothing is compiled, and in
+      #    particular the nightly-only `libfuzzer-sys` is resolved but never
+      #    built - cargo-deny reads the graph, it does not build it, which is why
+      #    this job runs happily on stable.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Install current stable.
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # 3. The same ambient-resolution assertion as the other jobs. Bare
+      #    `rustc`/`rustup` on purpose.
+      - name: Verify the resolved toolchain is stable
+        run: |
+          set -euo pipefail
+          rustc --version --verbose
+          cargo --version
+          active="$(rustup show active-toolchain)"
+          echo "active toolchain: $active"
+          case "$active" in
+            stable-*) ;;
+            *) echo "::error::expected the stable toolchain, but resolved '$active'."\
+               " The RUSTUP_TOOLCHAIN override was lost and rust-toolchain.toml won."; exit 1 ;;
+          esac
+
+      # 4. Install cargo-deny at the same pin as the root policy job. The two
+      #    pins must never diverge: the root and fuzz policies are siblings
+      #    written against one schema, and evaluating them with different
+      #    cargo-deny versions would make "the 102-package closure is governed"
+      #    a statement about two different rulebooks.
+      - name: Install cargo-deny
+        run: cargo +stable install cargo-deny --version 0.20.2 --locked
+
+      # 5. Assert the pin, as above.
+      - name: Assert the pinned cargo-deny version
+        run: |
+          set -euo pipefail
+          expected='0.20.2'
+          cargo +stable deny --version
+          actual="$(cargo +stable deny --version | awk '{ print $NF }')"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::expected cargo-deny ${expected} but resolved ${actual}."\
+                 " fuzz/deny.toml's SCHEMA VERSION note was validated against ${expected}."
+            exit 1
+          fi
+          echo "cargo-deny ${actual} matches the pin"
+
+      # 6. All four categories in ONE invocation, and that differs from the root
+      #    job on purpose. `cargo deny check` with no category runs advisories,
+      #    bans, licenses and sources and prints every verdict even when one of
+      #    them fails - measured against a deliberately failing licence fixture:
+      #    `advisories ok, bans ok, licenses FAILED, sources ok`, exit 4. For a
+      #    13-package graph that single summary line is clearer than four steps.
+      #
+      #    Three flags, each load-bearing:
+      #
+      #      `--manifest-path fuzz/Cargo.toml`
+      #                  points cargo-deny at the detached workspace. It resolves
+      #                  configuration from the TARGET manifest's workspace root,
+      #                  so this also selects `fuzz/deny.toml` - NOT the root
+      #                  policy, which bans `cc` outright and would therefore
+      #                  reject this graph's legitimate libFuzzer runtime shim.
+      #                  No `--config` flag is needed or wanted.
+      #      `--locked`  MANDATORY. Without it cargo-deny re-resolves and will
+      #                  REWRITE `fuzz/Cargo.lock` when manifest and lock have
+      #                  drifted, then report `ok` on the graph it just invented
+      #                  rather than on the committed pins. Measured: a loose
+      #                  `libc = "0.2"` added to `fuzz/Cargo.toml` alone made the
+      #                  un-`--locked` command rewrite the lockfile and still
+      #                  print all four `ok` lines; with `--locked` the same
+      #                  fixture fails and the lockfile is untouched.
+      #      `-L info`   prints `using config from fuzz/deny.toml`, which is the
+      #                  evidence that the SIBLING policy is in force. cargo-deny
+      #                  falls back to built-in defaults when it finds no config,
+      #                  and a silent fallback looks exactly like a pass.
+      - name: Check the detached fuzz graph against fuzz/deny.toml
+        run: cargo +stable deny --locked --manifest-path fuzz/Cargo.toml -L info check
+
+      # 7. Lockfile immutability, from the outside, exactly as the two jobs above
+      #    do it. `fuzz/Cargo.lock` is the one this job could plausibly disturb,
+      #    and it is a file no job in this workflow has any business writing.
+      - name: Assert both lockfiles are unchanged
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          dirty="$(git status --porcelain Cargo.lock fuzz/Cargo.lock)"
+          if [ -n "$dirty" ]; then
+            echo "::error::the fuzz policy check modified a lockfile, which would"\
+                 " silently change what every other job resolves: $dirty"
             exit 1
           fi
           echo "Cargo.lock and fuzz/Cargo.lock are unchanged"

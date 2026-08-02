@@ -69,6 +69,54 @@
 #   `needs:` that job, so the harnesses are only ever built from an audited
 #   dependency graph.
 #
+#   DIVISION OF RESPONSIBILITY WITH `audit.yml`. The fuzz policy is now
+#   evaluated in TWO places, and neither is redundant:
+#
+#     * `.github/workflows/audit.yml`, job `cargo-deny-fuzz`, runs the same
+#       policy on `push`, `pull_request`, the daily 05:00 cron and
+#       `workflow_dispatch`. It exists for TRIGGER COVERAGE. This workflow has
+#       no `push` trigger, so before that job existed a direct push touching
+#       `fuzz/Cargo.toml`, `fuzz/Cargo.lock` or `fuzz/deny.toml` got advisory
+#       coverage but NO licence, ban or source evaluation until the next pull
+#       request or the Monday 03:00 cron - a blind window of up to seven days.
+#
+#     * The `supply-chain` job below exists for SEQUENCING. It is what
+#       `cargo-fuzz` declares `needs:` on, so it is the step that actually
+#       prevents an unaudited graph from being built and fuzzed. A green run in
+#       `audit.yml` cannot serve that purpose: it is a different workflow, so it
+#       cannot be a `needs:` predecessor here.
+#
+#   Do NOT "de-duplicate" this by deleting the job below and relying on
+#   `audit.yml`, and do NOT "close the gap" by adding a `push:` trigger to this
+#   workflow. The second option looks cheaper than it is: `cargo-fuzz` declares
+#   `needs: supply-chain`, so every push would launch the full sequential
+#   campaign - about 50 minutes of runner time per push, for a policy verdict
+#   that `audit.yml` already produces in under a minute.
+#
+#   BOTH INVOCATIONS MUST PASS `--locked`. Without it cargo-deny is free to
+#   re-resolve the graph and REWRITE `fuzz/Cargo.lock` on the runner, and it
+#   reports `ok` while doing so. That is not a cosmetic difference: the verdict
+#   would then describe a dependency set that no commit contains, which is the
+#   opposite of what a supply-chain gate is for. Measured on this repository, a
+#   single un-`--locked` invocation moved `fuzz/Cargo.lock` from sha256 prefix
+#   522d40b9 to 5ffba8d2 and still printed all four `ok` lines. The closing
+#   assertion in the job below is the belt-and-braces half of that guarantee:
+#   `--locked` states the intent, and `git status --porcelain` proves the
+#   outcome even if a future cargo-deny stops honouring the flag.
+#
+#   THE TOOL VERSION IS PINNED. `cargo install cargo-deny --locked` pins
+#   cargo-deny's OWN lockfile, not the version of cargo-deny that gets
+#   installed - `--locked` and `--version` solve different problems. The
+#   version is pinned to 0.20.2 because that is the release `fuzz/deny.toml`
+#   was authored and validated against, and the step below ASSERTS the
+#   resolved version rather than merely logging it. See the matching sections
+#   in `audit.yml` for the upgrade procedure; the two pins must move together.
+#
+#   `cargo-fuzz` itself is deliberately left FLOATING (see its install step).
+#   It is coupled to whatever the current nightly compiler accepts, not to a
+#   policy schema, so pinning it would convert an upstream nightly fix into a
+#   build break here.
+#
 # BUDGET
 # ======
 #   The per-target budget is EVENT-CONDITIONAL, because the callers want
@@ -169,17 +217,81 @@ jobs:
             *) echo "::error::expected the stable toolchain (RUSTUP_TOOLCHAIN=stable); got '${active}'"; exit 1 ;;
           esac
 
-      # `--locked` keeps the install reproducible against cargo-deny's own
-      # lockfile, matching the cargo-fuzz install idiom below.
+      # Two flags doing two different jobs, which is easy to conflate:
+      #   `--version 0.20.2` pins WHICH cargo-deny is installed. Without it,
+      #     `cargo install` resolves whatever crates.io serves at run time, so a
+      #     new upstream release could change this gate's verdict with no commit
+      #     to this repository. `fuzz/deny.toml` records the schema version it
+      #     was validated against, and that record is only meaningful if the
+      #     tool honouring it is the tool it was checked against.
+      #   `--locked` pins cargo-deny's OWN dependency graph, keeping the install
+      #     itself reproducible.
+      # Both are required. See the SUPPLY-CHAIN GATE section in the header for
+      # the upgrade procedure - this pin and the two in `audit.yml` move
+      # together, never independently.
       - name: Install cargo-deny
-        run: cargo +stable install cargo-deny --locked
+        run: cargo +stable install cargo-deny --version 0.20.2 --locked
+
+      # Assert, do not merely log. A pin that is silently not honoured - a cache
+      # hit on a differently-versioned binary, a pre-installed cargo-deny
+      # earlier on PATH - would otherwise be invisible in the log and would
+      # produce a verdict from an unvalidated tool.
+      - name: Assert the pinned cargo-deny version
+        run: |
+          set -euo pipefail
+          expected='0.20.2'
+          cargo +stable deny --version
+          actual="$(cargo +stable deny --version | awk '{ print $NF }')"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::expected cargo-deny ${expected} but resolved ${actual}."\
+                 " fuzz/deny.toml's SCHEMA VERSION note was validated against ${expected};"\
+                 " re-validate the policy before changing the pin."
+            exit 1
+          fi
+          echo "cargo-deny ${actual} matches the pin and fuzz/deny.toml's SCHEMA VERSION note"
 
       # cargo-deny resolves its configuration from the TARGET manifest's
       # workspace root. `fuzz/` is its own workspace, so `fuzz/deny.toml` is
       # discovered automatically and the root `deny.toml` is not consulted - no
-      # `--config` flag is needed or wanted here.
+      # `--config` flag is needed or wanted here. `-L info` makes that
+      # resolution visible in the log ("using config from .../fuzz/deny.toml"),
+      # so a future change that silently started applying the ROOT policy to the
+      # fuzz graph would be evident rather than merely suspected.
+      #
+      # `--locked` is MANDATORY and is not a stylistic preference. Without it
+      # cargo-deny re-resolves the graph and may rewrite `fuzz/Cargo.lock` in
+      # place, reporting `ok` for a dependency set that no commit contains. A
+      # supply-chain verdict must describe the pins that are actually committed;
+      # anything else is a verdict about a graph nobody will ever build. See the
+      # SUPPLY-CHAIN GATE section in the header for the measured evidence.
       - name: Audit the fuzz dependency graph
-        run: cargo +stable deny --manifest-path fuzz/Cargo.toml check
+        run: cargo +stable deny --locked --manifest-path fuzz/Cargo.toml -L info check
+
+      # Belt and braces for the flag above. `--locked` states the intent; this
+      # step proves the outcome, and keeps proving it if some future cargo-deny
+      # stops honouring the flag or grows a path that writes a lockfile anyway.
+      # Both lockfiles are checked, not just the fuzz one: this job only targets
+      # the fuzz manifest, so any movement in the ROOT lockfile would be an even
+      # more surprising side effect and is worth failing on.
+      #
+      # `if: ${{ !cancelled() }}` so the invariant is still verified when the
+      # audit above FAILS - that is exactly the run in which a stray lockfile
+      # rewrite would otherwise go unnoticed, because the job is already red for
+      # another reason. This guard cannot convert a failure into a pass; it only
+      # ensures this check is not skipped. It is deliberately `!cancelled()` and
+      # not `always()`, so a cancelled run still stops immediately.
+      - name: Assert both lockfiles are unchanged
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          dirty="$(git status --porcelain Cargo.lock fuzz/Cargo.lock)"
+          if [ -n "$dirty" ]; then
+            echo "::error::the fuzz policy check modified a lockfile, so the verdict"\
+                 " above describes a dependency graph that no commit contains: $dirty"
+            git --no-pager diff -- Cargo.lock fuzz/Cargo.lock | head -40
+            exit 1
+          fi
+          echo "Cargo.lock and fuzz/Cargo.lock are byte-identical to the commit under test"
 
   cargo-fuzz:
     name: cargo-fuzz (libFuzzer)

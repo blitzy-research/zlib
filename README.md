@@ -561,10 +561,39 @@ each is picked up automatically). Both set `[advisories]`, `[licenses]`, `[bans]
 and `[sources]` with `all-features = true`, deny yanked crates, and bound advisory
 staleness; the root policy additionally pins nine target triples so the audit
 covers the Windows, Apple, aarch64, bare-metal, and wasm configurations rather
-than only the host. `.github/workflows/fuzz.yml` already runs the fuzz-workspace
-policy as a `supply-chain` job that **gates** fuzzing (`needs: supply-chain`), and
-`.github/workflows/audit.yml` carries the root-graph `cargo-deny` plus
-`cargo-audit` gate.
+than only the host. Both hold duplicate major versions to the same standard
+(`[bans] multiple-versions = "deny"`): the fuzz graph is measurably
+duplicate-free, while the root graph acknowledges the two `rand` majors that
+reach it through `quickcheck` with exact-version `skip` entries, so an
+*unreviewed* duplicate fails the build rather than merely printing a warning.
+
+[`.github/workflows/audit.yml`](.github/workflows/audit.yml) runs the gate on
+push, pull request, a daily schedule, and manual dispatch, as four independent
+blocking jobs — none declares `needs:`, so one failing category can never mask
+another's verdict:
+
+| Job | What it proves |
+| --- | --- |
+| `policy-integrity` | Both policy files still declare every governed table and hold every load-bearing key at its reviewed value. Guards against section-level erosion, which would otherwise pass vacuously. |
+| `cargo-audit` | No known advisory affects either lockfile — the root graph and the detached fuzz graph are both scanned. |
+| `cargo-deny` | The root graph satisfies all four categories: licences, advisories, bans, sources. |
+| `cargo-deny-fuzz` | The detached fuzz graph satisfies `fuzz/deny.toml`. |
+
+[`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml) additionally runs the
+fuzz-workspace policy as a `supply-chain` job that **gates** fuzzing
+(`needs: supply-chain`). That is not redundant with `cargo-deny-fuzz`: the
+`audit.yml` job exists for trigger coverage (this workflow has no `push`
+trigger), while the `fuzz.yml` job is what actually prevents an unaudited graph
+from being built and fuzzed, and a job in another workflow cannot serve as a
+`needs:` predecessor.
+
+Every invocation passes `--locked`, so a verdict always describes the pins that
+are actually committed rather than a graph resolved on the runner, and each job
+asserts afterwards that neither lockfile moved. The tools themselves are
+version-pinned (`cargo-deny` 0.20.2, `cargo-audit` 0.22.2) and the resolved
+version is asserted rather than merely logged, because `--locked` pins a tool's
+own lockfile and not which release of the tool gets installed. Neither tool is
+ever a manifest dependency.
 
 Offline builds work from a warmed Cargo cache. The development dependencies
 ([`criterion`](https://crates.io/crates/criterion),

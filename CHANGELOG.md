@@ -322,8 +322,28 @@ the security properties the initial release establishes.
   configurations rather than only the host, and its `[bans] deny` list keeps
   `cc`, `bindgen`, `pkg-config`, `libz-sys`, and the bzip2/lzma/zstd/brotli
   families out of the graph by name.
-  `cargo-deny` and `cargo-audit` run as a dedicated CI gate, and the
-  fuzz-workspace policy additionally gates fuzzing.
+  Both policies hold duplicate major versions to the same standard
+  (`[bans] multiple-versions = "deny"`), so an unreviewed duplicate fails the
+  build instead of printing a warning that nothing acts on; the root graph's two
+  known `rand` majors are acknowledged individually with exact-version `skip`
+  entries that expire on the next bump.
+  [`.github/workflows/audit.yml`](.github/workflows/audit.yml) runs the gate on
+  push, pull request, a daily schedule, and manual dispatch as four independent
+  blocking jobs — `policy-integrity` (both policy files still declare every
+  governed table and hold every load-bearing key at its reviewed value, so
+  section-level erosion cannot pass vacuously), `cargo-audit` (both lockfiles),
+  `cargo-deny` (all four root categories), and `cargo-deny-fuzz` (the detached
+  fuzz graph). None declares `needs:`, so one failing category cannot mask
+  another's verdict. [`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml)
+  additionally runs the fuzz-workspace policy as the `supply-chain` job that
+  gates fuzzing via `needs:` — retained deliberately, because a job in another
+  workflow cannot act as a `needs:` predecessor. Every invocation passes
+  `--locked`, so a verdict describes the committed pins rather than a graph
+  resolved on the runner; every job then asserts that neither lockfile moved;
+  and both tools are version-pinned (`cargo-deny` 0.20.2, `cargo-audit` 0.22.2)
+  with the resolved version asserted rather than merely logged, because
+  `--locked` pins a tool's own lockfile and not which release of the tool is
+  installed. Neither tool is ever a manifest dependency.
 - **RUSTSEC-2026-0097 affects a development dependency only** (`rand`) and does
   **not** reach consumers of the published crate — a dev-dependency is not part of
   a downstream build graph. The direct requirement is pinned at or above the

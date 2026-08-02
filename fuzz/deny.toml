@@ -18,17 +18,46 @@
 # cargo-deny resolves its configuration next to the manifest it is pointed at,
 # so this file is picked up automatically -- no `--config` needed:
 #
-#     cargo deny --manifest-path fuzz/Cargo.toml check
+#     cargo deny --locked --manifest-path fuzz/Cargo.toml check
 #
 # That is a SECOND invocation, in addition to the root one. Both are required;
 # neither substitutes for the other:
 #
-#     cargo deny check                                      # the 89 root packages
-#     cargo deny --manifest-path fuzz/Cargo.toml check       # these 13
+#     cargo deny --locked check                                      # the 89 root
+#     cargo deny --locked --manifest-path fuzz/Cargo.toml check       # these 13
 #
 # `check` with no argument runs all four subcommands (advisories, bans,
-# licenses, sources). Verified: both invocations report
-# "advisories ok, bans ok, licenses ok, sources ok".
+# licenses, sources), and it reports ALL FOUR verdicts even when one of them
+# fails -- verified with a deliberately failing licence fixture, which printed
+# "advisories ok, bans ok, licenses FAILED, sources ok" and exited 4. Both
+# invocations currently report "advisories ok, bans ok, licenses ok, sources ok".
+#
+# `--locked` IS MANDATORY, and it is easy to get wrong here specifically.
+# Without it cargo-deny re-resolves the graph and will REWRITE `fuzz/Cargo.lock`
+# if the manifest and the lock have drifted -- then report `ok` on the graph it
+# just invented, rather than on the committed pins. Measured: adding a loose
+# `libc = "0.2"` to `fuzz/Cargo.toml` alone made the un-`--locked` invocation
+# rewrite the lockfile and still print all four `ok` lines; with `--locked` the
+# same fixture fails with "cannot update the lock file ... because --locked was
+# passed" and leaves the lockfile byte-identical. Every CI invocation passes it.
+#
+# WHO RUNS IT IN CI
+# -----------------
+#   * `.github/workflows/audit.yml`, job `cargo-deny-fuzz` -- gives this graph the
+#     same trigger coverage the root graph gets: push, pull_request, a daily
+#     schedule, and manual dispatch.
+#   * `.github/workflows/fuzz.yml`, job `supply-chain`, which the `cargo-fuzz`
+#     job `needs:` -- this is the one that GATES fuzzing, so no harness is ever
+#     built against an unaudited graph.
+#   * `.github/workflows/audit.yml`, job `cargo-audit`, additionally scans
+#     `fuzz/Cargo.lock` for advisories with `--file`, independently of this file.
+#   * `.github/workflows/audit.yml`, job `policy-integrity`, asserts that this
+#     file still declares every governed table and load-bearing key -- because a
+#     `[bans]` or `[sources]` table that has simply been deleted otherwise
+#     produces a silent, diagnostic-free exit 0.
+# Both cargo-deny invocations are blocking and neither is redundant: drop the
+# audit.yml one and this graph goes up to seven days without a policy
+# evaluation; drop the fuzz.yml one and fuzzing can run on an unevaluated graph.
 #
 # THE PRIME DIRECTIVE OF THIS FILE
 # --------------------------------
@@ -60,11 +89,15 @@
 #   4. `Unicode-3.0` is not allowed, because nothing in this graph uses it and
 #      `unused-allowed-license = "deny"` would reject a stale entry.
 #
-# One further setting is STRICTER here than at the root rather than looser:
-# `multiple-versions = "deny"`, where the root says `warn`. That is affordable
-# only because this graph is measurably duplicate-free -- every crate name in it
-# occurs exactly once -- while the root graph legitimately carries two `rand`
-# majors through `quickcheck` and `criterion`.
+# `multiple-versions = "deny"` is set here, and the root policy now sets it too.
+# It was once the one place this file was STRICTER than the root, which meant the
+# 13-package half of the closure was governed more tightly than the 89-package
+# half -- an asymmetry with no defensible reason behind it. The root has since
+# been raised to match. The reasons the two files can BOTH afford `deny` differ,
+# though, and the difference is worth keeping straight: this graph is measurably
+# duplicate-free (13 packages, 13 distinct crate names, so `skip` is empty),
+# whereas the root graph legitimately carries two `rand` majors through
+# `quickcheck` and acknowledges each one with an exact-version `skip` entry.
 #
 # Everything else -- the advisory posture, the source restrictions, and the
 # fifteen remaining crate bans -- is identical, so relaxing the root policy is
@@ -274,12 +307,17 @@ registries = []
 # [bans] -- `cargo deny --manifest-path fuzz/Cargo.toml check bans`
 # -----------------------------------------------------------------------------
 [bans]
-# STRICTER than the root policy, which can only manage `warn` because four
-# dev-only duplicate majors reach it through `quickcheck`. This graph is
-# verifiably duplicate-free -- 13 packages, 13 distinct crate names -- so `deny`
-# locks that property in instead of merely reporting it. `libc 0.2.186` is
-# reached twice (directly from `cc`, and through `jobserver`) but resolves to one
-# version, which is exactly what this check is about.
+# The SAME standard as the root policy, which also sets `deny`. This file was
+# once the only half of the closure that could manage it; the root has since been
+# raised to match, so duplicate-major drift is now blocking on all 102 packages
+# rather than on 13 of them. The two files can afford it for different reasons,
+# and the difference matters when reading the settings below: this graph is
+# verifiably duplicate-free -- 13 packages, 13 distinct crate names -- so `skip`
+# is empty and `deny` costs nothing, whereas the root graph legitimately carries
+# two `rand` majors through `quickcheck` and acknowledges each with an
+# exact-version `skip` entry. `libc 0.2.186` is reached twice here (directly from
+# `cc`, and through `jobserver`) but resolves to one version, which is exactly
+# what this check is about.
 multiple-versions = "deny"
 # Dev-dependencies count, as at the root. The harness has no `[dev-dependencies]`
 # table today; this keeps a future one governed from the first commit.
@@ -357,8 +395,9 @@ deny = [
     { crate = "openssl", reason = "a compression library needs no TLS stack; this would add a large C dependency" },
     { crate = "openssl-sys", reason = "same boundary as openssl" },
 ]
-# EMPTY, and it must stay empty. The root policy carries four `skip` entries for
-# dev-only duplicate majors reached through `quickcheck`; none of them exist in
+# EMPTY, and it must stay empty. The root policy carries exactly three `skip`
+# entries for dev-only duplicate majors reached through `quickcheck`
+# (`rand@0.10.2`, `rand_core@0.10.1`, `getrandom@0.4.3`); none of them exist in
 # this graph, and copying them here would produce `warning[unmatched-skip]` and
 # `warning[unnecessary-skip]` diagnostics -- noise that trains reviewers to
 # ignore this file. With `multiple-versions = "deny"` above, a duplicate must be
