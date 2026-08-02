@@ -704,10 +704,10 @@ unsafe extern "C" {
 /// because whether a given `size_t` is refused is a property of the platform
 /// allocator, and because an optimizing compiler is entitled to reason about a
 /// `malloc` whose result is only ever tested for nullity. Measured on this
-/// repository at `opt-level = 3` with `lto = true` and `codegen-units = 1` — the
-/// crate's own `[profile.release]` — the call to `malloc` for an unrepresentable
-/// size was removed outright and the null test folded away, so the property held
-/// in a debug build and silently did not hold in the profile that actually ships.
+/// repository at `opt-level = 3` with `codegen-units = 1` — the crate's own
+/// `[profile.release]` — the call to `malloc` for an unrepresentable size was
+/// removed outright and the null test folded away, so the property held in a
+/// debug build and silently did not hold in the profile that actually ships.
 /// Deciding the ceiling here, in ordinary integer arithmetic on values the
 /// compiler cannot assume anything about, is what makes the answer identical in
 /// every profile and on every target.
@@ -2064,8 +2064,8 @@ mod foreign_alloc_tests {
     /// the guarantee independent of the host's free memory, of whether `malloc`
     /// chooses to refuse an absurd size, and — the failure this test exists to
     /// prevent — of whether the optimizer decided to keep the `malloc` call at
-    /// all. It held in a debug build and did not hold at `opt-level = 3` with
-    /// `lto` and one codegen unit when the ceiling was delegated to `malloc`.
+    /// all. It held in a debug build and did not hold at `opt-level = 3` with one
+    /// codegen unit when the ceiling was delegated to `malloc`.
     #[test]
     fn default_zalloc_rejects_every_unrepresentable_request() {
         // The ceiling, expressed the way the guard expresses it.

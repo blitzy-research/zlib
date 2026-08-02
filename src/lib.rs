@@ -1502,6 +1502,138 @@ mod tests {
         );
     }
 
+    /// Returns the body of one top-level table from the repository manifest,
+    /// i.e. the lines after `[<table>]` up to the next `[`-introduced header.
+    ///
+    /// Deliberately reads `Cargo.toml` rather than a baked copy of its values,
+    /// because the property under test *is* what the manifest says. It works in a
+    /// packaged crate as well as in the working tree: `cargo package` normalizes
+    /// the manifest but keeps both `[lib]` and `[profile.release]`, and
+    /// `CARGO_MANIFEST_DIR` resolves to the unpacked crate root there.
+    fn manifest_table(table: &str) -> alloc::string::String {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let text =
+            std::fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml must be readable");
+        let header = alloc::format!("[{table}]");
+        let start = text
+            .lines()
+            .position(|line| line.trim() == header)
+            .unwrap_or_else(|| panic!("Cargo.toml must declare a `{header}` table"))
+            + 1;
+        text.lines()
+            .skip(start)
+            .take_while(|line| !line.trim_start().starts_with('['))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// `[profile.release]` must NOT declare an `lto` key while `[lib]
+    /// crate-type` still emits an rlib, because such a declaration cannot take
+    /// effect and Cargo will not say so.
+    ///
+    /// Cargo builds `lib` + `cdylib` + `staticlib` from one rustc invocation, and
+    /// rustc cannot run LTO for a unit that also emits an rlib, so Cargo silently
+    /// drops any LTO-*enabling* value. Measured by reading the `--crate-name
+    /// zlib_rs` command line out of `cargo build --release --verbose` while
+    /// overriding the profile through `CARGO_PROFILE_RELEASE_LTO`: `true`, `"fat"`,
+    /// `"thin"` and `false` all produce **no** `-C lto` flag, and only `"off"` is
+    /// forwarded (as `-C lto=off`). A `lto = true` line therefore reads as a
+    /// request that never happens — and a declared optimization that silently does
+    /// nothing is worse than an honest absence, because it invites performance
+    /// reasoning from a flag that is not there.
+    ///
+    /// This is a *manifest-level* guard on purpose. The defect is invisible to
+    /// every build, test and lint gate: the crate compiles, the artifacts emit and
+    /// nothing warns. Only the rustc command line shows it, and no job reads that.
+    ///
+    /// The `crate-type` half is what keeps the guard honest rather than dogmatic:
+    /// if the rlib is ever dropped from the triple, fat LTO becomes available and
+    /// this assertion is the thing that says so instead of silently forbidding a
+    /// setting that would by then be legitimate.
+    #[test]
+    fn the_release_profile_declares_no_inert_lto_setting() {
+        let lib = manifest_table("lib");
+        let crate_types = lib
+            .lines()
+            .skip_while(|line| !line.trim_start().starts_with("crate-type"))
+            .take_while(|line| !line.contains(']') || line.trim_start().starts_with("crate-type"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ");
+        assert!(
+            crate_types.contains("crate-type"),
+            "[lib] must declare `crate-type`"
+        );
+        for expected in ["\"lib\"", "\"cdylib\"", "\"staticlib\""] {
+            assert!(
+                crate_types.contains(expected),
+                "[lib] crate-type must keep {expected}; the three-artifact triple \
+                 is a requirement of the migration. Found: {crate_types}"
+            );
+        }
+
+        let release = manifest_table("profile.release");
+        let declares_lto = release
+            .lines()
+            .map(str::trim)
+            .any(|line| line.starts_with("lto") && line[3..].trim_start().starts_with('='));
+        assert!(
+            !declares_lto,
+            "[profile.release] declares an `lto` key while [lib] crate-type still \
+             emits an rlib ({crate_types}). Cargo cannot forward an LTO-enabling \
+             value for a unit that also emits an rlib, so the declaration is inert \
+             and no other gate can see that. Remove the key, or remove `\"lib\"` \
+             from crate-type first — and if you remove `\"lib\"`, relax this test \
+             deliberately rather than by accident."
+        );
+
+        // The settings that DO reach rustc must still be declared, so removing the
+        // inert key cannot be mistaken for abandoning release optimization.
+        for expected in ["opt-level = 3", "codegen-units = 1", "panic = \"abort\""] {
+            assert!(
+                release.contains(expected),
+                "[profile.release] must keep `{expected}`"
+            );
+        }
+    }
+
+    /// The CI `lint` job must run the clippy gate the repository documents,
+    /// `--all-features` included.
+    ///
+    /// Without `--all-features` clippy silently skips every feature-gated unit:
+    /// `tests/c_oracle.rs` is not linted at all (it carries `required-features =
+    /// ["c-oracle"]`), and neither are the `inflate_strict` arms or the `no_std`
+    /// runtime block. `lint` is the only job in the workflow that promotes
+    /// warnings to errors, so a lint regression in any of them would have nowhere
+    /// else to surface. `.cargo/config.toml` states this exact gate twice, which
+    /// is what made the narrower CI spelling a documentation drift as well as a
+    /// coverage gap.
+    #[test]
+    fn the_lint_job_runs_the_documented_clippy_gate() {
+        let block = workflow_job_block(".github/workflows/ci.yml", "lint");
+        assert!(
+            block.contains("clippy --all-targets --all-features -- -D warnings"),
+            "the ci.yml `lint` job must run `cargo clippy --all-targets \
+             --all-features -- -D warnings`; without `--all-features` the \
+             feature-gated surface (tests/c_oracle.rs, the inflate_strict arms, \
+             the no_std runtime block) is never linted anywhere"
+        );
+        assert!(
+            block.contains("fmt --all -- --check"),
+            "the ci.yml `lint` job must also run `cargo fmt --all -- --check`"
+        );
+
+        // The gate the workflow runs and the gate the repository documents must be
+        // the same string, or one of them is lying.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cargo_config = std::fs::read_to_string(root.join(".cargo/config.toml"))
+            .expect(".cargo/config.toml must be readable");
+        assert!(
+            cargo_config.contains("clippy --all-targets --all-features -- -D warnings"),
+            ".cargo/config.toml must keep documenting the same clippy gate the \
+             `lint` job runs"
+        );
+    }
+
     /// `OS_CODE` — the gzip-header operating-system byte — is declared in exactly
     /// one module, and the gzip emission path reads that one declaration.
     ///

@@ -347,9 +347,37 @@ path = "tests/c_oracle.rs"
 required-features = ["c-oracle"]
 
 [profile.release]
-# The release build is optimized with LTO (project-guide §6.4).
 opt-level = 3
-lto = true
+# `codegen-units = 1` is the whole-crate optimization this crate can actually
+# have, and it is deliberately NOT accompanied by an `lto` key.
+#
+# NO `lto` KEY - DO NOT ADD ONE. `[lib] crate-type` above emits `lib` (rlib)
+# alongside `cdylib` and `staticlib`, and Cargo builds all three from ONE rustc
+# invocation. rustc cannot run LTO for a unit that also emits an rlib, so Cargo
+# silently DROPS any LTO-enabling value rather than reporting it. Measured on
+# this tree by reading the `--crate-name zlib_rs` command line out of
+# `cargo build --release --verbose` while overriding the profile through
+# `CARGO_PROFILE_RELEASE_LTO`:
+#
+#     lto = true / "fat" / "thin" / false  ->  no `-C lto` flag at all
+#     lto = "off"                          ->  `-C lto=off`
+#
+# i.e. only the DISABLING value is ever forwarded. `lto = true` therefore read as
+# a request that never happened, and no job noticed - a declared optimization
+# that silently does nothing is worse than an honest absence, because it invites
+# performance reasoning from a flag that is not there. A control crate with
+# `crate-type = ["cdylib", "staticlib"]` (no rlib) and the same setting DOES
+# receive `-C lto`, which isolates the cause to the rlib in the triple.
+#
+# Dropping `lib` to buy LTO back is not available: the three-artifact triple is a
+# requirement of the migration (Rust consumers need the rlib; the C drop-in needs
+# the other two), and `benches/`, `tests/` and every Rust consumer link the rlib.
+# The flags that DO reach rustc here are `-C opt-level=3`, `-C codegen-units=1`
+# and `-C panic=abort`, all three verified present on that same command line.
+#
+# `src/lib.rs`'s `the_release_profile_declares_no_inert_lto_setting` fails the
+# build if an `lto` key reappears while `lib` is still in the crate-type list, so
+# this cannot silently drift back.
 codegen-units = 1
 # `panic = "abort"` is REQUIRED (not merely preferred): a `--no-default-features`
 # (`no_std`) build emits the `cdylib`/`staticlib` without an unwinding runtime,

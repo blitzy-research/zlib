@@ -911,10 +911,19 @@ mod tests {
     // (`not(test)` is part of its predicate), so `std::fs` is available here in
     // every feature configuration, including `--no-default-features`.
     //
-    // Note on `zlib.map` availability: it is `REFERENCE`-only and excluded from
-    // the published crate, exactly like the retained C baseline. These tests run
-    // from the repository working tree, where `CARGO_MANIFEST_DIR` resolves to
-    // the checkout root and the file is present.
+    // Note on `zlib.map` availability: it is `REFERENCE`-only and is EXCLUDED
+    // from the published crate, exactly like the retained C baseline — the
+    // `package-verify` job in `.github/workflows/ci.yml` asserts that no `*.map`
+    // is ever packaged, so its absence there is structural rather than
+    // incidental. From the repository working tree `CARGO_MANIFEST_DIR` resolves
+    // to the checkout root and the file is present, and the two tests that read
+    // it assert in full. Inside an unpacked `.crate` it cannot be present, so
+    // they print `skip_notice` and pass instead of panicking, which is what keeps
+    // the published crate `cargo test`-able for a downstream consumer or distro
+    // packager. That is the same degradation `tests/c_oracle.rs` performs for the
+    // same reason, and the condition is deliberately narrow: only "the file does
+    // not exist" skips (see `repo_file_if_present`), while a file that exists and
+    // cannot be read, or reads but does not parse, still fails hard.
 
     /// The `#[unsafe(no_mangle)]`-bearing shim modules, and the number of
     /// attribute *sites* each one is expected to carry.
@@ -928,10 +937,53 @@ mod tests {
         [("deflate", 17), ("inflate", 22), ("util", 25), ("gz", 34)];
 
     /// Reads a file from the repository root, panicking with the path on error.
+    ///
+    /// Used for the four shim sources, which are `src/**` and therefore always
+    /// present — in the working tree and inside a packaged `.crate` alike — so
+    /// any failure to read them really is a defect.
     fn repo_file(relative: &str) -> std::string::String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
         std::fs::read_to_string(&path)
             .unwrap_or_else(|err| panic!("{} must be readable: {err}", path.display()))
+    }
+
+    /// Reads a `REFERENCE`-only file that is excluded from the published crate,
+    /// yielding `None` **only** when it does not exist.
+    ///
+    /// The narrowness is the whole point, and it mirrors the skip contract of
+    /// `tests/c_oracle.rs`: "not packaged" is a capability condition and is the
+    /// single tolerated outcome, whereas a file that exists but cannot be read —
+    /// a permission error, a directory in its place, an I/O failure — means the
+    /// check *was* possible and something is wrong, so it still panics. Parsing
+    /// is likewise never softened: a present-but-malformed script fails the
+    /// caller's assertions as loudly as it always did.
+    fn repo_file_if_present(relative: &str) -> Option<std::string::String> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => panic!("{} exists but could not be read: {err}", path.display()),
+        }
+    }
+
+    /// Prints why a `REFERENCE`-file-dependent check could not run.
+    ///
+    /// Emitted instead of panicking so that `cargo test` inside an unpacked
+    /// `.crate` reports zero failures. `#[ignore]` is deliberately not used: the
+    /// crate's own gate keeps the ignored-test count at zero (AAP §0.7.2 S10),
+    /// and an ignored test would stay silently skipped in the repository too,
+    /// where the check must and does run in full.
+    fn skip_notice(relative: &str) {
+        std::println!(
+            "\nffi: SKIPPED — {relative} is not present in this build tree.\n\
+             ffi: It is a REFERENCE-only artifact excluded from the published crate\n\
+             ffi: (see [Cargo.toml:exclude]; the `package-verify` CI job asserts no\n\
+             ffi: *.map is ever packaged), so this check is unrunnable here by design.\n\
+             ffi: The compile-time signature guards themselves are unaffected — they\n\
+             ffi: are ordinary code in this module and are checked by the compiler on\n\
+             ffi: every build. The full 54-global / 10-local reconciliation runs from\n\
+             ffi: the repository working tree, where the script is present.\n"
+        );
     }
 
     /// Strips `//`-introduced comments (including `///` and `//!` doc comments)
@@ -958,11 +1010,14 @@ mod tests {
     /// block starts over at `global` (only the first and last nodes carry an
     /// explicit `global:` label). The `_*` catch-all is a wildcard pattern, not a
     /// symbol, so it is skipped.
-    fn zlib_map_partition() -> (
+    ///
+    /// Returns `None` only when the script is absent, i.e. inside an unpacked
+    /// `.crate`; see `repo_file_if_present` for why nothing else is tolerated.
+    fn zlib_map_partition() -> Option<(
         std::vec::Vec<std::string::String>,
         std::vec::Vec<std::string::String>,
-    ) {
-        let text = repo_file("zlib.map");
+    )> {
+        let text = repo_file_if_present("zlib.map")?;
         let mut globals = std::vec::Vec::new();
         let mut locals = std::vec::Vec::new();
         let mut exported = true;
@@ -1003,7 +1058,7 @@ mod tests {
             }
         }
 
-        (globals, locals)
+        Some((globals, locals))
     }
 
     /// Every C symbol the crate exports, derived from the anchored
@@ -1105,9 +1160,15 @@ mod tests {
     /// so they are the narrowest set a drop-in replacement must get exactly
     /// right (preservation directive D-4). This test proves each one is bound;
     /// the sibling test below proves the wider 96-name export surface is too.
+    ///
+    /// Skips — printing `skip_notice`, never `#[ignore]` — when `zlib.map` is
+    /// absent, which happens only inside an unpacked `.crate`.
     #[test]
     fn every_zlib_map_global_symbol_has_a_compile_time_signature_guard() {
-        let (globals, _) = zlib_map_partition();
+        let Some((globals, _)) = zlib_map_partition() else {
+            skip_notice("zlib.map");
+            return;
+        };
         assert_eq!(
             globals.len(),
             54,
@@ -1177,9 +1238,15 @@ mod tests {
     /// equivalents private and deliberately do not apply `#[unsafe(no_mangle)]`.
     /// `zcalloc`/`zcfree` in particular have no Rust symbol at all — the
     /// allocator bridge in `crate::ffi::alloc` carries no `#[unsafe(no_mangle)]`.
+    ///
+    /// Skips — printing `skip_notice`, never `#[ignore]` — when `zlib.map` is
+    /// absent, which happens only inside an unpacked `.crate`.
     #[test]
     fn no_zlib_map_local_symbol_is_exported_or_guarded() {
-        let (_, locals) = zlib_map_partition();
+        let Some((_, locals)) = zlib_map_partition() else {
+            skip_notice("zlib.map");
+            return;
+        };
         assert_eq!(
             locals.len(),
             10,
@@ -1205,6 +1272,74 @@ mod tests {
              {guarded_locals:?}",
             guarded_locals.len()
         );
+    }
+
+    /// The `zlib.map` skip may only fire in a tree where the *whole* retained C
+    /// baseline is absent — i.e. inside an unpacked `.crate`.
+    ///
+    /// This is what stops the skip from silently swallowing coverage in the
+    /// repository. `zlib.map` and the C sources are excluded from the published
+    /// crate by the same `[Cargo.toml:exclude]` contract and are therefore
+    /// present or absent together; if any C source is here, the script must be
+    /// here too, and the two reconciliation tests above must have asserted in
+    /// full rather than printed a notice.
+    #[test]
+    fn the_zlib_map_skip_can_only_happen_where_the_whole_c_baseline_is_absent() {
+        // Three of the retained C translation units and the API header. Each is
+        // matched by an `exclude` pattern (`*.c` / `*.h`), so `cargo package`
+        // drops all of them together with `zlib.map` (`*.map`).
+        const C_BASELINE: [&str; 4] = ["deflate.c", "inflate.c", "trees.c", "zlib.h"];
+
+        let baseline_present: std::vec::Vec<&str> = C_BASELINE
+            .into_iter()
+            .filter(|relative| repo_file_if_present(relative).is_some())
+            .collect();
+
+        if baseline_present.is_empty() {
+            skip_notice("the retained C baseline");
+            return;
+        }
+
+        assert!(
+            zlib_map_partition().is_some(),
+            "the retained C baseline is present ({baseline_present:?}) but zlib.map is \
+             not, so the two reconciliation tests skipped instead of asserting. \
+             zlib.map is REFERENCE-only and must never be deleted from the working \
+             tree: it is the authoritative global:/local: partition (preservation \
+             directive D-7)."
+        );
+    }
+
+    /// `repo_file_if_present` tolerates exactly one condition: the file does not
+    /// exist.
+    ///
+    /// The positive half pins that a file which *is* there still reads, so the
+    /// helper cannot degrade into "always `None`" and quietly disable both
+    /// reconciliation tests.
+    #[test]
+    fn the_reference_file_skip_condition_is_narrow() {
+        assert!(
+            repo_file_if_present("zlib.map.this-path-is-deliberately-absent").is_none(),
+            "a genuinely missing REFERENCE file must yield None"
+        );
+        assert!(
+            repo_file_if_present("src/ffi/mod.rs")
+                .is_some_and(|text| text.contains("fn repo_file_if_present")),
+            "a present file must still be read in full"
+        );
+    }
+
+    /// A path that exists but cannot be read as text is a defect, not a
+    /// capability condition, so it must still panic.
+    ///
+    /// `src` is a directory: `read_to_string` fails on it with an error whose
+    /// kind is never `NotFound` (`IsADirectory` on Linux, a permission or
+    /// generic error elsewhere), which is precisely the class this asserts is
+    /// still fatal.
+    #[test]
+    #[should_panic(expected = "exists but could not be read")]
+    fn a_reference_path_that_exists_but_cannot_be_read_still_fails_hard() {
+        let _ = repo_file_if_present("src");
     }
 
     /// The free-function surface `crate::ffi::types` publishes, pinned by name.
@@ -1475,9 +1610,9 @@ mod tests {
         // Distinctness, up to the identical-code folding an optimized build
         // legitimately performs.
         //
-        // `[profile.release]` sets `lto` and `codegen-units = 1`, so LLVM's
-        // function merging collapses two exports whose machine code is
-        // byte-identical onto one address. That is reachable only for the ABI
+        // `[profile.release]` sets `codegen-units = 1`, so the whole crate is
+        // optimized as a single unit and LLVM's function merging collapses two
+        // exports whose machine code is byte-identical onto one address. That is reachable only for the ABI
         // *width twins* — the motley `_z` exports (`compress_z`, `compress2_z`,
         // `compressBound_z`, `deflateBound_z`, `uncompress_z`, `uncompress2_z`,
         // `adler32_z`, `crc32_z`) and the large-file `*64` exports — because on an

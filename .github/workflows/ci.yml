@@ -28,7 +28,9 @@
 #   bare-metal-no-std  library build for thumbv7em-none-eabihf: the only
 #                 configuration in which `mod no_std_support` compiles (gap D10)
 #   package-verify  `cargo package --list` checked against Cargo.toml's
-#                 `exclude` contract, plus the packaging build (gap D12)
+#                 `exclude` contract, plus the packaging build AND the unpacked
+#                 archive's own `cargo test` run, so the published crate is
+#                 proven self-testable and not merely self-buildable (gap D12)
 #
 # Action versions are standardized on @v4 across this repository's Cargo CI.
 # No native toolchain is required: the `flate2` dev-dependency resolves to its
@@ -64,7 +66,8 @@
 #     19 on Apple and 3 elsewhere, guarded by a const-evaluated cross-check in
 #     the same module. `src/deflate/mod.rs` imports it and writes it into the
 #     RFC 1952 header, so this is live behaviour on those two runners, not dead
-#     code. See the KNOWN EXPECTED FAILURE note below.
+#     code. See the GZIP `OS` BYTE note below for how the byte-identity gate
+#     asserts it per platform.
 #   * `src/lib.rs` `MIN_ALIGN` - 16 on 64-bit, 8 on 32-bit, inside
 #     `mod no_std_support`. The 8 arm needs a 32-bit target AND the full no_std
 #     predicate, so the `bare-metal-no-std` job is the only place it compiles.
@@ -87,23 +90,42 @@
 #     name says so. A check row is worth having, but it is not test coverage and
 #     is never labelled as if it were.
 #
-# KNOWN EXPECTED FAILURE ON THE WINDOWS AND macOS ROWS - READ BEFORE "FIXING"
+# THE GZIP `OS` BYTE ON THE WINDOWS AND macOS ROWS - READ BEFORE "FIXING"
 # ---------------------------------------------------------------------------
 # `tests/interop.rs`'s `BI_VECTORS_GZIP` bakes 75 reference gzip members whose
-# `OS` field (byte 9) is literally `03`, and its consumer compares them with a
-# bare `assert_eq!`, gated only on `feature = "gzip"`. Because `OS_CODE` is 10
-# on Windows and 19 on Apple, that one assertion fails on those two runners.
-# The LIBRARY IS CORRECT: byte-identity is defined against the reference C
-# library built for the SAME target, and C's `zutil.h` selects 10 and 19 there
-# too, so emitting them is parity rather than a regression. The table is a
-# fixture that hard-codes a Unix host, and `tests/interop.rs` says so itself,
-# naming the cross-platform matrix as the thing that would surface it. The fix
-# belongs in that file - normalise byte 9 the way its own `normalise_gzip_os`
-# helper already does for the platform-neutral gzip tables - and it is NOT in
-# this workflow's scope. These rows are therefore deliberately NOT feature-
-# scoped, `if:`-guarded or filtered around the failure: a platform-specific
-# failure is a finding to surface, and papering over it would delete the only
-# signal that the fixture needs fixing. Nothing here claims these rows pass.
+# `OS` field (byte 9) is literally `03`, because they were baked on a Unix host.
+# `OS_CODE` is 10 on Windows and 19 on Apple, so a naive comparison of that byte
+# fails on these two runners - and it did, until the fixture consumer was taught
+# the difference. THE LIBRARY WAS ALWAYS CORRECT: byte-identity is defined
+# against the reference C library built for the SAME target, and C's `zutil.h`
+# selects 10 and 19 there too, so emitting them is parity rather than a
+# regression.
+#
+# The resolution is in `tests/interop.rs`, where the defect was: `check_all`
+# retargets byte 9 of the EXPECTED vector to `HOST_GZIP_OS_CODE` - the value
+# reference zlib writes on the target being compiled, derived there from raw
+# `#[cfg]` attributes independently of `zlib_rs::util::OS_CODE` - and then still
+# compares every byte, byte 9 included, with a bare `assert_eq!`. Note what this
+# is NOT: it is not `normalise_gzip_os`, which ERASES byte 9 from the produced
+# stream and is used only by the platform-neutral tables. Retargeting the
+# expectation keeps a positive assertion on that byte on every host, so these
+# rows gain coverage rather than losing it. On a Unix host the retargeting is a
+# no-op and the 75 rows are compared exactly as baked.
+#
+# Three tests in `tests/interop.rs::byte_identity` hold that contract, and all
+# three run on every row including `ubuntu-latest`, so a regression here is
+# caught before a Windows or macOS runner ever sees it:
+# `retargeting_the_gzip_os_byte_touches_only_that_byte`,
+# `the_gzip_vector_family_holds_for_every_platform_os_code` (replays all 75 rows
+# against all three `OS_CODE` values from a single host, so the Windows and
+# Apple behaviour is proved rather than assumed), and
+# `the_host_gzip_os_code_agrees_with_the_library_cascade`.
+#
+# So these rows are expected to be GREEN, and they remain deliberately NOT
+# feature-scoped, `if:`-guarded or filtered: a platform-specific failure here is
+# a real finding, and scoping around one would delete the signal. Do not add
+# `test: false` to them - that would silently drop the only execution coverage
+# `gzopen_w`, the `cfg(not(unix))` arms and `O_NONBLOCK`'s BSD value ever get.
 #
 # Also surfaced by the Windows rows and left to their owners: `src/gz/mod.rs`
 # and `src/gz/open.rs` emit three dead-code warnings on the Windows targets
@@ -248,10 +270,10 @@ jobs:
           # within a run. With `fail-fast: false` above, several rows can and do
           # fail at once, so a collision would mask the real failure with a 409.
           #
-          # See "KNOWN EXPECTED FAILURE ON THE WINDOWS AND macOS ROWS" in the
-          # header: one `tests/interop.rs` assertion bakes a Unix `OS_CODE` and
-          # fails here by design. It is not scoped around, and these rows are
-          # not claimed to be green.
+          # Both rows run the real suite (`test: true`) and are expected to pass.
+          # See "THE GZIP `OS` BYTE ON THE WINDOWS AND macOS ROWS" in the header
+          # for the one byte that legitimately differs per host and how
+          # `tests/interop.rs` asserts it per platform instead of assuming Unix.
           # ---------------------------------------------------------------
           # Windows/MSVC. The only runner that compiles `gzopen_w` - the sole
           # platform-gated exported C symbol - and the five `cfg(not(unix))`
@@ -301,10 +323,10 @@ jobs:
     - name: Test
       if: ${{ matrix.test }}
       run: cargo +stable test --verbose ${{ matrix.features }}
-    # The SHIPPED profile, tested. `[profile.release]` sets `opt-level = 3`,
-    # `lto = true` and `codegen-units = 1`, none of which apply to the debug test
-    # run above, so a debug-only gate cannot see a defect whose reproduction
-    # depends on optimization. That is not hypothetical: a guarantee in
+    # The SHIPPED profile, tested. `[profile.release]` sets `opt-level = 3` and
+    # `codegen-units = 1`, neither of which applies to the debug test run above,
+    # so a debug-only gate cannot see a defect whose reproduction depends on
+    # optimization. That is not hypothetical: a guarantee in
     # `src/ffi/alloc.rs` that delegated its size ceiling to `malloc` held in debug
     # and did not hold here, because at these settings the call was removed and
     # the null test folded away. `cargo build --release` above compiles the
@@ -375,8 +397,8 @@ jobs:
       run: cargo +stable test --no-default-features --features no-std
     # Both std-off rows again under the SHIPPED profile. See the rationale on the
     # `build-test` job's release step: `[profile.release]`'s `opt-level = 3` +
-    # `lto` + `codegen-units = 1` can decide whether an assertion holds, so the
-    # profile that ships has to be the profile that is tested.
+    # `codegen-units = 1` can decide whether an assertion holds, so the profile
+    # that ships has to be the profile that is tested.
     - name: Test (no default features, release profile)
       run: cargo +stable test --release --no-default-features
     - name: Test (no-std feature, release profile)
@@ -431,8 +453,28 @@ jobs:
         esac
     - name: Format check
       run: cargo +stable fmt --all -- --check
+    # `--all-features` is REQUIRED, not decorative, and it is the gate the rest of
+    # the repository already documents: `.cargo/config.toml` states it twice (its
+    # "nothing weakening a diagnostic" clause and its "re-observe the gates"
+    # list), and it is the migration plan's own standard for this job.
+    #
+    # Without it clippy never sees the feature-gated surface. Measured on the
+    # fingerprint directory: `--all-targets` alone lints 14 units and SKIPS
+    # `tests/c_oracle.rs` entirely, because that target carries
+    # `required-features = ["c-oracle"]`. Also unlinted without it: the
+    # `inflate_strict` arms and the `no_std` runtime block. Those are precisely
+    # the places a lint regression would hide longest, since no other job in this
+    # file promotes warnings to errors.
+    #
+    # `--all-features` enables `c-oracle`, but that costs nothing here: clippy
+    # only type-checks, and the harness shells out to a C compiler at RUN time,
+    # never at lint time. Both spellings were measured exit 0 with zero
+    # diagnostics, so widening the gate cannot turn it red on today's tree.
+    #
+    # `src/lib.rs`'s `the_lint_job_runs_the_documented_clippy_gate` asserts this
+    # exact command, so the narrower spelling cannot come back unnoticed.
     - name: Clippy
-      run: cargo +stable clippy --all-targets -- -D warnings
+      run: cargo +stable clippy --all-targets --all-features -- -D warnings
 
   # Minimum Supported Rust Version gate: pins the toolchain to 1.85.0 (the
   # release that stabilized the 2024 edition) and verifies the crate builds and
@@ -1365,6 +1407,91 @@ jobs:
     # second property for free: no earlier step left the tree modified.
     - name: Verify the packaged crate builds from its own contents
       run: cargo +stable package --locked --verbose
+    # `cargo package --verbose` COMPILES the packaged crate but does not TEST
+    # it, and those are different properties: a downstream consumer or distro
+    # packager who unpacks the `.crate` and runs `cargo test` is running a suite
+    # whose fixtures include files the `exclude` contract deliberately removed.
+    # That is not hypothetical - it was measured. `src/ffi/mod.rs` reconciles the
+    # exported symbol surface against `zlib.map`, which is REFERENCE-only and is
+    # excluded by the `\.map$` pattern asserted above, so inside the archive both
+    # reconciliation tests used to panic with `zlib.map must be readable: No such
+    # file or directory`: 681 passed, 2 failed. They now degrade to a printed
+    # skip notice for that one condition (file absent) and stay hard failures for
+    # every other (present but unreadable, or present but malformed), which is
+    # the same contract `tests/c_oracle.rs` uses for a missing C compiler.
+    #
+    # This step is what keeps that true. It extracts the tarball rather than
+    # reusing the `target/package/<name>-<version>/` directory `cargo package`
+    # leaves behind, because the tarball is what a consumer actually downloads,
+    # so this also proves the archive is self-sufficient. It runs entirely inside
+    # `RUNNER_TEMP` with its own `CARGO_TARGET_DIR`, so it cannot perturb the
+    # workspace or either lockfile - the step below still gets to assert that.
+    - name: Run the packaged crate's own test suite
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        crates=(target/package/*.crate)
+        if [ "${#crates[@]}" -ne 1 ]; then
+          echo "::error::expected exactly one .crate in target/package, found"\
+               "${#crates[@]}: ${crates[*]-none}"
+          exit 1
+        fi
+        crate="${crates[0]}"
+        echo "packaged archive: $crate ($(wc -c < "$crate") bytes)"
+
+        unpacked="$RUNNER_TEMP/packaged"
+        rm -rf "$unpacked"
+        mkdir -p "$unpacked"
+        tar -xzf "$crate" -C "$unpacked"
+        roots=("$unpacked"/*/)
+        if [ "${#roots[@]}" -ne 1 ]; then
+          echo "::error::expected exactly one top-level directory in the archive,"\
+               "found ${#roots[@]}: ${roots[*]-none}"
+          exit 1
+        fi
+        root="${roots[0]%/}"
+        echo "unpacked to: $root"
+
+        # Precondition, not a nicety: if the script were present the run below
+        # would prove nothing about the degradation path. The `--list` gate above
+        # forbids `\.map$` outright, so this is the second, independent check
+        # that the two suites really do execute without it.
+        if [ -e "$root/zlib.map" ]; then
+          echo "::error::zlib.map is inside the packaged crate; the exclude contract"\
+               " has regressed and the skip path below is untested"
+          exit 1
+        fi
+
+        cd "$root"
+        # The consumer gate: every suite, zero failures, zero ignored. Not
+        # `--no-fail-fast`; a single failure here is a broken published crate.
+        CARGO_TARGET_DIR="$RUNNER_TEMP/packaged-target" \
+          cargo +stable test --locked
+        # Belt and braces: prove the two suites PASSED BY DEGRADING rather than
+        # by having been silently filtered out or renamed away. `--nocapture` is
+        # required because a passing test's stdout is swallowed by default.
+        CARGO_TARGET_DIR="$RUNNER_TEMP/packaged-target" \
+          cargo +stable test --locked --lib -- --nocapture \
+          ffi::tests::every_zlib_map_global_symbol_has_a_compile_time_signature_guard \
+          ffi::tests::no_zlib_map_local_symbol_is_exported_or_guarded \
+          > "$RUNNER_TEMP/packaged-skip.log" 2>&1 || {
+            cat "$RUNNER_TEMP/packaged-skip.log"
+            echo "::error::the zlib.map reconciliation tests did not pass inside the"\
+                 " packaged crate"
+            exit 1
+          }
+        notices="$(grep -c 'ffi: SKIPPED — zlib.map is not present' \
+          "$RUNNER_TEMP/packaged-skip.log" || true)"
+        selected="$(grep -c '^test result: ok\. 2 passed' \
+          "$RUNNER_TEMP/packaged-skip.log" || true)"
+        if [ "$notices" -ne 2 ] || [ "$selected" -ne 1 ]; then
+          cat "$RUNNER_TEMP/packaged-skip.log"
+          echo "::error::expected both zlib.map reconciliation tests to run and print the"\
+               " skip notice; saw $notices notice(s) and $selected matching result line(s)"
+          exit 1
+        fi
+        echo "the packaged crate is self-testable: full suite green, and both zlib.map"\
+             "reconciliation tests degraded to a printed skip notice as designed"
     # A packaging step that re-resolved dependencies would invalidate every
     # `--locked` gate in this file, and `fuzz/Cargo.lock` belongs to a detached
     # workspace that nothing here should be touching at all.

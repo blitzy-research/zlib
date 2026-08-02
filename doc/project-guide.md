@@ -219,7 +219,7 @@ cargo fetch
 cargo build
 # Expected output: Finished `dev` profile [unoptimized + debuginfo]
 
-# Release build (optimized with LTO)
+# Release build (optimized: opt-level 3, one codegen unit)
 cargo build --release
 # Expected output: Finished `release` profile [optimized]
 

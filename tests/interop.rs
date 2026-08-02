@@ -1156,20 +1156,34 @@ mod byte_identity {
     /// rows = 5 corpora × the same 15 level/strategy combinations as
     /// [`BI_VECTORS`], at `memLevel = 8`.
     ///
-    /// # Platform assumption: `OS_CODE == 3`
+    /// # The one host-dependent byte, and why it is still asserted exactly
     ///
     /// Byte 9 of a gzip member is the `OS` field, and zlib fills it from the
     /// compile-time `OS_CODE`: **3 on Unix-family targets, 10 on Windows, 19 on
-    /// non-Windows Apple** (AAP §0.6.6). Every row below carries `03`, so this
-    /// table is implicitly Unix-specific and would fail on a Windows or macOS
-    /// runner — which is exactly the residual risk AAP §0.6.6 records as the
-    /// motivation for the cross-platform CI matrix (gap D3); all current CI jobs
-    /// run on `ubuntu-latest`. The rows are deliberately left as-is (weakening a
-    /// passing assertion is forbidden by AAP §0.8.1 directive D-5); the
-    /// assumption is documented here so that a future non-Unix runner fails
-    /// legibly instead of mysteriously. The platform-neutral gzip tables
-    /// ([`BI_GRID_GZIP`], [`BI_EXTREMES_GZIP`]) normalise that one byte through
-    /// [`normalise_gzip_os`] and therefore hold on every host.
+    /// non-Windows Apple** (AAP §0.6.6). Every row below was baked on a Unix host
+    /// and therefore carries `03`.
+    ///
+    /// That is a property of the *baking host*, not of the library: byte-identity
+    /// (AAP §0.8.1 directive D-1) is defined against the reference C library built
+    /// for the **same** target, and C's own `zutil.h` cascade selects 10 and 19 on
+    /// Windows and Apple too, so emitting them there is parity rather than a
+    /// regression. The rows are consequently *retargeted*, not weakened: before
+    /// each comparison [`check_all`] rewrites byte 9 of the expected vector to
+    /// [`HOST_GZIP_OS_CODE`] — the value reference zlib writes on the target being
+    /// compiled, derived independently of the library by [`retarget_gzip_os`] —
+    /// and then compares **every** byte, byte 9 included, with a bare
+    /// `assert_eq!`. On a Unix host the rewrite is a no-op (`HOST_GZIP_OS_CODE ==
+    /// 3`), so the 75 rows below are compared exactly as baked, bit for bit.
+    ///
+    /// Nothing is given up by this: unlike the platform-neutral gzip tables
+    /// ([`BI_GRID_GZIP`], [`BI_EXTREMES_GZIP`]), which erase byte 9 through
+    /// [`normalise_gzip_os`] and therefore assert nothing about it, this family
+    /// keeps a positive assertion on that byte on every host. It is what makes the
+    /// `windows-latest` and `macos-latest` rows of the `build-test` matrix
+    /// (AAP gap D3) run this gate for real instead of failing on a fixture
+    /// artifact. `the_gzip_vector_family_holds_for_every_platform_os_code`
+    /// exercises all three values from a single host so the Windows and Apple
+    /// behaviour is proved rather than assumed.
     #[cfg(feature = "gzip")]
     const BI_VECTORS_GZIP: &str = "\
     0 -1 31 0 1f8b080000000000000303000000000000000000
@@ -1263,6 +1277,13 @@ mod byte_identity {
     /// Assert every vector line in `table` reproduces the reference bytes
     /// exactly. Line format: `<input-index> <level> <windowBits> <strategy-id>
     /// <hex-expected>`.
+    ///
+    /// Every byte is compared with a bare `assert_eq!`. The only adjustment is
+    /// [`retarget_gzip_os`], which rewrites the single legitimately host-dependent
+    /// gzip `OS` byte of the *expected* vector to [`HOST_GZIP_OS_CODE`] so that the
+    /// comparison is against what reference zlib emits **on this target** — a
+    /// no-op on the Unix hosts the tables were baked on, and an exact
+    /// per-platform expectation everywhere else. Non-gzip framings are untouched.
     fn check_all(table: &str) {
         let inputs = parse_inputs();
         let mut count = 0usize;
@@ -1272,7 +1293,7 @@ mod byte_identity {
             let level: i32 = f.next().unwrap().parse().unwrap();
             let wbits: i32 = f.next().unwrap().parse().unwrap();
             let strat: u8 = f.next().unwrap().parse().unwrap();
-            let expected = unhex(f.next().unwrap());
+            let expected = retarget_gzip_os(unhex(f.next().unwrap()), wbits, HOST_GZIP_OS_CODE);
             assert!(
                 f.next().is_none(),
                 "unexpected trailing field in vector line: {line:?}"
@@ -1283,7 +1304,8 @@ mod byte_identity {
                 produced,
                 expected,
                 "byte-identity mismatch vs C zlib 1.3.2.1-motley: input #{idx} \
-                 (len {}), level {level}, windowBits {wbits}, strategy {:?}",
+                 (len {}), level {level}, windowBits {wbits}, strategy {:?} \
+                 (expected gzip OS byte for this target: {HOST_GZIP_OS_CODE})",
                 input.len(),
                 strat_from_id(strat),
             );
@@ -1304,6 +1326,168 @@ mod byte_identity {
     #[test]
     fn matches_reference_zlib_gzip_framing() {
         check_all(BI_VECTORS_GZIP);
+    }
+
+    // =======================================================================
+    // The gzip `OS` byte across platforms — what makes the Windows and macOS
+    // rows of the `build-test` matrix (AAP gap D3) able to run this gate.
+    //
+    // `OS_CODE` is the one compile-time platform choice that reaches the wire
+    // (AAP §0.6.6), so it is the one axis the tier-1 tables cannot bake. The
+    // three tests below cover it completely from a single host: the retargeting
+    // helper is exercised for every value the cascade can select, the whole
+    // 75-row gzip family is replayed against every value, and the host value is
+    // diffed against the library's own independent derivation.
+    // =======================================================================
+
+    /// [`retarget_gzip_os`] rewrites exactly one byte of a gzip-framed expectation
+    /// and leaves every other byte, and every other framing, alone.
+    ///
+    /// Table-driven over all three values `zutil.h`'s cascade can select, so the
+    /// Windows (10) and Apple (19) behaviour is checked on a Unix host rather than
+    /// waiting for a runner that produces them.
+    #[test]
+    fn retargeting_the_gzip_os_byte_touches_only_that_byte() {
+        // A gzip member long enough to have bytes on both sides of offset 9.
+        let baked: Vec<u8> = (0u8..24).map(|i| if i == 9 { 0x03 } else { i }).collect();
+        assert_eq!(baked[GZIP_OS_FIELD_OFFSET], NORMALISED_OS_CODE);
+
+        for os_code in PLATFORM_OS_CODES {
+            for wbits in [24, 25, 31] {
+                let out = retarget_gzip_os(baked.clone(), wbits, os_code);
+                assert_eq!(
+                    out[GZIP_OS_FIELD_OFFSET], os_code,
+                    "windowBits {wbits} selects gzip framing, so byte \
+                     {GZIP_OS_FIELD_OFFSET} must become {os_code}"
+                );
+                assert_eq!(out.len(), baked.len(), "length must not change");
+                for (offset, (&got, &want)) in out.iter().zip(baked.iter()).enumerate() {
+                    if offset != GZIP_OS_FIELD_OFFSET {
+                        assert_eq!(
+                            got, want,
+                            "byte {offset} must be untouched by OS retargeting"
+                        );
+                    }
+                }
+            }
+
+            // Non-gzip framings carry no `OS` field, so nothing may change —
+            // this is what keeps the 225 plain-framing rows of `BI_VECTORS`
+            // out of the retargeting path entirely.
+            for wbits in [-15, -9, 9, 15, 23, 32] {
+                assert_eq!(
+                    retarget_gzip_os(baked.clone(), wbits, os_code),
+                    baked,
+                    "windowBits {wbits} is not gzip framing and must pass through \
+                     byte-for-byte"
+                );
+            }
+        }
+
+        // The Unix value must be a genuine no-op, which is what makes the
+        // retargeting invisible on the hosts the tables were baked on.
+        assert_eq!(
+            retarget_gzip_os(baked.clone(), 31, NORMALISED_OS_CODE),
+            baked,
+            "retargeting to the baked value must be a no-op"
+        );
+    }
+
+    /// The whole [`BI_VECTORS_GZIP`] family holds for **every** platform
+    /// `OS_CODE`, not just this host's.
+    ///
+    /// This is the executable stand-in for a `windows-latest` / `macos-latest`
+    /// run. The `OS` byte is the only part of a gzip member that depends on the
+    /// build host — `src/deflate` writes it with a single `put_byte(OS_CODE)` and
+    /// nothing else in the stream reads it — so substituting that byte in the
+    /// produced stream reproduces exactly what a host with that `OS_CODE` would
+    /// have emitted. Retargeting the expectation with the same value and then
+    /// comparing all 75 rows in full therefore proves those two matrix rows pass,
+    /// from a Linux runner, for all three values the cascade can select.
+    ///
+    /// It is deliberately a *superset* of [`matches_reference_zlib_gzip_framing`]
+    /// rather than a replacement: that test still runs the unmodified produced
+    /// stream against this host's expectation.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn the_gzip_vector_family_holds_for_every_platform_os_code() {
+        let inputs = parse_inputs();
+
+        for os_code in PLATFORM_OS_CODES {
+            let mut count = 0usize;
+            for line in BI_VECTORS_GZIP.lines().filter(|l| !l.trim().is_empty()) {
+                let mut f = line.split_whitespace();
+                let idx: usize = f.next().unwrap().parse().unwrap();
+                let level: i32 = f.next().unwrap().parse().unwrap();
+                let wbits: i32 = f.next().unwrap().parse().unwrap();
+                let strat: u8 = f.next().unwrap().parse().unwrap();
+                let expected = retarget_gzip_os(unhex(f.next().unwrap()), wbits, os_code);
+                assert!(
+                    f.next().is_none(),
+                    "unexpected trailing field in vector line: {line:?}"
+                );
+                assert!(
+                    (24..=31).contains(&wbits),
+                    "BI_VECTORS_GZIP must contain only gzip framings; found \
+                     windowBits {wbits}"
+                );
+
+                let input = &inputs[idx];
+                let mut produced =
+                    zlib_rs_deflate_strategy(input, level, wbits, strat_from_id(strat));
+                // Stand in for a host whose `OS_CODE` is `os_code`: the encoder
+                // writes that byte and only that byte from the platform cascade.
+                assert!(produced.len() > GZIP_OS_FIELD_OFFSET);
+                produced[GZIP_OS_FIELD_OFFSET] = os_code;
+
+                assert_eq!(
+                    produced,
+                    expected,
+                    "byte-identity mismatch vs C zlib 1.3.2.1-motley on a host with \
+                     OS_CODE {os_code}: input #{idx} (len {}), level {level}, \
+                     windowBits {wbits}, strategy {:?}",
+                    input.len(),
+                    strat_from_id(strat),
+                );
+                count += 1;
+            }
+            assert_eq!(
+                count, 75,
+                "BI_VECTORS_GZIP must carry 75 rows; parsed {count} for OS_CODE \
+                 {os_code}"
+            );
+        }
+    }
+
+    /// This file's independent `OS_CODE` derivation must agree with the library's.
+    ///
+    /// [`HOST_GZIP_OS_CODE`] is spelled from raw `#[cfg]` attributes so that an
+    /// expectation is never computed from the constant it is testing. That
+    /// independence is only worth having if the two derivations are also checked
+    /// against each other: a divergence means one of the two cascades is wrong,
+    /// and this names which host it happened on. On a Unix host it additionally
+    /// pins the value the tier-1 gzip tables were baked with.
+    #[test]
+    fn the_host_gzip_os_code_agrees_with_the_library_cascade() {
+        assert_eq!(
+            HOST_GZIP_OS_CODE,
+            zlib_rs::util::OS_CODE,
+            "tests/interop.rs derives gzip OS byte {HOST_GZIP_OS_CODE} for this \
+             target while zlib_rs::util::OS_CODE is {}; one of the two zutil.h \
+             cascades is wrong",
+            zlib_rs::util::OS_CODE
+        );
+        assert!(
+            PLATFORM_OS_CODES.contains(&HOST_GZIP_OS_CODE),
+            "the host OS byte {HOST_GZIP_OS_CODE} must be one of the three values \
+             zutil.h's cascade can select: {PLATFORM_OS_CODES:?}"
+        );
+        #[cfg(all(not(windows), not(target_vendor = "apple")))]
+        assert_eq!(
+            HOST_GZIP_OS_CODE, NORMALISED_OS_CODE,
+            "on a Unix-family host the tier-1 gzip tables must be compared exactly \
+             as baked, with no retargeting at all"
+        );
     }
 
     // =======================================================================
@@ -1454,9 +1638,81 @@ Whenever the lazy dog dozed, the quick brown fox vaulted the picket fence. ";
     /// `ID1 ID2 CM FLG MTIME[4] XFL OS`).
     const GZIP_OS_FIELD_OFFSET: usize = 9;
 
-    /// The `OS_CODE` value the platform-neutral gzip tables are normalised to:
-    /// 3, "Unix".
+    /// The `OS_CODE` value the platform-neutral gzip tables are normalised to,
+    /// and the value every baked full-hex gzip row carries: 3, "Unix".
     const NORMALISED_OS_CODE: u8 = 0x03;
+
+    /// The three gzip `OS` byte values `zutil.h`'s cascade can select, in the
+    /// cascade's own order. Used by the platform-simulation tests to exercise the
+    /// Windows and Apple values from a host that is neither.
+    const PLATFORM_OS_CODES: [u8; 3] = [10, 19, NORMALISED_OS_CODE];
+
+    // -----------------------------------------------------------------------
+    // The gzip `OS` byte reference zlib writes on the target being compiled.
+    //
+    // This is a deliberate second, INDEPENDENT derivation of the same cascade
+    // `src/util/mod.rs` holds — spelled as raw `#[cfg]` attributes rather than
+    // read from `zlib_rs::util::OS_CODE`, for exactly the reason that module
+    // gives for its own `EXPECTED_OS_CODE` mirror: an expectation computed from
+    // the constant under test cannot detect a wrong constant. Deriving it here
+    // keeps `check_all`'s assertion on byte 9 a real assertion — a library that
+    // emitted the wrong `OS_CODE` would still fail byte-identity — while making
+    // the expectation correct on every host rather than on Unix only.
+    // `the_host_gzip_os_code_agrees_with_the_library_cascade` diffs the two
+    // derivations, so the pair cannot drift apart unnoticed.
+    // -----------------------------------------------------------------------
+
+    /// The gzip `OS` byte for a Windows target: 10 (`zutil.h` L156-L158).
+    #[cfg(windows)]
+    const HOST_GZIP_OS_CODE: u8 = 10;
+
+    /// The gzip `OS` byte for a non-Windows Apple target: 19 (`zutil.h`
+    /// L168-L170).
+    #[cfg(all(not(windows), target_vendor = "apple"))]
+    const HOST_GZIP_OS_CODE: u8 = 19;
+
+    /// The gzip `OS` byte for every other target: the Unix default 3
+    /// (`zutil.h` L187-L189) — the value the tables below were baked with.
+    #[cfg(all(not(windows), not(target_vendor = "apple")))]
+    const HOST_GZIP_OS_CODE: u8 = NORMALISED_OS_CODE;
+
+    /// Rewrite the gzip `OS` byte of an *expected* full-hex reference vector from
+    /// the [`NORMALISED_OS_CODE`] it was baked with to `os_code`, when
+    /// `window_bits` selects gzip framing; return other framings untouched.
+    ///
+    /// This is the inverse in spirit of [`normalise_gzip_os`] and the opposite in
+    /// effect. `normalise_gzip_os` *erases* byte 9 from a produced stream so a
+    /// platform-neutral table can be compared; this *retargets* byte 9 of the
+    /// expectation so the comparison stays exact — the produced stream is never
+    /// touched, and the caller still asserts all of it, byte 9 included. That
+    /// distinction is what lets the full-hex family keep a positive assertion on
+    /// the `OS` byte on every host (AAP §0.8.1 directive D-5: coverage only ever
+    /// increases).
+    ///
+    /// On a host whose `os_code` is already [`NORMALISED_OS_CODE`] this is a no-op
+    /// by construction, so the Unix comparison is bit-for-bit what it was before
+    /// the retargeting existed.
+    ///
+    /// # Panics
+    ///
+    /// If a gzip-framed expected vector does not carry [`NORMALISED_OS_CODE`] at
+    /// [`GZIP_OS_FIELD_OFFSET`]. Silently overwriting an unexpected value would
+    /// turn a mis-baked row — or a table accidentally regenerated on a non-Unix
+    /// host — into a passing test on every platform, which is precisely the class
+    /// of false green this helper must not create.
+    fn retarget_gzip_os(mut expected: Vec<u8>, window_bits: i32, os_code: u8) -> Vec<u8> {
+        if (24..=31).contains(&window_bits) && expected.len() > GZIP_OS_FIELD_OFFSET {
+            assert_eq!(
+                expected[GZIP_OS_FIELD_OFFSET], NORMALISED_OS_CODE,
+                "a baked gzip reference vector must carry the Unix OS byte \
+                 {NORMALISED_OS_CODE} at offset {GZIP_OS_FIELD_OFFSET}; found {} \
+                 — the table was not baked on a Unix host, or the offset is wrong",
+                expected[GZIP_OS_FIELD_OFFSET]
+            );
+            expected[GZIP_OS_FIELD_OFFSET] = os_code;
+        }
+        expected
+    }
 
     /// Force the gzip `OS` byte of `stream` to [`NORMALISED_OS_CODE`] when
     /// `window_bits` selects gzip framing; return other framings untouched.
@@ -1467,8 +1723,11 @@ Whenever the lazy dog dozed, the quick brown fox vaulted the picket fence. ";
     /// than gate the platform-neutral gzip assertions behind a platform predicate
     /// (which would silently delete their coverage everywhere else), this
     /// normalises that single header byte and asserts *everything else* exactly.
-    /// The one byte given up here is still pinned on Unix hosts by
-    /// [`BI_VECTORS_GZIP`], whose 75 rows are compared raw.
+    ///
+    /// The byte this gives up is not given up by the suite: the full-hex family
+    /// [`BI_VECTORS_GZIP`] asserts it positively on **every** host by retargeting
+    /// the expectation instead of erasing the observation — see
+    /// [`retarget_gzip_os`].
     fn normalise_gzip_os(mut stream: Vec<u8>, window_bits: i32) -> Vec<u8> {
         if (24..=31).contains(&window_bits) && stream.len() > GZIP_OS_FIELD_OFFSET {
             stream[GZIP_OS_FIELD_OFFSET] = NORMALISED_OS_CODE;
