@@ -68,14 +68,62 @@
 #   `fuzz/deny.toml`, and the `supply-chain` job below enforces it. `cargo-fuzz`
 #   `needs:` that job, so the harnesses are only ever built from an audited
 #   dependency graph.
+#
+# BUDGET
+# ======
+#   The per-target budget is EVENT-CONDITIONAL, because the callers want
+#   opposite things. A `pull_request` run sits on the critical path of a merge,
+#   so it gets 120s/target; `schedule` and `workflow_dispatch` have nothing
+#   waiting on them, so they get 600s/target. The loop is SEQUENTIAL over the
+#   five targets, so the fuzzing wall clock is the per-target budget times five:
+#   about 10 minutes on a pull request and about 50 on the weekly run.
+#
+#   Only `-max_total_time` varies. `-max_len` and `-rss_limit_mb` are FIXED,
+#   because the harnesses size their internal buffers against those exact values
+#   (see `fuzz/fuzz_targets/fuzz_deflate_roundtrip.rs`); relaxing either would
+#   turn a harness OOM into something indistinguishable from a real finding,
+#   which is the worst outcome a fuzzing gate can produce.
+#
+# CORPUS PERSISTENCE
+# ==================
+#   Each target's libFuzzer corpus is cached under its OWN key, so one target's
+#   growth can neither invalidate nor evict another's. `cargo fuzz` keys corpora
+#   by target name under `fuzz/corpus/<target>/`, which is why the five cache
+#   entries below are spelled out one per target, and why renaming a target
+#   would silently orphan its corpus rather than fail loudly.
+#
+#   The keys are ROLLING - they carry the run id - so the primary key always
+#   misses, `restore-keys` restores the most recent prefix match, and the
+#   post-job hook therefore always saves the grown corpus. Cache entries are
+#   immutable, so a content-hashed key would hit, save nothing, and freeze the
+#   corpus at its first-ever contents. A persisted corpus lets successive runs
+#   build on previously discovered inputs instead of restarting from empty.
+#
+#   Cache entries are BRANCH-SCOPED: a branch reads its own and the default
+#   branch's, but a pull request's entries are not visible to other pull
+#   requests. The weekly run on the default branch is therefore what accumulates
+#   the durable corpus, and pull requests read from it. A total cache MISS is a
+#   fully supported path and not an error: `fuzz/corpus` is gitignored (root
+#   `.gitignore`), so a cold run is both the normal first execution and the
+#   permanent fallback, and `cargo fuzz run` creates the directory itself.
+#
+#   `fuzz/seeds/**` is a SEPARATE, committed, read-only tree and is deliberately
+#   NOT part of any cache entry here; see the "Committed seed corpus" section in
+#   the header of `fuzz/fuzz_targets/fuzz_inflate.rs`.
 
 name: Fuzz
 
 # Triggers:
 #   * pull_request      - hard requirement carried over from the original file.
-#   * workflow_dispatch - allow maintainers to launch a fuzz run on demand.
+#                         Runs on the shorter per-target budget because it is on
+#                         the critical path of a merge.
+#   * workflow_dispatch - allow maintainers to launch a fuzz run on demand, on
+#                         the same longer budget as the schedule.
 #   * schedule          - a weekly bounded run (Mondays 03:00 UTC) for drift
-#                         detection across the fuzz targets.
+#                         detection across the fuzz targets. This is the run that
+#                         accumulates the durable, branch-scoped corpus, which is
+#                         why it carries the longer budget. See "BUDGET" and
+#                         "CORPUS PERSISTENCE" in the header.
 on:
   pull_request:
   workflow_dispatch:
@@ -138,8 +186,17 @@ jobs:
     runs-on: ubuntu-latest
     # Do not fuzz an unaudited dependency graph.
     needs: supply-chain
+    # Backstop against a pathological hang consuming a full runner slot, sized so
+    # it can NEVER truncate a scheduled campaign: the longest budget is 600s over
+    # five sequential targets (50 minutes), plus the cargo-fuzz install, the
+    # harness build and the corpus restore/save, which lands the worst realistic
+    # case around 60-65 minutes. 120 leaves roughly a 2x margin. A timeout that
+    # cut fuzzing short would be a silent coverage reduction reported as a red
+    # build with no finding, so this number must stay well above the arithmetic
+    # above if the budget is ever raised again.
+    timeout-minutes: 120
     # MANDATORY. `rust-toolchain.toml` pins `channel = "1.85.0"`, and a toolchain
-    # FILE is overridden only by the `RUSTUP_TOOLCHAIN` environment variable — so
+    # FILE is overridden only by the `RUSTUP_TOOLCHAIN` environment variable - so
     # this must be set explicitly. Installing nightly with
     # `dtolnay/rust-toolchain@nightly` does NOT change which toolchain an
     # unqualified `cargo` resolves to (rustup override rank 4 beats the `rustup
@@ -161,8 +218,8 @@ jobs:
       - name: Install Rust nightly toolchain
         uses: dtolnay/rust-toolchain@nightly
 
-      # 2a. Fail loudly if the nightly override is ever lost — if anything
-      #     re-routes this job onto stable or the MSRV floor — instead of
+      # 2a. Fail loudly if the nightly override is ever lost (if anything
+      #     re-routes this job onto stable or the MSRV floor) instead of
       #     discovering it as an opaque `-Z` parse error part-way through the
       #     build.
       - name: Verify the resolved toolchain is nightly
@@ -191,24 +248,99 @@ jobs:
       - name: Build fuzz targets
         run: cargo +nightly fuzz build
 
-      # 5. Fuzz each target for a bounded budget. `cargo fuzz list` is captured
+      # 5. Restore each target's libFuzzer corpus, one cache entry PER TARGET.
+      #    `cargo fuzz` keys corpora by target name under `fuzz/corpus/<target>/`,
+      #    so the paths below must match the five `[[bin]]` names in
+      #    `fuzz/Cargo.toml` character for character. Keeping them separate means
+      #    one target's growth cannot invalidate or evict another's.
+      #
+      #    The key carries `github.run_id`, so it is unique per run and the PRIMARY
+      #    key always misses; `restore-keys` then restores the most recent prefix
+      #    match, and because a miss occurred, `actions/cache` saves the grown
+      #    corpus in its post-job hook. That rolling shape is what makes the corpus
+      #    durable: cache entries are immutable, so a stable or content-hashed key
+      #    would hit, save nothing, and freeze the corpus at its first contents.
+      #
+      #    A MISS IS NOT AN ERROR. `fuzz/corpus` is gitignored, so a cold run is
+      #    the normal first execution and the permanent fallback; `cargo fuzz run`
+      #    creates the directory itself. Nothing here is gated on a cache hit.
+      #    Restoring after the build means a broken harness still fails fast.
+      - name: Restore corpus (fuzz_checksum)
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/fuzz_checksum
+          key: fuzz-corpus-fuzz_checksum-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-fuzz_checksum-
+
+      - name: Restore corpus (fuzz_deflate_roundtrip)
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/fuzz_deflate_roundtrip
+          key: fuzz-corpus-fuzz_deflate_roundtrip-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-fuzz_deflate_roundtrip-
+
+      - name: Restore corpus (fuzz_ffi_roundtrip)
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/fuzz_ffi_roundtrip
+          key: fuzz-corpus-fuzz_ffi_roundtrip-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-fuzz_ffi_roundtrip-
+
+      - name: Restore corpus (fuzz_gzip)
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/fuzz_gzip
+          key: fuzz-corpus-fuzz_gzip-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-fuzz_gzip-
+
+      - name: Restore corpus (fuzz_inflate)
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/fuzz_inflate
+          key: fuzz-corpus-fuzz_inflate-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-fuzz_inflate-
+
+      # 6. Fuzz each target for a bounded budget. `cargo fuzz list` is captured
       #    ONCE into a variable (avoids a `| head` SIGPIPE under the default
       #    `bash -eo pipefail` shell). A crash/timeout writes a reproducer under
-      #    `fuzz/artifacts` and returns non-zero, failing the pipeline. The
-      #    budget is intentionally bounded (60s/target, capped input length and
-      #    RSS) so the scheduled/PR run stays fast and deterministic.
+      #    `fuzz/artifacts` and returns non-zero, failing the pipeline.
+      #
+      #    The budget stays bounded, but it is now EVENT-CONDITIONAL: 120s/target
+      #    on a `pull_request`, where the run is on the critical path of a merge,
+      #    and 600s/target on `schedule` and `workflow_dispatch`, where nothing is
+      #    waiting on it. The loop is SEQUENTIAL, so the fuzzing wall clock is that
+      #    figure times five targets - roughly 10 minutes on a pull request and 50
+      #    on the weekly run. Both branches of the expression are non-empty integer
+      #    literals, and the shell default below is a second guard, because an
+      #    empty `-max_total_time=` is an argument error that would fail the job for
+      #    the wrong reason.
+      #
+      #    `-max_len` and `-rss_limit_mb` are deliberately NOT parameterised: the
+      #    harnesses size their internal buffers against those exact values, so
+      #    relaxing either would turn a harness OOM into something that looks
+      #    exactly like a genuine finding. The resolved budget is echoed so the run
+      #    log, rather than this comment, is the record of what was actually used.
       - name: Run bounded fuzzing (all targets)
+        env:
+          MAX_TOTAL_TIME: ${{ (github.event_name == 'pull_request') && '120' || '600' }}
         run: |
+          : "${MAX_TOTAL_TIME:=120}"
           targets="$(cargo +nightly fuzz list)"
           echo "Fuzz targets: ${targets}"
+          echo "Event: ${GITHUB_EVENT_NAME}; per-target budget: ${MAX_TOTAL_TIME}s"
           for target in ${targets}; do
             echo "::group::Fuzzing ${target}"
             cargo +nightly fuzz run "${target}" -- \
-              -max_total_time=60 -max_len=65536 -rss_limit_mb=2048
+              -max_total_time="${MAX_TOTAL_TIME}" -max_len=65536 -rss_limit_mb=2048
             echo "::endgroup::"
           done
 
-      # 6. On failure (a crash/timeout reproducer was written), publish the
+      # 7. On failure (a crash/timeout reproducer was written), publish the
       #    cargo-fuzz artifacts directory so the offending input is retrievable.
       - name: Upload crash artifacts
         uses: actions/upload-artifact@v4
