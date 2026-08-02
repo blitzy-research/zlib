@@ -1,0 +1,597 @@
+# Security Policy
+
+`zlib-rs` is a memory-safe Rust reimplementation of [zlib](https://zlib.net/) that
+presents the C `libz` ABI as a drop-in replacement. Memory safety *is* the value
+proposition, and one of the most widely deployed C libraries in existence is what
+it proposes to replace. That raises the bar for this document twice over: the
+disclosure process has to be a real one, and the assurance claims have to be
+things that were actually measured rather than things that sound reassuring.
+
+So this policy states what has been verified, names the command that verified it,
+and is equally explicit about the coverage that does **not** exist yet. A security
+policy that overstates its assurances is worse than no policy at all.
+
+Every figure below was observed on this tree with the command quoted beside it,
+on stable `rustc 1.97.1 (8bab26f4f 2026-07-14, LLVM 22.1.6)`,
+`x86_64-unknown-linux-gnu`, unless it is explicitly marked **attributed** — in
+which case it is inherited from the migration's own records and is *not*
+re-measured here.
+
+---
+
+## Scope
+
+### What this policy covers
+
+- The Rust crate **`zlib-rs`** — every module under [`src/`](src), including the C
+  ABI boundary in [`src/ffi/`](src/ffi).
+- The build script [`build.rs`](build.rs), which regenerates the CRC-32 lookup
+  tables into `OUT_DIR` at build time.
+- All three shipped artifacts: the Rust `lib` (rlib), the `cdylib`
+  (`libzlib_rs.so` — the `libz` drop-in), and the `staticlib` (`libzlib_rs.a`).
+- The crate's dependency closure and its supply-chain policy — see
+  [Supply chain and dependencies](#supply-chain-and-dependencies).
+
+### What this policy does not cover
+
+- **The retained C sources** (`*.c`, `*.h`, `test/*.c`, [`zlib.map`](zlib.map)).
+  They are kept in-tree deliberately, as the cross-validation oracle, the
+  behavioural specification, and the source of the official test vectors, and they
+  are **never modified**. They are also excluded from the published crate through
+  the `exclude` list in [`Cargo.toml`](Cargo.toml), so **no C code is compiled
+  into any shipped artifact** and their presence in the repository is not an
+  exposure. A vulnerability in **upstream zlib itself** belongs to the
+  [upstream project](https://github.com/madler/zlib), not here.
+
+  One important carve-in: a report that **this crate fails to reproduce an
+  upstream fix**, or diverges from upstream behaviour in a way that has security
+  impact, is squarely in scope. The C tree being the oracle is exactly why such a
+  divergence is a defect here.
+- `contrib/**`, `examples/**`, and the legacy platform trees `amiga/`, `msdos/`,
+  `os400/`, `qnx/`, `watcom/`, `win32/` — third-party bindings, C sample
+  programs, and legacy build descriptors. None of them is part of this library or
+  of the published crate.
+- The C build and packaging descriptors (`CMakeLists.txt`, `Makefile.in`,
+  `configure`, `BUILD.bazel`, and friends), retained for C consumers who integrate
+  against the upstream layout.
+
+### Version identity — please cite both
+
+There are two version identities — the Cargo one and the C API one — and a report
+is much easier to act on when it names both:
+
+| Identity | Value | Source of truth |
+|----------|-------|-----------------|
+| Cargo package version | `1.3.2` | [`Cargo.toml`](Cargo.toml) `[package] version` |
+| C API `zlibVersion()` | `"1.3.2.1-motley"` | [`src/util/version.rs`](src/util/version.rs) |
+| C API `ZLIB_VERNUM` | `0x1321` | [`src/lib.rs`](src/lib.rs) |
+
+They differ because Cargo requires SemVer and upstream zlib's four-component
+`1.3.2.1-motley` string is not valid SemVer. The C shim still reports the full
+upstream identity, verified live through the ABI:
+`zlibVersion()="1.3.2.1-motley" ZLIB_VERNUM=0x1321`.
+
+---
+
+## Supported versions
+
+| Version line | Status | Security fixes |
+|--------------|--------|----------------|
+| `1.3.x` (current, package version `1.3.2`) | **Experimental** — active migration | Yes |
+| Anything earlier | Does not exist | n/a |
+
+Two things are worth saying plainly rather than implying otherwise:
+
+- **The declared lifecycle is `experimental`**, as recorded in
+  [`catalog-info.yaml`](catalog-info.yaml). This is not a long-term-support
+  posture, there is no back-port branch, and the API surface may still shift while
+  parity work continues. Fixes land on the current line.
+- **There is no prior release**, so there is no matrix of maintained older
+  versions and no retroactive guarantee about unreleased history. See
+  [`CHANGELOG.md`](CHANGELOG.md) for what the initial entry establishes.
+
+**Toolchain support.** The crate declares `rust-version = "1.85.0"` (the release
+that stabilised edition 2024) and pins it for local builds through
+[`rust-toolchain.toml`](rust-toolchain.toml). Both the MSRV floor and current
+stable are exercised: `cargo +1.85.0 build --locked` and
+`cargo +1.85.0 check --locked --all-targets` both exit 0, and CI runs them as a
+blocking `msrv` job. **A security fix will not silently raise the MSRV** — an MSRV
+change is a documented, `CHANGELOG.md`-recorded change like any other.
+
+---
+
+## Reporting a vulnerability
+
+### Please do not open a public issue or pull request
+
+Do not file a public issue, a discussion, or a PR for a suspected vulnerability,
+and please do not attach a reproducing input to a public thread. That includes
+"probably harmless" findings — whether an inflate defect is exploitable is
+precisely the thing that is hard to judge from the outside.
+
+### Preferred channel — GitHub private vulnerability reporting
+
+Use GitHub's private vulnerability reporting on this repository,
+[`Blitzy-Sandbox/blitzy-zlib`](https://github.com/Blitzy-Sandbox/blitzy-zlib):
+
+> **Security** tab → **Report a vulnerability**
+
+That opens a private advisory thread visible only to you and the maintainers, and
+it is where a fix and a published advisory are coordinated from.
+
+**If that form is not available to you** — private reporting is a per-repository
+setting and this document cannot assert on your behalf that it is enabled — then
+open an ordinary issue containing **no technical detail whatsoever**: say only
+that you have a security report and how a maintainer can reach you privately, and
+wait for a private thread to be opened before sending anything substantive. There
+is deliberately **no email address or PGP key published here**, because publishing
+a contact this project cannot commit to monitoring would be worse than pointing
+you at the mechanism that genuinely exists.
+
+### What to include
+
+Compression bugs are configuration-sensitive, so a report that pins the
+configuration down is dramatically faster to act on. Please include as much of
+this as you have:
+
+1. **Versions** — the crate version and the string `zlibVersion()` returns.
+2. **Feature set** — which Cargo features were enabled. `std`, `gzip`, `gz-io`,
+   and `simd` are on by default; `no-std`, `inflate_strict`, and `c-oracle` are
+   opt-in (see [Feature flags](README.md#feature-flags)).
+3. **How you consume the library** — the Rust API, the `cdylib`, or the
+   `staticlib`; and if you are substituting it for a system `libz`, say so
+   (`-lz`, `LD_PRELOAD`, or installed as `libz.so.1`).
+4. **Target triple, endianness, and pointer width.** These are not boilerplate
+   here: [`src/checksum/crc32.rs`](src/checksum/crc32.rs) selects its CRC braid
+   tables with `cfg!(target_endian)`, and [`src/util/mod.rs`](src/util/mod.rs)
+   selects the gzip header's `OS_CODE` per platform (10 on Windows, 19 on
+   non-Windows Apple, 3 otherwise) — so a defect can be genuinely
+   platform-specific.
+5. **The four encoder axes**, when compression is involved: `windowBits` (raw
+   `-8..-15`, zlib `8..15`, gzip `+16`, auto-detect `+32`), `level`, `strategy`,
+   and `memLevel`.
+6. **A minimal reproducing input**, as raw bytes or base64 rather than as prose —
+   a description of a byte sequence is not a byte sequence. If it came out of a
+   fuzzer, name the target (`fuzz_inflate`, `fuzz_deflate_roundtrip`, `fuzz_gzip`,
+   `fuzz_checksum`, `fuzz_ffi_roundtrip`) and attach the artifact.
+7. **Which surface reproduces it** — the Rust API, the C ABI, or both. A defect
+   that only reproduces through the C ABI points at
+   [`src/ffi/`](src/ffi); one that reproduces through safe Rust is more serious,
+   because the core is `unsafe`-free by construction.
+8. **Impact as you see it** — crash, hang, memory unsafety, incorrect output,
+   information disclosure — and the call sequence that gets there.
+
+### What happens next
+
+These are **targets this project holds itself to, on a best-effort basis. They are
+not a service-level agreement**, and there is no funded on-call rotation behind
+them:
+
+| Step | Best-effort target |
+|------|--------------------|
+| Acknowledge the report | within 5 business days |
+| Initial triage and a severity assessment | within 10 business days |
+| Fix, or a written explanation of why it is not a vulnerability | tracked in the advisory thread until closed |
+
+- **Coordinated disclosure is preferred.** Please give the fix a chance to land
+  before publishing. If you have a disclosure deadline, say so in your first
+  message and it will be worked to rather than argued with.
+- **You will be credited** in the advisory and in [`CHANGELOG.md`](CHANGELOG.md)
+  unless you ask not to be.
+- **Every fix gets two records**: a `Security` entry in
+  [`CHANGELOG.md`](CHANGELOG.md), and — where the impact warrants it — a published
+  GitHub Security Advisory, plus a RustSec advisory request so that
+  `cargo audit` users are told.
+- If a report turns out to describe one of the
+  [documented divergences](#what-is-not-a-vulnerability), you will get that
+  explanation with a pointer to where the behaviour is specified, not a silent
+  close.
+
+---
+
+## What counts as a vulnerability here
+
+This project's four binding constraints are that compressed output must be
+binary-compatible with zlib-produced streams, that the FFI layer must match the
+zlib C API signatures exactly, that the compression core must contain zero
+`unsafe`, and that the official zlib test vectors must pass. The classes below are
+what a violation of those constraints looks like in practice.
+
+### 1. Memory unsafety reachable without writing `unsafe` yourself
+
+Out-of-bounds reads or writes, use-after-free, double free, reads of
+uninitialised memory, or a data race — reached either from safe Rust or from a
+**correct** C ABI call sequence.
+
+Worth being precise about where such a bug can live: the compression and
+decompression core measures **zero** executable `unsafe` and a stray block there
+would not compile (see [Assurance posture](#assurance-posture--what-has-actually-been-verified)).
+So a genuine memory-safety finding is almost certainly either in
+[`src/ffi/`](src/ffi) — the boundary that unavoidably handles raw pointers — or a
+soundness bug in the interface those modules present to safe code. Both are in
+scope, and both are the highest-severity class here.
+
+### 2. Soundness bugs at the C ABI boundary
+
+Mishandled null or misaligned pointers, unvalidated caller-supplied lengths,
+incorrect assumptions about caller buffer aliasing, or an `End`/terminator call on
+a handle belonging to a different engine.
+
+That last case is guarded *by construction*: every boxed FFI engine handle carries
+a `#[repr(transparent)]` `HandleKind` discriminant as its first field, read and
+validated through a `HandleHeader` prefix **before** the handle is ever
+reconstituted as a `Box`
+([`src/ffi/types.rs`](src/ffi/types.rs)) — because reconstituting a box whose
+`Layout` does not match the original allocation is undefined behaviour even when
+it appears to work. A way to bypass that tag, or any other route to a
+layout-mismatched free, is a reportable defect.
+
+### 3. Panics reachable through the C ABI
+
+Both `[profile.release]` and `[profile.dev]` set `panic = "abort"`. This is
+required rather than stylistic — a stable-toolchain `no_std` `cdylib`/`staticlib`
+cannot link an unwinding runtime — and it is also what upholds the invariant that
+a Rust panic never unwinds across the C ABI, which would be undefined behaviour.
+
+The consequence for a C consumer is direct: **a reachable panic aborts the host
+process**, which is a denial of service. Reachable-panic reports are therefore in
+scope. The boundary already converts the foreseeable cases into ordinary `Z_*`
+error codes through the `guard_int` / `guard_ulong` / `guard_ptr` / `guard_off`
+family in [`src/ffi/types.rs`](src/ffi/types.rs); those guards exist to make
+boundary failures deterministic, so a panic that escapes them is exactly the kind
+of finding this section wants.
+
+### 4. Resource exhaustion on adversarial input
+
+Unbounded allocation, non-terminating loops, or superlinear behaviour driven by a
+crafted stream — the decompression side especially, since it consumes untrusted
+data by definition.
+
+One bound deserves naming. The decoder's Huffman table arena is sized by
+`ENOUGH = ENOUGH_LENS + ENOUGH_DISTS = 852 + 592 = 1444`
+([`src/inflate/tables.rs`](src/inflate/tables.rs)); understating it would mean
+table overflow on adversarial input. A demonstration that the arena bound can be
+exceeded, or that table construction can be driven past its limits, is **high
+severity**.
+
+### 5. Stream-acceptance and correctness failures with security impact
+
+- **Accepting a malformed stream that reference zlib rejects.** This is how a
+  decoder becomes a parser-differential, and it is in scope.
+- **Rejecting a stream reference zlib accepts** — a correctness and availability
+  defect.
+- **A checksum mismatch** in Adler-32 or CRC-32, or a `*_combine` result that
+  disagrees with reference zlib.
+- **Compressed output that differs from reference zlib**, byte for byte, for the
+  same input and the same `(level, strategy, windowBits, memLevel)`.
+
+That last item needs its framing stated honestly. Byte-identity with reference
+zlib is *this project's defining acceptance criterion*, so a byte-level divergence
+is always treated as a real defect — but it is usually a **functional** defect
+rather than a vulnerability, since both outputs decode correctly. Report it
+through the same channel; expect it to be triaged as a conformance bug unless
+there is security impact.
+
+### 6. Allocator-hook contract deviations
+
+The C `zalloc`/`zfree` hook semantics are part of the observable contract, and two
+clauses in particular must hold: caller-supplied buffers are used **only when both
+`zalloc` and `zfree` are present** ([`src/stream.rs`](src/stream.rs)), and a null
+allocator must propagate as an **allocation failure** rather than silently falling
+back to the global allocator. A deviation — including a copy path such as
+`deflateCopy`/`inflateCopy` that routes around a caller-supplied arena — is a
+reportable behavioural defect, because a caller who supplied an arena for
+isolation reasons would be silently losing that isolation.
+
+### 7. Supply-chain issues
+
+Anything in the governed dependency closure: a vulnerable, unmaintained, yanked,
+or license-incompatible package, or a policy gap that let one through. See
+[Supply chain and dependencies](#supply-chain-and-dependencies).
+
+### Severity, roughly
+
+| Severity | Typical finding |
+|----------|-----------------|
+| **Critical** | Memory unsafety reachable from safe Rust, or from a correct C call sequence, with a plausible path to code execution or disclosure |
+| **High** | Any other memory-safety or soundness violation at the boundary; exceeding the `ENOUGH` table bound; accepting a malformed stream that reference zlib rejects |
+| **Medium** | Reachable panic (host-process abort) through the C ABI; unbounded allocation or a hang on crafted input; an ABI signature or `#[repr(C)]` layout mismatch against `zlib.h` |
+| **Low** | Allocator-hook contract deviation; checksum or acceptance divergence with no security impact; a dev-only supply-chain advisory |
+
+Severity is assigned per report, with reasoning, in the advisory thread. If you
+disagree with an assessment, say so there.
+
+---
+
+## What is not a vulnerability
+
+The following are **deliberate, documented design decisions that are preserved on
+purpose**, not defects awaiting a fix. They are listed here so nobody spends
+effort rediscovering them. Each is also recorded in
+[`CHANGELOG.md`](CHANGELOG.md) under *Known limitations and documented
+divergences*.
+
+- **`gzprintf` / `gzvprintf` return `Z_STREAM_ERROR`.** Rendering a C `va_list`
+  needs the nightly-only `c_variadic` language feature, which would break the
+  crate's stable build and its MSRV contract. Both symbols are still exported with
+  the correct signatures — removing them would break linkage — and the limitation
+  is **programmatically detectable rather than silent**: `zlibCompileFlags` sets
+  **bit 27**, exactly as a C zlib built without a secure `vsnprintf` does
+  ([`src/util/version.rs`](src/util/version.rs)). This ships the documented
+  no-`vsnprintf` zlib build variant. The *idiomatic Rust* `gzprintf`, which takes
+  `core::fmt::Arguments` instead of a `va_list`, formats fully.
+- **`inflate_strict` is off by default.** Enabling it changes which streams are
+  accepted, so the default build deliberately matches a default-built reference
+  zlib. It is therefore *not* a defect that this crate accepts a stream reference
+  zlib also accepts, however lenient that pair of decisions looks in isolation. A
+  divergence **from** reference zlib, in either direction, is — see class 5 above.
+- **`gzclose` / `gzclose_w` are mandatory.** `GzState`'s `Drop`
+  ([`src/gz/state.rs`](src/gz/state.rs)) releases every buffer but is
+  intentionally empty of *finishing* logic, because a destructor cannot surface a
+  deferred compression or I/O error — silently swallowing a failed write of a
+  member's final block and trailer during unwinding would be strictly worse than
+  matching C's explicit-close contract. Dropping a writer without closing it
+  leaves an unfinished gzip member on disk. That is the documented contract, and
+  it must not be "improved" into an auto-finishing destructor.
+- **Exported symbols carry no `@ZLIB_x.y.z` version tags by default.** The symbol
+  *set* is exactly right — **95** emitted symbols, all of type `T`, with **54/54**
+  [`zlib.map`](zlib.map) `global:` names present and **0/10** `local:` names
+  leaked — and only the version *tags* are absent. Static linking, ordinary
+  dynamic linking, `-lz` substitution, and `LD_PRELOAD` are all unaffected.
+  Opting in with `ZLIB_RS_VERSION_SCRIPT=1` makes [`build.rs`](build.rs) derive a
+  version script from `zlib.map` and apply it to the `cdylib`. It is off by
+  default because a version script is a GNU-ld/ELF-only construct and no CI row
+  sets the variable, so the opt-in path carries linker-portability risk the matrix
+  does not yet retire. Full detail:
+  [Symbol versioning](README.md#symbol-versioning).
+- **The retained C sources are not compiled into the shipped artifact.** They are
+  the oracle and the specification, they are excluded from the published crate,
+  and their presence in the repository is not an exposure.
+- **Performance is not a security property here.** The crate is measurably slower
+  than C on compression (*attributed*: aggregate ≈ 85% of C throughput; per-profile
+  roughly 58–64% on compressible input and 82–86% on incompressible input) and at
+  or above parity on decompression (*attributed*: 107–127% aggregate, 104–125%
+  per profile). A performance report is welcome as an ordinary issue. It is a
+  vulnerability only if the slowdown is *input-triggered and superlinear*, which
+  makes it class 4 above. Any proposed speed-up must clear the byte-identity gate
+  first: the heuristics that cost throughput are the same ones that determine the
+  output bytes, so a faster match finder that emits different tokens is a
+  regression, not an improvement.
+
+---
+
+## Supply chain and dependencies
+
+**The runtime closure is two crates.** `cfg-if 1.0.4`, plus the optional
+`crc32fast 1.5.0` behind the `simd` feature (itself pure Rust, itself depending
+only on `cfg-if`). Everything else in the lockfile — `criterion`, `flate2`,
+`quickcheck`, `rand` — is **dev-only by contract** and never appears under
+`src/`. That minimality is a security decision, not an aesthetic one: a
+memory-safety replacement for `libz` that dragged in a large transitive graph
+would trade one class of risk for another.
+
+**No C toolchain is required to build or test the crate.** [`build.rs`](build.rs)
+is pure `std` — no external crates, no `[build-dependencies]` table, no `links =`
+key, and zero `unsafe`. `flate2` resolves to its default pure-Rust `miniz_oxide`
+backend, so even the test graph needs no compiler. The only place a C-compiler
+driver chain enters any dependency graph is the **detached** `fuzz/` workspace
+(`cc`, `jobserver`, `shlex`, `find-msvc-tools`), which the root build never
+touches; and the opt-in `c-oracle` test feature shells out to a system compiler
+through `std::process::Command` rather than adding a build-dependency, so it too
+leaves `Cargo.lock` untouched.
+
+**The governed closure is 102 packages** — **89** pinned by
+[`Cargo.lock`](Cargo.lock) and **13** by [`fuzz/Cargo.lock`](fuzz/Cargo.lock), all
+from crates.io except the fuzz workspace's single `path = ".."` self-reference.
+Both lockfiles are committed deliberately, because the crate ships
+`cdylib`/`staticlib` distributables and reproducible offline builds need exact
+resolved versions.
+
+**The gates.** Two `cargo-deny` policies govern that closure — [`deny.toml`](deny.toml)
+for the root graph and [`fuzz/deny.toml`](fuzz/deny.toml) for the detached fuzz
+workspace. Both declare `[advisories]`, `[licenses]`, `[bans]`, and `[sources]`,
+resolve with `all-features = true`, deny yanked crates, and bound advisory-database
+staleness at `maximum-db-staleness = "P7D"`. The root policy carries an **empty
+`ignore` list** — no advisory is waived — pins nine target triples so the audit
+covers the Windows, Apple, aarch64, bare-metal, and wasm configurations rather than
+only the host, and names `cc`, `bindgen`, `pkg-config`, `libz-sys`, and the
+bzip2/lzma/zstd/brotli families in `[bans] deny` so the zero-C-dependency and
+single-codec properties cannot erode by accident.
+[`.github/workflows/audit.yml`](.github/workflows/audit.yml) runs `cargo-audit`
+over **both** lockfiles plus the root `cargo-deny` policy on every push and pull
+request and on a daily schedule, and asserts that neither lockfile was rewritten;
+[`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml) runs the fuzz-workspace
+policy as a `supply-chain` job that **gates** fuzzing.
+
+**The finding that motivated all of that.** `rand 0.9.4` is the direct
+dev-dependency, pinned at or above the patched range for **RUSTSEC-2026-0097**.
+But `rand 0.10.2` also sits in the graph, reached transitively through
+`quickcheck 1.1.0` — so the mitigation expressed against the direct requirement
+did not, on its own, govern the transitive line. Both lines are in fact above the
+advisory's patched range, which is why the policy waives nothing; and because the
+advisory reaches only a **development** dependency, it does **not** affect
+consumers of the published crate — a dev-dependency is not part of a downstream
+build graph. The gate exists precisely to catch this class of drift: a policy
+written against a single assumed `rand` version would be wrong on contact.
+
+**Four duplicate majors are expected.** `cargo deny check bans` reports `rand`
+(0.9.4 / 0.10.2), `rand_core` (0.9.5 / 0.10.1), `getrandom` (0.3.4 / 0.4.3), and
+`r-efi` (5.3.0 / 6.0.0) as duplicates. All four are dev-graph-only and are
+documented in [`deny.toml`](deny.toml); `multiple-versions` is set to `warn`
+rather than `deny` for exactly this reason. They are not a finding.
+
+---
+
+## Assurance posture — what has actually been verified
+
+### `unsafe` is contained as a compile error, not as a convention
+
+[`src/lib.rs`](src/lib.rs) carries a crate-wide `#![deny(unsafe_code)]` with
+**exactly two** narrowly scoped `#[allow(unsafe_code)]` carve-outs: `pub mod ffi`,
+the C ABI surface, and a private `mod no_std_support` holding the libc-backed
+`#[global_allocator]`, `#[panic_handler]`, and personality symbol that a
+freestanding `cdylib`/`staticlib` must supply. `deny` rather than `forbid` is
+deliberate — `forbid` cannot be relaxed by an inner `allow`, which would make
+those two boundary carve-outs inexpressible.
+
+Measured on this tree with a comment-excluded token scan:
+
+| Location | Unsafe-bearing code lines |
+|----------|---------------------------|
+| `src/ffi/` (the designated boundary) | **1,111** — `inflate.rs` 309, `deflate.rs` 226, `util.rs` 159, `gz.rs` 148, `types.rs` 113, `mod.rs` 101, `alloc.rs` 55 |
+| `src/deflate/`, `src/inflate/`, `src/checksum/`, `src/gz/`, `src/util/`, `src/error.rs`, `src/constants.rs`, `src/gz_header.rs` | **0** |
+| `src/stream.rs` | **2**, and both are `type` aliases only — `ZallocFn` and `ZfreeFn` merely *name* the C hook signatures the crate interoperates with. `grep -c "unsafe {"` on that file returns **0**, and the module carries its own `#![deny(unsafe_code)]` |
+
+Every `unsafe` block that does exist is justified in place: **383** `// SAFETY:`
+comments across `src/`, with `#![warn(clippy::undocumented_unsafe_blocks)]` and
+`#![warn(missing_docs)]` promoted to hard errors by the `-D warnings` lint gate.
+Containment is checked four independent ways — the `deny` attribute, that lint
+gate, in-crate boundary tests that re-derive the boundary from the source text and
+assert that exactly two carve-outs exist, and a toolchain-independent shell
+assertion in CI's `unsafe-boundary` job. The attribute alone cannot catch a
+smuggled *third* carve-out, because such code still compiles; the tests can.
+Mechanism detail: [How the `unsafe` boundary is enforced](README.md#how-the-unsafe-boundary-is-enforced).
+
+### Ownership replaced every manual free
+
+All **22** `ZALLOC`/`ZFREE` call sites in the C baseline — `deflate.c` 11,
+`inflate.c` 9, `infback.c` 2 — are replaced by owned buffers behind a single
+allocator abstraction, so there is no free path left to forget. C's
+self-referential interior table pointers (`state->next`, `lencode`, `distcode`,
+all pointing into `state->codes[]`) became an integer offset plus a
+`TableSource { Fixed, Dynamic }` discriminant
+([`src/inflate/state.rs`](src/inflate/state.rs)), which is what makes a deep
+`Clone` sound for `inflateCopy` where a C `memcpy` of the struct would leave
+dangling pointers. Whole classes of C defect — use-after-free, double free, buffer
+overrun, unhandled state transition — are removed by construction rather than by
+review.
+
+### The ABI is a compile-time-checked contract
+
+A `cfg(test)` guard in [`src/ffi/mod.rs`](src/ffi/mod.rs) coerces every exported
+function *item* to its exact `unsafe extern "C"` fn-pointer *type*, binding all
+**96** exported names — exhaustive, not a representative sample — so a change to an
+argument, a return type, or a calling convention is a **compile error** rather
+than something a C caller discovers at run time. The emitted surface reconciles
+exactly: `nm -D --defined-only target/release/libzlib_rs.so` reports **95**
+symbols, all of type `T` (96 declared names minus the `#[cfg(windows)]`-gated
+`gzopen_w`), with 54/54 `zlib.map` globals present and 0/10 locals leaked. Full
+derivation: [Exported symbol reconciliation](README.md#exported-symbol-reconciliation).
+
+### Tests
+
+| Command | Result |
+|---------|--------|
+| `cargo test --locked` | **842 passed / 0 failed / 0 ignored** (688 unit, 127 integration, 27 doctests) |
+| `cargo test --locked --all-features` | **855 passed / 0 failed / 0 ignored** (adds the 13 live C-oracle tests) |
+| `cargo test --locked --no-default-features` | **626 passed / 0 failed / 0 ignored** |
+
+The **ignored-test count is zero in every configuration and stays zero**. A
+capability that cannot be exercised in a given build is expressed by a feature
+gate or by a run-time probe that *passes with a printed notice*, never by
+`#[ignore]`.
+
+The suite includes Rust ports of all three official C drivers, which is how "must
+pass the official zlib test vectors" is operationalised: `test/example.c` →
+[`tests/regression.rs`](tests/regression.rs) (fixed vectors) and
+[`tests/round_trip.rs`](tests/round_trip.rs) (the `quickcheck` randomised half);
+`test/infcover.c` → [`tests/inflate_coverage.rs`](tests/inflate_coverage.rs), the
+exhaustive malformed-stream decoder coverage table — the most security-relevant
+suite in the tree; and `test/minigzip.c` →
+[`tests/gzip_compat.rs`](tests/gzip_compat.rs). Checksum known-answer vectors live
+in [`tests/checksum.rs`](tests/checksum.rs).
+
+### Byte-identity against reference C zlib
+
+- **Always-on, no C toolchain required.** Tier 1 of
+  [`tests/interop.rs`](tests/interop.rs) carries **4,461 baked byte-identity
+  assertions** derived from the genuine C encoder. Because the reference bytes are
+  precomputed constants, this gate runs by default, everywhere.
+- **Live, reproducible in-repository.** The opt-in
+  [`tests/c_oracle.rs`](tests/c_oracle.rs) harness (`--features c-oracle`) builds
+  reference C zlib from the 15 retained in-tree translation units and 11 headers
+  and diffs live output. Observed on this tree: **50/50** on the smoke sweep
+  (200,000-byte corpus) and **3,750/3,750** byte-identical on the full grid —
+  5 corpus shapes × 5 `windowBits` × 3 `memLevel`s × 10 levels × 5 strategies —
+  against a `libz_ref.a` built with the system `cc` (observed:
+  `cc (Ubuntu 15.2.0-4ubuntu4) 15.2.0`). The same run re-confirmed the canonical
+  vectors through the C ABI: `crc32("123456789") = 0xcbf43926`,
+  `adler32("123456789") = 0x091e01de`, `compressBound(9) = 22`.
+
+### Fuzzing
+
+Five `cargo-fuzz` / libFuzzer targets — `fuzz_inflate`, `fuzz_deflate_roundtrip`,
+`fuzz_gzip`, `fuzz_checksum`, `fuzz_ffi_roundtrip` — live in a detached `fuzz/`
+workspace that the root build never pulls in.
+[`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml) builds every target and
+runs each on a weekly schedule (`cron: '0 3 * * 1'`) and on pull requests, with a
+per-target budget of **120 s on a pull request and 600 s otherwise**, at
+`-max_len=65536 -rss_limit_mb=2048`, behind the `cargo-deny` supply-chain gate.
+Each target's corpus is persisted between runs, and crash artifacts are uploaded
+on failure. The fuzz crate builds with `overflow-checks = true`, so an arithmetic
+overflow is a finding rather than a wrap.
+
+Cumulative campaign results — **attributed, not re-measured here** — are
+approximately **1.13 million executions with 0 crashes** to date. Treat that as
+recorded history: the number a fresh CI run produces is bounded by the budgets
+above, not by that total.
+
+### Honest limitations
+
+Everything above describes coverage that exists; this section describes coverage
+that does not. `.github/workflows/ci.yml` runs **eleven jobs**, and the boundary
+sits here:
+
+- **Natively executed, full suite:** `ubuntu-latest` across five feature rows,
+  plus **`windows-latest` (x86_64)** and **`macos-latest` (aarch64)**. The Windows
+  row is the only place `OS_CODE = 10` and the `#[cfg(windows)]`-gated `gzopen_w`
+  are compiled *and* run; the macOS row is the only place that reaches
+  `OS_CODE = 19` and `O_NONBLOCK`'s BSD value.
+- **Compile-verified only, never executed:** `aarch64-unknown-linux-gnu`,
+  `i686-unknown-linux-gnu` (32-bit `usize`), and `s390x-unknown-linux-gnu`
+  (**big-endian**) are cross type-checked with `cargo check --all-targets`. So the
+  big-endian CRC braid arms and the 32-bit pointer-width arms are **compiled but
+  not run**, and this document does not claim otherwise. A unit test does assert
+  that the endian-selected table anchors match the active target's values on every
+  target, so the relationship is checked at run time even where those arms are
+  not.
+- **Built, not run:** the bare-metal `thumbv7em-none-eabihf` target, in both
+  `--no-default-features` and `--features no-std` configurations, with an `nm`
+  assertion that the freestanding runtime block — the libc-backed allocator, the
+  abort panic handler, the personality shim — was genuinely compiled. **`no_std`
+  has been validated on a hosted target and compile-verified for bare metal; it
+  has not been exercised on real embedded hardware.** 626 passing hosted tests do
+  not prove an embedded target works.
+- **Human code review across the full Rust surface (≈ 57,000 lines under `src/`)
+  is outstanding**, and it is the highest-severity remaining hardening item
+  precisely because it cannot be automated away. Everything above is machine
+  evidence; none of it substitutes for a reviewer.
+- **No third-party security audit, penetration test, certification, or CVE
+  history exists for this crate.** Nothing in this document should be read as
+  claiming one.
+- **The declared lifecycle is `experimental`.** Please weigh that before putting
+  the artifact in front of untrusted input in production.
+
+The same boundary is drawn, job by job, in
+[Portability: what CI actually exercises](README.md#portability-what-ci-actually-exercises).
+
+---
+
+## Related documents
+
+| Document | What it covers |
+|----------|----------------|
+| [`README.md`](README.md) | Overview, feature matrix, measured evidence, the drop-in ABI, and the portability boundary |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution workflow, the blocking quality gates, and the MSRV policy |
+| [`CHANGELOG.md`](CHANGELOG.md) | Release history for the Rust crate; `Security` entries record every fix |
+| [`deny.toml`](deny.toml) / [`fuzz/deny.toml`](fuzz/deny.toml) | The supply-chain policy for the root and fuzz graphs |
+| [`Cargo.toml`](Cargo.toml) | Crate identity, the feature contract, profiles, and the published-crate `exclude` list |
+| [`LICENSE`](LICENSE) | The zlib/libpng license, carried forward from upstream |
+
+The separate upstream `ChangeLog` file (no extension) is the **C baseline's**
+history and is retained unmodified; it is not this crate's release history.
+
+Thank you for reporting responsibly. A library that positions itself as a
+memory-safety replacement for a ubiquitous C dependency has to earn that claim
+continuously, and a careful report is the most useful thing anyone outside the
+project can contribute to it.
