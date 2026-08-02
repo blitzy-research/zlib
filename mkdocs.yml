@@ -1,10 +1,73 @@
+# MkDocs configuration for the published `blitzy-zlib` documentation site.
+#
+# This file is also the Backstage TechDocs entry point: `catalog-info.yaml`
+# annotates the component with `backstage.io/techdocs-ref: dir:.`, so TechDocs
+# builds this project from the repository root using the `docs_dir` declared
+# below. That annotation is not ours to change, so this configuration honours
+# the contract rather than fighting it.
+
+# DOCUMENTATION ROOT — DO NOT REPOINT THIS AT `docs/`.
+#
+# The repository carries two similarly named directories and only ONE of them
+# is the build root. `doc/` is canonical and holds all three published pages.
+# The sibling `docs/` holds a single redirect stub and is NOT part of this
+# MkDocs project.
+#
+# Flipping this value looks like a one-word tidy-up and is not.
+# `project-guide.md` (~58 KB) and `technical-specifications.md` (~185 KB) exist
+# ONLY under `doc/`, so pointing at `docs/` would unpublish the two largest
+# documents in the repository in order to rescue a 2 KB stub — trading one
+# orphan for two far worse ones. It would also silently contradict
+# `Cargo.toml`, whose `exclude` commentary records that this site builds
+# exactly `doc/index.md`, `doc/project-guide.md`, and
+# `doc/technical-specifications.md`.
 docs_dir: doc
+
+# Must stay equal to `catalog-info.yaml`'s `metadata.name`. Renaming it breaks
+# the Backstage TechDocs association for this component.
 site_name: 'blitzy-zlib'
 site_description: 'zlib-rs — a memory-safe, idiomatic Rust rewrite of the zlib 1.3.2.1 compression library with a C-compatible FFI drop-in layer'
+
+# ANTI-ORPHAN INVARIANT: every Markdown file inside `docs_dir` MUST appear in
+# `nav`, and every `nav` entry MUST resolve to a file that exists under
+# `docs_dir`. A page missing from `nav` is still built, but it is then
+# reachable only by guessing its URL — precisely the defect that once left a
+# second landing page stranded outside the build root. MkDocs reports that
+# omission at INFO level, so `--strict` will NOT catch it for you; keep the two
+# sides equal by hand whenever a page is added, renamed, or removed. `doc/`
+# currently holds three Markdown files and `nav` lists three.
+#
+# The canonical landing page is `doc/index.md`. `docs/index.md` is deliberately
+# retained as a redirect stub pointing at it, is not a second copy, and must
+# never regain project substance.
+#
+# Paths are relative to `docs_dir`, so `index.md` resolves to `doc/index.md`.
+# The normative wire-format references that ship beside those pages —
+# `rfc1950.txt`, `rfc1951.txt`, `rfc1952.txt`, `algorithm.txt`, `txtvsbin.txt`,
+# and `crc-doc.1.0.pdf` — are read-only reference inputs, are never edited, and
+# are deliberately absent from `nav`: MkDocs navigation covers Markdown pages,
+# and these are copied verbatim into the built site as static files.
 nav:
   - Home: index.md
   - Project Guide: project-guide.md
   - Technical Specifications: technical-specifications.md
+
+# `techdocs-core` is required by Backstage and supplies the theme, the Markdown
+# extension set, and the search plugin — which is why no `theme:` and no
+# `markdown_extensions:` block is declared here. `techdocs-core` replaces a
+# foreign `theme:` outright, resets the palette, and merely logs when overridden
+# theme settings are in use, so declaring either block competes with the preset
+# and is a known way to break TechDocs rendering.
+#
+# `mermaid2` is required: `project-guide.md` and `technical-specifications.md`
+# each carry two `mermaid` fenced diagrams. Because no `pymdownx.superfences`
+# custom fence routes those fences to the plugin, and the `techdocs-core`
+# preset declares none, a local `mkdocs build` publishes them as highlighted
+# source rather than as rendered diagrams. That is accepted deliberately and is
+# recorded in `technical-specifications.md`: the fenced form is the portable
+# one that GitHub and Backstage TechDocs render natively, and declaring the
+# custom fence here would mean overriding the `techdocs-core` extension set to
+# gain nothing on the published site.
 plugins:
   - techdocs-core
   - mermaid2
