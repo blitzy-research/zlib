@@ -115,22 +115,21 @@ use crate::constants::DEF_WBITS;
 use crate::error::ReturnCode;
 use crate::ffi::alloc::try_box;
 use crate::ffi::types::{
-    Bytef, CAllocator, HandleKind, advance_input, advance_output, guard_int, guard_ulong,
-    gz_headerp, in_func, init_allocator_prologue, input_ptr_valid, input_slice, out_func,
-    output_slice, peek_handle_kind, set_adler, set_data_type, set_msg, state_ptr_from_box,
-    stream_buffers_valid, uInt, z_stream, z_streamp,
+    Bytef, CAllocator, HandleKind, TaggedHandle, advance_input, advance_output, guard_int,
+    guard_long, guard_ulong, gz_headerp, handle_owner_valid, handle_prefix_valid, in_func,
+    init_allocator_prologue, input_ptr_valid, input_slice, install_handle, out_func, output_slice,
+    peek_handle_kind, republish_total_in, rewind_input, set_adler, set_data_type, set_msg,
+    stream_buffers_valid, uInt, ulong_to_u32, z_stream, z_streamp,
 };
 use crate::inflate::back::{InFunc, OutFunc};
-use crate::inflate::state::InflateState;
-use crate::stream::ZStream;
+use crate::inflate::state::{InflateState, InflateStream};
+use crate::stream::{BoxedEngine, ZStream};
 
 // `gz_header` (the `#[repr(C)]` mirror) and the header write-back helper are
 // only referenced by the gzip-only `inflateGetHeader` path and the header
 // write-back inside `inflate`, so gate their imports to avoid unused warnings.
 #[cfg(feature = "gzip")]
-use crate::ffi::types::{gz_header, publish_gz_header};
-#[cfg(feature = "gzip")]
-use crate::gz_header::GzHeader;
+use crate::ffi::types::{borrow_gz_header_sink, gz_header, publish_gz_header};
 
 // ---------------------------------------------------------------------------
 // Return-code constants
@@ -231,28 +230,7 @@ fn mirror_adler_if_wrapped(sref: &mut z_stream, wrap: c_int, adler: u32) {
 /// be live.
 #[inline]
 fn seed_adler_mirror<A: crate::stream::Allocator>(zs: &mut ZStream<A>, caller_adler: c_ulong) {
-    zs.adler = caller_adler as u32;
-}
-
-// ---------------------------------------------------------------------------
-// Panic guard for `c_long`-returning shims (`inflateMark`)
-//
-// `crate::ffi::types` provides `guard_int`/`guard_ulong`/`guard_off`/`guard_ptr`
-// but not a `c_long` variant, so we add a private one mirroring their exact
-// `#[cfg(feature = "std")]` structure: catch unwinding under `std`, run directly
-// under `no_std` (where `catch_unwind` is unavailable and builds abort on panic).
-// ---------------------------------------------------------------------------
-
-/// Runs `f`, returning its `c_long` result, or `default` if it panics.
-#[cfg(feature = "std")]
-fn guard_long(default: c_long, f: impl FnOnce() -> c_long + core::panic::UnwindSafe) -> c_long {
-    std::panic::catch_unwind(f).unwrap_or(default)
-}
-
-/// `no_std` fallback: runs `f` directly (no unwinding to catch).
-#[cfg(not(feature = "std"))]
-fn guard_long(_default: c_long, f: impl FnOnce() -> c_long + core::panic::UnwindSafe) -> c_long {
-    f()
+    zs.adler = ulong_to_u32(caller_adler);
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +305,10 @@ fn msg_to_cstr(msg: Option<&str>) -> *const c_char {
 struct InflateHandle {
     /// Discriminant tag; always [`HandleKind::INFLATE`]. MUST be the first field.
     kind: HandleKind,
+    /// Address of the `z_stream` this handle is installed into — C's
+    /// `state->strm` (`inflate.c` L203). MUST be the second field. Written by
+    /// [`install_handle`]; null until then.
+    owner: *const z_stream,
     /// The idiomatic stream carrying the boxed `InflateState` plus observable
     /// bookkeeping (`total_in`/`total_out`/`adler`/`data_type`/`msg`).
     zs: ZStream<CAllocator>,
@@ -339,9 +321,14 @@ struct InflateHandle {
 impl InflateHandle {
     /// Wraps a freshly initialized idiomatic stream, tagging it as an inflate
     /// handle, with no registered header.
+    ///
+    /// The owner is left null: it is bound by [`install_handle`] at the moment
+    /// the handle becomes reachable through a `z_stream`, so a handle that has
+    /// not been installed can never pass [`inflate_state_check`].
     fn new(zs: ZStream<CAllocator>) -> Self {
         Self {
             kind: HandleKind::INFLATE,
+            owner: ptr::null(),
             zs,
             #[cfg(feature = "gzip")]
             head: ptr::null_mut(),
@@ -349,51 +336,100 @@ impl InflateHandle {
     }
 }
 
-/// Borrows the [`InflateHandle`] behind the opaque `state` pointer, validating
-/// the [`HandleKind`] tag first. Returns [`None`] when no handle is installed OR
-/// the installed handle is not an inflate handle (cross-type misuse), so the
-/// caller can return `Z_STREAM_ERROR` WITHOUT reinterpreting a wrong-type
-/// allocation.
-///
-/// # Safety
-///
-/// A non-null `state` must point at a live handle installed by an FFI init shim
-/// (so its leading tag is readable).
-#[inline]
-unsafe fn inflate_handle(strm: &mut z_stream) -> Option<&mut InflateHandle> {
-    // SAFETY: delegated tag read; see `peek_handle_kind`.
-    match unsafe { peek_handle_kind(strm) } {
-        Some(kind) if kind == HandleKind::INFLATE => {
-            // SAFETY: the tag confirms a live `InflateHandle`; the borrow is tied
-            // to `strm`, so it cannot alias for its lifetime.
-            Some(unsafe { &mut *(strm.state as *mut InflateHandle) })
-        }
-        _ => None,
+impl TaggedHandle for InflateHandle {
+    const KIND: HandleKind = HandleKind::INFLATE;
+
+    #[inline]
+    fn set_owner(&mut self, owner: *const z_stream) {
+        self.owner = owner;
+    }
+
+    #[inline]
+    fn engine_status_is_c_valid(&self) -> bool {
+        self.zs
+            .inflate_state()
+            .is_some_and(|st| st.mode.is_c_valid())
     }
 }
 
-/// Reclaims the boxed [`InflateHandle`] from `state`, validating the
-/// [`HandleKind`] tag first and nulling `state` on success. Returns [`None`] —
-/// leaving `state` untouched — when the handle is absent or not an inflate
-/// handle, so [`inflateEnd`] never drops a wrong-type box.
+/// C's `inflateStateCheck` (`inflate.c` L88-L97), reproduced clause for clause.
+///
+/// Returns `true` when reference zlib would have accepted `strm` — i.e. when C's
+/// `inflateStateCheck` would have returned 0: a non-null stream, both allocator
+/// hooks live, an installed state, `state->strm == strm`, and
+/// `HEAD <= state->mode <= SYNC`.
+///
+/// Every `inflate*` shim that reaches the engine runs this first, and, critically,
+/// **runs it before bridging any auxiliary caller pointer**: C rejects an invalid
+/// stream without reading the `dictionary`, `head`, or window pointers passed
+/// alongside it, so a stale non-null pointer must not be turned into a Rust slice
+/// or reference either.
 ///
 /// # Safety
 ///
-/// A non-null `state` must point at a live handle installed by an FFI init shim,
-/// not already reclaimed.
+/// A non-null [`z_stream::state`] must point at a live handle installed by
+/// [`install_handle`].
+#[inline]
+#[must_use]
+unsafe fn inflate_state_check(strm: &z_stream) -> bool {
+    // SAFETY: delegated to the canonical clause helper in `ffi::types`; every
+    // clause is discharged there and nothing outside `strm` and its own handle is
+    // read.
+    unsafe { handle_prefix_valid::<InflateHandle>(strm) }
+}
+
+/// Borrows the [`InflateHandle`] behind the opaque `state` pointer after running
+/// the whole of C's [`inflate_state_check`]. Returns [`None`] — so the caller can
+/// return `Z_STREAM_ERROR` WITHOUT reinterpreting a wrong-type allocation — when
+/// no handle is installed, the allocator pair is not live, the handle belongs to
+/// a different engine or a different `z_stream`, or the mode is outside
+/// `HEAD..=SYNC`.
+///
+/// # Safety
+///
+/// A non-null `state` must point at a live handle installed by
+/// [`install_handle`].
+#[inline]
+unsafe fn inflate_handle(strm: &mut z_stream) -> Option<&mut InflateHandle> {
+    // SAFETY: delegated; runs every clause of C's `inflateStateCheck` and reads
+    // nothing outside `strm` and its own handle.
+    if !unsafe { inflate_state_check(strm) } {
+        return None;
+    }
+    // SAFETY: the check confirmed the tag and the owner, so the allocation really
+    // is a live `InflateHandle`; the borrow is tied to `strm`, so it cannot alias
+    // for its lifetime.
+    Some(unsafe { &mut *(strm.state as *mut InflateHandle) })
+}
+
+/// Reclaims the boxed [`InflateHandle`] from `state` after running the whole of
+/// C's [`inflate_state_check`], nulling `state` on success. Returns [`None`] —
+/// leaving `state` untouched — when the check fails, so [`inflateEnd`] never
+/// drops a wrong-type box and never frees a handle through a stream that does not
+/// own it.
+///
+/// The owner clause is what makes reclaim sound against transplantation: a caller
+/// who copies the 14-field `z_stream` holds a second struct pointing at the SAME
+/// handle, and freeing through the copy would leave the original with a dangling
+/// `state`. C returns `Z_STREAM_ERROR` for the copy (`inflate.c` L95,
+/// `state->strm != strm`) and this reproduces that refusal, so the allocation is
+/// released exactly once, through its owner.
+///
+/// # Safety
+///
+/// A non-null `state` must point at a live handle installed by
+/// [`install_handle`], not already reclaimed.
 #[inline]
 unsafe fn inflate_take(strm: &mut z_stream) -> Option<Box<InflateHandle>> {
-    // SAFETY: delegated tag read; see `peek_handle_kind`.
-    match unsafe { peek_handle_kind(strm) } {
-        Some(kind) if kind == HandleKind::INFLATE => {
-            // SAFETY: the tag confirms a live `Box<InflateHandle>`; reconstitute
-            // exactly once and null the field to prevent a double free.
-            let boxed = unsafe { Box::from_raw(strm.state as *mut InflateHandle) };
-            strm.state = ptr::null_mut();
-            Some(boxed)
-        }
-        _ => None,
+    // SAFETY: delegated; runs every clause of C's `inflateStateCheck`.
+    if !unsafe { inflate_state_check(strm) } {
+        return None;
     }
+    // SAFETY: the check confirmed a live, owner-matched `Box<InflateHandle>`;
+    // reconstitute it exactly once and null the field to prevent a double free.
+    let boxed = unsafe { Box::from_raw(strm.state as *mut InflateHandle) };
+    strm.state = ptr::null_mut();
+    Some(boxed)
 }
 
 /// The boxed `inflateBack` engine handle installed in [`z_stream::state`] by
@@ -401,7 +437,7 @@ unsafe fn inflate_take(strm: &mut z_stream) -> Option<Box<InflateHandle>> {
 ///
 /// Unlike the streaming [`inflate`] path, `inflateBack` drives the raw engine
 /// directly with a caller-owned window (which doubles as the output buffer), so
-/// this handle owns the `Box<InflateState>` outright rather than an idiomatic
+/// this handle owns the placed engine state outright rather than an idiomatic
 /// [`ZStream`]. The leading [`HandleKind`] tag ([`HandleKind::INFLATE_BACK`])
 /// lets [`inflateBack`] and [`inflateBackEnd`] verify the handle *kind* before
 /// reinterpreting the opaque `state` pointer, closing the undefined behavior where an
@@ -412,68 +448,179 @@ unsafe fn inflate_take(strm: &mut z_stream) -> Option<Box<InflateHandle>> {
 struct InflateBackHandle {
     /// Discriminant tag; always [`HandleKind::INFLATE_BACK`]. MUST be first.
     kind: HandleKind,
-    /// The engine state whose owned window doubles as the sliding output buffer.
-    inner: Box<InflateState>,
+    /// Address of the `z_stream` this handle was installed into. MUST be the
+    /// second field so the shared `#[repr(C)]` prefix stays uniform across all
+    /// three handle kinds.
+    ///
+    /// Recorded by [`install_handle`], but — unlike the deflate and inflate
+    /// handles — **not** consulted by [`inflate_back_state_check`]. Reference
+    /// zlib never assigns `state->strm` anywhere in `infback.c`, so there is no
+    /// owner for the decode path to compare against; see that function for the
+    /// full reasoning and for the one place the field *is* enforced.
+    owner: *const z_stream,
+    /// The engine state whose window doubles as the sliding output buffer.
+    ///
+    /// Held as a placed engine, not a plain [`Box`]: reference zlib charges the
+    /// state to the caller's `zalloc` (`infback.c` L51) and this shim does the
+    /// same, so for a caller with an active hook these bytes live in the caller's
+    /// own region and go back through their `zfree` when the handle drops.
+    inner: BoxedEngine<InflateState>,
 }
 
 impl InflateBackHandle {
     /// Wraps a freshly built back-inflate state, tagging it as an `inflateBack`
     /// handle.
+    ///
+    /// The owner is left null until [`install_handle`] binds it.
     #[inline]
-    fn new(inner: Box<InflateState>) -> Self {
+    fn new(inner: BoxedEngine<InflateState>) -> Self {
         Self {
             kind: HandleKind::INFLATE_BACK,
+            owner: ptr::null(),
             inner,
         }
     }
 }
 
-/// Borrows the [`InflateBackHandle`] behind the opaque `state` pointer,
-/// validating the [`HandleKind`] tag first. Returns [`None`] when no handle is
-/// installed OR the installed handle is not an `inflateBack` handle (cross-type
-/// misuse), so the caller can return `Z_STREAM_ERROR` WITHOUT reinterpreting a
-/// wrong-type allocation.
-///
-/// # Safety
-///
-/// A non-null `state` must point at a live handle installed by an FFI init shim
-/// (so its leading tag is readable).
-#[inline]
-unsafe fn inflate_back_handle(strm: &mut z_stream) -> Option<&mut InflateBackHandle> {
-    // SAFETY: delegated tag read; see `peek_handle_kind`.
-    match unsafe { peek_handle_kind(strm) } {
-        Some(kind) if kind == HandleKind::INFLATE_BACK => {
-            // SAFETY: the tag confirms a live `InflateBackHandle`; the borrow is
-            // tied to `strm`, so it cannot alias for its lifetime.
-            Some(unsafe { &mut *(strm.state as *mut InflateBackHandle) })
-        }
-        _ => None,
+impl TaggedHandle for InflateBackHandle {
+    const KIND: HandleKind = HandleKind::INFLATE_BACK;
+
+    #[inline]
+    fn set_owner(&mut self, owner: *const z_stream) {
+        self.owner = owner;
+    }
+
+    #[inline]
+    fn engine_status_is_c_valid(&self) -> bool {
+        // `infback.c` L208-L219 range-checks nothing: `inflateBack` overwrites
+        // `state->mode = TYPE` on entry (`infback.c` L221), so whatever mode the
+        // previous call left behind is irrelevant and C never rejects on it.
+        // Reporting `true` unconditionally is therefore the faithful answer, and
+        // it is only ever consulted if some future caller routes this handle
+        // through the symmetric `handle_prefix_valid` predicate.
+        true
     }
 }
 
-/// Reclaims the boxed [`InflateBackHandle`] from `state`, validating the
-/// [`HandleKind`] tag first and nulling `state` on success. Returns [`None`] —
-/// leaving `state` untouched — when the handle is absent or not an `inflateBack`
-/// handle, so [`inflateBackEnd`] never drops a wrong-type box.
+/// The entry validation reference zlib performs in `inflateBack`
+/// (`infback.c` L208-L219), reproduced clause for clause.
+///
+/// C checks **strictly less** here than in `inflateStateCheck`, and that
+/// difference is deliberate rather than an oversight to be tidied up:
+///
+/// * `strm == Z_NULL || strm->state == Z_NULL` — the only two clauses C applies.
+///   Discharged by holding a `&z_stream` and by the tag read below.
+/// * **No allocator clause.** `inflate`/`deflate` reject a stream whose `zalloc`
+///   or `zfree` has been cleared; `inflateBack` does not, because it allocates
+///   nothing during decode — the window is the caller's.
+/// * **No mode clause.** `inflateBack` assigns `state->mode = TYPE` on entry
+///   (`infback.c` L221), so the incoming mode cannot make the call invalid.
+/// * **No owner clause.** `infback.c` never assigns `state->strm` at all, so
+///   reference zlib has no owner recorded to compare against. Imposing one would
+///   reject a `z_stream` the caller has *moved* since `inflateBackInit_` — which
+///   C accepts on this path — and that is a behavior change on an input C handles
+///   defined, so it is not imposed.
+///
+/// The one clause added beyond C is the Rust-only [`HandleKind`] tag, which is
+/// strictly stronger than anything C can express and is what prevents
+/// reinterpreting a deflate or inflate allocation through this handle's layout.
+///
+/// The owner *is* enforced on the reclaim path — see
+/// [`inflate_back_end_state_check`] — because there, and only there, tolerating a
+/// foreign stream would mean freeing one allocation twice.
 ///
 /// # Safety
 ///
-/// A non-null `state` must point at a live handle installed by an FFI init shim,
-/// not already reclaimed.
+/// A non-null [`z_stream::state`] must point at a live handle installed by
+/// [`install_handle`].
+#[inline]
+#[must_use]
+unsafe fn inflate_back_state_check(strm: &z_stream) -> bool {
+    // SAFETY: delegated prefix read; see `peek_handle_kind`.
+    let kind = unsafe { peek_handle_kind(strm) };
+    kind == Some(HandleKind::INFLATE_BACK)
+}
+
+/// The entry validation reference zlib performs in `inflateBackEnd`
+/// (`infback.c` L573), plus the owner clause that reclaim soundness requires.
+///
+/// C's predicate is `strm == Z_NULL || strm->state == Z_NULL ||
+/// strm->zfree == (free_func)0` — note `zfree` but *not* `zalloc`, since the only
+/// thing left to do is free.
+///
+/// Beyond that this adds the [`HandleKind`] tag and the owner comparison. The
+/// owner is the deliberate divergence, and it is confined to inputs on which
+/// reference zlib is already undefined: a caller who *copies* the 14-field
+/// `z_stream` holds two structs naming one handle, and C — having no owner to
+/// check — frees it through both, a double free. Refusing the copy with
+/// `Z_STREAM_ERROR` releases the allocation exactly once, through the stream it
+/// was installed into. The cost is that a *moved* stream leaks rather than frees
+/// and reports `Z_STREAM_ERROR`; a leak is memory-safe and observable, a double
+/// free is neither, and no other zlib engine tolerates a moved stream either
+/// (`deflate.c` L546, `inflate.c` L95), so no portable caller can be relying on
+/// it.
+///
+/// # Safety
+///
+/// A non-null [`z_stream::state`] must point at a live handle installed by
+/// [`install_handle`].
+#[inline]
+#[must_use]
+unsafe fn inflate_back_end_state_check(strm: &z_stream) -> bool {
+    if strm.zfree.is_none() {
+        return false;
+    }
+    // SAFETY: delegated; the identity clauses read only the handle prefix.
+    unsafe { handle_owner_valid::<InflateBackHandle>(strm) }.is_some()
+}
+
+/// Borrows the [`InflateBackHandle`] behind the opaque `state` pointer after
+/// running [`inflate_back_state_check`] — reference zlib's `inflateBack` entry
+/// validation. Returns [`None`] when no handle is installed OR the installed
+/// handle is not an `inflateBack` handle (cross-type misuse), so the caller can
+/// return `Z_STREAM_ERROR` WITHOUT reinterpreting a wrong-type allocation.
+///
+/// # Safety
+///
+/// A non-null `state` must point at a live handle installed by
+/// [`install_handle`].
+#[inline]
+unsafe fn inflate_back_handle(strm: &mut z_stream) -> Option<&mut InflateBackHandle> {
+    // SAFETY: delegated; runs C's `infback.c` L208-L219 clauses plus the kind tag,
+    // and reads nothing outside `strm` and its own handle.
+    if !unsafe { inflate_back_state_check(strm) } {
+        return None;
+    }
+    // SAFETY: the tag confirms a live `InflateBackHandle`; the borrow is tied to
+    // `strm`, so it cannot alias for its lifetime.
+    Some(unsafe { &mut *(strm.state as *mut InflateBackHandle) })
+}
+
+/// Reclaims the boxed [`InflateBackHandle`] from `state` after running
+/// [`inflate_back_end_state_check`] — reference zlib's `inflateBackEnd`
+/// validation (`infback.c` L573) plus the owner clause — nulling `state` on
+/// success.
+///
+/// Returns [`None`], leaving `state` untouched, when the check fails, so
+/// [`inflateBackEnd`] never drops a wrong-type box, never frees while the
+/// caller's `zfree` hook is absent, and never frees one allocation through two
+/// streams.
+///
+/// # Safety
+///
+/// A non-null `state` must point at a live handle installed by
+/// [`install_handle`], not already reclaimed.
 #[inline]
 unsafe fn inflate_back_take(strm: &mut z_stream) -> Option<Box<InflateBackHandle>> {
-    // SAFETY: delegated tag read; see `peek_handle_kind`.
-    match unsafe { peek_handle_kind(strm) } {
-        Some(kind) if kind == HandleKind::INFLATE_BACK => {
-            // SAFETY: the tag confirms a live `Box<InflateBackHandle>`;
-            // reconstitute exactly once and null the field to prevent a double
-            // free.
-            let boxed = unsafe { Box::from_raw(strm.state as *mut InflateBackHandle) };
-            strm.state = ptr::null_mut();
-            Some(boxed)
-        }
-        _ => None,
+    // SAFETY: delegated; runs C's `infback.c` L573 clauses plus kind and owner.
+    if !unsafe { inflate_back_end_state_check(strm) } {
+        return None;
     }
+    // SAFETY: the check confirmed a live, owner-matched `Box<InflateBackHandle>`;
+    // reconstitute exactly once and null the field to prevent a double free.
+    let boxed = unsafe { Box::from_raw(strm.state as *mut InflateBackHandle) };
+    strm.state = ptr::null_mut();
+    Some(boxed)
 }
 
 // ---------------------------------------------------------------------------
@@ -482,9 +629,14 @@ unsafe fn inflate_back_take(strm: &mut z_stream) -> Option<Box<InflateBackHandle
 
 /// Adapts zlib's C `in_func` to the engine's [`InFunc`] trait.
 ///
-/// On the first call it yields whatever input was already buffered in the
+/// On the first advance it yields whatever input was already buffered in the
 /// stream (`next_in[..avail_in]`); thereafter it invokes the C callback, which
 /// returns a byte count and points `*buf` at that many readable input bytes.
+///
+/// The chunk is never copied. `advance` only records the provenance of the region
+/// the callback published, and `chunk` re-forms a slice over it on demand, so the
+/// engine decodes straight out of the caller's memory — the zero-allocation
+/// property `infback.c` has and a growing owned buffer would not.
 ///
 /// It also records the provenance of the most recent chunk it hands to the
 /// engine (`last_ptr`/`last_len`), whether it has handed out any real input
@@ -516,7 +668,7 @@ struct CInFunc<'a> {
 }
 
 impl InFunc for CInFunc<'_> {
-    fn next_input(&mut self) -> &[u8] {
+    fn advance(&mut self) -> bool {
         if !self.initial_done {
             self.initial_done = true;
             if !self.initial.is_empty() {
@@ -525,7 +677,7 @@ impl InFunc for CInFunc<'_> {
                 self.last_len = self.initial.len();
                 self.handed_out = true;
                 self.dry = false;
-                return self.initial;
+                return true;
             }
         }
         let mut buf: *const c_uchar = ptr::null();
@@ -533,21 +685,41 @@ impl InFunc for CInFunc<'_> {
         // `inflateBack` shim before this adapter is constructed). Per the zlib
         // callback contract it returns a count `n` and stores in `*buf` a pointer
         // to `n` readable bytes that remain valid at least until the next call —
-        // which is exactly the lifetime over which the engine uses the slice.
+        // which is exactly the window over which `chunk` re-forms the slice.
         let n = unsafe { (self.in_fn)(self.in_desc, &mut buf) };
         if n == 0 || buf.is_null() {
-            // Callback ran dry: mirror C `PULL` returning 0 (next = Z_NULL).
+            // Callback ran dry: mirror C `PULL` returning 0 (next = Z_NULL). The
+            // recorded provenance is left in place so `chunk` keeps reporting the
+            // previous, fully consumed region and C's `have` stays `0`.
             self.dry = true;
-            &[]
+            false
         } else {
             // Record this callback buffer as the current chunk.
             self.last_ptr = buf;
             self.last_len = n as usize;
             self.handed_out = true;
             self.dry = false;
-            // SAFETY: the callback guaranteed `n` bytes are readable at `buf`.
-            unsafe { slice::from_raw_parts(buf, n as usize) }
+            true
         }
+    }
+
+    fn chunk(&self) -> &[u8] {
+        if !self.handed_out {
+            // Nothing has been published yet. `last_ptr`/`last_len` are
+            // pre-seeded with the initial buffer so the exit-cursor arithmetic
+            // works even for a decode that pulls nothing, but that region has not
+            // been handed to the engine, so reporting it here would let the
+            // decoder consume the same bytes twice.
+            return &[];
+        }
+        // SAFETY: `handed_out` means the most recent successful `advance` recorded
+        // `last_len` readable bytes at `last_ptr` — either the caller's
+        // `next_in[..avail_in]` window or a region the C `in_func` published.
+        // Either stays valid until the next callback invocation, and `advance` is
+        // the only thing that invokes it, so no slice formed here outlives its
+        // region. `last_len` came from a `c_uint`, so it cannot exceed
+        // `isize::MAX`.
+        unsafe { slice::from_raw_parts(self.last_ptr, self.last_len) }
     }
 
     fn set_unconsumed(&mut self, unconsumed: usize) {
@@ -679,9 +851,12 @@ pub unsafe extern "C" fn inflateInit2_(
                 let Some(handle) = try_box(InflateHandle::new(zs)) else {
                     return Z_MEM_ERROR;
                 };
-                // SAFETY: transfers ownership of the box into the opaque
-                // `state` slot; reclaimed and dropped by `inflateEnd`.
-                sref.state = unsafe { state_ptr_from_box(handle) };
+                // SAFETY: transfers ownership of the box into the opaque `state`
+                // slot and binds the handle's owner to this stream — C's
+                // `state->strm = strm` (`inflate.c` L203). `state` was reclaimed
+                // (or was never populated) before this point, so nothing leaks.
+                // Reclaimed and dropped by `inflateEnd`.
+                unsafe { install_handle(sref, handle) };
                 sref.total_in = 0;
                 sref.total_out = 0;
                 sref.msg = ptr::null_mut();
@@ -749,9 +924,11 @@ pub unsafe extern "C" fn inflateInit_(
 /// Only a call that will be *accepted* must actually supply `1 << windowBits`
 /// live, un-aliased bytes that outlive the state.
 ///
-/// The region is zero-filled before use — see `crate::ffi::alloc`'s
-/// `borrow_caller_window` for why that is required and why it is unobservable to
-/// a correct caller.
+/// The region is adopted, never written — see `crate::ffi::alloc`'s
+/// `borrow_caller_window`. A caller that pre-fills its window and then makes a
+/// call this function refuses (a rejected argument, or an allocator that turns
+/// the state request down) finds the buffer byte-for-byte unchanged, exactly as a
+/// C build leaves it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn inflateBackInit_(
     strm: z_streamp,
@@ -795,20 +972,24 @@ pub unsafe extern "C" fn inflateBackInit_(
         // Lend the caller's buffer to the engine rather than allocating a
         // replacement: C adopts the pointer with `state->window = window;`
         // (`infback.c` L60) and `inflateBackEnd` never frees it.
-        // SAFETY: `window` is non-null (checked above) and the caller's documented
-        // contract on this entry point guarantees it is valid for reads and writes
-        // of `1 << window_bits` bytes and stays valid, un-aliased, until
-        // `inflateBackEnd` destroys the state built from it.
-        let lent =
-            unsafe { crate::ffi::alloc::borrow_caller_window(window, 1usize << window_bits) };
-        let Some(lent) = lent else {
-            // The only reachable causes are an exhausted global heap (the tiny box
-            // holding the borrow) — `Z_MEM_ERROR`, as C reports for a failed
-            // allocation — since the null and range checks above already ran.
-            return Z_MEM_ERROR;
+        //
+        // The borrow is handed over as a *closure* so the engine can run C's
+        // ordering: the state `ZALLOC` (`infback.c` L51-L53) first, and only on
+        // its success the L60 adoption. A refused state request therefore returns
+        // `Z_MEM_ERROR` without this closure ever running, leaving the caller's
+        // window as untouched as C leaves it. The `1 << window_bits` length is
+        // computed here — not taken from the caller — because C derives
+        // `state->wsize` the same way and never inspects the buffer's real size.
+        let lend = move || {
+            // SAFETY: `window` is non-null (checked above) and the caller's
+            // documented contract on this entry point guarantees it is valid for
+            // reads and writes of `1 << window_bits` bytes and stays valid,
+            // un-aliased, until `inflateBackEnd` destroys the state built from it.
+            // The bytes need not be initialized; nothing here writes or reads them.
+            unsafe { crate::ffi::alloc::borrow_caller_window(window, 1usize << window_bits) }
         };
 
-        match crate::inflate::back::inflate_back_init_borrowed_window(&allocator, window_bits, lent)
+        match crate::inflate::back::inflate_back_init_borrowed_window(&allocator, window_bits, lend)
         {
             Ok(state) => {
                 // Tag the state as an `inflateBack` handle before installing it,
@@ -825,8 +1006,10 @@ pub unsafe extern "C" fn inflateBackInit_(
                 };
                 // SAFETY: transfers ownership of the `Box<InflateBackHandle>`
                 // into the opaque `state` slot; reclaimed and dropped by
-                // `inflateBackEnd` after tag validation.
-                sref.state = unsafe { state_ptr_from_box(handle) };
+                // `inflateBackEnd` after tag validation. The owner is recorded
+                // here for the reclaim-path check even though `infback.c` itself
+                // never assigns `state->strm` — see `inflate_back_state_check`.
+                unsafe { install_handle(sref, handle) };
                 sref.total_in = 0;
                 sref.total_out = 0;
                 sref.msg = ptr::null_mut();
@@ -856,6 +1039,69 @@ pub unsafe extern "C" fn inflateBackInit_(
 /// dictionary is required (with `strm.adler` set to the required checksum),
 /// `Z_BUF_ERROR` on no progress, and `Z_DATA_ERROR` with `strm.msg` set on
 /// corrupt input.
+///
+/// # Safety
+///
+/// `strm` may be null, which is rejected with `Z_STREAM_ERROR` before any
+/// dereference. When non-null it must be a valid, exclusively-owned `z_stream`
+/// previously initialized by `inflateInit*`, with its `state` handle unmodified
+/// by the caller. A handle belonging to a different engine is *not* undefined
+/// behavior either: `inflate_handle` checks the `HandleKind` tag before the state
+/// is reborrowed, and a mismatch yields `Z_STREAM_ERROR`.
+///
+/// **Buffer pointers and counts.** Each `next_*` pointer paired with a non-zero
+/// `avail_*` count must address that many valid, live bytes — readable for
+/// `next_in`, writable for `next_out` — and must be correctly aligned for `u8`
+/// (that is, any non-null address). Overstating an `avail_*` count relative to
+/// the real allocation, or passing a dangling or freed pointer, is undefined
+/// behavior; the C API carries no length information with which to detect it,
+/// so this obligation cannot be discharged by the callee.
+///
+/// **Aliasing.** The input region `next_in[..avail_in]` and the output region
+/// `next_out[..avail_out]` must not overlap each other, and neither may overlap
+/// the `*strm` struct itself. This is a hard requirement rather than a
+/// convention: the two regions are bridged to a `&[u8]` and a `&mut [u8]` that
+/// are live simultaneously, so an overlap would create a shared and a unique
+/// reference to the same bytes. For the duration of the call the caller must
+/// also not access `*strm` or either buffer from another thread, since `*strm`
+/// is reborrowed as `&mut`.
+///
+/// **Registered gzip header.** If a `gz_header` was registered through
+/// [`inflateGetHeader`], it must still be live and writable for this call, and
+/// its `extra` / `name` / `comment` buffers must address at least the
+/// `extra_max` / `name_max` / `comm_max` bytes they advertise, since this call
+/// publishes into them.
+///
+/// **Pre-dereference validation — the two defined rejection cases.** Two
+/// pointer/count combinations that this contract would otherwise appear to
+/// forbid are in fact *defined, rejected* configurations rather than undefined
+/// behavior, and callers (including the fuzz harness's
+/// `probe_buffer_validation`) may rely on that:
+///
+/// - `next_out == NULL`, rejected **unconditionally** with `Z_STREAM_ERROR` —
+///   with no `avail_out == 0` qualifier, matching C, whose `next_out == Z_NULL`
+///   test likewise carries none.
+/// - `avail_in != 0` paired with `next_in == NULL`, rejected with
+///   `Z_STREAM_ERROR`.
+///
+/// Both are tested by [`stream_buffers_valid`] at the top of the body, *before*
+/// `input_slice`/`output_slice` bridge anything, so neither pointer is
+/// dereferenced and no slice is ever formed from a null base. This mirrors C
+/// `inflate`'s entry guard (`inflate.c` L474) and exists precisely so the
+/// programmer error surfaces as an error code instead of being silently masked
+/// into an empty slice. The complementary shape `avail_in == 0` with
+/// `next_in == NULL` is legal: nothing is read. Note that it is not thereby
+/// productive — unlike `deflate`, which has an RFC 1950 header of its own to
+/// publish, a raw `inflate` with an empty input window has nothing to do and
+/// reports `Z_BUF_ERROR`.
+///
+/// **Unwinding.** The body runs inside a `guard_int` panic guard, so a Rust
+/// panic can never unwind across this `extern "C"` boundary. With `std` the
+/// guard is a `catch_unwind` that substitutes `Z_STREAM_ERROR`; without it the
+/// closure runs directly, because a `no_std` build has no unwinding runtime to
+/// catch and the crate sets `panic = "abort"` in both profiles, so a panic
+/// aborts the process rather than crossing the boundary. Either way the caller
+/// never observes a foreign unwind.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
     guard_int(Z_STREAM_ERROR, move || {
@@ -864,6 +1110,19 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
         }
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
+
+        // C `inflate` validates the *stream* first: `inflateStateCheck(strm) ||
+        // strm->next_out == Z_NULL || (strm->next_in == Z_NULL && avail_in != 0)`
+        // is a single expression whose first operand is the state clause
+        // (`inflate.c` L474). Running it here, rather than after the slices are
+        // formed, is also a soundness requirement: on an unvalidated stream
+        // `next_in`/`next_out` may be stale, and constructing a slice over a stale
+        // pointer is undefined behavior even when the slice is never read.
+        // SAFETY: `state`, when non-null, was installed by `inflateInit*` via
+        // `install_handle`; the check reads nothing outside `sref` and its handle.
+        if !unsafe { inflate_state_check(sref) } {
+            return Z_STREAM_ERROR;
+        }
 
         // C `inflate` entry validation (`inflate.c` L474): reject a null
         // `next_out`, or a null `next_in` paired with a positive `avail_in`,
@@ -905,8 +1164,51 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
         // `total_in`/`total_out` mirrors may advance; the public
         // `crate::inflate::inflate` discards that flag (see
         // `TrackedInflateOutcome`).
-        let tracked = crate::inflate::inflate_tracked(&mut handle.zs, input, output, flush);
+        // Lend the decoder the caller's own gzip-header output buffers for the
+        // duration of this call. C stores every decoded header byte straight into
+        // them, re-reading `head->extra`/`name`/`comment` and their `*_max`
+        // capacities as it goes (`inflate.c` L614-L621, L632-L637, L654-L659);
+        // re-materializing the view here — rather than snapshotting it back at
+        // `inflateGetHeader` time — is what makes a sink installed, resized or
+        // withdrawn after registration behave as it does in C, and what keeps the
+        // header path free of the allocation (and therefore of the `Z_MEM_ERROR`)
+        // that C does not have.
+        //
+        // The pointer is read out of the *validated* handle, so the header is only
+        // dereferenced once the state check has passed, and the slices alias the
+        // caller's buffers rather than the stream, so they coexist with the
+        // `&mut handle.zs` borrow below.
+        #[cfg(feature = "gzip")]
+        let head_ptr = handle.head;
+        // The sink is scoped to the engine call alone: the mutable slices it holds
+        // alias the caller's header buffers, and the write-back below reaches the
+        // same struct through `head_ptr`, so the borrow must be provably finished
+        // before that happens.
+        let tracked = {
+            // SAFETY: `head_ptr` is either null or the `gz_header` the caller
+            // registered through `inflateGetHeader` and undertook to keep valid,
+            // with `extra`/`name`/`comment` writable for their declared `*_max`.
+            #[cfg(feature = "gzip")]
+            let mut sink = unsafe { borrow_gz_header_sink(head_ptr) };
+            crate::inflate::inflate_tracked_lending(
+                &mut handle.zs,
+                input,
+                output,
+                flush,
+                #[cfg(feature = "gzip")]
+                sink.as_mut(),
+            )
+        };
         let outcome = tracked.outcome;
+
+        // C's `inflate_fast` gives back `bits >> 3` whole input bytes by rewinding a
+        // raw pointer (`inffast.c` L290-L294), which may move `next_in` to before
+        // where this call began when the accumulator held whole bytes on entry. A
+        // `&[u8]` index cannot express that, so the engine defers the out-of-slice
+        // part; settle it here, where the caller's one contiguous buffer makes it
+        // meaningful. This must precede the `data_type` snapshot below, because the
+        // settlement reduces `bits` and `data_type`'s low seven bits *are* `bits`.
+        let rewound = crate::inflate::inflate_take_input_history_rewind(&mut handle.zs);
 
         // Snapshot observable fields out of the handle before its borrow ends.
         let adler = handle.zs.adler;
@@ -932,7 +1234,6 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
         // S5). See `publish_gz_header`.
         #[cfg(feature = "gzip")]
         {
-            let head_ptr = handle.head;
             if !head_ptr.is_null() {
                 if let Some(state) = handle.zs.inflate_state() {
                     if let Some(gh) = state.head.as_ref() {
@@ -956,6 +1257,21 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
         // SAFETY: `outcome.consumed <= input.len() == avail_in`, so advancing by
         // that amount keeps `next_in`/`avail_in`/`total_in` consistent.
         unsafe { advance_input(sref, outcome.consumed) };
+        if rewound != 0 {
+            // The deferred half of C's give-back, applied as the inverse of the
+            // advance above: `next_in` ends at `entry + consumed - rewound` and
+            // `avail_in` at `entry - consumed + rewound`.
+            // SAFETY: `rewound` counts bytes the decoder itself read from this
+            // stream on an earlier call, so they precede `next_in` inside the
+            // caller's buffer — the same contiguity reference zlib requires. The
+            // pointer is not dereferenced.
+            unsafe { rewind_input(sref, rewound) };
+            // `total_in` cannot be maintained by composing the two adjustments
+            // above: C collapses the call into a single `uInt` delta and only then
+            // widens it, so a give-back larger than the bytes consumed wraps at
+            // 2^32 rather than 2^64. Rebuild that delta from the pre-call total.
+            republish_total_in(sref, prev_total_in, outcome.consumed, rewound);
+        }
         // SAFETY: `outcome.produced <= output.len() == avail_out`, as above.
         unsafe { advance_output(sref, outcome.produced) };
         if !tracked.commit_totals {
@@ -1032,6 +1348,11 @@ pub unsafe extern "C" fn inflateReset(strm: z_streamp) -> c_int {
         };
         let res = crate::inflate::inflate_reset(&mut handle.zs);
         let adler = handle.zs.adler;
+        // Mirrored from the engine rather than written as a literal so the two
+        // layers cannot drift: `inflate_reset_keep` performs C's
+        // `strm->data_type = 0` (`inflate.c` L107) on the owned stream, and this
+        // is the value the caller must observe.
+        let data_type = handle.zs.data_type;
         // C's whole reset family funnels into `inflateResetKeep`, whose
         // only `strm->adler` write is guarded by `if (state->wrap)`
         // (`inflate.c` L108-L109). See `mirror_adler_if_wrapped`.
@@ -1042,6 +1363,17 @@ pub unsafe extern "C" fn inflateReset(strm: z_streamp) -> c_int {
                 sref.total_in = 0;
                 sref.total_out = 0;
                 sref.msg = ptr::null_mut();
+                // C's `inflateResetKeep` clears the caller-visible decode-state
+                // word unconditionally, on the same line as `total_in`/`msg`
+                // (`inflate.c` L105-L107), and every reset variant funnels
+                // through it (`inflateReset` L125-L134, `inflateReset2`
+                // L136-L177). Leaving the previous value in place published a
+                // stale `data_type` — `128` (mode == TYPE) after a clean reset,
+                // or the residue of an aborted stream — to a caller that C
+                // guarantees sees `0`. Only the success path writes: both
+                // `inflateStateCheck` and `inflateReset2`'s `windowBits`
+                // validation return before any field is touched.
+                set_data_type(sref, data_type);
                 mirror_adler_if_wrapped(sref, wrap, adler);
                 Z_OK
             }
@@ -1068,6 +1400,11 @@ pub unsafe extern "C" fn inflateReset2(strm: z_streamp, window_bits: c_int) -> c
         };
         let res = crate::inflate::inflate_reset2(&mut handle.zs, window_bits);
         let adler = handle.zs.adler;
+        // Mirrored from the engine rather than written as a literal so the two
+        // layers cannot drift: `inflate_reset_keep` performs C's
+        // `strm->data_type = 0` (`inflate.c` L107) on the owned stream, and this
+        // is the value the caller must observe.
+        let data_type = handle.zs.data_type;
         // C's whole reset family funnels into `inflateResetKeep`, whose
         // only `strm->adler` write is guarded by `if (state->wrap)`
         // (`inflate.c` L108-L109). See `mirror_adler_if_wrapped`.
@@ -1078,6 +1415,17 @@ pub unsafe extern "C" fn inflateReset2(strm: z_streamp, window_bits: c_int) -> c
                 sref.total_in = 0;
                 sref.total_out = 0;
                 sref.msg = ptr::null_mut();
+                // C's `inflateResetKeep` clears the caller-visible decode-state
+                // word unconditionally, on the same line as `total_in`/`msg`
+                // (`inflate.c` L105-L107), and every reset variant funnels
+                // through it (`inflateReset` L125-L134, `inflateReset2`
+                // L136-L177). Leaving the previous value in place published a
+                // stale `data_type` — `128` (mode == TYPE) after a clean reset,
+                // or the residue of an aborted stream — to a caller that C
+                // guarantees sees `0`. Only the success path writes: both
+                // `inflateStateCheck` and `inflateReset2`'s `windowBits`
+                // validation return before any field is touched.
+                set_data_type(sref, data_type);
                 mirror_adler_if_wrapped(sref, wrap, adler);
                 Z_OK
             }
@@ -1104,6 +1452,11 @@ pub unsafe extern "C" fn inflateResetKeep(strm: z_streamp) -> c_int {
         };
         let res = crate::inflate::inflate_reset_keep(&mut handle.zs);
         let adler = handle.zs.adler;
+        // Mirrored from the engine rather than written as a literal so the two
+        // layers cannot drift: `inflate_reset_keep` performs C's
+        // `strm->data_type = 0` (`inflate.c` L107) on the owned stream, and this
+        // is the value the caller must observe.
+        let data_type = handle.zs.data_type;
         // C's whole reset family funnels into `inflateResetKeep`, whose
         // only `strm->adler` write is guarded by `if (state->wrap)`
         // (`inflate.c` L108-L109). See `mirror_adler_if_wrapped`.
@@ -1114,6 +1467,17 @@ pub unsafe extern "C" fn inflateResetKeep(strm: z_streamp) -> c_int {
                 sref.total_in = 0;
                 sref.total_out = 0;
                 sref.msg = ptr::null_mut();
+                // C's `inflateResetKeep` clears the caller-visible decode-state
+                // word unconditionally, on the same line as `total_in`/`msg`
+                // (`inflate.c` L105-L107), and every reset variant funnels
+                // through it (`inflateReset` L125-L134, `inflateReset2`
+                // L136-L177). Leaving the previous value in place published a
+                // stale `data_type` — `128` (mode == TYPE) after a clean reset,
+                // or the residue of an aborted stream — to a caller that C
+                // guarantees sees `0`. Only the success path writes: both
+                // `inflateStateCheck` and `inflateReset2`'s `windowBits`
+                // validation return before any field is touched.
+                set_data_type(sref, data_type);
                 mirror_adler_if_wrapped(sref, wrap, adler);
                 Z_OK
             }
@@ -1150,6 +1514,20 @@ pub unsafe extern "C" fn inflateSetDictionary(
         }
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
+
+        // C runs `inflateStateCheck(strm)` before it looks at `dictionary` at all
+        // (`inflate.c` L1256-L1262); the dictionary bytes are read only afterwards,
+        // and only when the state permits. Validating first is what makes the
+        // `slice::from_raw_parts` below sound: a stale pointer paired with an
+        // invalid stream must be refused without a slice ever being constructed
+        // over it, because constructing one is undefined behavior even if it is
+        // never read.
+        // SAFETY: `state`, when non-null, was installed via `install_handle`; the
+        // check reads nothing outside `sref` and its own handle.
+        if !unsafe { inflate_state_check(sref) } {
+            return Z_STREAM_ERROR;
+        }
+
         let dict: &[u8] = if dictionary.is_null() || dict_length == 0 {
             &[]
         } else {
@@ -1230,6 +1608,18 @@ pub unsafe extern "C" fn inflateSync(strm: z_streamp) -> c_int {
         }
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
+
+        // C runs `inflateStateCheck(strm)` as the very first statement of
+        // `inflateSync` (`inflate.c` L1349-L1351) and only then reaches
+        // `syncsearch(..., strm->next_in, ...)`. Validating before the input
+        // window is bridged reproduces that order and keeps a stale `next_in` on
+        // an invalid stream from being turned into a slice.
+        // SAFETY: `state`, when non-null, was installed via `install_handle`; the
+        // check reads nothing outside `sref` and its own handle.
+        if !unsafe { inflate_state_check(sref) } {
+            return Z_STREAM_ERROR;
+        }
+
         // Reject a null `next_in` paired with a positive `avail_in` before the
         // input window is bridged. `inflateSync` has no output buffer, so only
         // the input half of the entry contract applies. C `inflateSync` would
@@ -1335,12 +1725,25 @@ pub unsafe extern "C" fn inflateCopy(dest: z_streamp, source: z_streamp) -> c_in
             return Z_STREAM_ERROR;
         }
 
+        // C evaluates `inflateStateCheck(source) || dest == Z_NULL` as one
+        // expression (`inflate.c` L1381), so the *source* is fully validated
+        // before anything else is read — including its own allocator fields — and
+        // before `dest` is used at all. Running the whole predicate first means an
+        // invalid source is refused before a reference to either stream is formed
+        // for any other purpose.
+        // SAFETY: `source` is non-null and valid; the check reads only `source`
+        // and its own handle prefix and leaves no borrow behind.
+        if !unsafe { inflate_state_check(&*source) } {
+            return Z_STREAM_ERROR;
+        }
+
         // Build the destination idiomatic stream carrying the source's allocator
         // hooks. This shared read completes before we take the `&mut` borrow of
         // `source` below, avoiding aliasing.
         // SAFETY: `source` is non-null and a valid `z_stream`; reads its alloc
         // fields only.
         let source_alloc = unsafe { CAllocator::from_stream(&*source) };
+
         // C reaches the same verdict through `inflateStateCheck(source)`, which
         // rejects a source whose `zalloc` or `zfree` is null (`inflate.c` L90-L91,
         // called from `inflateCopy` before its `ZALLOC(source, …)`). A stream this
@@ -1389,8 +1792,12 @@ pub unsafe extern "C" fn inflateCopy(dest: z_streamp, source: z_streamp) -> c_in
                 // SAFETY: `dest` is non-null and a valid `z_stream`.
                 let dref = unsafe { &mut *dest };
                 // SAFETY: transfers ownership of the cloned handle into
-                // `dest.state`; reclaimed by `inflateEnd`.
-                dref.state = unsafe { state_ptr_from_box(boxed) };
+                // `dest.state` and re-points its owner at `dest`, reproducing
+                // C's `ds->strm = dest` in `deflateCopy` (`deflate.c` L1340) —
+                // the clone belongs to the destination, not to the source, so
+                // `inflateEnd(dest)` reclaims it and `inflateEnd(source)` cannot.
+                // Reclaimed by `inflateEnd`.
+                unsafe { install_handle(dref, boxed) };
 
                 // Mirror zlib's `zmemcpy(dest, source, sizeof(z_stream))` for the
                 // observable fields (the `state` pointer was just set above).
@@ -1513,10 +1920,19 @@ pub unsafe extern "C" fn inflateCodesUsed(strm: z_streamp) -> c_ulong {
 /// file name, and comment, bounded by the caller's `extra_max`/`name_max`/
 /// `comm_max`) are captured into it.
 ///
-/// The caller's `extra`/`name`/`comment` are **output** buffers here; we build a
-/// fresh idiomatic [`GzHeader`] that pre-allocates capture vectors only for the
-/// non-null buffers, register it with the engine, and remember the raw pointer
-/// so [`inflate`] can mirror the captured fields back after each call.
+/// The caller's `extra`/`name`/`comment` are **output** buffers here, and they
+/// stay in the caller's memory: this shim records only the registration plus the
+/// raw pointer, and [`inflate`] lends the decoder a borrowed view of those buffers
+/// on every call. Nothing about the header is read at registration time, matching
+/// C — which likewise consults `extra`/`name`/`comment` and their `*_max`
+/// capacities only later, live, from the parser (`inflate.c` L614-L621, L632-L637,
+/// L654-L659). A caller may therefore install or resize a sink *after* registering,
+/// exactly as it can in C, and the header path allocates nothing, so it cannot
+/// report the `Z_MEM_ERROR` C has no way to return.
+///
+/// The header's decoded scalars are mirrored back by [`inflate`] through C's
+/// incremental publication schedule, so a caller polling between calls sees only
+/// what the stream has actually delivered.
 ///
 /// Registration has one caller-visible side effect, reproduced from
 /// `inflate.c` L1228-L1229 (`state->head = head; head->done = 0;`): on success
@@ -1536,53 +1952,39 @@ pub unsafe extern "C" fn inflateGetHeader(strm: z_streamp, head: gz_headerp) -> 
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
 
-        // Construct the idiomatic header describing what to capture. We must not
-        // use `gz_header_to_idiomatic` here: that reads `extra`/`name`/`comment`
-        // as *inputs* (the `deflateSetHeader` direction), whereas here they are
-        // caller output buffers. The engine captures a field only when its
-        // idiomatic slot is pre-set to `Some(Vec)`, bounded by the `*_max`.
-        let gh = if head.is_null() {
-            GzHeader::default()
-        } else {
-            // SAFETY: `head` is non-null and a valid `gz_header`; we read its
-            // buffer pointers (to test for null) and capacity fields.
-            let raw = unsafe { &*head };
-            GzHeader {
-                extra: if raw.extra.is_null() {
-                    None
-                } else {
-                    Some(alloc::vec::Vec::new())
-                },
-                name: if raw.name.is_null() {
-                    None
-                } else {
-                    Some(alloc::vec::Vec::new())
-                },
-                comment: if raw.comment.is_null() {
-                    None
-                } else {
-                    Some(alloc::vec::Vec::new())
-                },
-                // The caller's `extra_len` needs no seeding: C assigns
-                // `head->extra_len` only when the header actually carries an
-                // `FEXTRA` field (`inflate.c` L596-L600), and for a stream without
-                // one it leaves the caller's field exactly as it found it
-                // (`inflate.c` L605-L606 nulls `extra`, never `extra_len`).
-                // `publish_gz_header` writes the field only when the decoder
-                // reports a declared `XLEN`, so both cases fall out for free.
-                extra_max: raw.extra_max,
-                name_max: raw.name_max,
-                comm_max: raw.comm_max,
-                ..GzHeader::default()
-            }
-        };
+        // C's `inflateGetHeader` runs `inflateStateCheck(strm)` and the
+        // `(state->wrap & 2) == 0` test *before* it touches `head` at all — the
+        // first write to the caller's struct is `head->done = 0` after both
+        // clauses pass (`inflate.c` L1219-L1230). Reading `head->extra`/`name`/
+        // `comment`/`*_max` below therefore must not happen until the stream has
+        // been validated: a caller who passes a stale header alongside an
+        // uninitialized stream gets C's `Z_STREAM_ERROR` without this shim
+        // dereferencing the header.
+        // SAFETY: `state`, when non-null, was installed via `install_handle`; the
+        // check reads nothing outside `sref` and its own handle.
+        if !unsafe { inflate_state_check(sref) } {
+            return Z_STREAM_ERROR;
+        }
 
+        // Record only *that* a caller-owned header is registered. Nothing about
+        // it is read here — not a buffer pointer, not a capacity — because C reads
+        // nothing either: `inflateGetHeader` stores the pointer and clears `done`,
+        // full stop (`inflate.c` L1228-L1229), and every field is consulted later,
+        // live, by the parser.
+        //
+        // Snapshotting the pointers and `*_max` values at this instant was a real
+        // divergence: a caller that registers a header and only afterwards installs
+        // its `extra`/`name`/`comment` buffers — which C honors — would have had
+        // those fields silently skipped, and the owned capture vectors introduced an
+        // allocation, hence a `Z_MEM_ERROR`, on a path C cannot fail on. The
+        // per-call `borrow_gz_header_sink` view in `inflate` replaces both.
+        //
         // SAFETY: `state`, if non-null, is the `Box<InflateHandle>`.
         let handle = match unsafe { inflate_handle(sref) } {
             Some(h) => h,
             None => return Z_STREAM_ERROR,
         };
-        match crate::inflate::inflate_get_header(&mut handle.zs, gh) {
+        match crate::inflate::inflate_get_header_foreign(&mut handle.zs, !head.is_null()) {
             Ok(_) => {
                 handle.head = head;
                 // Clear `head->done` at *registration*, synchronously, exactly as
@@ -1600,9 +2002,9 @@ pub unsafe extern "C" fn inflateGetHeader(strm: z_streamp, head: gz_headerp) -> 
                 //
                 // C dereferences `head` unconditionally here, so a null `head` is
                 // a caller error it does not survive; this shim already tolerates
-                // one (capturing into a default `GzHeader` above), so the write is
-                // guarded to keep that tolerance rather than reintroducing the
-                // crash.
+                // one (registering it as "no header", exactly as C's assignment of
+                // a null pointer would), so the write is guarded to keep that
+                // tolerance rather than reintroducing the crash.
                 if !head.is_null() {
                     // SAFETY: `head` is non-null and, per this entry point's FFI
                     // contract, points at a valid caller-owned `gz_header` that
@@ -1682,6 +2084,19 @@ pub unsafe extern "C" fn inflateBack(
 
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
+
+        // C's `inflateBack` validates `strm` and `strm->state` (plus both
+        // callbacks) as its first act (`infback.c` L208-L219) and only afterwards
+        // copies `strm->next_in`/`avail_in` into its local `next`/`have`
+        // (`infback.c` L226-L231). Validating before the window is bridged
+        // reproduces that order and keeps a stale `next_in` on a stream that was
+        // never `inflateBackInit_`-ed from being turned into a slice.
+        // SAFETY: `state`, when non-null, is a live tagged handle installed via
+        // `install_handle`; the check reads only the handle prefix.
+        if !unsafe { inflate_back_state_check(sref) } {
+            return Z_STREAM_ERROR;
+        }
+
         // SAFETY: detached-lifetime input window (see `inflate`); it points at the
         // caller's external buffer, so it stays valid across the later `&mut`
         // re-borrow of the stream for cursor restoration.
@@ -1695,7 +2110,7 @@ pub unsafe extern "C" fn inflateBack(
             Some(h) => h,
             None => return Z_STREAM_ERROR,
         };
-        let state = &mut *handle.inner;
+        let state = &mut **handle.inner;
 
         let mut src = CInFunc {
             in_fn,
@@ -1710,9 +2125,21 @@ pub unsafe extern "C" fn inflateBack(
         };
         let mut sink = COutFunc { out_fn, out_desc };
 
-        let code = crate::inflate::back::inflate_back(state, &mut src, &mut sink);
+        let outcome = crate::inflate::back::inflate_back(state, &mut src, &mut sink);
         // `state`/`handle` borrows of `sref` end here; `src` is a local that only
         // borrows the detached-lifetime `initial`, so it stays readable below.
+
+        // Publish `strm->msg`. C clears it at `infback.c` L214 — after the
+        // valid-state check at L209-L210, which is why a rejected call (handled
+        // above, before this point) must leave the caller's existing diagnostic
+        // alone — and each of the twelve error sites then stores its own literal.
+        // `BackMsg` carries which of those three happened; `msg_to_cstr` maps the
+        // engine's `&'static str` onto the matching `c"…"` literal.
+        match outcome.msg {
+            crate::inflate::back::BackMsg::Untouched => {}
+            crate::inflate::back::BackMsg::Cleared => set_msg(sref, ptr::null()),
+            crate::inflate::back::BackMsg::Set(m) => set_msg(sref, msg_to_cstr(Some(m))),
+        }
 
         // Restore `next_in`/`avail_in` exactly like C `infback.c`'s `inf_leave`
         // (L561-L569 sets `strm->next_in = next; strm->avail_in = have;`), which
@@ -1738,7 +2165,7 @@ pub unsafe extern "C" fn inflateBack(
         // state before reading). C returns without loading `next`/`have`, so the
         // caller's cursors are left untouched.
 
-        code.as_c_int()
+        outcome.code.as_c_int()
     })
 }
 
@@ -1764,7 +2191,7 @@ pub unsafe extern "C" fn inflateBackEnd(strm: z_streamp) -> c_int {
             Some(handle) => {
                 // Hand the owned engine state to the terminator (which validates
                 // it); RAII then frees the window when `handle`/`inner` drop.
-                crate::inflate::back::inflate_back_end(handle.inner).as_c_int()
+                crate::inflate::back::inflate_back_end_engine(handle.inner).as_c_int()
             }
             None => Z_STREAM_ERROR,
         }
@@ -1789,6 +2216,14 @@ mod tests {
     const Z_NO_FLUSH: c_int = 0;
     /// C `Z_STREAM_END`.
     const Z_STREAM_END: c_int = ReturnCode::StreamEnd.as_c_int();
+    /// C `Z_FINISH`.
+    const Z_FINISH: c_int = crate::constants::Z_FINISH;
+    /// C `Z_BLOCK` — stop at the next deflate block boundary.
+    const Z_BLOCK: c_int = crate::constants::Z_BLOCK;
+    /// C `Z_DATA_ERROR`.
+    const Z_DATA_ERROR: c_int = ReturnCode::DataError.as_c_int();
+    /// C `Z_BUF_ERROR`.
+    const Z_BUF_ERROR: c_int = ReturnCode::BufError.as_c_int();
 
     /// The plaintext that every compressed test vector decodes to.
     const MSG: &[u8] = b"hello, hello, hello, world!";
@@ -2038,6 +2473,822 @@ mod tests {
         assert_eq!(&out2[..produced], MSG);
 
         assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+    }
+
+    // -- inflateGetDictionary / inflatePrime / inflateValidate / -----------
+    // -- inflateUndermine: C-boundary behaviour ---------------------------
+
+    /// Installs a deflate handle in `strm` so a cross-engine rejection can be
+    /// exercised. The caller must pass the same `strm` to `deflateEnd`.
+    ///
+    /// The `HandleKind` tag makes every inflate shim reject this stream. C would
+    /// reinterpret the pointer as an `inflate_state` and misread it; the tag check
+    /// is deliberate hardening beyond C (module header, "cross-engine handle").
+    ///
+    /// It initializes IN PLACE, through `&mut z_stream`, rather than returning an
+    /// initialized stream by value. `deflateInit_` records the owning stream's
+    /// address in its handle and every later entry point re-checks it - C's
+    /// `s->strm != strm` clause (`deflate.c` L546, `inflate.c` L95), ported by
+    /// `handle_owner_valid`. Returning the stream by value MOVES it to a different
+    /// address, so the handle would point at the caller's slot while recording the
+    /// helper's, and `deflateEnd` would answer `Z_STREAM_ERROR` and leak the
+    /// engine - exactly as reference zlib would. Initializing at the final address
+    /// keeps the test about the cross-engine tag rather than about a moved stream.
+    fn install_a_deflate_handle(strm: &mut z_stream) {
+        assert_eq!(
+            unsafe {
+                crate::ffi::deflate::deflateInit_(
+                    strm,
+                    6,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+    }
+
+    /// Re-encodes `src`'s DEFLATE bitstream `k` bits later, returning a buffer
+    /// one byte longer whose low `k` bits are zero padding.
+    ///
+    /// DEFLATE packs bits least-significant-first, so bit `j` of `src` lives at
+    /// `src[j / 8] >> (j % 8)`. The result satisfies `out` bit `j + k` == `src`
+    /// bit `j`, which is exactly the shape a caller resuming at a non-byte
+    /// boundary has to hand to `inflatePrime`.
+    ///
+    /// # Panics
+    ///
+    /// If `k` is not in `1..8` — a whole-byte shift needs no priming at all.
+    fn shift_stream_later_by_bits(src: &[u8], k: u32) -> Vec<u8> {
+        assert!((1..8).contains(&k), "k must be a partial-byte shift");
+        let mut out = vec![0u8; src.len() + 1];
+        for (i, &byte) in src.iter().enumerate() {
+            out[i] |= byte << k;
+            out[i + 1] |= byte >> (8 - k);
+        }
+        out
+    }
+
+    /// `int inflateGetDictionary(z_streamp, Bytef *, uInt *)` at the C boundary
+    /// (`ZLIB_1.2.9`).
+    ///
+    /// The shim sizes the caller's buffer from the engine's `whave`, so the
+    /// null/non-null combinations of the two output pointers are the whole
+    /// contract surface and all four are exercised. The bytes are cross-checked
+    /// against [`crate::inflate::inflate_get_dictionary`] read through the same
+    /// handle, so the shim cannot pass by copying the right *number* of the wrong
+    /// bytes.
+    ///
+    /// History only exists once a call has *returned* mid-stream: C folds produced
+    /// bytes into the check value at `CHECK` and resets its progress counter
+    /// (`out = left`, `inflate.c` L1121), so a stream decoded entirely inside one
+    /// call never touches the window. The decode below is therefore deliberately
+    /// output-starved rather than run to `Z_STREAM_END`.
+    #[test]
+    fn inflate_get_dictionary_at_the_c_boundary() {
+        assert_eq!(
+            unsafe { inflateGetDictionary(ptr::null_mut(), ptr::null_mut(), ptr::null_mut()) },
+            Z_STREAM_ERROR,
+            "a NULL z_streamp is Z_STREAM_ERROR"
+        );
+
+        let mut bare = zeroed_stream();
+        let mut len: uInt = 0xdead;
+        assert_eq!(
+            unsafe { inflateGetDictionary(&mut bare, ptr::null_mut(), &mut len) },
+            Z_STREAM_ERROR,
+            "an uninitialized z_stream is Z_STREAM_ERROR"
+        );
+        assert_eq!(
+            len, 0xdead,
+            "a rejected call must not write the length out-parameter"
+        );
+
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    15,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+
+        // Before any decode the window is empty, so every combination reports 0
+        // and copies nothing.
+        let mut buf = [0xa5u8; 64];
+        let mut len: uInt = 0xdead;
+        assert_eq!(
+            unsafe { inflateGetDictionary(&mut strm, buf.as_mut_ptr(), &mut len) },
+            Z_OK
+        );
+        assert_eq!(len, 0, "a fresh stream has no history");
+        assert!(
+            buf.iter().all(|&b| b == 0xa5),
+            "an empty history writes no bytes"
+        );
+        assert_eq!(
+            unsafe { inflateGetDictionary(&mut strm, ptr::null_mut(), ptr::null_mut()) },
+            Z_OK,
+            "both output pointers NULL is legal"
+        );
+
+        // Decode an output-starved prefix so the call returns mid-stream and the
+        // engine flushes what it produced into the history window.
+        const PREFIX: usize = 12;
+        let mut sink = [0u8; PREFIX];
+        strm.next_in = ZLIB_STREAM.as_ptr();
+        strm.avail_in = ZLIB_STREAM.len() as c_uint;
+        strm.next_out = sink.as_mut_ptr();
+        strm.avail_out = PREFIX as c_uint;
+        assert_eq!(
+            unsafe { inflate(&mut strm, Z_NO_FLUSH) },
+            Z_OK,
+            "an output-starved call returns Z_OK, not Z_STREAM_END"
+        );
+        assert_eq!(strm.avail_out, 0, "the whole sink was filled");
+        assert_eq!(&sink[..], &MSG[..PREFIX]);
+
+        // (a) Length-only query: `dictionary == NULL`.
+        let mut len: uInt = 0xdead;
+        assert_eq!(
+            unsafe { inflateGetDictionary(&mut strm, ptr::null_mut(), &mut len) },
+            Z_OK
+        );
+        assert_eq!(
+            len as usize, PREFIX,
+            "the history is exactly what was produced"
+        );
+
+        // (b) Both pointers: exact bytes and exact length, nothing beyond.
+        let mut buf = [0xa5u8; 64];
+        let mut len: uInt = 0;
+        assert_eq!(
+            unsafe { inflateGetDictionary(&mut strm, buf.as_mut_ptr(), &mut len) },
+            Z_OK
+        );
+        assert_eq!(len as usize, PREFIX);
+        assert_eq!(
+            &buf[..PREFIX],
+            &MSG[..PREFIX],
+            "the history is the decoded prefix, in order"
+        );
+        assert!(
+            buf[PREFIX..].iter().all(|&b| b == 0xa5),
+            "exactly `whave` bytes are written and no more"
+        );
+
+        // (c) Buffer only: a NULL `dictLength` must not be dereferenced, and the
+        //     copy must still happen.
+        let mut buf2 = [0x5au8; 64];
+        assert_eq!(
+            unsafe { inflateGetDictionary(&mut strm, buf2.as_mut_ptr(), ptr::null_mut()) },
+            Z_OK,
+            "a NULL dictLength is legal, not an error"
+        );
+        assert_eq!(&buf2[..PREFIX], &MSG[..PREFIX]);
+        assert!(buf2[PREFIX..].iter().all(|&b| b == 0x5a));
+
+        // Cross-check the bytes against the safe core through the same handle.
+        {
+            let handle = unsafe { inflate_handle(&mut strm) }.expect("an inflate handle");
+            let mut core_bytes = vec![0u8; PREFIX];
+            let mut core_len: usize = 0;
+            assert_eq!(
+                crate::inflate::inflate_get_dictionary(&handle.zs, &mut core_bytes, &mut core_len),
+                Ok(ReturnCode::Ok)
+            );
+            assert_eq!(core_len, PREFIX, "core and shim agree on the length");
+            assert_eq!(
+                &buf[..PREFIX],
+                &core_bytes[..],
+                "the shim copied exactly what the safe core reports"
+            );
+        }
+
+        // The stream is still usable: the query is non-destructive.
+        let mut rest = vec![0u8; 512];
+        strm.next_out = rest.as_mut_ptr();
+        strm.avail_out = rest.len() as c_uint;
+        assert_eq!(unsafe { inflate(&mut strm, Z_NO_FLUSH) }, Z_STREAM_END);
+        let produced = rest.len() - strm.avail_out as usize;
+        assert_eq!(&rest[..produced], &MSG[PREFIX..]);
+
+        // A deflate handle is rejected by the tag check rather than misread.
+        let mut def = zeroed_stream();
+        install_a_deflate_handle(&mut def);
+        let mut len: uInt = 0xdead;
+        assert_eq!(
+            unsafe { inflateGetDictionary(&mut def, ptr::null_mut(), &mut len) },
+            Z_STREAM_ERROR,
+            "a deflate handle is not an inflate handle"
+        );
+        assert_eq!(len, 0xdead);
+        assert_eq!(unsafe { crate::ffi::deflate::deflateEnd(&mut def) }, Z_OK);
+
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+        assert_eq!(
+            unsafe { inflateGetDictionary(&mut strm, ptr::null_mut(), ptr::null_mut()) },
+            Z_STREAM_ERROR,
+            "inflateEnd nulls `state`, so a later query is rejected"
+        );
+    }
+
+    /// `inflateGetDictionary` must return a **wrapped** history in chronological
+    /// order at the C boundary, not in raw window-buffer order.
+    ///
+    /// Once more bytes have been produced than the window holds, the engine's
+    /// circular buffer has `wnext != 0` and the oldest surviving byte sits at
+    /// `window[wnext]`, not at `window[0]`. C therefore emits `window[wnext..whave]`
+    /// followed by `window[..wnext]` (`inflate.c` L1301-L1313). A shim that handed
+    /// the window back verbatim would return the right *count* of bytes in the
+    /// wrong *order* — decodable-looking, silently corrupt as a preset dictionary,
+    /// and invisible to a length-only assertion. This is the one defect the report
+    /// names for this entry point, so it gets its own vector.
+    ///
+    /// A 512-byte window (`windowBits = 9`) is used on both sides so the wrap is
+    /// reached quickly; the encoder must match, or the decoder would see distances
+    /// beyond its window.
+    #[test]
+    fn inflate_get_dictionary_at_the_c_boundary_wraps_in_chronological_order() {
+        use crate::constants::{Z_DEFAULT_STRATEGY, Z_DEFLATED, Z_FINISH};
+        use crate::ffi::deflate::{deflate, deflateEnd, deflateInit2_};
+
+        // Low-order-byte noise: compressible enough to stream, varied enough that
+        // an out-of-order window would not accidentally compare equal.
+        let payload: Vec<u8> = (0..1500u32)
+            .map(|i| (i.wrapping_mul(31).wrapping_add(i >> 3) % 251) as u8)
+            .collect();
+
+        // Encode at windowBits 9 so the decoder's 512-byte window suffices.
+        let mut d = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                deflateInit2_(
+                    &mut d,
+                    6,
+                    Z_DEFLATED,
+                    9,
+                    8,
+                    Z_DEFAULT_STRATEGY,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        let mut encoded = vec![0u8; payload.len() + 256];
+        d.next_in = payload.as_ptr();
+        d.avail_in = payload.len() as c_uint;
+        d.next_out = encoded.as_mut_ptr();
+        d.avail_out = encoded.len() as c_uint;
+        assert_eq!(unsafe { deflate(&mut d, Z_FINISH) }, Z_STREAM_END);
+        let produced = encoded.len() - d.avail_out as usize;
+        encoded.truncate(produced);
+        assert_eq!(unsafe { deflateEnd(&mut d) }, Z_OK);
+
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    9,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+
+        // Decode in small output-starved slices and stop the instant the window
+        // has both filled AND wrapped. Stopping mid-stream is mandatory: a stream
+        // finished inside a single call leaves the window untouched.
+        const SLICE: usize = 64;
+        let mut decoded: Vec<u8> = Vec::new();
+        let mut cursor = 0usize;
+        let mut wrapped = None;
+        strm.next_in = encoded.as_ptr();
+        strm.avail_in = encoded.len() as c_uint;
+        for _ in 0..(payload.len() / SLICE + 8) {
+            let mut chunk = [0u8; SLICE];
+            strm.next_out = chunk.as_mut_ptr();
+            strm.avail_out = SLICE as c_uint;
+            let rc = unsafe { inflate(&mut strm, Z_NO_FLUSH) };
+            let n = SLICE - strm.avail_out as usize;
+            decoded.extend_from_slice(&chunk[..n]);
+            cursor += n;
+
+            let (whave, wnext, wsize) = {
+                let handle = unsafe { inflate_handle(&mut strm) }.expect("an inflate handle");
+                let s = handle.zs.inflate_state().expect("engine state");
+                (s.whave as usize, s.wnext as usize, s.wsize as usize)
+            };
+            if whave == wsize && wsize != 0 && wnext != 0 {
+                wrapped = Some((whave, wnext, wsize));
+                break;
+            }
+            assert_ne!(
+                rc, Z_STREAM_END,
+                "the stream ended before the window wrapped; enlarge the payload"
+            );
+        }
+
+        let (whave, wnext, wsize) = wrapped.expect("the window must fill and wrap");
+        assert_eq!(wsize, 512, "windowBits 9 gives a 512-byte window");
+        assert_eq!(whave, wsize, "the window is full");
+        assert!(wnext > 0 && wnext < wsize, "the write cursor has wrapped");
+        assert!(
+            cursor > wsize,
+            "more bytes were produced than the window holds"
+        );
+
+        // Query through the C entry point.
+        let mut dict = vec![0xa5u8; whave + 16];
+        let mut len: uInt = 0;
+        assert_eq!(
+            unsafe { inflateGetDictionary(&mut strm, dict.as_mut_ptr(), &mut len) },
+            Z_OK
+        );
+        assert_eq!(
+            len as usize, whave,
+            "a full window reports its whole length"
+        );
+        assert!(
+            dict[whave..].iter().all(|&b| b == 0xa5),
+            "exactly `whave` bytes are written and no more"
+        );
+
+        // The history must be the most recent `whave` decoded bytes, in order.
+        assert_eq!(
+            &dict[..whave],
+            &decoded[decoded.len() - whave..],
+            "the wrapped history is returned oldest-to-newest"
+        );
+
+        // Independent cross-check of the splice itself, so the assertion above
+        // cannot be satisfied by a coincidentally-aligned window.
+        {
+            let handle = unsafe { inflate_handle(&mut strm) }.expect("an inflate handle");
+            let s = handle.zs.inflate_state().expect("engine state");
+            let mut spliced = Vec::with_capacity(whave);
+            spliced.extend_from_slice(&s.window[wnext..whave]);
+            spliced.extend_from_slice(&s.window[..wnext]);
+            assert_eq!(
+                &dict[..whave],
+                &spliced[..],
+                "the shim emits window[wnext..whave] then window[..wnext]"
+            );
+            assert_ne!(
+                &dict[..whave],
+                &s.window[..whave],
+                "a wrapped window is NOT raw buffer order, so the test is meaningful"
+            );
+        }
+
+        // The query is non-destructive: the rest of the stream still decodes.
+        let mut tail = vec![0u8; payload.len()];
+        strm.next_out = tail.as_mut_ptr();
+        strm.avail_out = tail.len() as c_uint;
+        assert_eq!(unsafe { inflate(&mut strm, Z_FINISH) }, Z_STREAM_END);
+        let n = tail.len() - strm.avail_out as usize;
+        decoded.extend_from_slice(&tail[..n]);
+        assert_eq!(decoded, payload, "the full payload round-trips");
+
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+    }
+
+    /// `int inflatePrime(z_streamp, int, int)` at the C boundary
+    /// (`ZLIB_1.2.2.4`).
+    ///
+    /// Every documented outcome of C `inflatePrime` (`inflate.c` L219-L236) is
+    /// asserted with its exact code — note that an over-wide request is
+    /// `Z_STREAM_ERROR` here, **not** the `Z_BUF_ERROR` its `deflatePrime`
+    /// counterpart returns, and the two must not be conflated.
+    ///
+    /// The success path is proved functionally rather than by its return code: a
+    /// raw stream is re-emitted three bits later, and only a correctly primed
+    /// accumulator reconstructs the original bitstream. The unprimed control
+    /// decode is asserted to *fail* to produce the message, so the test cannot
+    /// pass with `inflatePrime` stubbed out to `Z_OK`.
+    #[test]
+    fn inflate_prime_at_the_c_boundary() {
+        assert_eq!(
+            unsafe { inflatePrime(ptr::null_mut(), 8, 0) },
+            Z_STREAM_ERROR,
+            "a NULL z_streamp is Z_STREAM_ERROR"
+        );
+
+        let mut bare = zeroed_stream();
+        assert_eq!(
+            unsafe { inflatePrime(&mut bare, 8, 0) },
+            Z_STREAM_ERROR,
+            "an uninitialized z_stream is Z_STREAM_ERROR"
+        );
+
+        const K: u32 = 3;
+        let shifted = shift_stream_later_by_bits(RAW_STREAM, K);
+
+        // Control: the shifted stream without priming must NOT yield the message.
+        // Feeding `shifted[1..]` drops the bits stranded in `shifted[0]`.
+        let (rc, out) = {
+            let mut strm = zeroed_stream();
+            assert_eq!(
+                unsafe {
+                    inflateInit2_(
+                        &mut strm,
+                        -15,
+                        VERSION.as_ptr(),
+                        size_of::<z_stream>() as c_int,
+                    )
+                },
+                Z_OK
+            );
+            let mut out = vec![0u8; 512];
+            strm.next_in = shifted[1..].as_ptr();
+            strm.avail_in = (shifted.len() - 1) as c_uint;
+            strm.next_out = out.as_mut_ptr();
+            strm.avail_out = out.len() as c_uint;
+            let rc = unsafe { inflate(&mut strm, Z_NO_FLUSH) };
+            let produced = out.len() - strm.avail_out as usize;
+            out.truncate(produced);
+            assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+            (rc, out)
+        };
+        assert!(
+            rc != Z_STREAM_END || out != MSG,
+            "without priming the bit-shifted stream must not decode to the message"
+        );
+
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    -15,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+
+        // A zero-width prime is legal and a no-op (C's loop exits immediately).
+        assert_eq!(
+            unsafe { inflatePrime(&mut strm, 0, 0) },
+            Z_OK,
+            "a 0-bit prime is accepted"
+        );
+
+        // Over-wide and accumulator-overflowing requests are Z_STREAM_ERROR.
+        assert_eq!(
+            unsafe { inflatePrime(&mut strm, 17, 0) },
+            Z_STREAM_ERROR,
+            "17 bits exceeds the 16-bit limit"
+        );
+        assert_eq!(unsafe { inflatePrime(&mut strm, 16, 0xffff) }, Z_OK);
+        assert_eq!(unsafe { inflatePrime(&mut strm, 16, 0xffff) }, Z_OK);
+        assert_eq!(
+            unsafe { inflatePrime(&mut strm, 16, 0) },
+            Z_STREAM_ERROR,
+            "a 48-bit accumulator would overflow the 32-bit hold"
+        );
+
+        // A negative width flushes the accumulator, which is what makes the
+        // over-filled state above recoverable.
+        assert_eq!(
+            unsafe { inflatePrime(&mut strm, -1, 0) },
+            Z_OK,
+            "a negative width flushes the bit buffer"
+        );
+        {
+            let handle = unsafe { inflate_handle(&mut strm) }.expect("an inflate handle");
+            let s = handle.zs.inflate_state().expect("engine state");
+            assert_eq!((s.hold, s.bits), (0, 0), "the accumulator is empty again");
+        }
+
+        // Now the real use: inject the 8 - K high bits stranded in `shifted[0]`
+        // and decode from `shifted[1]`, reconstructing the original bitstream.
+        assert_eq!(
+            unsafe { inflatePrime(&mut strm, (8 - K) as c_int, c_int::from(shifted[0] >> K)) },
+            Z_OK
+        );
+        let mut out = vec![0u8; 512];
+        strm.next_in = shifted[1..].as_ptr();
+        strm.avail_in = (shifted.len() - 1) as c_uint;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+        assert_eq!(
+            unsafe { inflate(&mut strm, Z_NO_FLUSH) },
+            Z_STREAM_END,
+            "a primed accumulator decodes the bit-shifted stream"
+        );
+        let produced = out.len() - strm.avail_out as usize;
+        assert_eq!(
+            &out[..produced],
+            MSG,
+            "priming reconstructs the original bitstream exactly"
+        );
+
+        // A deflate handle is rejected by the tag check.
+        let mut def = zeroed_stream();
+        install_a_deflate_handle(&mut def);
+        assert_eq!(
+            unsafe { inflatePrime(&mut def, 8, 0) },
+            Z_STREAM_ERROR,
+            "a deflate handle is not an inflate handle"
+        );
+        assert_eq!(unsafe { crate::ffi::deflate::deflateEnd(&mut def) }, Z_OK);
+
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+        assert_eq!(
+            unsafe { inflatePrime(&mut strm, 8, 0) },
+            Z_STREAM_ERROR,
+            "inflateEnd nulls `state`, so a later prime is rejected"
+        );
+    }
+
+    /// `int inflateValidate(z_streamp, int)` at the C boundary (`ZLIB_1.2.9`).
+    ///
+    /// The only externally visible effect of this call is whether a stream with a
+    /// broken trailer is accepted, so that is what is asserted — in both
+    /// directions, on the *same* corrupted vector: rejected with `Z_DATA_ERROR`
+    /// by default, accepted with `Z_STREAM_END` and the correct plaintext once
+    /// validation is switched off, and rejected again once it is switched back on.
+    /// A shim that returned `Z_OK` without touching `wrap` would pass a
+    /// return-code-only test and fail this one.
+    ///
+    /// The `state.wrap != 0` guard in C (`inflate.c` L1385-L1395) means enabling
+    /// validation on a *raw* stream is a legal no-op, which is asserted too.
+    #[test]
+    fn inflate_validate_at_the_c_boundary() {
+        assert_eq!(
+            unsafe { inflateValidate(ptr::null_mut(), 1) },
+            Z_STREAM_ERROR,
+            "a NULL z_streamp is Z_STREAM_ERROR"
+        );
+
+        let mut bare = zeroed_stream();
+        assert_eq!(
+            unsafe { inflateValidate(&mut bare, 1) },
+            Z_STREAM_ERROR,
+            "an uninitialized z_stream is Z_STREAM_ERROR"
+        );
+
+        // A zlib stream whose big-endian Adler-32 trailer has one flipped byte.
+        let mut corrupt = ZLIB_STREAM.to_vec();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xff;
+
+        let decode = |check: Option<c_int>| -> (c_int, Vec<u8>) {
+            let mut strm = zeroed_stream();
+            assert_eq!(
+                unsafe {
+                    inflateInit2_(
+                        &mut strm,
+                        15,
+                        VERSION.as_ptr(),
+                        size_of::<z_stream>() as c_int,
+                    )
+                },
+                Z_OK
+            );
+            if let Some(flag) = check {
+                assert_eq!(
+                    unsafe { inflateValidate(&mut strm, flag) },
+                    Z_OK,
+                    "inflateValidate is accepted on an initialized zlib stream"
+                );
+            }
+            let mut out = vec![0u8; 512];
+            strm.next_in = corrupt.as_ptr();
+            strm.avail_in = corrupt.len() as c_uint;
+            strm.next_out = out.as_mut_ptr();
+            strm.avail_out = out.len() as c_uint;
+            let rc = unsafe { inflate(&mut strm, Z_NO_FLUSH) };
+            let produced = out.len() - strm.avail_out as usize;
+            out.truncate(produced);
+            assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+            (rc, out)
+        };
+
+        // Default: the trailer is verified, so the stream is rejected.
+        let (rc, out) = decode(None);
+        assert_eq!(
+            rc, Z_DATA_ERROR,
+            "a corrupted trailer is rejected by default"
+        );
+        assert_eq!(
+            out, MSG,
+            "the payload still decoded; only the trailer check failed"
+        );
+
+        // Validation off: the same bytes are accepted.
+        let (rc, out) = decode(Some(0));
+        assert_eq!(
+            rc, Z_STREAM_END,
+            "with validation off the corrupted trailer is accepted"
+        );
+        assert_eq!(out, MSG);
+
+        // Validation explicitly on: rejected again, proving the toggle is live in
+        // both directions rather than a one-way latch.
+        let (rc, _) = decode(Some(1));
+        assert_eq!(
+            rc, Z_DATA_ERROR,
+            "re-enabling validation restores the rejection"
+        );
+
+        // Toggling mid-stream, before the trailer is reached, still takes effect.
+        {
+            let mut strm = zeroed_stream();
+            assert_eq!(
+                unsafe {
+                    inflateInit2_(
+                        &mut strm,
+                        15,
+                        VERSION.as_ptr(),
+                        size_of::<z_stream>() as c_int,
+                    )
+                },
+                Z_OK
+            );
+            let mut head = [0u8; 8];
+            strm.next_in = corrupt.as_ptr();
+            strm.avail_in = corrupt.len() as c_uint;
+            strm.next_out = head.as_mut_ptr();
+            strm.avail_out = head.len() as c_uint;
+            assert_eq!(unsafe { inflate(&mut strm, Z_NO_FLUSH) }, Z_OK);
+            assert_eq!(unsafe { inflateValidate(&mut strm, 0) }, Z_OK);
+            let mut rest = vec![0u8; 512];
+            strm.next_out = rest.as_mut_ptr();
+            strm.avail_out = rest.len() as c_uint;
+            assert_eq!(
+                unsafe { inflate(&mut strm, Z_NO_FLUSH) },
+                Z_STREAM_END,
+                "disabling validation mid-stream suppresses the trailer check"
+            );
+            assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+        }
+
+        // Raw streams have no wrapper, so enabling validation is a legal no-op
+        // and decoding is unaffected.
+        {
+            let mut strm = zeroed_stream();
+            assert_eq!(
+                unsafe {
+                    inflateInit2_(
+                        &mut strm,
+                        -15,
+                        VERSION.as_ptr(),
+                        size_of::<z_stream>() as c_int,
+                    )
+                },
+                Z_OK
+            );
+            assert_eq!(
+                unsafe { inflateValidate(&mut strm, 1) },
+                Z_OK,
+                "enabling validation on a raw stream is accepted"
+            );
+            {
+                let handle = unsafe { inflate_handle(&mut strm) }.expect("an inflate handle");
+                let s = handle.zs.inflate_state().expect("engine state");
+                assert_eq!(
+                    s.wrap & 4,
+                    0,
+                    "a raw stream has no wrapper, so the check bit stays clear"
+                );
+            }
+            let mut out = vec![0u8; 512];
+            strm.next_in = RAW_STREAM.as_ptr();
+            strm.avail_in = RAW_STREAM.len() as c_uint;
+            strm.next_out = out.as_mut_ptr();
+            strm.avail_out = out.len() as c_uint;
+            assert_eq!(unsafe { inflate(&mut strm, Z_NO_FLUSH) }, Z_STREAM_END);
+            let produced = out.len() - strm.avail_out as usize;
+            assert_eq!(&out[..produced], MSG);
+            assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+        }
+
+        // A deflate handle is rejected by the tag check.
+        let mut def = zeroed_stream();
+        install_a_deflate_handle(&mut def);
+        assert_eq!(
+            unsafe { inflateValidate(&mut def, 1) },
+            Z_STREAM_ERROR,
+            "a deflate handle is not an inflate handle"
+        );
+        assert_eq!(unsafe { crate::ffi::deflate::deflateEnd(&mut def) }, Z_OK);
+
+        // After teardown the stream is stateless again.
+        let mut spent = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut spent,
+                    15,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        assert_eq!(unsafe { inflateEnd(&mut spent) }, Z_OK);
+        assert_eq!(
+            unsafe { inflateValidate(&mut spent, 1) },
+            Z_STREAM_ERROR,
+            "inflateEnd nulls `state`, so a later toggle is rejected"
+        );
+    }
+
+    /// `int inflateUndermine(z_streamp, int)` at the C boundary
+    /// (`ZLIB_1.2.3.4`).
+    ///
+    /// The realized engine, like a default-configured reference zlib, is built
+    /// without `INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR`, so C's
+    /// `inflateUndermine` (`inflate.c` L1370-L1383) forces `sane` back on and
+    /// reports `Z_DATA_ERROR` to signal the leniency is unavailable. Both halves
+    /// are asserted, for both `subvert` polarities: the exact code, and — through
+    /// the handle — that `sane` really is left `true` rather than merely reported
+    /// as such. Reporting success here would silently promise a decoder leniency
+    /// the engine does not have.
+    #[test]
+    fn inflate_undermine_at_the_c_boundary() {
+        assert_eq!(
+            unsafe { inflateUndermine(ptr::null_mut(), 1) },
+            Z_STREAM_ERROR,
+            "a NULL z_streamp is Z_STREAM_ERROR"
+        );
+
+        let mut bare = zeroed_stream();
+        assert_eq!(
+            unsafe { inflateUndermine(&mut bare, 1) },
+            Z_STREAM_ERROR,
+            "an uninitialized z_stream is Z_STREAM_ERROR"
+        );
+
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    15,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+
+        // Both polarities report Z_DATA_ERROR and both leave `sane` on.
+        for subvert in [1, 0, -1] {
+            assert_eq!(
+                unsafe { inflateUndermine(&mut strm, subvert) },
+                Z_DATA_ERROR,
+                "undermining is unavailable in this build, whatever `subvert` is"
+            );
+            let handle = unsafe { inflate_handle(&mut strm) }.expect("an inflate handle");
+            let s = handle.zs.inflate_state().expect("engine state");
+            assert!(
+                s.sane,
+                "`sane` is forced back on, so distance checks stay enforced"
+            );
+        }
+
+        // The rejection is advisory: the stream is untouched and still decodes.
+        let mut out = vec![0u8; 512];
+        strm.next_in = ZLIB_STREAM.as_ptr();
+        strm.avail_in = ZLIB_STREAM.len() as c_uint;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+        assert_eq!(unsafe { inflate(&mut strm, Z_NO_FLUSH) }, Z_STREAM_END);
+        let produced = out.len() - strm.avail_out as usize;
+        assert_eq!(
+            &out[..produced],
+            MSG,
+            "a refused undermine leaves the stream fully usable"
+        );
+
+        // A deflate handle is rejected before the engine is reached, so the code
+        // is Z_STREAM_ERROR rather than Z_DATA_ERROR — the two are distinguished.
+        let mut def = zeroed_stream();
+        install_a_deflate_handle(&mut def);
+        assert_eq!(
+            unsafe { inflateUndermine(&mut def, 1) },
+            Z_STREAM_ERROR,
+            "a deflate handle is not an inflate handle"
+        );
+        assert_eq!(unsafe { crate::ffi::deflate::deflateEnd(&mut def) }, Z_OK);
+
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+        assert_eq!(
+            unsafe { inflateUndermine(&mut strm, 1) },
+            Z_STREAM_ERROR,
+            "inflateEnd nulls `state`, so a later call is Z_STREAM_ERROR"
+        );
     }
 
     // -- inflateGetHeader ---------------------------------------------------
@@ -3671,7 +4922,8 @@ mod tests {
 
         let expected = crate::checksum::adler32::adler32(1, MSG);
         assert_eq!(
-            strm.adler as u32, expected,
+            ulong_to_u32(strm.adler),
+            expected,
             "zlib decode must publish the payload Adler-32",
         );
         assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
@@ -4657,5 +5909,1240 @@ mod tests {
         src.zalloc = published_zalloc;
 
         assert_eq!(unsafe { inflateEnd(&mut src) }, Z_OK);
+    }
+
+    // =======================================================================
+    // Owner-bound handles (S7-02) and validation-before-borrow (S7-01)
+    // =======================================================================
+
+    /// All three tagged handles share the same `#[repr(C)]` `(kind, owner)`
+    /// prefix, at the same offsets, so `peek_handle_prefix` may read it through
+    /// `HandleHeader` before the concrete handle type is known.
+    ///
+    /// `ffi::types` asserts this for `DeflateHandle`, which is the only handle
+    /// declared there; the other two live here and are private to this module, so
+    /// they are asserted here. A drift in either would let `handle_owner_valid`
+    /// compare the wrong bytes and silently defeat both the kind tag and the owner
+    /// check.
+    #[test]
+    fn every_tagged_handle_shares_the_kind_owner_prefix_layout() {
+        use core::mem::offset_of;
+
+        assert_eq!(offset_of!(InflateHandle, kind), 0);
+        assert_eq!(offset_of!(InflateBackHandle, kind), 0);
+        assert_eq!(
+            offset_of!(InflateHandle, owner),
+            size_of::<HandleKind>(),
+            "`owner` must immediately follow `kind`, as it does in `HandleHeader`"
+        );
+        assert_eq!(
+            offset_of!(InflateBackHandle, owner),
+            size_of::<HandleKind>(),
+            "`owner` must immediately follow `kind`, as it does in `HandleHeader`"
+        );
+
+        // The trait constants must agree with the tags the constructors write, or
+        // a handle would fail its own kind check.
+        assert_eq!(<InflateHandle as TaggedHandle>::KIND, HandleKind::INFLATE);
+        assert_eq!(
+            <InflateBackHandle as TaggedHandle>::KIND,
+            HandleKind::INFLATE_BACK
+        );
+    }
+
+    /// A byte-copied `z_stream` must not be able to drive or reclaim the
+    /// original's inflate state.
+    ///
+    /// This is C's `state->strm != strm` clause (`inflate.c` L95). Without it the
+    /// copy could reclaim and free the handle, leaving the original's `state`
+    /// dangling — a use-after-free reachable from ordinary C usage. Reference zlib
+    /// returns `Z_STREAM_ERROR` for the copy and `Z_OK` for the owner.
+    #[test]
+    fn a_byte_copied_z_stream_can_neither_drive_nor_reclaim_the_inflate_state() {
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    15,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        assert!(!strm.state.is_null());
+
+        // `z_stream copy = strm;` — the plain struct copy a C caller can write.
+        // SAFETY: `z_stream` is a `#[repr(C)]` aggregate of `Copy` scalars and raw
+        // pointers with no `Drop`, so a bitwise read is a valid duplicate.
+        let mut copy = unsafe { core::ptr::read(&raw const strm) };
+        assert!(core::ptr::eq(copy.state, strm.state));
+
+        let mut out = vec![0u8; 512];
+        copy.next_in = ZLIB_STREAM.as_ptr();
+        copy.avail_in = ZLIB_STREAM.len() as c_uint;
+        copy.next_out = out.as_mut_ptr();
+        copy.avail_out = out.len() as c_uint;
+        assert_eq!(
+            unsafe { inflate(&mut copy, Z_NO_FLUSH) },
+            Z_STREAM_ERROR,
+            "C's inflateStateCheck rejects a stream that does not own its state"
+        );
+        assert_eq!(unsafe { inflateReset(&mut copy) }, Z_STREAM_ERROR);
+        assert_eq!(unsafe { inflateSync(&mut copy) }, Z_STREAM_ERROR);
+        assert_eq!(
+            unsafe { inflateEnd(&mut copy) },
+            Z_STREAM_ERROR,
+            "a wrong-owner inflateEnd must refuse rather than free"
+        );
+        assert!(
+            !copy.state.is_null(),
+            "a refused reclaim must leave the handle installed for its real owner"
+        );
+
+        // The owner is untouched and still decodes correctly.
+        strm.next_in = ZLIB_STREAM.as_ptr();
+        strm.avail_in = ZLIB_STREAM.len() as c_uint;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+        assert_eq!(unsafe { inflate(&mut strm, Z_NO_FLUSH) }, Z_STREAM_END);
+        let produced = out.len() - strm.avail_out as usize;
+        assert_eq!(&out[..produced], MSG);
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+        assert!(strm.state.is_null());
+    }
+
+    /// A byte-copied `z_stream` must not be able to reclaim an `inflateBack`
+    /// state either.
+    ///
+    /// `infback.c` records no owner, so C double-frees here (`inflateBackEnd`
+    /// L573 checks only `strm`, `strm->state` and `zfree`). This port refuses the
+    /// copy instead — the sole deliberate divergence in
+    /// `inflate_back_end_state_check`, confined to an input on which reference
+    /// zlib is undefined. The *decode* path deliberately keeps C's weaker
+    /// predicate, which this test also pins.
+    #[test]
+    fn a_byte_copied_z_stream_cannot_reclaim_the_inflate_back_state() {
+        let mut strm = zeroed_stream();
+        let mut window = [0u8; 1 << 15];
+        assert_eq!(
+            unsafe {
+                inflateBackInit_(
+                    &mut strm,
+                    15,
+                    window.as_mut_ptr(),
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+
+        // SAFETY: see `a_byte_copied_z_stream_can_neither_drive_nor_reclaim_the_inflate_state`.
+        let mut copy = unsafe { core::ptr::read(&raw const strm) };
+
+        // The decode path keeps C's weaker `infback.c` L208-L219 predicate, which
+        // has no owner clause — so the copy is accepted here, exactly as C accepts
+        // it. Driving it with a dry input callback is a complete, side-effect-free
+        // way to observe that: it reaches the engine and reports a data error
+        // rather than `Z_STREAM_ERROR`.
+        let mut in_state = BackIn {
+            data: &[],
+            given: false,
+        };
+        let mut out_state = BackOut {
+            collected: Vec::new(),
+        };
+        let rc = unsafe {
+            inflateBack(
+                &mut copy,
+                Some(back_in),
+                &raw mut in_state as *mut c_void,
+                Some(back_out),
+                &raw mut out_state as *mut c_void,
+            )
+        };
+        assert_ne!(
+            rc, Z_STREAM_ERROR,
+            "inflateBack keeps C's weaker entry predicate, which has no owner \
+             clause (infback.c never assigns state->strm)"
+        );
+
+        // The reclaim path does add the owner clause, because tolerating a
+        // foreign stream there means freeing one allocation twice.
+        assert_eq!(
+            unsafe { inflateBackEnd(&mut copy) },
+            Z_STREAM_ERROR,
+            "a wrong-owner inflateBackEnd must refuse rather than double free"
+        );
+        assert!(!copy.state.is_null());
+
+        // The owner still reclaims exactly once.
+        assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
+        assert!(strm.state.is_null());
+    }
+
+    /// `inflateBackEnd` refuses to reclaim while the caller's `zfree` hook is
+    /// absent, exactly as C does.
+    ///
+    /// `infback.c` L573 tests `strm->zfree == (free_func)0` — and notably *not*
+    /// `zalloc`, since the only remaining work is to free. Freeing anyway would
+    /// release, through the global allocator, memory the caller's own hook owns.
+    #[test]
+    fn inflate_back_end_refuses_while_zfree_is_absent() {
+        let mut strm = zeroed_stream();
+        let mut window = [0u8; 1 << 15];
+        assert_eq!(
+            unsafe {
+                inflateBackInit_(
+                    &mut strm,
+                    15,
+                    window.as_mut_ptr(),
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        let published_zfree = strm.zfree;
+        assert!(
+            published_zfree.is_some(),
+            "the init prologue must publish a zfree half"
+        );
+
+        strm.zfree = None;
+        assert_eq!(
+            unsafe { inflateBackEnd(&mut strm) },
+            Z_STREAM_ERROR,
+            "C's inflateBackEnd refuses when zfree is null (infback.c L573)"
+        );
+        assert!(
+            !strm.state.is_null(),
+            "a refused reclaim must leave the state installed"
+        );
+
+        // `zalloc` is deliberately NOT part of C's predicate here: clearing it
+        // alone must still allow the reclaim to proceed.
+        strm.zfree = published_zfree;
+        strm.zalloc = None;
+        assert_eq!(
+            unsafe { inflateBackEnd(&mut strm) },
+            Z_OK,
+            "infback.c L573 checks zfree only, never zalloc"
+        );
+        assert!(strm.state.is_null());
+    }
+
+    /// `inflateCopy` re-points the clone's owner at `dest`, so each stream
+    /// reclaims its own state and neither can free the other's.
+    #[test]
+    fn copy_binds_the_clone_to_dest_so_each_stream_reclaims_its_own_state() {
+        let mut src = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut src,
+                    15,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        let mut dst = zeroed_stream();
+        assert_eq!(unsafe { inflateCopy(&mut dst, &mut src) }, Z_OK);
+        assert!(!dst.state.is_null());
+        assert!(
+            !core::ptr::eq(dst.state, src.state),
+            "inflateCopy must install a distinct handle"
+        );
+
+        // Each stream decodes independently through its own owner-bound handle.
+        for (label, strm) in [("clone", &mut dst), ("source", &mut src)] {
+            let mut out = vec![0u8; 512];
+            strm.next_in = ZLIB_STREAM.as_ptr();
+            strm.avail_in = ZLIB_STREAM.len() as c_uint;
+            strm.next_out = out.as_mut_ptr();
+            strm.avail_out = out.len() as c_uint;
+            assert_eq!(
+                unsafe { inflate(strm, Z_NO_FLUSH) },
+                Z_STREAM_END,
+                "the {label} must decode through its own owner-bound handle"
+            );
+            let produced = out.len() - strm.avail_out as usize;
+            assert_eq!(&out[..produced], MSG, "{label} output");
+        }
+
+        assert_eq!(unsafe { inflateEnd(&mut dst) }, Z_OK);
+        assert!(dst.state.is_null());
+        assert_eq!(
+            unsafe { inflateEnd(&mut src) },
+            Z_OK,
+            "ending the clone must not disturb the source's handle"
+        );
+        assert!(src.state.is_null());
+    }
+
+    /// A stateless stream is refused by every auxiliary-pointer entry point
+    /// *without* the auxiliary pointer being bridged (S7-01).
+    ///
+    /// The pointers below are non-null and deliberately far smaller than the
+    /// lengths claimed, so a shim that bridged them before validating would be
+    /// constructing a slice or reference over memory it has no right to — which is
+    /// undefined behavior at the moment of creation, regardless of the code the
+    /// shim then returns.
+    #[test]
+    fn a_stateless_stream_is_refused_without_its_auxiliary_pointers_being_used() {
+        let probe = [0xA5u8; 1];
+        let probe_ptr = probe.as_ptr();
+
+        let mut strm = zeroed_stream();
+        assert!(strm.state.is_null());
+
+        assert_eq!(
+            unsafe { inflateSetDictionary(&mut strm, probe_ptr, 4096) },
+            Z_STREAM_ERROR,
+            "C validates the stream before it reads one dictionary byte"
+        );
+        assert_eq!(
+            unsafe { inflateGetDictionary(&mut strm, probe_ptr.cast_mut(), ptr::null_mut()) },
+            Z_STREAM_ERROR
+        );
+
+        strm.next_in = probe_ptr;
+        strm.avail_in = 4096;
+        strm.next_out = probe_ptr.cast_mut();
+        strm.avail_out = 4096;
+        assert_eq!(
+            unsafe { inflate(&mut strm, Z_NO_FLUSH) },
+            Z_STREAM_ERROR,
+            "C validates the stream before it bridges next_in/next_out"
+        );
+        assert_eq!(
+            unsafe { inflateSync(&mut strm) },
+            Z_STREAM_ERROR,
+            "C validates the stream before it reaches strm->next_in"
+        );
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_STREAM_ERROR);
+
+        // `inflateBack` must reject a stream that was never `inflateBackInit_`-ed
+        // before it bridges the input window.
+        let mut in_state = BackIn {
+            data: &[],
+            given: false,
+        };
+        let mut out_state = BackOut {
+            collected: Vec::new(),
+        };
+        assert_eq!(
+            unsafe {
+                inflateBack(
+                    &mut strm,
+                    Some(back_in),
+                    &raw mut in_state as *mut c_void,
+                    Some(back_out),
+                    &raw mut out_state as *mut c_void,
+                )
+            },
+            Z_STREAM_ERROR,
+            "infback.c L208-L219 rejects a null state before loading next/have"
+        );
+
+        // `inflateCopy` from a stateless source must not touch `dest`.
+        let mut dst = zeroed_stream();
+        dst.total_out = 0x5EED;
+        assert_eq!(
+            unsafe { inflateCopy(&mut dst, &mut strm) },
+            Z_STREAM_ERROR,
+            "C evaluates inflateStateCheck(source) before it looks at dest"
+        );
+        assert_eq!(
+            dst.total_out, 0x5EED,
+            "a refused inflateCopy must leave dest byte-for-byte untouched"
+        );
+        assert!(dst.state.is_null());
+    }
+
+    /// `inflateGetHeader` refuses an unvalidated stream without dereferencing the
+    /// caller's `gz_header`.
+    ///
+    /// C writes `head->done = 0` only after `inflateStateCheck` and the
+    /// `(state->wrap & 2)` test have both passed (`inflate.c` L1219-L1230), so a
+    /// caller who pairs a stale header with an uninitialized stream must see
+    /// `Z_STREAM_ERROR` and an untouched header.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn get_header_refuses_a_stateless_stream_without_touching_the_header() {
+        let mut strm = zeroed_stream();
+        let mut head = zeroed_gz_header();
+        head.done = 0x5EED;
+        head.extra_max = 0;
+        assert_eq!(
+            unsafe { inflateGetHeader(&mut strm, &mut head) },
+            Z_STREAM_ERROR,
+            "C validates the stream before it writes head->done"
+        );
+        assert_eq!(
+            head.done, 0x5EED,
+            "a refused registration must leave the caller's header untouched"
+        );
+    }
+    // -----------------------------------------------------------------------
+    // Live borrowed gzip header sinks (`inflateGetHeader`)
+    //
+    // C's `inflateGetHeader` stores the caller's pointer and clears `done`
+    // (`inflate.c` L1228-L1229) — nothing else. Every one of `extra`, `name`,
+    // `comment`, `extra_max`, `name_max` and `comm_max` is then re-read from the
+    // caller's struct on each stored byte (`inflate.c` L614-L621, L632-L637,
+    // L654-L659), so a sink installed, resized or withdrawn after registration
+    // takes effect, and the decoder allocates nothing for the header at all.
+    // -----------------------------------------------------------------------
+
+    /// A gzip stream carrying `FEXTRA`/`FNAME`/`FCOMMENT`, decoded with the
+    /// caller's sinks installed **after** `inflateGetHeader` returned.
+    ///
+    /// A registration-time snapshot of the pointers records three null sinks and
+    /// three zero capacities and therefore captures nothing; reference C fills all
+    /// three fields, because it looks at the caller's struct only while parsing.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn get_header_honors_sinks_installed_after_registration() {
+        let stream = gzip_stream_with_fields(HeaderFields::ALL);
+
+        // Registered with no sinks whatsoever: null pointers, zero capacities.
+        let mut hdr = PoisonedHeader::new(0, 0, 0);
+        assert!(hdr.head.extra.is_null() && hdr.head.name.is_null());
+
+        let mut extra = vec![HDR_POISON; 16];
+        let mut name = vec![HDR_POISON; 16];
+        let mut comment = vec![HDR_POISON; 16];
+
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    31,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        assert_eq!(unsafe { inflateGetHeader(&mut strm, &mut hdr.head) }, Z_OK);
+
+        // Only *now* does the caller publish its buffers — after registration and
+        // before a single byte has been parsed.
+        hdr.head.extra = extra.as_mut_ptr();
+        hdr.head.extra_max = extra.len() as c_uint;
+        hdr.head.name = name.as_mut_ptr();
+        hdr.head.name_max = name.len() as c_uint;
+        hdr.head.comment = comment.as_mut_ptr();
+        hdr.head.comm_max = comment.len() as c_uint;
+
+        let mut out = vec![0u8; stream.len() * 8 + 512];
+        strm.next_in = stream.as_ptr();
+        strm.avail_in = stream.len() as c_uint;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+        assert_eq!(unsafe { inflate(&mut strm, Z_FINISH) }, Z_STREAM_END);
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+
+        assert_eq!(hdr.head.done, 1, "the header completed");
+        assert_eq!(
+            hdr.head.extra_len as usize,
+            HDR_EXTRA.len(),
+            "the declared XLEN is published regardless of the sink"
+        );
+        assert_eq!(
+            &extra[..HDR_EXTRA.len()],
+            HDR_EXTRA,
+            "a sink installed after registration must still receive the extra field"
+        );
+        assert_eq!(&name[..HDR_NAME.len()], HDR_NAME, "…and the name");
+        assert_eq!(name[HDR_NAME.len()], 0, "…NUL-terminated, as C stores it");
+        assert_eq!(
+            &comment[..HDR_COMMENT.len()],
+            HDR_COMMENT,
+            "…and the comment"
+        );
+        assert_eq!(comment[HDR_COMMENT.len()], 0, "…NUL-terminated");
+    }
+
+    /// A capacity reduced **after** registration truncates against the new value.
+    ///
+    /// C's store guard is `len < state->head->extra_max`, re-read from the
+    /// caller's struct on every pass (`inflate.c` L616-L618), so shrinking
+    /// `extra_max` mid-decode is honored. Feeding one byte per call gives the
+    /// caller a window in which to change it.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn get_header_truncates_against_the_live_capacity() {
+        let stream = gzip_stream_with_fields(HeaderFields::ALL);
+        // Registered with room for the whole extra field…
+        let mut hdr = PoisonedHeader::new(16, 16, 16);
+
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    31,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        assert_eq!(unsafe { inflateGetHeader(&mut strm, &mut hdr.head) }, Z_OK);
+
+        let mut out = vec![0u8; stream.len() * 8 + 512];
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+
+        let mut shrunk = false;
+        let mut off = 0usize;
+        let mut rc = Z_OK;
+        while off < stream.len() && rc == Z_OK {
+            // …shrunk to 3 the instant the declared XLEN becomes visible, which is
+            // before any extra byte has been stored.
+            if !shrunk && hdr.head.extra_len as usize == HDR_EXTRA.len() {
+                hdr.head.extra_max = 3;
+                shrunk = true;
+            }
+            strm.next_in = stream[off..].as_ptr();
+            strm.avail_in = 1;
+            off += 1;
+            rc = unsafe { inflate(&mut strm, Z_NO_FLUSH) };
+            if hdr.head.done == 1 {
+                break;
+            }
+        }
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+
+        assert!(shrunk, "the declared XLEN must become visible mid-decode");
+        assert_eq!(hdr.head.done, 1, "the header completed");
+        assert_eq!(
+            hdr.head.extra_len as usize,
+            HDR_EXTRA.len(),
+            "the declared length still reports the full field"
+        );
+        assert_eq!(
+            &hdr.extra[..3],
+            &HDR_EXTRA[..3],
+            "exactly the live capacity is filled"
+        );
+        assert_eq!(
+            &hdr.extra[3..],
+            &vec![HDR_POISON; hdr.extra.len() - 3][..],
+            "nothing may be written beyond the live capacity"
+        );
+    }
+
+    /// The decoder accumulates **nothing** of its own for the header: every byte
+    /// is written straight into the caller's buffers.
+    ///
+    /// The engine-side header carries only the scalars; its `extra`/`name`/
+    /// `comment` slots — the sole allocating parts of the old capture model —
+    /// stay `None` for the whole decode. That is what removes the `Z_MEM_ERROR`
+    /// this path could once report while C cannot (AAP §0.6.5).
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn get_header_accumulates_nothing_in_the_engines_owned_vectors() {
+        let stream = gzip_stream_with_fields(HeaderFields::ALL);
+        // Capacities far larger than the fields, so an accumulating
+        // implementation would definitely have grown its vectors.
+        let mut hdr = PoisonedHeader::new(4096, 4096, 4096);
+
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    31,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        assert_eq!(unsafe { inflateGetHeader(&mut strm, &mut hdr.head) }, Z_OK);
+
+        let mut out = vec![0u8; stream.len() * 8 + 512];
+        strm.next_in = stream.as_ptr();
+        strm.avail_in = stream.len() as c_uint;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+        assert_eq!(unsafe { inflate(&mut strm, Z_FINISH) }, Z_STREAM_END);
+
+        // The caller's buffers hold the fields…
+        assert_eq!(hdr.head.done, 1);
+        assert_eq!(&hdr.name[..HDR_NAME.len()], HDR_NAME);
+        assert_eq!(&hdr.comment[..HDR_COMMENT.len()], HDR_COMMENT);
+        assert_eq!(&hdr.extra[..HDR_EXTRA.len()], HDR_EXTRA);
+
+        // …while the engine grew nothing.
+        // SAFETY: `strm` is a live, validated inflate stream owned by this test.
+        let handle = unsafe { inflate_handle(&mut strm) }.expect("inflate handle");
+        let state = handle.zs.inflate_state().expect("inflate state");
+        assert!(state.head_foreign, "the C ABI registers a foreign header");
+        let gh = state.head.as_ref().expect("a header is registered");
+        assert!(
+            gh.extra.is_none() && gh.name.is_none() && gh.comment.is_none(),
+            "no header payload may be accumulated engine-side"
+        );
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+    }
+
+    /// `inflateReset` drops the registration, exactly as C's `state->head =
+    /// Z_NULL` in `inflateResetKeep` does (`inflate.c` L115).
+    ///
+    /// This is load-bearing for safety as well as fidelity: once the registration
+    /// is gone the caller is entitled to free its `gz_header`, so no later call
+    /// may consult it.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn inflate_reset_drops_the_foreign_header_registration() {
+        let stream = gzip_stream_with_fields(HeaderFields::ALL);
+        let mut hdr = PoisonedHeader::new(16, 16, 16);
+
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    31,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        assert_eq!(unsafe { inflateGetHeader(&mut strm, &mut hdr.head) }, Z_OK);
+        assert_eq!(unsafe { inflateReset(&mut strm) }, Z_OK);
+
+        // SAFETY: `strm` is a live, validated inflate stream owned by this test.
+        {
+            let handle = unsafe { inflate_handle(&mut strm) }.expect("inflate handle");
+            let state = handle.zs.inflate_state().expect("inflate state");
+            assert!(state.head.is_none(), "reset clears the registration");
+            assert!(
+                !state.head_foreign,
+                "reset must clear the foreign-ownership marker with it"
+            );
+        }
+
+        let mut out = vec![0u8; stream.len() * 8 + 512];
+        strm.next_in = stream.as_ptr();
+        strm.avail_in = stream.len() as c_uint;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+        assert_eq!(unsafe { inflate(&mut strm, Z_FINISH) }, Z_STREAM_END);
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+
+        assert_eq!(
+            hdr.head.done, 0,
+            "a de-registered header must not be written to"
+        );
+        assert_eq!(
+            hdr.head.extra_len,
+            PoisonedHeader::XLEN,
+            "…nor may its declared length be republished"
+        );
+        assert!(
+            hdr.name.iter().all(|&b| b == HDR_POISON),
+            "…nor may its buffers be touched"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Reset publication (`inflate.c` L100-L134) and the `inflate_fast`
+    // give-back (`inffast.c` L282-L299) as a C caller observes them.
+    // -----------------------------------------------------------------------
+
+    /// Every reset variant publishes C's cleared `data_type` into the *caller's*
+    /// `z_stream`.
+    ///
+    /// `inflate.c` L107 clears `strm->data_type` inside `inflateResetKeep`, in the
+    /// same group of assignments as `total_in`, `total_out` and `msg`, and all
+    /// three public reset entry points funnel through it (`inflateReset`
+    /// L125-L134, `inflateReset2` L136-L177). The engine clearing its own
+    /// `ZStream` is not sufficient: unless the shim mirrors the value out, the
+    /// caller keeps reading the decode-state word left over from the previous
+    /// stream — `128` (mode == TYPE) after a clean stop.
+    ///
+    /// The `assert_ne!` before each reset is a deliberate non-vacuity guard: it
+    /// fails if the fixture ever stops leaving something to clear.
+    #[test]
+    fn every_reset_variant_publishes_the_cleared_data_type() {
+        type Reset = fn(&mut z_stream) -> c_int;
+        fn via_reset(s: &mut z_stream) -> c_int {
+            // SAFETY: `s` is a live inflate stream owned by this test.
+            unsafe { inflateReset(s) }
+        }
+        fn via_reset2(s: &mut z_stream) -> c_int {
+            // SAFETY: as above; 15 keeps the existing zlib wrap and window size.
+            unsafe { inflateReset2(s, 15) }
+        }
+        fn via_reset_keep(s: &mut z_stream) -> c_int {
+            // SAFETY: as above.
+            unsafe { inflateResetKeep(s) }
+        }
+        let variants: [(&str, Reset); 3] = [
+            ("inflateReset", via_reset),
+            ("inflateReset2", via_reset2),
+            ("inflateResetKeep", via_reset_keep),
+        ];
+
+        for (label, reset) in variants {
+            let mut strm = zeroed_stream();
+            assert_eq!(
+                // SAFETY: `strm` is a valid zeroed `z_stream` owned by this test.
+                unsafe {
+                    inflateInit2_(
+                        &mut strm,
+                        15,
+                        VERSION.as_ptr(),
+                        size_of::<z_stream>() as c_int,
+                    )
+                },
+                Z_OK,
+                "{label}: init"
+            );
+
+            let mut out = vec![0u8; 512];
+            strm.next_in = ZLIB_STREAM.as_ptr();
+            strm.avail_in = ZLIB_STREAM.len() as c_uint;
+            strm.next_out = out.as_mut_ptr();
+            strm.avail_out = out.len() as c_uint;
+            // `Z_BLOCK` leaves at the block boundary with mode == TYPE, so C's
+            // formula (`inflate.c` L1147-L1149) sets bit 128.
+            // SAFETY: both cursors point at live buffers sized by the fields above.
+            let rc = unsafe { inflate(&mut strm, Z_BLOCK) };
+            assert_eq!(rc, Z_OK, "{label}: Z_BLOCK stops at the block boundary");
+            assert_ne!(
+                strm.data_type, 0,
+                "{label}: the fixture must leave a nonzero data_type to clear"
+            );
+
+            assert_eq!(reset(&mut strm), Z_OK, "{label}: reset");
+            assert_eq!(
+                strm.data_type, 0,
+                "{label}: C clears the caller's data_type (inflate.c L107)"
+            );
+            assert_eq!(strm.total_in, 0, "{label}: ...alongside total_in");
+            assert_eq!(strm.total_out, 0, "{label}: ...and total_out");
+            assert!(strm.msg.is_null(), "{label}: ...and msg");
+
+            // SAFETY: `strm` still owns its state; this is the single reclaim.
+            assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK, "{label}: end");
+        }
+    }
+
+    /// A reset after a *failed* decode clears the published `data_type` too.
+    ///
+    /// The failure path is the interesting one: C's `inf_leave` publishes
+    /// `data_type` from the aborted state, so the caller is left holding a bit
+    /// count that no longer describes anything. `inflateResetKeep` clears it
+    /// together with `msg` (`inflate.c` L106-L107), which is what lets the
+    /// canonical "reset and retry" idiom start from a clean slate.
+    #[test]
+    fn a_reset_after_a_failed_decode_clears_the_published_data_type_and_msg() {
+        // Corrupt FLG so CMF*256+FLG is no longer a multiple of 31: C reports
+        // "incorrect header check" with 16 bits still buffered.
+        let mut corrupt = ZLIB_STREAM.to_vec();
+        corrupt[1] = corrupt[1].wrapping_add(1);
+
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            // SAFETY: `strm` is a valid zeroed `z_stream` owned by this test.
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    15,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        let mut out = vec![0u8; 512];
+        strm.next_in = corrupt.as_ptr();
+        strm.avail_in = corrupt.len() as c_uint;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+        // SAFETY: both cursors point at live buffers sized by the fields above.
+        assert_eq!(
+            unsafe { inflate(&mut strm, Z_NO_FLUSH) },
+            ReturnCode::DataError.as_c_int(),
+            "a bad FCHECK must be rejected"
+        );
+        assert!(!strm.msg.is_null(), "C publishes a diagnostic here");
+        assert_ne!(
+            strm.data_type, 0,
+            "the aborted state must leave a nonzero data_type to clear"
+        );
+
+        // SAFETY: `strm` is a live inflate stream owned by this test.
+        assert_eq!(unsafe { inflateReset(&mut strm) }, Z_OK);
+        assert_eq!(
+            strm.data_type, 0,
+            "the reset must clear the error residue, not preserve it"
+        );
+        assert!(strm.msg.is_null(), "...and the diagnostic with it");
+
+        // SAFETY: `strm` still owns its state; this is the single reclaim.
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+    }
+
+    /// Bytes buffered by `inflatePrime` are handed back exactly as C hands them
+    /// back — including past the start of the slice the caller supplied.
+    ///
+    /// `inffast.c` L290-L294 returns whole buffered bytes with no lower bound:
+    /// `len = bits >> 3; in -= len; bits -= len << 3;`. The comment justifying it
+    /// ("on entry, bits < 8, so in won't go too far back") does not hold when the
+    /// caller primed whole bytes, so `strm->next_in` legitimately ends up *before*
+    /// the pointer it was handed, `avail_in` ends up larger than it was given, and
+    /// the `uInt` per-call delta wraps `total_in` at 2^32.
+    ///
+    /// The fixture primes the entire three-byte block plus one trailing byte, so
+    /// `inflate_fast` decodes wholly out of the accumulator and pulls nothing from
+    /// the slice — leaving a byte of debt that no in-slice index can absorb. Every
+    /// number below was read off reference zlib built from this repository's own C
+    /// sources; `data_type == 198` is `6` bits buffered `+ 64` (last block)
+    /// `+ 128` (mode == TYPE) per `inflate.c` L1147-L1149.
+    #[test]
+    fn primed_bytes_are_given_back_exactly_as_c_gives_them_back() {
+        use crate::ffi::deflate::{deflate, deflateEnd, deflateInit2_};
+
+        // A raw fixed-Huffman block holding the single literal 'Q'.
+        let mut blk = [0u8; 64];
+        let payload = *b"Q";
+        let mut d = zeroed_stream();
+        assert_eq!(
+            // SAFETY: `d` is a valid zeroed `z_stream` owned by this test.
+            unsafe {
+                deflateInit2_(
+                    &mut d,
+                    6,
+                    crate::constants::Z_DEFLATED,
+                    -15,
+                    8,
+                    crate::constants::Z_FIXED,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        d.next_in = payload.as_ptr();
+        d.avail_in = payload.len() as c_uint;
+        d.next_out = blk.as_mut_ptr();
+        d.avail_out = blk.len() as c_uint;
+        // SAFETY: both cursors point at live buffers sized by the fields above.
+        let drc = unsafe { deflate(&mut d, Z_FINISH) };
+        let blen = blk.len() - d.avail_out as usize;
+        // SAFETY: `d` still owns its state; this is the single reclaim.
+        assert_eq!(unsafe { deflateEnd(&mut d) }, Z_OK);
+        assert_eq!(drc, Z_STREAM_END, "the whole block must be emitted");
+        assert_eq!(blen, 3, "the fixture depends on a three-byte fixed block");
+
+        // The caller's contiguous buffer: the block, then trailing padding. The
+        // slice handed to `inflate` starts after every primed byte, so one primed
+        // byte lies past the end of the block.
+        let mut whole = Vec::with_capacity(blen + 16);
+        whole.extend_from_slice(&blk[..blen]);
+        whole.extend_from_slice(&[0u8; 16]);
+        let pre = blen + 1; // 32 bits — exactly `inflatePrime`'s ceiling.
+
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            // SAFETY: `strm` is a valid zeroed `z_stream` owned by this test.
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    -15,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        for (k, &byte) in whole[..pre].iter().enumerate() {
+            assert_eq!(
+                // SAFETY: `strm` is a live inflate stream owned by this test.
+                unsafe { inflatePrime(&mut strm, 8, c_int::from(byte)) },
+                Z_OK,
+                "priming byte {k}"
+            );
+        }
+
+        let mut out = vec![0u8; 1024];
+        // SAFETY: `pre <= whole.len()`, so the offset is in bounds (one past the
+        // end would also be sound, and is not reached here).
+        let base = unsafe { whole.as_ptr().add(pre) };
+        let avail = whole.len() - pre;
+        strm.next_in = base;
+        strm.avail_in = avail as c_uint;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+        // SAFETY: both cursors point at live buffers sized by the fields above.
+        let rc = unsafe { inflate(&mut strm, Z_BLOCK) };
+        assert_eq!(rc, Z_OK, "Z_BLOCK stops at the boundary after the block");
+
+        let produced = out.len() - strm.avail_out as usize;
+        assert_eq!(&out[..produced], b"Q", "the literal must decode");
+        assert_eq!(strm.total_out, 1, "one byte produced");
+
+        let delta = (strm.next_in as isize) - (base as isize);
+        assert_eq!(
+            delta, -1,
+            "the returned byte must move next_in behind the slice, as C does"
+        );
+        assert_eq!(
+            strm.avail_in as usize,
+            avail + 1,
+            "...and grow avail_in past the value the caller supplied"
+        );
+        assert_eq!(
+            strm.total_in,
+            c_ulong::from(u32::MAX),
+            "C forms the per-call delta in uInt before widening it, so the give-back \
+             wraps total_in at 2^32 — not at 2^64"
+        );
+        assert_eq!(
+            strm.data_type, 198,
+            "6 bits buffered + 64 (last) + 128 (mode == TYPE), per inflate.c L1147"
+        );
+
+        // SAFETY: `strm` still owns its state; this is the single reclaim.
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+    }
+
+    /// A stream that pulls its own input keeps `total_in` monotonic — the
+    /// give-back settlement must not perturb the ordinary path.
+    ///
+    /// This is the counterpart to
+    /// [`primed_bytes_are_given_back_exactly_as_c_gives_them_back`]: with nothing
+    /// primed, the debt is always zero and every published field must match a
+    /// plain accumulation.
+    #[test]
+    fn an_unprimed_decode_publishes_a_plain_input_accumulation() {
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            // SAFETY: `strm` is a valid zeroed `z_stream` owned by this test.
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    15,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        let mut out = vec![0u8; 512];
+        let base = ZLIB_STREAM.as_ptr();
+        strm.next_in = base;
+        strm.avail_in = ZLIB_STREAM.len() as c_uint;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+        // SAFETY: both cursors point at live buffers sized by the fields above.
+        assert_eq!(unsafe { inflate(&mut strm, Z_NO_FLUSH) }, Z_STREAM_END);
+
+        let delta = (strm.next_in as isize) - (base as isize);
+        assert_eq!(
+            delta as usize,
+            ZLIB_STREAM.len(),
+            "the whole stream is consumed"
+        );
+        assert_eq!(strm.avail_in, 0, "and nothing is handed back");
+        assert_eq!(
+            strm.total_in,
+            ZLIB_STREAM.len() as c_ulong,
+            "total_in is a plain accumulation when no byte was primed"
+        );
+        assert_eq!(&out[..strm.total_out as usize], MSG);
+
+        // SAFETY: `strm` still owns its state; this is the single reclaim.
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+    }
+    /// `inflateBack` must publish C's exact diagnostic into `strm.msg` for every
+    /// error site, and must clear the field on the paths where C clears it
+    /// (M4-01).
+    ///
+    /// The field is planted with a sentinel first, so a shim that simply never
+    /// wrote it — the pre-remediation behaviour — fails on every row rather than
+    /// passing vacuously on the ones whose expected value happens to be null.
+    #[test]
+    fn inflate_back_publishes_cs_exact_diagnostic() {
+        /// `(raw DEFLATE, expected return code, expected `strm.msg`)` — the error
+        /// rows are `test/infcover.c` L584-L598 and the C strings are
+        /// `infback.c` L256-L518.
+        const CASES: &[(&[u8], c_int, Option<&str>)] = &[
+            (
+                &[0x00, 0x00, 0x00, 0x00, 0x00],
+                Z_DATA_ERROR,
+                Some("invalid stored block lengths"),
+            ),
+            (&[0x06], Z_DATA_ERROR, Some("invalid block type")),
+            (
+                &[0xfc, 0x00, 0x00],
+                Z_DATA_ERROR,
+                Some("too many length or distance symbols"),
+            ),
+            (
+                &[0x04, 0x00, 0xfe, 0xff],
+                Z_DATA_ERROR,
+                Some("invalid code lengths set"),
+            ),
+            (
+                &[0x04, 0x00, 0x24, 0x49, 0x00],
+                Z_DATA_ERROR,
+                Some("invalid bit length repeat"),
+            ),
+            (
+                &[0x04, 0x00, 0x24, 0xe9, 0xff, 0x6d],
+                Z_DATA_ERROR,
+                Some("invalid code -- missing end-of-block"),
+            ),
+            (
+                &[0x02, 0x7e, 0xff, 0xff],
+                Z_DATA_ERROR,
+                Some("invalid distance code"),
+            ),
+            (
+                &[
+                    0x0c, 0xc0, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x90, 0xff, 0x6b, 0x04, 0x00,
+                ],
+                Z_DATA_ERROR,
+                Some("invalid distance too far back"),
+            ),
+            // Well-formed: C clears `strm->msg` at `infback.c` L214 and assigns
+            // nothing, so the planted sentinel must be gone.
+            (&[0x03, 0x00], Z_STREAM_END, None),
+            (&[0x01, 0x01, 0x00, 0xfe, 0xff, 0x00], Z_STREAM_END, None),
+            // Truncated: `Z_BUF_ERROR` carries no diagnostic in C either.
+            (&[0x04], Z_BUF_ERROR, None),
+        ];
+
+        const PLANTED: &CStr = c"planted sentinel";
+
+        for (bytes, want_code, want_msg) in CASES {
+            let mut window = [0u8; 1 << 15];
+            let mut strm = zeroed_stream();
+            // SAFETY: `strm` and `window` are live locals of the right size.
+            assert_eq!(
+                unsafe {
+                    inflateBackInit_(
+                        &mut strm,
+                        15,
+                        window.as_mut_ptr(),
+                        VERSION.as_ptr(),
+                        size_of::<z_stream>() as c_int,
+                    )
+                },
+                Z_OK
+            );
+            strm.msg = PLANTED.as_ptr() as *mut c_char;
+            strm.next_in = bytes.as_ptr();
+            strm.avail_in = bytes.len() as c_uint;
+            let mut sink = BackOut {
+                collected: Vec::new(),
+            };
+            // A provider that immediately reports dry: everything is pre-loaded at
+            // `next_in`, exactly as `infcover.c`'s `pull(desc == Z_NULL)` does.
+            let mut dry = BackIn {
+                data: &[],
+                given: true,
+            };
+            // SAFETY: both callbacks match the zlib `in_func`/`out_func` ABI and
+            // each descriptor points at the matching live local.
+            let code = unsafe {
+                inflateBack(
+                    &mut strm,
+                    Some(back_in),
+                    (&mut dry) as *mut BackIn as *mut c_void,
+                    Some(back_out),
+                    (&mut sink) as *mut BackOut as *mut c_void,
+                )
+            };
+            assert_eq!(code, *want_code, "return code for {want_msg:?}");
+            match want_msg {
+                Some(expected) => {
+                    assert!(!strm.msg.is_null(), "{expected:?} must publish a message");
+                    // SAFETY: a non-null `msg` is one of the crate's `'static`
+                    // `c"…"` literals, hence NUL-terminated and readable.
+                    let got = unsafe { CStr::from_ptr(strm.msg) };
+                    assert_eq!(
+                        got.to_str().expect("diagnostics are ASCII"),
+                        *expected,
+                        "diagnostic text"
+                    );
+                }
+                None => assert!(
+                    strm.msg.is_null(),
+                    "C clears strm->msg here, so the planted sentinel must be gone"
+                ),
+            }
+            // SAFETY: `strm` still owns the handle installed above.
+            assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
+        }
+    }
+
+    /// A rejected `inflateBack` must leave `strm.msg` exactly as the caller left
+    /// it, because C's `strm->state == Z_NULL` return at `infback.c` L209-L210
+    /// happens *before* the `strm->msg = Z_NULL` at L214 (M4-01).
+    #[test]
+    fn a_rejected_inflate_back_leaves_the_callers_message_alone() {
+        const PLANTED: &CStr = c"survives rejection";
+
+        // Never `inflateBackInit_`-ed: the stand-in for C's null `strm->state`.
+        let mut strm = zeroed_stream();
+        strm.msg = PLANTED.as_ptr() as *mut c_char;
+        let mut sink = BackOut {
+            collected: Vec::new(),
+        };
+        let mut dry = BackIn {
+            data: &[],
+            given: true,
+        };
+        // SAFETY: `strm` is a live zeroed stream; the callbacks and descriptors are
+        // valid. The shim rejects on the null `state` before touching anything.
+        let code = unsafe {
+            inflateBack(
+                &mut strm,
+                Some(back_in),
+                (&mut dry) as *mut BackIn as *mut c_void,
+                Some(back_out),
+                (&mut sink) as *mut BackOut as *mut c_void,
+            )
+        };
+        assert_eq!(code, Z_STREAM_ERROR);
+        assert_eq!(
+            strm.msg as *const c_char,
+            PLANTED.as_ptr(),
+            "a rejected call must not clear a diagnostic C preserves"
+        );
+
+        // The same clause with a WRONG-kind handle: an `inflateInit2_` stream is
+        // not an `inflateBack` handle, and the rejection is equally silent.
+        let mut other = zeroed_stream();
+        // SAFETY: standard init of a live stream.
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut other,
+                    15,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        other.msg = PLANTED.as_ptr() as *mut c_char;
+        // SAFETY: `other` holds a live INFLATE handle, not an INFLATE_BACK one.
+        let code = unsafe {
+            inflateBack(
+                &mut other,
+                Some(back_in),
+                (&mut dry) as *mut BackIn as *mut c_void,
+                Some(back_out),
+                (&mut sink) as *mut BackOut as *mut c_void,
+            )
+        };
+        assert_eq!(code, Z_STREAM_ERROR);
+        assert_eq!(
+            other.msg as *const c_char,
+            PLANTED.as_ptr(),
+            "a cross-kind rejection must not clear the diagnostic either"
+        );
+        // SAFETY: reclaim the inflate handle exactly once.
+        assert_eq!(unsafe { inflateEnd(&mut other) }, Z_OK);
+    }
+
+    /// `inflateBackInit_` must leave the caller's window byte-for-byte unchanged,
+    /// on both the accepting and the refusing path (M6-09).
+    ///
+    /// C's `infback.c` L60 is a bare `state->window = window;`: it stores the
+    /// pointer and writes nothing. And because the single state `ZALLOC` at
+    /// L51-L53 runs *first*, a refused allocation returns `Z_MEM_ERROR` having
+    /// never reached the window at all — so a caller that pre-fills the buffer and
+    /// then hits an exhausted allocator finds its own bytes intact.
+    #[test]
+    fn back_init_never_writes_the_callers_window() {
+        use crate::ffi::alloc::test_hook::HookStats;
+
+        const FILL: u8 = 0xC3;
+
+        // --- accepting path -------------------------------------------------
+        let mut window = vec![FILL; 1 << 15];
+        let mut strm = zeroed_stream();
+        // SAFETY: `strm` and the window are live and correctly sized.
+        assert_eq!(
+            unsafe {
+                inflateBackInit_(
+                    &mut strm,
+                    15,
+                    window.as_mut_ptr(),
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        assert!(
+            window.iter().all(|&b| b == FILL),
+            "a successful inflateBackInit_ adopts the window without writing it"
+        );
+        // SAFETY: single reclaim of the handle just installed.
+        assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
+        assert!(
+            window.iter().all(|&b| b == FILL),
+            "inflateBackEnd frees only the state (infback.c L572-L577)"
+        );
+
+        // --- refusing path: C's single ZALLOC fails before L60 ---------------
+        let stats = HookStats::with_budget(0);
+        let hook = stats.hook();
+        let mut window2 = vec![FILL; 1 << 15];
+        let mut strm2 = zeroed_stream();
+        strm2.zalloc = hook.zalloc();
+        strm2.zfree = hook.zfree();
+        strm2.opaque = hook.opaque();
+        // SAFETY: `strm2` is live; the hook pair is the test allocator's.
+        let code = unsafe {
+            inflateBackInit_(
+                &mut strm2,
+                15,
+                window2.as_mut_ptr(),
+                VERSION.as_ptr(),
+                size_of::<z_stream>() as c_int,
+            )
+        };
+        assert_eq!(
+            code, Z_MEM_ERROR,
+            "a refused state request is C's Z_MEM_ERROR (infback.c L52-L53)"
+        );
+        assert_eq!(
+            stats.ooms(),
+            1,
+            "exactly C's one state request was attempted, and it was refused"
+        );
+        assert_eq!(
+            stats.allocs(),
+            0,
+            "nothing may be allocated once the state request fails -- C makes no \
+             second request (infback.c has exactly one ZALLOC)"
+        );
+        assert!(
+            window2.iter().all(|&b| b == FILL),
+            "a failing allocation must not mutate memory C leaves untouched"
+        );
+        assert!(
+            strm2.state.is_null(),
+            "no handle may be installed on the failing path"
+        );
     }
 }

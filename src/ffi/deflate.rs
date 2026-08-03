@@ -275,10 +275,12 @@ pub unsafe extern "C" fn deflateInit2_(
         // Install the boxed state. C overwrites `strm->state` unconditionally;
         // callers must not re-init without `deflateEnd` (documented contract).
         // SAFETY: transfers ownership of the tagged `Box<DeflateHandle>` into the
-        // opaque `state` handle; it is reclaimed exactly once by `deflateEnd`,
-        // whose `deflate_take` validates the `HandleKind::DEFLATE` tag first and
-        // nulls `state` on success.
-        s.state = unsafe { state_ptr_from_box(handle) };
+        // opaque `state` handle and binds the handle's owner to this stream — C's
+        // `s->strm = strm` (`deflate.c` L444). It is reclaimed exactly once by
+        // `deflateEnd`, whose `deflate_take` runs the whole of
+        // `deflateStateCheck` — tag, owner, allocator pair and status — before
+        // reconstituting the box, and nulls `state` on success.
+        unsafe { install_handle(s, handle) };
         s.total_in = 0;
         s.total_out = 0;
         set_msg(s, msg);
@@ -339,10 +341,57 @@ pub unsafe extern "C" fn deflateInit_(
 ///
 /// # Safety
 ///
-/// `strm` must be null or a valid `z_stream` previously initialized by
-/// `deflateInit*` (its `state` handle unmodified by the caller). When
-/// `avail_in` / `avail_out` are non-zero, `next_in` / `next_out` must address
-/// that many valid readable / writable bytes.
+/// `strm` may be null, which is rejected with `Z_STREAM_ERROR` before any
+/// dereference. When non-null it must be a valid, exclusively-owned `z_stream`
+/// previously initialized by `deflateInit*`, with its `state` handle unmodified
+/// by the caller. A handle belonging to a different engine is *not* undefined
+/// behavior either: the `HandleKind` tag is checked before the state is
+/// reborrowed, and a mismatch yields `Z_STREAM_ERROR`.
+///
+/// **Buffer pointers and counts.** Each `next_*` pointer paired with a non-zero
+/// `avail_*` count must address that many valid, live bytes — readable for
+/// `next_in`, writable for `next_out` — and must be correctly aligned for `u8`
+/// (that is, any non-null address). Overstating an `avail_*` count relative to
+/// the real allocation, or passing a dangling or freed pointer, is undefined
+/// behavior; the C API carries no length information with which to detect it,
+/// so this obligation cannot be discharged by the callee.
+///
+/// **Aliasing.** The input region `next_in[..avail_in]` and the output region
+/// `next_out[..avail_out]` must not overlap each other, and neither may overlap
+/// the `*strm` struct itself. This is a hard requirement rather than a
+/// convention: the two regions are bridged to a `&[u8]` and a `&mut [u8]` that
+/// are live simultaneously, so an overlap would create a shared and a unique
+/// reference to the same bytes. For the duration of the call the caller must
+/// also not access `*strm` or either buffer from another thread, since `*strm`
+/// is reborrowed as `&mut`.
+///
+/// **Pre-dereference validation — the two defined rejection cases.** Two
+/// pointer/count combinations that this contract would otherwise appear to
+/// forbid are in fact *defined, rejected* configurations rather than undefined
+/// behavior, and callers (including the fuzz harness's
+/// `probe_buffer_validation`) may rely on that:
+///
+/// - `next_out == NULL`, rejected **unconditionally** with `Z_STREAM_ERROR` —
+///   with no `avail_out == 0` qualifier, matching C, whose `next_out == Z_NULL`
+///   test likewise carries none.
+/// - `avail_in != 0` paired with `next_in == NULL`, rejected with
+///   `Z_STREAM_ERROR`.
+///
+/// Both are tested by [`stream_buffers_valid`] at the top of the body, *before*
+/// `input_slice`/`output_slice` bridge anything, so neither pointer is
+/// dereferenced and no slice is ever formed from a null base. This mirrors C
+/// `deflate`'s entry guards (`deflate.c` L981-L1010) and exists precisely so the
+/// programmer error surfaces as an error code instead of being silently masked
+/// into an empty slice. The complementary shape `avail_in == 0` with
+/// `next_in == NULL` is simply legal: nothing is read.
+///
+/// **Unwinding.** The body runs inside a `guard_int` panic guard, so a Rust
+/// panic can never unwind across this `extern "C"` boundary. With `std` the
+/// guard is a `catch_unwind` that substitutes `Z_STREAM_ERROR`; without it the
+/// closure runs directly, because a `no_std` build has no unwinding runtime to
+/// catch and the crate sets `panic = "abort"` in both profiles, so a panic
+/// aborts the process rather than crossing the boundary. Either way the caller
+/// never observes a foreign unwind.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn deflate(strm: z_streamp, flush: c_int) -> c_int {
     guard_int(Z_STREAM_ERROR, || {
@@ -352,6 +401,20 @@ pub unsafe extern "C" fn deflate(strm: z_streamp, flush: c_int) -> c_int {
         // SAFETY: `strm` is non-null and points at a valid, uniquely-owned
         // `z_stream` for the duration of this call.
         let s = unsafe { &mut *strm };
+
+        // C `deflate` validates the *stream* before it looks at anything else:
+        // `if (deflateStateCheck(strm) || flush > Z_BLOCK || flush < 0) return
+        // Z_STREAM_ERROR;` precedes the `next_out`/`next_in` null tests
+        // (`deflate.c` L981-L1010). Running it first here is both C-faithful and
+        // a soundness requirement: `next_in`/`next_out` on an unvalidated stream
+        // may be stale, and turning a stale pointer into a slice is undefined
+        // behavior even when the slice is never read. The check borrows nothing
+        // outside `s` and its own handle.
+        // SAFETY: `state`, when non-null, was installed by `deflateInit*` via
+        // `install_handle`, so its `#[repr(C)]` prefix is readable.
+        if !unsafe { deflate_state_check(s) } {
+            return Z_STREAM_ERROR;
+        }
 
         // C `deflate` entry validation (`deflate.c` L981-L1010): a null
         // `next_out`, or a positive `avail_in` paired with a null `next_in`, is
@@ -380,10 +443,29 @@ pub unsafe extern "C" fn deflate(strm: z_streamp, flush: c_int) -> c_int {
             // a `Box<DeflateHandle>`; `deflate_state` confirms the
             // `HandleKind::DEFLATE` tag before reborrowing `handle.zs`, and
             // returns `None` for any other engine's handle.
-            let Some(zs) = (unsafe { deflate_state(s) }) else {
+            let Some(handle) = (unsafe { deflate_handle(s) }) else {
                 return Z_STREAM_ERROR;
             };
-            let outcome = engine::deflate(zs, input, output, flush);
+            // C re-reads the caller's `gz_header` here, at emission time, through
+            // the pointer `deflateSetHeader` stored (`deflate.c` L1092-L1188).
+            // Re-borrowing it on every call is what makes a mutation performed
+            // after registration but before emission observable in the output
+            // bytes, exactly as in C.
+            //
+            // SAFETY: `handle.head` is null, or the `gz_header` the caller passed
+            // to `deflateSetHeader` and undertook to keep valid until emission
+            // completes (`zlib.h` L843-L847). The borrow lives only for this call.
+            #[cfg(feature = "gzip")]
+            let lent = unsafe { borrow_gz_header(handle.head) };
+            let zs = &mut handle.zs;
+            let outcome = engine::deflate_lending(
+                zs,
+                input,
+                output,
+                flush,
+                #[cfg(feature = "gzip")]
+                lent.as_ref(),
+            );
             (
                 outcome.code.as_c_int(),
                 outcome.consumed,
@@ -732,8 +814,18 @@ pub unsafe extern "C" fn deflateBound(strm: z_streamp, source_len: uLong) -> uLo
             // SAFETY: `state`, when non-null, is a `Box<DeflateHandle>`;
             // `deflate_state` validates the `HandleKind::DEFLATE` tag before
             // reborrowing `handle.zs`.
-            if let Some(zs) = unsafe { deflate_state(s) } {
-                return engine::deflate_bound(zs, source_len as usize) as uLong;
+            if let Some(handle) = unsafe { deflate_handle(s) } {
+                // C's `deflateBound` reads the live header too (`deflate.c`
+                // L893-L907).
+                // SAFETY: as in `deflate`; see `borrow_gz_header`.
+                #[cfg(feature = "gzip")]
+                let lent = unsafe { borrow_gz_header(handle.head) };
+                return engine::deflate_bound_lending(
+                    &handle.zs,
+                    source_len as usize,
+                    #[cfg(feature = "gzip")]
+                    lent.as_ref(),
+                ) as uLong;
             }
         }
         stateless
@@ -759,8 +851,17 @@ pub unsafe extern "C" fn deflateBound_z(strm: z_streamp, source_len: z_size_t) -
         // SAFETY: `state`, when non-null, is a `Box<DeflateHandle>`;
         // `deflate_state` validates the `HandleKind::DEFLATE` tag before
         // reborrowing `handle.zs`.
-        if let Some(zs) = unsafe { deflate_state(s) } {
-            return engine::deflate_bound_z(zs, source_len);
+        if let Some(handle) = unsafe { deflate_handle(s) } {
+            // C's `deflateBound` reads the live header too (`deflate.c` L893-L907).
+            // SAFETY: as in `deflate`; see `borrow_gz_header`.
+            #[cfg(feature = "gzip")]
+            let lent = unsafe { borrow_gz_header(handle.head) };
+            return engine::deflate_bound_z_lending(
+                &handle.zs,
+                source_len,
+                #[cfg(feature = "gzip")]
+                lent.as_ref(),
+            );
         }
     }
     engine::deflate_bound_z(&ZStream::new(), source_len)
@@ -907,6 +1008,19 @@ pub unsafe extern "C" fn deflateSetDictionary(
         // SAFETY: `strm` is non-null and valid for this call.
         let s = unsafe { &mut *strm };
 
+        // C evaluates `deflateStateCheck(strm) || dictionary == Z_NULL` as one
+        // expression, so the stream is validated *first* — before the dictionary
+        // pointer is looked at at all, and long before it is read. Reproducing
+        // that order is a soundness requirement here, not a stylistic one:
+        // `slice::from_raw_parts` below would otherwise be handed a pointer whose
+        // provenance C never vouched for, and constructing a slice over invalid
+        // memory is undefined behavior even if the slice is never read.
+        // SAFETY: `state`, when non-null, was installed by `deflateInit*` via
+        // `install_handle`; the check reads nothing outside `s` and its handle.
+        if !unsafe { deflate_state_check(s) } {
+            return Z_STREAM_ERROR;
+        }
+
         // A null dictionary is a usage error: reference C's
         // `deflateSetDictionary` returns `Z_STREAM_ERROR` for a `Z_NULL`
         // dictionary regardless of length, rather than silently
@@ -995,37 +1109,39 @@ pub unsafe extern "C" fn deflateGetDictionary(
 /// `int deflateSetHeader(z_streamp strm, gz_headerp head)` (`ZLIB_1.2.2`)
 ///
 /// Supplies the gzip header for a gzip-wrapped stream. Returns `Z_STREAM_ERROR`
-/// unless the stream is in gzip mode (`wrap == 2`), mirroring C. C stores the
-/// caller's pointer; this shim deep-copies the header fields into an owned
-/// [`GzHeader`](crate::gz_header::GzHeader), so no dangling pointer can be read during later `deflate`
-/// calls. A `NULL` header clears any previously set header (restoring the
-/// default), exactly as passing `Z_NULL` does in C.
+/// unless the stream is in gzip mode (`wrap == 2`), mirroring C; otherwise
+/// `Z_OK`. Those are the only two outcomes, exactly as `zlib.h` L854-L855
+/// documents — nothing is copied and nothing is allocated, so no memory error is
+/// reachable. A `NULL` header clears any previously set header (restoring the
+/// default), exactly as assigning `Z_NULL` does in C.
 ///
-/// # Return values — exactly C's two, and no third
+/// # The header stays the caller's, and stays live
 ///
-/// `zlib.h` L854-L855 documents precisely two outcomes for this entry point —
-/// `Z_OK` on success, `Z_STREAM_ERROR` when the stream state was inconsistent —
-/// and `deflate.c` L714-L719 produces only those two because it allocates
-/// nothing. **This shim produces exactly the same two and no others**, so a C
-/// caller's `switch` over the documented codes stays exhaustive.
+/// C does exactly two things here: validate, then `s->gzhead = head`
+/// (`deflate.c` L714-L719). Every field is then re-read **lazily**, when the
+/// header is finally sized by `deflateBound` (`deflate.c` L893-L907) or emitted
+/// by `deflate` (`deflate.c` L1092-L1188). This shim reproduces that: it records
+/// only the pointer, and the engine borrows the caller's fields per call.
 ///
-/// That has one non-obvious consequence worth stating, because the deep copy is
-/// an allocation C does not perform: if the caller's `extra`, `name` or `comment`
-/// cannot be copied, the operation has failed and is reported with the one
-/// failure code C defines here, `Z_STREAM_ERROR`. It is **not** reported as
-/// `Z_MEM_ERROR`, which C cannot return from this function; inventing a third
-/// code would break exact C API equivalence, and allocating infallibly instead
-/// would abort the process on a condition C survives. Nothing is installed on
-/// that path — the stream keeps whatever header it already had — so the caller
-/// may retry. The copy itself is an internal implementation convenience with a
-/// stricter buffer-lifetime guarantee than C's, not an ABI divergence; it is
-/// registered as such alongside the five preserved divergences in `CONTRIBUTING.md`.
+/// The consequence is caller-visible and load-bearing: a mutation made after
+/// registration but before emission **is** reflected in the compressed bytes. A
+/// deep copy taken here would instead emit the registration-time snapshot, which
+/// is a different gzip stream for a legitimate call sequence and therefore a
+/// byte-identity divergence (AAP §0.8.1 D-1), and would additionally introduce a
+/// `Z_MEM_ERROR` on an entry point C cannot fail.
+///
+/// The registration survives `deflateReset`: C clears `gzhead` only in
+/// `deflateInit2_` (`deflate.c` L448). It also travels to a `deflateCopy` clone,
+/// because C's struct-wide `zmemcpy` duplicates the pointer (`deflate.c` L1345),
+/// so both streams read the caller's one header.
 ///
 /// # Safety
 ///
 /// `strm` must be null or a valid `z_stream` initialized by `deflateInit*`.
-/// `head` must be null or point to a valid `gz_header` whose field-declared
-/// buffers remain valid for the duration of the call.
+/// `head` must be null or point to a valid `gz_header`. Because only the pointer
+/// is retained, that header — and the `extra`/`name`/`comment` buffers it names —
+/// must stay valid until the header has been emitted or the registration has been
+/// replaced, which is the same obligation C places on the caller.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn deflateSetHeader(strm: z_streamp, head: gz_headerp) -> c_int {
     guard_int(Z_STREAM_ERROR, || {
@@ -1040,28 +1156,33 @@ pub unsafe extern "C" fn deflateSetHeader(strm: z_streamp, head: gz_headerp) -> 
             // Validate installed state before touching `head` (C order:
             // `deflateStateCheck` precedes the `wrap` test).
             // SAFETY: installed engine state (see `deflate`).
-            let Some(zs) = (unsafe { deflate_state(s) }) else {
+            let Some(handle) = (unsafe { deflate_handle(s) }) else {
                 return Z_STREAM_ERROR;
             };
-            // SAFETY: `head` is null or points at a valid `gz_header` whose
-            // field-declared buffers remain valid for this call.
+            // C does exactly two things here: validate, then `s->gzhead = head`
+            // (`deflate.c` L714-L719). It copies nothing, reads nothing through
+            // `head`, and allocates nothing — so neither does this shim.
             //
-            // The deep copy is fallible because its three buffers are sized by
-            // the caller (`extra_len`, and the `name`/`comment` NUL positions).
-            // C stores the caller's pointers and allocates nothing here, so it
-            // has no corresponding failure — and, decisively, `zlib.h` L854-L855
-            // gives this entry point exactly two return values. An exhausted
-            // allocator is therefore reported with the only failure code C
-            // defines here, `Z_STREAM_ERROR`, and never with `Z_MEM_ERROR`: a
-            // code C cannot produce from this function would break exact C API
-            // equivalence, and copying infallibly instead would abort the process
-            // on a condition C survives. Nothing has been installed at this
-            // point, so the stream keeps whatever header it already had and the
-            // caller may retry.
-            let Ok(header) = (unsafe { gz_header_to_idiomatic(head) }) else {
-                return Z_STREAM_ERROR;
-            };
-            code_of(engine::deflate_set_header(zs, header))
+            // The header is therefore *not* converted to an owned `GzHeader`. A
+            // deep copy would introduce two divergences that reference zlib
+            // cannot exhibit: a `Z_MEM_ERROR` from an entry point whose only
+            // documented outcomes are `Z_OK` and `Z_STREAM_ERROR` (`zlib.h`
+            // L854-L855), and a stale snapshot that ignores mutations the caller
+            // makes before the header is emitted — which changes the emitted gzip
+            // bytes and so breaks byte identity (AAP §0.8.1 D-1).
+            //
+            // Ordering note: the engine slot is set *before* the pointer is
+            // stored, so that a stream which fails the `wrap != 2` test keeps
+            // whatever header it already had, exactly as C leaves `s->gzhead`
+            // untouched when it returns `Z_STREAM_ERROR`.
+            let rc = code_of(engine::deflate_set_header_foreign(
+                &mut handle.zs,
+                !head.is_null(),
+            ));
+            if rc == Z_OK {
+                handle.head = head;
+            }
+            rc
         }
         #[cfg(not(feature = "gzip"))]
         {
@@ -1082,10 +1203,16 @@ pub unsafe extern "C" fn deflateSetHeader(strm: z_streamp, head: gz_headerp) -> 
 /// Duplicates a compression stream, including its sliding window, pending
 /// buffer, and hash tables (the engine's allocator-preserving
 /// `DeflateState::try_clone` performs the deep copy, re-allocating every working
-/// buffer through the **same** `zalloc` as the source — AAP §0.6.5). All
-/// observable `z_stream` fields are mirrored from `source` into `dest`, matching
-/// C's full-struct copy. Returns `Z_MEM_ERROR` if a copy allocation fails, in
-/// which case `dest` is left entirely untouched.
+/// buffer through the **same** `zalloc` as the source — AAP §0.6.5).
+///
+/// Every application-visible `z_stream` field is mirrored from `source` into
+/// `dest` *before* the first allocation, because that is where C does it:
+/// `zmemcpy(dest, source, sizeof(z_stream))` at `deflate.c` L1333 precedes the
+/// destination-state `ZALLOC` at L1335. The ordering is observable — on
+/// `Z_MEM_ERROR` C leaves `dest` carrying the source's cursors, totals, `msg`,
+/// allocator triple, `data_type` and `adler` rather than leaving it untouched —
+/// so this shim reproduces it. Returns `Z_MEM_ERROR` if a copy allocation fails,
+/// with `dest.state` left as the caller had it (see the note at the mirror below).
 ///
 /// `Z_STREAM_ERROR` is returned when either pointer is null, when `source`
 /// carries no deflate state, or when `source`'s caller-visible `zalloc`/`zfree`
@@ -1106,6 +1233,18 @@ pub unsafe extern "C" fn deflateCopy(dest: z_streamp, source: z_streamp) -> c_in
             return Z_STREAM_ERROR;
         }
 
+        // C evaluates `deflateStateCheck(source) || dest == Z_NULL` as one
+        // expression (`deflate.c` L1327-L1329), so the *source* stream is fully
+        // validated before anything else is read — including its own allocator
+        // fields — and before `dest` is touched at all. Running the whole
+        // predicate first means an invalid source is rejected before a reference
+        // to either stream is formed for any other purpose.
+        // SAFETY: `source` is non-null and valid; the check reads only `source`
+        // and its own handle prefix, and creates no lasting borrow.
+        if !unsafe { deflate_state_check(&*source) } {
+            return Z_STREAM_ERROR;
+        }
+
         // Capture the source's **caller-visible** `zalloc`/`zfree`/`opaque`
         // triple. C charges every clone allocation to exactly this triple: it
         // `zmemcpy`s the whole `z_stream` from `source` into `dest` and then
@@ -1118,6 +1257,7 @@ pub unsafe extern "C" fn deflateCopy(dest: z_streamp, source: z_streamp) -> c_in
         // `Copy` allocator fields are copied out, and no hook pointer is
         // dereferenced.
         let source_alloc = unsafe { CAllocator::from_stream(&*source) };
+
         // C rejects a source whose `zalloc` **or** `zfree` is null through
         // `deflateStateCheck(source)` (`deflate.c` L540-L541), evaluated in
         // `deflateCopy` before the first `ZALLOC(dest, …)` (`deflate.c`
@@ -1138,40 +1278,28 @@ pub unsafe extern "C" fn deflateCopy(dest: z_streamp, source: z_streamp) -> c_in
         // SAFETY: see above; `source` is distinct from `dest`.
         let src = unsafe { &mut *source };
 
-        // Deep-copy the source engine into a fresh stream carrying the same
-        // allocator, then install it into `dest`.
-        let new_zs = {
-            // SAFETY: `source.state`, when non-null, is a
-            // `Box<DeflateHandle>`; `deflate_state` confirms the
-            // `HandleKind::DEFLATE` tag before reborrowing `handle.zs`.
-            let Some(src_zs) = (unsafe { deflate_state(src) }) else {
-                return Z_STREAM_ERROR;
-            };
-            let mut new_zs = ZStream::with_allocator(source_alloc);
-            if let Err(err) = engine::deflate_copy(&mut new_zs, src_zs) {
-                return err.as_return_code().as_c_int();
-            }
-            new_zs
-        };
-
-        // Box the cloned handle **fallibly** before any field of `dest` is
-        // written, so global-heap exhaustion is reported as `Z_MEM_ERROR` with
-        // `dest` untouched — the state C leaves behind when it calls
-        // `deflateEnd(dest)` and returns `Z_MEM_ERROR` (AAP §0.6.5). The dropped
-        // `new_zs` releases the freshly cloned buffers through the caller's
-        // `zfree`.
-        let Some(handle) = try_box(DeflateHandle::new(new_zs)) else {
-            return Z_MEM_ERROR;
-        };
-
-        // Install the cloned state into `dest`.
-        // SAFETY: transfers ownership of the tagged `Box<DeflateHandle>` into
-        // `dest.state`; reclaimed exactly once by `deflateEnd`, whose
-        // `deflate_take` validates the `HandleKind::DEFLATE` tag and nulls
-        // `dest.state` on success.
-        d.state = unsafe { state_ptr_from_box(handle) };
-
-        // Mirror the full observable `z_stream` (C copies the whole struct).
+        // Mirror the whole caller-visible `z_stream` **before** anything is
+        // allocated, reproducing C's `zmemcpy(dest, source, sizeof(z_stream))`
+        // (`deflate.c` L1333), which precedes the destination-state `ZALLOC` at
+        // L1335. Doing it here rather than after a successful clone is what makes
+        // the `Z_MEM_ERROR` path match: reference zlib leaves `dest` holding the
+        // source's cursors, totals, `msg`, allocator triple, `data_type` and
+        // `adler`, and a caller inspecting `dest` after a refused copy sees them.
+        //
+        // The one field C's struct copy carries that is deliberately **not**
+        // mirrored is the opaque `state` pointer. C's memcpy leaves
+        // `dest->state == source->state` until L1337 overwrites it, so on the
+        // failure path C hands the caller a pointer into *another* stream's state.
+        // That is not reproduced here, for three reasons that together make it
+        // unobservable through the zlib contract: `zlib.h` declares the field "not
+        // visible by applications"; C's own `deflateStateCheck` rejects the alias
+        // through its `s->strm != strm` clause, exactly as this port's owner-bound
+        // handle header does, so `deflateEnd(dest)` returns `Z_STREAM_ERROR` in
+        // both implementations (measured, not assumed); and publishing a live
+        // pointer to a state this stream does not own would defeat the owner
+        // binding that makes cross-stream reclamation impossible by construction.
+        // On the success path `install_handle` below writes `dest.state` itself,
+        // which is C's L1337.
         d.next_in = src.next_in;
         d.avail_in = src.avail_in;
         d.total_in = src.total_in;
@@ -1185,6 +1313,72 @@ pub unsafe extern "C" fn deflateCopy(dest: z_streamp, source: z_streamp) -> c_in
         d.zfree = src.zfree;
         d.opaque = src.opaque;
         d.reserved = src.reserved;
+
+        // Deep-copy the source engine into a fresh stream carrying the same
+        // allocator, then install it into `dest`.
+        //
+        // The registered `gz_header` pointer travels with the copy. C's
+        // `zmemcpy(ds, ss, sizeof(deflate_state))` (`deflate.c` L1345) duplicates
+        // the whole state struct, and `gzhead` is one of its members, so the
+        // clone ends up pointing at the *same* caller-owned header as the
+        // original — it is never deep-copied and never cleared. Carrying the raw
+        // pointer across reproduces that exactly: both streams read the caller's
+        // one live header, and a mutation the caller makes afterwards is seen by
+        // both. Only the pointer is copied here; nothing is dereferenced.
+        #[cfg(feature = "gzip")]
+        let src_head;
+        let new_zs = {
+            // SAFETY: `source.state`, when non-null, is a
+            // `Box<DeflateHandle>`; `deflate_handle` runs the whole of
+            // `deflateStateCheck` — confirming the `HandleKind::DEFLATE` tag and
+            // the owner — before reborrowing the handle.
+            let Some(src_handle) = (unsafe { deflate_handle(src) }) else {
+                return Z_STREAM_ERROR;
+            };
+            #[cfg(feature = "gzip")]
+            {
+                src_head = src_handle.head;
+            }
+            let mut new_zs = ZStream::with_allocator(source_alloc);
+            if let Err(err) = engine::deflate_copy(&mut new_zs, &src_handle.zs) {
+                return err.as_return_code().as_c_int();
+            }
+            new_zs
+        };
+
+        // Box the cloned handle **fallibly** before `dest.state` is written, so
+        // global-heap exhaustion is reported as `Z_MEM_ERROR` rather than an abort
+        // — the outcome C reaches when its destination `ZALLOC` fails and it calls
+        // `deflateEnd(dest)` (AAP §0.6.5). `dest` keeps the mirrored fields written
+        // above, exactly as C's earlier struct copy leaves them, and its `state` is
+        // never touched. The dropped `new_zs` releases the freshly cloned buffers
+        // through the caller's `zfree`.
+        let Some(handle) = try_box(DeflateHandle::new(new_zs)) else {
+            return Z_MEM_ERROR;
+        };
+
+        // Carry the registered header pointer onto the clone, matching C's
+        // struct-wide `zmemcpy` (see the note above the copy). The engine-side
+        // `GzHeaderSlot` was already duplicated by `deflate_copy`, which
+        // propagates the `Foreign` marker; this restores the raw pointer that
+        // marker refers to.
+        #[cfg(feature = "gzip")]
+        let handle = {
+            let mut handle = handle;
+            handle.head = src_head;
+            handle
+        };
+
+        // Install the cloned state into `dest`.
+        // SAFETY: transfers ownership of the tagged `Box<DeflateHandle>` into
+        // `dest.state` and re-points the clone's owner at `dest`, reproducing C's
+        // `ds->strm = dest` (`deflate.c` L1340). That re-pointing is what makes
+        // the two streams independent: `deflateEnd(dest)` reclaims the clone and
+        // `deflateEnd(source)` reclaims only the original, so neither can free the
+        // other's state. Reclaimed exactly once by `deflateEnd`, whose
+        // `deflate_take` runs the whole of `deflateStateCheck` first.
+        unsafe { install_handle(d, handle) };
+
         Z_OK
     })
 }
@@ -1201,6 +1395,8 @@ mod tests {
     use super::*;
     use crate::constants::{Z_DEFAULT_COMPRESSION, Z_FINISH, Z_NO_FLUSH};
     use crate::ffi::alloc::test_hook::BuiltinHookStats;
+    #[cfg(feature = "gzip")]
+    use core::ffi::c_uchar;
     use core::ffi::c_void;
     use core::mem::size_of;
     use std::io::Read;
@@ -1754,6 +1950,389 @@ mod tests {
         assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
     }
 
+    /// Reads the four match-finder thresholds out of an initialized stream's
+    /// engine state, through the same tag-validating accessor the shims use.
+    ///
+    /// # Panics
+    ///
+    /// If `strm` carries no deflate handle.
+    fn tune_fields(strm: &mut z_stream) -> (usize, usize, c_int, usize) {
+        // The engine accessors live on this trait rather than on `ZStream`, which
+        // is what keeps the `stream` layer free of an upward edge into `deflate`
+        // (AAP §0.3.1, §0.4.2); it has to be in scope to call them.
+        use crate::deflate::state::DeflateStream;
+
+        // SAFETY: the caller passes an initialized `z_stream`; `deflate_state`
+        // compares the `HandleKind` tag before reinterpreting `state`, so a
+        // stateless or foreign-handle stream yields `None` rather than a misread.
+        let zs = unsafe { deflate_state(strm) }.expect("an initialized stream has a handle");
+        let s = zs.deflate_state().expect("the handle carries engine state");
+        (
+            s.good_match,
+            s.max_lazy_match,
+            s.nice_match,
+            s.max_chain_length,
+        )
+    }
+
+    /// `int deflateTune(z_streamp, int, int, int, int)` at the C boundary
+    /// (`ZLIB_1.2.2.3`).
+    ///
+    /// C `deflateTune` (`deflate.c` L819-L830) performs the state check and then
+    /// writes all four values verbatim — it validates nothing else and cannot
+    /// fail for any other reason. Both halves are asserted here: every rejection
+    /// path returns exactly `Z_STREAM_ERROR`, and an accepted call is observed
+    /// **on the state** rather than merely by its return code, because a shim that
+    /// returned `Z_OK` while dropping the values on the floor would look identical
+    /// from the outside. `deflateTune` sits directly on the byte-identity surface
+    /// (AAP §0.6.4 (d)), so "it returned `Z_OK`" is not evidence that it worked.
+    #[test]
+    fn deflate_tune_at_the_c_boundary() {
+        // A null stream is rejected before any field is read.
+        assert_eq!(
+            unsafe { deflateTune(ptr::null_mut(), 8, 16, 128, 128) },
+            Z_STREAM_ERROR,
+            "a NULL z_streamp is Z_STREAM_ERROR"
+        );
+
+        // A zeroed, never-initialized stream: `state` is null, which the handle
+        // accessor reports as "no handle" without ever loading through it.
+        let mut bare = zeroed_stream();
+        assert_eq!(
+            unsafe { deflateTune(&mut bare, 8, 16, 128, 128) },
+            Z_STREAM_ERROR,
+            "an uninitialized z_stream is Z_STREAM_ERROR"
+        );
+
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe { deflateInit_(&mut strm, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+
+        // Level 6 loads `configuration_table[6] == {8, 16, 128, 128}`
+        // (`deflate.c` L118). Establishing the pre-state is what makes the
+        // override below meaningful rather than a coincidence.
+        assert_eq!(
+            tune_fields(&mut strm),
+            (8, 16, 128, 128),
+            "level 6 starts from its configuration-table row"
+        );
+
+        assert_eq!(
+            unsafe { deflateTune(&mut strm, 33, 133, 259, 4097) },
+            Z_OK,
+            "an initialized stream accepts advanced overrides"
+        );
+        assert_eq!(
+            tune_fields(&mut strm),
+            (33, 133, 259, 4097),
+            "all four thresholds are written through to the state"
+        );
+
+        // C imposes no range check whatsoever, so zeros are accepted and stored
+        // verbatim. A shim that "helpfully" rejected or clamped them would diverge
+        // from reference zlib on a call reference zlib accepts.
+        assert_eq!(unsafe { deflateTune(&mut strm, 0, 0, 0, 0) }, Z_OK);
+        assert_eq!(
+            tune_fields(&mut strm),
+            (0, 0, 0, 0),
+            "C validates nothing here; the values are stored as given"
+        );
+
+        // The stream still works after being tuned: the thresholds change which
+        // matches the finder accepts, never whether the output is a valid stream.
+        let corpus = b"tuned deflate stream, tuned deflate stream, tuned. ".repeat(20);
+        let mut out = std::vec![0u8; 64 * 1024];
+        strm.next_in = corpus.as_ptr();
+        strm.avail_in = corpus.len() as c_uint;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+        assert_eq!(unsafe { deflate(&mut strm, Z_FINISH) }, Z_STREAM_END);
+        let produced = strm.total_out as usize;
+        assert_eq!(
+            zlib_inflate(&out[..produced]),
+            corpus,
+            "a tuned stream still round-trips"
+        );
+
+        // A stream carrying the OTHER engine's handle is rejected by the tag
+        // check rather than misread as a deflate state.
+        let mut inf = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                crate::ffi::inflate::inflateInit_(&mut inf, ver(), size_of::<z_stream>() as c_int)
+            },
+            Z_OK
+        );
+        assert_eq!(
+            unsafe { deflateTune(&mut inf, 8, 16, 128, 128) },
+            Z_STREAM_ERROR,
+            "an inflate handle is not a deflate handle"
+        );
+        assert_eq!(unsafe { crate::ffi::inflate::inflateEnd(&mut inf) }, Z_OK);
+
+        // After teardown the stream is stateless again, so tuning is rejected.
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+        assert_eq!(
+            unsafe { deflateTune(&mut strm, 8, 16, 128, 128) },
+            Z_STREAM_ERROR,
+            "deflateEnd nulls `state`, so a later tune is rejected"
+        );
+    }
+
+    /// `int deflatePrime(z_streamp, int, int)` at the C boundary
+    /// (`ZLIB_1.2.0.8`).
+    ///
+    /// Three distinct outcomes are reachable and all three are asserted with
+    /// their exact codes: `Z_STREAM_ERROR` for a null or stateless stream,
+    /// `Z_BUF_ERROR` for a width outside `0..=16` (`deflate.c` L756-L758), and
+    /// `Z_OK` with the bits actually buffered. The success case is observed
+    /// through `deflatePending`, which is the only C-visible witness of the bit
+    /// accumulator: a shim that returned `Z_OK` without priming anything would
+    /// otherwise be indistinguishable, and `deflatePrime` exists precisely so a
+    /// caller can splice streams at a known bit offset.
+    #[test]
+    fn deflate_prime_at_the_c_boundary() {
+        assert_eq!(
+            unsafe { deflatePrime(ptr::null_mut(), 8, 0) },
+            Z_STREAM_ERROR,
+            "a NULL z_streamp is Z_STREAM_ERROR"
+        );
+
+        let mut bare = zeroed_stream();
+        assert_eq!(
+            unsafe { deflatePrime(&mut bare, 8, 0) },
+            Z_STREAM_ERROR,
+            "an uninitialized z_stream is Z_STREAM_ERROR"
+        );
+
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe { deflateInit_(&mut strm, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+
+        let pending = |strm: &mut z_stream| -> (c_uint, c_int) {
+            let mut bytes: c_uint = 0xdead;
+            let mut bits: c_int = -1;
+            assert_eq!(
+                unsafe { deflatePending(strm, &mut bytes, &mut bits) },
+                Z_OK,
+                "deflatePending must succeed on an initialized stream"
+            );
+            (bytes, bits)
+        };
+
+        assert_eq!(
+            pending(&mut strm),
+            (0, 0),
+            "a fresh stream has nothing pending"
+        );
+
+        // Five bits fit the empty accumulator without completing a byte.
+        assert_eq!(unsafe { deflatePrime(&mut strm, 5, 0b1_0101) }, Z_OK);
+        assert_eq!(
+            pending(&mut strm),
+            (0, 5),
+            "the primed bits are buffered, not emitted"
+        );
+
+        // Sixteen more: the low two bytes flush least-significant first and five
+        // bits stay buffered (21 bits total). The exact bytes are asserted by
+        // `deflate::tests::deflate_prime_packs_bits_low_order_first_and_rejects_bad_widths`;
+        // what matters here is that the C entry point drives the same engine.
+        assert_eq!(unsafe { deflatePrime(&mut strm, 16, 0xffff) }, Z_OK);
+        assert_eq!(pending(&mut strm), (2, 5));
+
+        // A zero-width prime is legal and a no-op, matching C's loop, which exits
+        // immediately when `bits == 0`.
+        assert_eq!(unsafe { deflatePrime(&mut strm, 0, 0) }, Z_OK);
+        assert_eq!(pending(&mut strm), (2, 5), "a 0-bit prime changes nothing");
+
+        // Out-of-range widths are `Z_BUF_ERROR`, NOT `Z_STREAM_ERROR`: the
+        // distinction is observable and C makes it.
+        assert_eq!(
+            unsafe { deflatePrime(&mut strm, 17, 0) },
+            Z_BUF_ERROR,
+            "17 bits exceeds the 16-bit limit"
+        );
+        assert_eq!(
+            unsafe { deflatePrime(&mut strm, -1, 0) },
+            Z_BUF_ERROR,
+            "a negative width is rejected"
+        );
+        assert_eq!(
+            pending(&mut strm),
+            (2, 5),
+            "a rejected prime must not disturb the accumulator"
+        );
+
+        // A cross-engine handle is rejected by the tag check.
+        let mut inf = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                crate::ffi::inflate::inflateInit_(&mut inf, ver(), size_of::<z_stream>() as c_int)
+            },
+            Z_OK
+        );
+        assert_eq!(
+            unsafe { deflatePrime(&mut inf, 8, 0) },
+            Z_STREAM_ERROR,
+            "an inflate handle is not a deflate handle"
+        );
+        assert_eq!(unsafe { crate::ffi::inflate::inflateEnd(&mut inf) }, Z_OK);
+
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+        assert_eq!(
+            unsafe { deflatePrime(&mut strm, 8, 0) },
+            Z_STREAM_ERROR,
+            "deflateEnd nulls `state`, so a later prime is rejected"
+        );
+    }
+
+    /// `int deflateGetDictionary(z_streamp, Bytef *, uInt *)` at the C boundary
+    /// (`ZLIB_1.2.9`).
+    ///
+    /// This shim is the only one in the module that implements the engine's
+    /// two-call pattern — query the length with `None`, then copy into a slice of
+    /// exactly that length — and it must honour C's rule that **either** output
+    /// pointer may be `NULL` independently. All four combinations are exercised,
+    /// and the bytes it produces are cross-checked against
+    /// [`engine::deflate_get_dictionary`] read through the same handle, so the
+    /// shim cannot pass by copying the right count of the wrong bytes.
+    #[test]
+    fn deflate_get_dictionary_at_the_c_boundary() {
+        const DICT: &[u8] = b"the quick brown fox jumps over the lazy dog";
+
+        assert_eq!(
+            unsafe { deflateGetDictionary(ptr::null_mut(), ptr::null_mut(), ptr::null_mut()) },
+            Z_STREAM_ERROR,
+            "a NULL z_streamp is Z_STREAM_ERROR"
+        );
+
+        let mut bare = zeroed_stream();
+        let mut len: uInt = 0xdead;
+        assert_eq!(
+            unsafe { deflateGetDictionary(&mut bare, ptr::null_mut(), &mut len) },
+            Z_STREAM_ERROR,
+            "an uninitialized z_stream is Z_STREAM_ERROR"
+        );
+        assert_eq!(
+            len, 0xdead,
+            "a rejected call must not write the length out-parameter"
+        );
+
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe { deflateInit_(&mut strm, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+
+        // Before any dictionary or input: length 0, and a supplied buffer is left
+        // untouched because the engine's `len != 0` guard suppresses the copy.
+        let mut buf = [0xa5u8; 64];
+        let mut len: uInt = 0xdead;
+        assert_eq!(
+            unsafe { deflateGetDictionary(&mut strm, buf.as_mut_ptr(), &mut len) },
+            Z_OK
+        );
+        assert_eq!(len, 0, "a fresh stream has an empty dictionary");
+        assert!(
+            buf.iter().all(|&b| b == 0xa5),
+            "an empty dictionary writes no bytes"
+        );
+
+        assert_eq!(
+            unsafe { deflateSetDictionary(&mut strm, DICT.as_ptr(), DICT.len() as uInt) },
+            Z_OK
+        );
+
+        // (a) Length-only query: `dictionary == NULL`, `dictLength` non-null.
+        //     This is the sizing half of the C idiom, and the buffer must stay
+        //     untouched because it was never passed.
+        let mut len: uInt = 0xdead;
+        assert_eq!(
+            unsafe { deflateGetDictionary(&mut strm, ptr::null_mut(), &mut len) },
+            Z_OK
+        );
+        assert_eq!(len, DICT.len() as uInt, "the length-only query reports it");
+        assert!(buf.iter().all(|&b| b == 0xa5));
+
+        // (b) Both output pointers non-null: exact bytes AND exact length.
+        let mut len: uInt = 0;
+        assert_eq!(
+            unsafe { deflateGetDictionary(&mut strm, buf.as_mut_ptr(), &mut len) },
+            Z_OK
+        );
+        assert_eq!(len, DICT.len() as uInt);
+        assert_eq!(&buf[..DICT.len()], DICT, "the exact dictionary bytes");
+        assert!(
+            buf[DICT.len()..].iter().all(|&b| b == 0xa5),
+            "exactly `len` bytes are written and no more"
+        );
+
+        // (c) Buffer only: `dictLength == NULL` must not be dereferenced, and the
+        //     copy must still happen.
+        let mut buf2 = [0x5au8; 64];
+        assert_eq!(
+            unsafe { deflateGetDictionary(&mut strm, buf2.as_mut_ptr(), ptr::null_mut()) },
+            Z_OK,
+            "a NULL dictLength is legal, not an error"
+        );
+        assert_eq!(&buf2[..DICT.len()], DICT);
+        assert!(buf2[DICT.len()..].iter().all(|&b| b == 0x5a));
+
+        // (d) Neither output pointer: a pure "is this stream usable" probe.
+        assert_eq!(
+            unsafe { deflateGetDictionary(&mut strm, ptr::null_mut(), ptr::null_mut()) },
+            Z_OK,
+            "both output pointers NULL is legal"
+        );
+
+        // Cross-check against the safe core reached through the same handle: the
+        // shim must not merely produce the right NUMBER of bytes.
+        {
+            let zs = unsafe { deflate_state(&mut strm) }.expect("handle");
+            let core_len = engine::deflate_get_dictionary(zs, None).expect("core length query");
+            assert_eq!(core_len, DICT.len(), "core and shim agree on the length");
+            let mut core_bytes = std::vec![0u8; core_len];
+            assert_eq!(
+                engine::deflate_get_dictionary(zs, Some(&mut core_bytes)),
+                Ok(core_len)
+            );
+            assert_eq!(
+                &buf[..core_len],
+                &core_bytes[..],
+                "the shim copied exactly what the safe core reports"
+            );
+        }
+
+        // A cross-engine handle is rejected by the tag check.
+        let mut inf = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                crate::ffi::inflate::inflateInit_(&mut inf, ver(), size_of::<z_stream>() as c_int)
+            },
+            Z_OK
+        );
+        let mut len: uInt = 0xdead;
+        assert_eq!(
+            unsafe { deflateGetDictionary(&mut inf, ptr::null_mut(), &mut len) },
+            Z_STREAM_ERROR,
+            "an inflate handle is not a deflate handle"
+        );
+        assert_eq!(len, 0xdead);
+        assert_eq!(unsafe { crate::ffi::inflate::inflateEnd(&mut inf) }, Z_OK);
+
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+        assert_eq!(
+            unsafe { deflateGetDictionary(&mut strm, ptr::null_mut(), ptr::null_mut()) },
+            Z_STREAM_ERROR,
+            "deflateEnd nulls `state`, so a later query is rejected"
+        );
+    }
+
     #[test]
     fn reset_clears_counters() {
         let mut strm = zeroed_stream();
@@ -2292,19 +2871,13 @@ mod tests {
     /// codes — `Z_OK` and `Z_STREAM_ERROR` — across every reachable stream shape.
     ///
     /// `zlib.h` L854-L855 documents only those two, and `deflate.c` L714-L719
-    /// produces only those two because it allocates nothing. This shim *does*
-    /// allocate (it deep-copies the caller's `extra`/`name`/`comment` so no
-    /// dangling pointer can be read during a later `deflate`), and the temptation
-    /// is to report an exhausted allocator as `Z_MEM_ERROR`. That would be a
-    /// return value C cannot produce here, so it is deliberately folded into
-    /// `Z_STREAM_ERROR` instead — see the entry point's own documentation. This
-    /// test is the standing guard on that decision: it sweeps the reachable
+    /// produces only those two because it allocates nothing. This shim allocates
+    /// nothing either — it records the caller's `gz_header` pointer and the engine
+    /// re-reads every field lazily, when the header is sized or emitted — so there
+    /// is no allocation failure here to fold into a third code, and `Z_MEM_ERROR`
+    /// (which reference zlib cannot produce from this function) can never appear.
+    /// This test is the standing guard on that contract: it sweeps the reachable
     /// argument space and fails if any configuration ever answers a third code.
-    ///
-    /// The allocation-failure path itself is not driven here (forcing a *global*
-    /// allocator failure would need a process-wide allocator shim, and
-    /// `Vec::try_reserve_exact` does not consult the stream's `zalloc` pair), so
-    /// what is pinned is the contract every other caller can observe.
     #[test]
     fn set_header_return_set_is_exactly_ok_or_stream_error() {
         // Assert a single observed code against the whole permitted set.
@@ -2416,25 +2989,24 @@ mod tests {
             assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
         }
     }
-
-    /// `deflateSetHeader` with a **populated** header must deep-copy every
-    /// caller-owned field and return `Z_OK`, and the fields must reach the wire.
+    /// `deflateSetHeader` with a **populated** header must return `Z_OK` and every
+    /// caller-owned field must reach the wire, byte for byte.
     ///
-    /// The deep copy is the shim's own allocation (C merely stores the caller's
-    /// pointers), which is why `gz_header_to_idiomatic` is fallible — though the
-    /// failure is folded into C's own `Z_STREAM_ERROR` rather than surfacing a
-    /// third code, so the observable return set stays exactly `zlib.h`'s two.
-    /// That makes the *success* path worth pinning explicitly: every other
-    /// `deflateSetHeader` test passes `NULL`, so without this one the copy could
-    /// stop copying — or start reporting failure spuriously — with nothing to
-    /// catch it.
+    /// This pins the *success* path: every other `deflateSetHeader` test passes
+    /// `NULL`, so without this one the whole header ladder — flags, MTIME, OS,
+    /// XLEN, extra, name, comment — could stop being emitted with nothing to catch
+    /// it.
     ///
-    /// Copying (rather than retaining the caller's pointers) is also load-bearing
-    /// for memory safety: the source buffers are dropped before `deflate` runs,
-    /// so a shim that stored pointers would read freed memory here.
+    /// The header is read from the caller's own storage at emission time, as in C
+    /// (`deflate.c` L714-L719 stores only the pointer; L1092-L1188 read the
+    /// fields). Accordingly the source buffers here stay alive and unmodified
+    /// across the `deflate` call, and are only scribbled over and dropped
+    /// afterwards — the obligation `zlib.h` L843-L847 places on a C caller. The
+    /// scribble is still meaningful: it proves the emitted bytes were produced
+    /// during the call rather than lazily afterwards.
     #[cfg(feature = "gzip")]
     #[test]
-    fn set_header_deep_copies_a_populated_header_and_emits_it() {
+    fn set_header_emits_every_populated_field_from_the_callers_storage() {
         let mut strm = zeroed_stream();
         let rc = unsafe {
             deflateInit2_(
@@ -2482,7 +3054,7 @@ mod tests {
                 "a populated header on a gzip stream must be accepted"
             );
 
-            let input = b"deep-copied gzip header fields".repeat(4);
+            let input = b"borrowed gzip header fields".repeat(4);
             let mut out = std::vec![0u8; 512];
             strm.next_in = input.as_ptr();
             strm.avail_in = input.len() as c_uint;
@@ -2494,9 +3066,9 @@ mod tests {
             let produced = out.len() - strm.avail_out as usize;
             out.truncate(produced);
 
-            // Prove the copies are independent of the caller's storage: scribble
-            // over every source buffer, then let them drop at the end of the
-            // scope. A shim that retained pointers would already have read this.
+            // The header has been emitted; scribbling over the source buffers and
+            // dropping them now proves the bytes were produced during the
+            // `deflate` call above and not read again afterwards.
             extra.fill(0);
             name.fill(0);
             comment.fill(0);
@@ -2588,6 +3160,229 @@ mod tests {
     /// untouched, release every buffer it did manage to allocate, and leave
     /// `source` fully usable — never silently completing the copy on the Rust
     /// global allocator.
+    /// A caller arena that runs out on the *last* working buffer sees its regions
+    /// handed back in C's documented teardown order, not in Rust field order.
+    ///
+    /// C issues all four working-buffer `ZALLOC`s unconditionally and checks them
+    /// **together** (`deflate.c` L458-L460, L505, tested at L507-L513), then calls
+    /// `deflateEnd`, which frees `pending_buf`, `head`, `prev`, `window` and
+    /// finally the state — "deallocate in reverse order of allocations"
+    /// (`deflate.c` L1300-L1306). Request numbers make that `[3, 2, 1, 0]`
+    /// followed by the state's `0`th region last.
+    ///
+    /// This is a real divergence this port had: dropping the buffers as a tuple
+    /// pattern released them left-to-right (`window, prev, head, pending_buf`,
+    /// i.e. `[1, 2, 3, 0]`), which a caller arena that coalesces or asserts on
+    /// release order can observe. Measured against a reference C zlib built from
+    /// the in-tree sources before being fixed.
+    #[test]
+    fn init_releases_working_buffers_in_c_reverse_order_when_the_arena_runs_out() {
+        use crate::ffi::alloc::test_hook::HookStats;
+
+        // Four successes — state, `window`, `prev`, `head` — then refusal, so the
+        // fifth request (`pending_buf`) is the one that fails.
+        let stats = HookStats::with_budget(4);
+        let hook = stats.hook();
+
+        let mut strm = zeroed_stream();
+        strm.zalloc = hook.zalloc();
+        strm.zfree = hook.zfree();
+        strm.opaque = hook.opaque();
+
+        assert_eq!(
+            unsafe { deflateInit_(&mut strm, 6, ver(), size_of::<z_stream>() as c_int) },
+            ReturnCode::MemError.as_c_int(),
+            "the fifth request is refused, so init must report Z_MEM_ERROR"
+        );
+
+        assert_eq!(
+            stats.allocs(),
+            4,
+            "C asks for the state and all four working buffers; four are served"
+        );
+        assert_eq!(
+            stats.ooms(),
+            1,
+            "exactly the `pending_buf` request is refused; C does not short-circuit \
+             the earlier ones (`deflate.c` L507-L513 checks them together)"
+        );
+        assert_eq!(
+            stats.free_order(),
+            std::vec![3, 2, 1, 0],
+            "C's `deflateEnd` releases `pending_buf` (refused, so absent), then \
+             `head`, `prev`, `window`, and the state region last — request numbers \
+             [3, 2, 1, 0] (`deflate.c` L1300-L1306)"
+        );
+        assert_eq!(
+            stats.live_bytes(),
+            0,
+            "a failed init must leave nothing outstanding in the caller's arena"
+        );
+    }
+
+    /// `deflateCopy` publishes the source `z_stream` into `dest` **before** it
+    /// makes its first allocation, so even a copy refused on its very first
+    /// request leaves `dest` carrying the source's bookkeeping.
+    ///
+    /// C's `zmemcpy(dest, source, sizeof(z_stream))` is at `deflate.c` L1333 and
+    /// the destination `ZALLOC` at L1335 — the mirror strictly precedes the
+    /// charge. This port originally mirrored *after* installing the handle, so a
+    /// refused copy left `dest` untouched; that divergence was measured against a
+    /// reference C zlib built from the in-tree sources.
+    ///
+    /// Budgeting the arena to zero for the copy makes the ordering the *only*
+    /// thing under test: nothing is allocated at all, so any mirrored field
+    /// observed in `dest` can only have been written before the first request.
+    #[test]
+    fn copy_mirrors_the_stream_before_its_first_allocation() {
+        use crate::ffi::alloc::test_hook::HookStats;
+
+        let stats = HookStats::new();
+        let hook = stats.hook();
+
+        let mut src = zeroed_stream();
+        src.zalloc = hook.zalloc();
+        src.zfree = hook.zfree();
+        src.opaque = hook.opaque();
+        assert_eq!(
+            unsafe { deflateInit_(&mut src, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+
+        // Give the source history so the mirrored counters are non-zero and the
+        // assertions below cannot pass against a still-zeroed `dest`.
+        let input = b"mirror before allocate ".repeat(16);
+        let mut out = std::vec![0u8; 4096];
+        src.next_in = input.as_ptr();
+        src.avail_in = input.len() as c_uint;
+        src.next_out = out.as_mut_ptr();
+        src.avail_out = out.len() as c_uint;
+        assert_eq!(unsafe { deflate(&mut src, Z_NO_FLUSH) }, Z_OK);
+        assert!(
+            src.total_in > 0,
+            "the source must have consumed input for this test to be meaningful"
+        );
+
+        let served = stats.allocs();
+        stats.set_budget(0);
+
+        let mut dst = zeroed_stream();
+        assert_eq!(
+            unsafe { deflateCopy(&mut dst, &mut src) },
+            ReturnCode::MemError.as_c_int()
+        );
+        assert_eq!(
+            stats.allocs(),
+            served,
+            "the copy must not have been served a single region"
+        );
+        assert_eq!(stats.ooms(), 1, "exactly the first copy request is refused");
+
+        // Every application-visible field is already present in `dest`.
+        assert_eq!(dst.total_in, src.total_in);
+        assert_eq!(dst.total_out, src.total_out);
+        assert_eq!(dst.next_in, src.next_in);
+        assert_eq!(dst.avail_in, src.avail_in);
+        assert_eq!(dst.next_out, src.next_out);
+        assert_eq!(dst.avail_out, src.avail_out);
+        assert_eq!(dst.adler, src.adler);
+        assert_eq!(dst.data_type, src.data_type);
+        assert!(dst.zalloc.is_some() && dst.zfree.is_some());
+
+        // The source is mid-stream (`BUSY_STATE`) because `deflate(Z_NO_FLUSH)`
+        // left output pending, and C's `deflateEnd` reports that as
+        // `Z_DATA_ERROR` while still releasing every region:
+        // `return status == BUSY_STATE ? Z_DATA_ERROR : Z_OK;` (`deflate.c`
+        // `deflateEnd`). The teardown itself is unconditional, which the balance
+        // assertion below confirms.
+        assert_eq!(
+            unsafe { deflateEnd(&mut src) },
+            ReturnCode::DataError.as_c_int(),
+            "tearing down a stream that still has pending output is Z_DATA_ERROR"
+        );
+        assert_eq!(stats.live_bytes(), 0);
+    }
+
+    /// The caller's `zalloc` is the real home of the engine state, not merely the
+    /// payer for a same-sized reservation, and the whole schedule matches C.
+    ///
+    /// This is the C-ABI end-to-end statement of the hook-backed-ownership
+    /// requirement (AAP §0.6.5). It pins four things at once:
+    ///
+    /// * the **count** — five requests for `deflateInit2_`, exactly C's
+    ///   `ZALLOC(1, sizeof(deflate_state))` plus `window`, `prev`, `head` and the
+    ///   single overlaid `pending_buf` (`deflate.c` L440, L458-L460, L505);
+    /// * the **residency** — outstanding bytes after init equal the state's own
+    ///   footprint *plus* the working buffers, which is only possible if the state
+    ///   value itself lives in the arena. A reservation charged and then abandoned
+    ///   would show the same byte count, so the companion assertions in
+    ///   `crate::ffi::types` additionally check the buffer and state handles report
+    ///   foreign backing;
+    /// * the **release order** — `[4, 3, 2, 1, 0]`, C's reverse-of-allocation
+    ///   teardown with the state last (`deflate.c` L1300-L1306);
+    /// * the **balance** — zero outstanding bytes afterwards, so nothing leaked
+    ///   into the arena and nothing was released twice.
+    #[test]
+    fn the_caller_arena_owns_the_state_and_sees_c_s_whole_schedule() {
+        use crate::deflate::state::DeflateState;
+        use crate::ffi::alloc::test_hook::HookStats;
+
+        let stats = HookStats::new();
+        let hook = stats.hook();
+
+        let mut strm = zeroed_stream();
+        strm.zalloc = hook.zalloc();
+        strm.zfree = hook.zfree();
+        strm.opaque = hook.opaque();
+
+        assert_eq!(
+            unsafe {
+                deflateInit2_(
+                    &mut strm,
+                    6,
+                    Z_DEFLATED,
+                    15,
+                    8,
+                    Z_DEFAULT_STRATEGY,
+                    ver(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+
+        assert_eq!(
+            stats.allocs(),
+            5,
+            "C's five `ZALLOC`s, no more and no fewer"
+        );
+        assert_eq!(stats.ooms(), 0);
+        assert_eq!(stats.frees(), 0, "a successful init releases nothing");
+
+        // `windowBits = 15`, `memLevel = 8` gives `w_size = 32768` and
+        // `hash_size = 32768`, so C's four working buffers are
+        // `window` 2*32768, `prev` 2*32768, `head` 2*32768 and `pending_buf`
+        // `lit_bufsize * LIT_BUFS` = 16384 * 4 — 262144 bytes in total, a figure
+        // measured to be identical in reference C.
+        const WORKING: usize = 262_144;
+        assert_eq!(
+            stats.live_bytes(),
+            size_of::<DeflateState>() + WORKING,
+            "the arena must hold the state value itself as well as every working \
+             buffer; a hook charged only for the buffers, or charged for the state \
+             and then handed a global `Box` instead, would not add up"
+        );
+
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+        assert_eq!(
+            stats.free_order(),
+            std::vec![4, 3, 2, 1, 0],
+            "`deflateEnd` releases `pending_buf`, `head`, `prev`, `window`, state"
+        );
+        assert_eq!(stats.frees(), 5, "every region is handed back exactly once");
+        assert_eq!(stats.live_bytes(), 0, "the arena is balanced");
+    }
+
     #[test]
     fn copy_reports_mem_error_when_the_caller_arena_is_exhausted() {
         use crate::ffi::alloc::test_hook::HookStats;
@@ -2640,14 +3435,59 @@ mod tests {
             "an exhausted caller arena must surface Z_MEM_ERROR"
         );
 
-        // `dest` is untouched: no state installed, no mirrored bookkeeping.
+        // `dest` carries the mirrored `z_stream` but no state, which is precisely
+        // what reference zlib leaves behind: its `zmemcpy(dest, source,
+        // sizeof(z_stream))` runs at `deflate.c` L1333, *before* the destination
+        // `ZALLOC` at L1335, so a refused copy still publishes the source's
+        // cursors, totals, `msg`, allocator triple, `data_type` and `adler`. This
+        // was measured against a reference C zlib built from the in-tree sources,
+        // not inferred.
+        assert_eq!(
+            dst.total_in, src.total_in,
+            "C mirrors total_in before it allocates"
+        );
+        assert_eq!(
+            dst.total_out, src.total_out,
+            "C mirrors total_out before it allocates"
+        );
+        assert_eq!(
+            dst.next_in, src.next_in,
+            "C mirrors next_in before it allocates"
+        );
+        assert_eq!(
+            dst.avail_in, src.avail_in,
+            "C mirrors avail_in before it allocates"
+        );
+        assert_eq!(dst.adler, src.adler, "C mirrors adler before it allocates");
+        assert_eq!(
+            dst.data_type, src.data_type,
+            "C mirrors data_type before it allocates"
+        );
+        assert!(
+            dst.zalloc.is_some() && dst.zfree.is_some(),
+            "C mirrors the allocator triple before it allocates, so a refused copy \
+             leaves dest carrying the source's hook"
+        );
+
+        // The one field C's struct copy carries that this port deliberately does
+        // not is the opaque `state` pointer: C leaves `dest->state ==
+        // source->state` on this path. `zlib.h` L100 declares that field "not
+        // visible by applications"; C's own `deflateStateCheck` rejects the alias
+        // through `s->strm != strm` exactly as this port's owner-bound handle
+        // header does, so `deflateEnd(dest)` answers `Z_STREAM_ERROR` in both; and
+        // publishing a live pointer to a state this stream does not own would
+        // defeat that owner binding. So the alias is not reproduced, and the
+        // contract-visible outcome is asserted instead.
         assert!(
             dst.state.is_null(),
             "a failed copy must not install state into dest"
         );
-        assert_eq!(dst.total_in, 0);
-        assert_eq!(dst.total_out, 0);
-        assert!(dst.zalloc.is_none() && dst.zfree.is_none());
+        assert_eq!(
+            unsafe { deflateEnd(&mut dst) },
+            Z_STREAM_ERROR,
+            "dest holds no state it owns, so its teardown is refused — the same answer \
+             reference C gives for its aliased pointer"
+        );
 
         // The partial copy was released through the caller's `zfree`, and no
         // allocation escaped to the global allocator.
@@ -2976,5 +3816,476 @@ mod tests {
             "a complete pair must actually route the working buffers through the \
              caller's zalloc, not through the built-in"
         );
+    }
+
+    // =======================================================================
+    // Owner-bound handles (S7-02) and validation-before-borrow (S7-01)
+    // =======================================================================
+
+    /// A byte-copied `z_stream` must not be able to drive or reclaim the
+    /// original's state.
+    ///
+    /// This is C's `s->strm != strm` clause (`deflate.c` L546), and it is the
+    /// clause that makes reclaim sound. A caller who writes `z_stream copy = strm;`
+    /// holds a second 14-field struct whose `state` names the SAME handle.
+    /// Reference zlib refuses every call through the copy — measured against a
+    /// reference build from this repository's own C sources: `deflateEnd(&copy)`
+    /// returns `-2` and the subsequent `deflateEnd(&strm)` returns `0`.
+    ///
+    /// Without the owner clause the Rust port inverted that: the copy reclaimed
+    /// and freed the box, and the original was then left reading freed memory —
+    /// a genuine use-after-free reachable from safe C usage. This test pins the
+    /// fix, and asserts the *order* too: the original must still be able to
+    /// finish its work afterwards.
+    #[test]
+    fn a_byte_copied_z_stream_can_neither_drive_nor_reclaim_the_originals_state() {
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe { deflateInit_(&mut strm, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+        assert!(!strm.state.is_null());
+
+        // `z_stream copy = strm;` — a plain struct copy, exactly what C does.
+        // SAFETY: `z_stream` is a `#[repr(C)]` aggregate of `Copy` scalars and raw
+        // pointers, so a bitwise read is a valid duplicate. Nothing is dropped:
+        // `z_stream` owns nothing and has no `Drop` impl.
+        let mut copy = unsafe { core::ptr::read(&raw const strm) };
+        assert!(
+            core::ptr::eq(copy.state, strm.state),
+            "the copy must name the same handle — that is the hazard being tested"
+        );
+
+        // Every stateful entry point must refuse the copy.
+        let mut out = [0u8; 64];
+        copy.next_out = out.as_mut_ptr();
+        copy.avail_out = out.len() as c_uint;
+        assert_eq!(
+            unsafe { deflate(&mut copy, Z_FINISH) },
+            Z_STREAM_ERROR,
+            "C's deflateStateCheck rejects a stream that does not own its state"
+        );
+        assert_eq!(unsafe { deflateReset(&mut copy) }, Z_STREAM_ERROR);
+        assert_eq!(unsafe { deflateParams(&mut copy, 1, 0) }, Z_STREAM_ERROR);
+
+        // The reclaim path is the one that would otherwise free the allocation
+        // through a stream that does not own it.
+        assert_eq!(
+            unsafe { deflateEnd(&mut copy) },
+            Z_STREAM_ERROR,
+            "a wrong-owner deflateEnd must refuse, matching reference C's -2"
+        );
+        assert!(
+            !copy.state.is_null(),
+            "a refused reclaim must leave the handle installed for its real owner"
+        );
+
+        // The true owner is untouched and still fully functional.
+        let source = b"owner-bound handles keep the original stream usable";
+        let mut dest = [0u8; 256];
+        strm.next_in = source.as_ptr();
+        strm.avail_in = source.len() as c_uint;
+        strm.next_out = dest.as_mut_ptr();
+        strm.avail_out = dest.len() as c_uint;
+        assert_eq!(
+            unsafe { deflate(&mut strm, Z_FINISH) },
+            crate::error::ReturnCode::StreamEnd.as_c_int(),
+            "the owning stream must still compress normally"
+        );
+        let produced = dest.len() - strm.avail_out as usize;
+        assert_eq!(
+            unsafe { deflateEnd(&mut strm) },
+            Z_OK,
+            "the owner reclaims exactly once, matching reference C's 0"
+        );
+        assert!(strm.state.is_null());
+        assert_eq!(
+            zlib_inflate(&dest[..produced]),
+            source,
+            "the stream the copy could not touch produced a valid zlib member"
+        );
+    }
+
+    /// `deflateCopy` re-points the clone's owner at `dest`, so each stream
+    /// reclaims its own state and neither can free the other's.
+    ///
+    /// C does this explicitly: `ds->strm = dest;` (`deflate.c` L1340) immediately
+    /// after the `zmemcpy` that would otherwise have left the clone claiming the
+    /// source as its owner. Getting it wrong is not a cosmetic bug — the clone
+    /// would be unusable through `dest` and, worse, `deflateEnd(&source)` would
+    /// be the only way to free it while `source` still owns its own handle.
+    #[test]
+    fn copy_binds_the_clone_to_dest_so_each_stream_reclaims_its_own_state() {
+        let mut src = zeroed_stream();
+        assert_eq!(
+            unsafe { deflateInit_(&mut src, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+        let mut dst = zeroed_stream();
+        assert_eq!(unsafe { deflateCopy(&mut dst, &mut src) }, Z_OK);
+        assert!(!dst.state.is_null());
+        assert!(
+            !core::ptr::eq(dst.state, src.state),
+            "deflateCopy must install a distinct handle, not share the source's"
+        );
+
+        // Both streams are independently drivable, which is only true if the
+        // clone's owner really is `dst`.
+        for (label, strm) in [("clone", &mut dst), ("source", &mut src)] {
+            let source = b"each stream owns its own handle";
+            let mut out = [0u8; 256];
+            strm.next_in = source.as_ptr();
+            strm.avail_in = source.len() as c_uint;
+            strm.next_out = out.as_mut_ptr();
+            strm.avail_out = out.len() as c_uint;
+            assert_eq!(
+                unsafe { deflate(strm, Z_FINISH) },
+                crate::error::ReturnCode::StreamEnd.as_c_int(),
+                "the {label} must compress through its own owner-bound handle"
+            );
+            let produced = out.len() - strm.avail_out as usize;
+            assert_eq!(zlib_inflate(&out[..produced]), source, "{label} output");
+        }
+
+        // Each reclaims exactly once, in either order.
+        assert_eq!(unsafe { deflateEnd(&mut dst) }, Z_OK);
+        assert!(dst.state.is_null());
+        assert_eq!(
+            unsafe { deflateEnd(&mut src) },
+            Z_OK,
+            "ending the clone must not have disturbed the source's handle"
+        );
+        assert!(src.state.is_null());
+    }
+
+    /// A stateless stream is refused by every auxiliary-pointer entry point
+    /// *without* the auxiliary pointer being bridged (S7-01).
+    ///
+    /// C reaches its verdict from `deflateStateCheck(strm)` alone and never reads
+    /// the `dictionary`, `head`, `next_in` or `next_out` it was handed
+    /// (`deflate.c` L602-L603, L981-L1010). The pointers below are deliberately
+    /// non-null and deliberately not backed by the sizes claimed, so any shim that
+    /// bridged them before validating would be constructing a slice or reference
+    /// over memory it has no right to. The structural companion to this test —
+    /// `state_validation_precedes_every_auxiliary_pointer_access` — is what
+    /// detects a regression in the *order*; this one pins the observable contract.
+    #[test]
+    fn a_stateless_stream_is_refused_without_its_auxiliary_pointers_being_used() {
+        // One real byte, but every call below claims far more than one.
+        let probe = [0xA5u8; 1];
+        let probe_ptr = probe.as_ptr();
+
+        let mut strm = zeroed_stream();
+        assert!(strm.state.is_null());
+
+        assert_eq!(
+            unsafe { deflateSetDictionary(&mut strm, probe_ptr, 4096) },
+            Z_STREAM_ERROR,
+            "C validates the stream before it reads one dictionary byte"
+        );
+
+        strm.next_in = probe_ptr;
+        strm.avail_in = 4096;
+        strm.next_out = probe.as_ptr().cast_mut();
+        strm.avail_out = 4096;
+        assert_eq!(
+            unsafe { deflate(&mut strm, Z_NO_FLUSH) },
+            Z_STREAM_ERROR,
+            "C validates the stream before it bridges next_in/next_out"
+        );
+        assert_eq!(
+            unsafe { deflateEnd(&mut strm) },
+            Z_STREAM_ERROR,
+            "there is nothing to reclaim"
+        );
+
+        // `deflateCopy` from a stateless source must not touch `dest` at all.
+        let mut dst = zeroed_stream();
+        dst.total_in = 0x5EED;
+        assert_eq!(
+            unsafe { deflateCopy(&mut dst, &mut strm) },
+            Z_STREAM_ERROR,
+            "C evaluates deflateStateCheck(source) before it looks at dest"
+        );
+        assert_eq!(
+            dst.total_in, 0x5EED,
+            "a refused deflateCopy must leave dest byte-for-byte untouched"
+        );
+        assert!(dst.state.is_null());
+    }
+    // -----------------------------------------------------------------------
+    // Live borrowed gzip header (`deflateSetHeader`)
+    //
+    // C stores the caller's `gz_header` *pointer* and copies nothing
+    // (`deflate.c` L714-L719), re-reading every field lazily when the header is
+    // finally emitted (`deflate.c` L893-L907 for `deflateBound`, L1092-L1188 for
+    // the emission ladder). Anything the caller changes between registration and
+    // emission therefore lands in the compressed bytes. A shim that deep-copied
+    // the header at registration produced *different gzip bytes* for a
+    // legitimate call sequence, and could additionally fail with `Z_MEM_ERROR`
+    // on a call C documents as returning only `Z_OK`/`Z_STREAM_ERROR`
+    // (`zlib.h` L854-L855).
+    //
+    // The header is driven through a raw pointer into a leaked `Box` throughout,
+    // rather than through a Rust local: that is how a C caller reaches it, it
+    // keeps one provenance for the whole registration lifetime, and it means the
+    // post-registration mutations are genuine writes the optimizer cannot
+    // discard.
+    // -----------------------------------------------------------------------
+
+    /// Initializes `strm` **in place** for gzip framing (`windowBits = 31`).
+    ///
+    /// In place is mandatory: `deflateStateCheck` compares `s->strm` against the
+    /// stream address (`deflate.c` L540-L541), so a stream initialized in one
+    /// location and then moved is refused — by C and by this crate alike.
+    #[cfg(feature = "gzip")]
+    fn init_gzip(strm: &mut z_stream) {
+        let rc = unsafe {
+            deflateInit2_(
+                strm,
+                6,
+                Z_DEFLATED,
+                31,
+                8,
+                Z_DEFAULT_STRATEGY,
+                ver(),
+                size_of::<z_stream>() as c_int,
+            )
+        };
+        assert_eq!(rc, Z_OK, "gzip deflateInit2_ must succeed");
+    }
+
+    /// A zeroed `gz_header` on the heap, reached only through the returned raw
+    /// pointer — the shape a C caller presents.
+    #[cfg(feature = "gzip")]
+    fn raw_header() -> *mut gz_header {
+        // SAFETY: `gz_header` is a `#[repr(C)]` aggregate of raw pointers and
+        // integers, for which the all-zero bit pattern is the valid "no fields"
+        // state a C caller produces with `memset`.
+        Box::into_raw(Box::new(unsafe { core::mem::zeroed::<gz_header>() }))
+    }
+
+    /// Releases a header obtained from [`raw_header`].
+    #[cfg(feature = "gzip")]
+    fn free_header(head: *mut gz_header) {
+        // SAFETY: `head` came from `Box::into_raw` in `raw_header` and is
+        // reclaimed exactly once.
+        drop(unsafe { Box::from_raw(head) });
+    }
+
+    /// Compresses `input` to completion, returning the emitted bytes.
+    #[cfg(feature = "gzip")]
+    fn finish(strm: &mut z_stream, input: &[u8]) -> Vec<u8> {
+        let mut out = std::vec![0u8; 4096];
+        strm.next_in = input.as_ptr().cast_mut();
+        strm.avail_in = input.len() as uInt;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as uInt;
+        let rc = unsafe { deflate(strm, Z_FINISH) };
+        assert_eq!(rc, Z_STREAM_END, "the whole payload must fit");
+        let produced = out.len() - strm.avail_out as usize;
+        out.truncate(produced);
+        out
+    }
+
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn set_header_emits_the_callers_live_fields_not_a_registration_snapshot() {
+        let payload = b"live gzip header payload".repeat(4);
+
+        // Two full field sets. The first is registered; the second replaces it
+        // *after* registration but *before* the header is emitted.
+        let extra_a: [c_uchar; 4] = [1, 2, 3, 4];
+        let extra_b: [c_uchar; 6] = [9, 8, 7, 6, 5, 4];
+        let name_a = c"aaa";
+        let name_b = c"bbbbbb";
+        let comm_a = c"ccc";
+        let comm_b = c"dddddd";
+
+        let mut strm = zeroed_stream();
+        init_gzip(&mut strm);
+        let head = raw_header();
+        // SAFETY: `head` is a live, uniquely-owned `gz_header`.
+        unsafe {
+            (*head).time = 0x1111_1111;
+            (*head).os = 3;
+            (*head).extra = extra_a.as_ptr().cast_mut();
+            (*head).extra_len = extra_a.len() as uInt;
+            (*head).name = name_a.as_ptr().cast::<c_uchar>().cast_mut();
+            (*head).comment = comm_a.as_ptr().cast::<c_uchar>().cast_mut();
+        }
+
+        assert_eq!(unsafe { deflateSetHeader(&mut strm, head) }, Z_OK);
+        let bound_before = unsafe { deflateBound(&mut strm, payload.len() as uLong) };
+
+        // Mutate every field the emitter reads.
+        // SAFETY: as above; the registration holds only the pointer.
+        unsafe {
+            (*head).text = 1;
+            (*head).time = 0x2222_2222;
+            (*head).os = 7;
+            (*head).extra = extra_b.as_ptr().cast_mut();
+            (*head).extra_len = extra_b.len() as uInt;
+            (*head).name = name_b.as_ptr().cast::<c_uchar>().cast_mut();
+            (*head).comment = comm_b.as_ptr().cast::<c_uchar>().cast_mut();
+            (*head).hcrc = 1;
+        }
+
+        // `deflateBound` reads `gzhead` too (`deflate.c` L893-L907), so the
+        // larger field set must enlarge the bound: +2 extra bytes, +3 name,
+        // +3 comment, +2 for the header CRC.
+        let bound_after = unsafe { deflateBound(&mut strm, payload.len() as uLong) };
+        assert_eq!(
+            bound_after - bound_before,
+            10,
+            "deflateBound must size the live header, not the registered snapshot"
+        );
+
+        let gz = finish(&mut strm, &payload);
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+        free_header(head);
+
+        // FLG: FTEXT|FHCRC|FEXTRA|FNAME|FCOMMENT, all five from the *new* values.
+        assert_eq!(&gz[..3], &[0x1f, 0x8b, 0x08], "gzip magic and method");
+        assert_eq!(gz[3], 0x1f, "FLG must reflect the mutated text/hcrc bits");
+        assert_eq!(&gz[4..8], &[0x22, 0x22, 0x22, 0x22], "mutated MTIME");
+        assert_eq!(gz[9], 7, "mutated OS");
+        assert_eq!(&gz[10..12], &[6, 0], "XLEN of the mutated extra field");
+        assert_eq!(&gz[12..18], &extra_b, "mutated extra bytes");
+        assert_eq!(&gz[18..25], b"bbbbbb\0", "mutated NAME");
+        assert_eq!(&gz[25..32], b"dddddd\0", "mutated COMMENT");
+        // None of the registration-time values may appear anywhere.
+        assert!(
+            !gz.windows(4).any(|w| w == [0x11, 0x11, 0x11, 0x11]),
+            "no field from the registration snapshot may be emitted"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn set_header_never_reports_a_memory_error() {
+        // C's `deflateSetHeader` copies nothing and so returns only `Z_OK` or
+        // `Z_STREAM_ERROR` (`zlib.h` L854-L855). Header sizes that would dwarf
+        // any registration-time copy must therefore still succeed, repeatedly.
+        let mut big_name = std::vec![b'x'; 4096];
+        *big_name.last_mut().expect("non-empty") = 0;
+        let big_extra = std::vec![0x5au8; 8192];
+
+        let mut strm = zeroed_stream();
+        init_gzip(&mut strm);
+        let head = raw_header();
+        // SAFETY: `head` is a live, uniquely-owned `gz_header`.
+        unsafe {
+            (*head).name = big_name.as_ptr().cast_mut();
+            (*head).comment = big_name.as_ptr().cast_mut();
+            (*head).extra = big_extra.as_ptr().cast_mut();
+            (*head).extra_len = big_extra.len() as uInt;
+        }
+        for _ in 0..64 {
+            assert_eq!(
+                unsafe { deflateSetHeader(&mut strm, head) },
+                Z_OK,
+                "registration is a pointer store; it cannot run out of memory"
+            );
+        }
+        // A null header clears the registration, as C's plain assignment does.
+        assert_eq!(
+            unsafe { deflateSetHeader(&mut strm, ptr::null_mut()) },
+            Z_OK
+        );
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+
+        // `wrap != 2` is still refused, and refusing must not disturb anything.
+        let mut raw = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                deflateInit2_(
+                    &mut raw,
+                    6,
+                    Z_DEFLATED,
+                    -15,
+                    8,
+                    Z_DEFAULT_STRATEGY,
+                    ver(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        assert_eq!(
+            unsafe { deflateSetHeader(&mut raw, head) },
+            Z_STREAM_ERROR,
+            "C rejects deflateSetHeader on a non-gzip stream (deflate.c L715-L716)"
+        );
+        assert_eq!(unsafe { deflateEnd(&mut raw) }, Z_OK);
+        free_header(head);
+    }
+
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn reset_keeps_the_registered_header_exactly_as_c_does() {
+        // C clears `s->gzhead` only in `deflateInit2_` (`deflate.c` L448); no
+        // reset path touches it, so the same header is emitted again after a
+        // `deflateReset`.
+        let payload = b"reset keeps the header".repeat(3);
+        let name = c"keep";
+
+        let mut strm = zeroed_stream();
+        init_gzip(&mut strm);
+        let head = raw_header();
+        // SAFETY: `head` is a live, uniquely-owned `gz_header`.
+        unsafe {
+            (*head).time = 0x3333_3333;
+            (*head).os = 3;
+            (*head).name = name.as_ptr().cast::<c_uchar>().cast_mut();
+        }
+        assert_eq!(unsafe { deflateSetHeader(&mut strm, head) }, Z_OK);
+
+        let first = finish(&mut strm, &payload);
+        assert_eq!(unsafe { deflateReset(&mut strm) }, Z_OK);
+        let second = finish(&mut strm, &payload);
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+        free_header(head);
+
+        assert_eq!(
+            first, second,
+            "deflateReset must not drop the registered gzip header"
+        );
+        assert_eq!(&second[10..15], b"keep\0", "the name is emitted again");
+    }
+
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn copy_carries_the_registered_header_pointer_to_the_clone() {
+        // C's `zmemcpy(ds, ss, sizeof(deflate_state))` (`deflate.c` L1345) copies
+        // the `gzhead` member, so the clone reads the same caller-owned header.
+        let payload = b"copy carries the header".repeat(3);
+        let name = c"copy";
+
+        let mut src = zeroed_stream();
+        init_gzip(&mut src);
+        let head = raw_header();
+        // SAFETY: `head` is a live, uniquely-owned `gz_header`.
+        unsafe {
+            (*head).time = 0x4444_4444;
+            (*head).os = 3;
+            (*head).name = name.as_ptr().cast::<c_uchar>().cast_mut();
+        }
+        assert_eq!(unsafe { deflateSetHeader(&mut src, head) }, Z_OK);
+
+        let mut dst = zeroed_stream();
+        assert_eq!(unsafe { deflateCopy(&mut dst, &mut src) }, Z_OK);
+
+        let from_src = finish(&mut src, &payload);
+        let from_dst = finish(&mut dst, &payload);
+        assert_eq!(unsafe { deflateEnd(&mut src) }, Z_OK);
+        assert_eq!(unsafe { deflateEnd(&mut dst) }, Z_OK);
+        free_header(head);
+
+        assert_eq!(
+            from_src, from_dst,
+            "a deflateCopy clone must emit the same gzip header as its source"
+        );
+        assert_eq!(&from_dst[10..15], b"copy\0", "the clone emits the name");
     }
 }

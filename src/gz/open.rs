@@ -81,6 +81,81 @@ const O_NONBLOCK: i32 = if cfg!(any(target_os = "linux", target_os = "android"))
     0o0004
 };
 
+/// The descriptor-level flags a `gz*` mode string asks for, which the C code
+/// expresses as `oflag` bits (`gzlib.c` L134-L138 for `'e'`, L162-L167 for
+/// `'N'`) and which therefore cannot all be reproduced through
+/// [`std::fs::OpenOptions`].
+///
+/// # Why this leaves the safe layer
+///
+/// Two of C's descriptor bits have no [`OpenOptions`](std::fs::OpenOptions)
+/// spelling that reproduces C exactly:
+///
+/// * `O_CLOEXEC` — a Rust [`File`] is close-on-exec **unconditionally**, whereas
+///   C sets the bit only for `'e'`. Matching C therefore means *clearing*
+///   `FD_CLOEXEC` when `'e'` is absent, which needs `fcntl(F_SETFD)`.
+/// * `O_NONBLOCK` on an **adopted** descriptor — `gzdopen` never calls `open`,
+///   so C applies the bit with `fcntl(F_SETFL)` instead (`gzlib.c` L254-L257).
+///   (For the open-by-path branch the bit *is* expressible, and
+///   [`gz_open`] passes it through
+///   [`OpenOptionsExt::custom_flags`](std::os::unix::fs::OpenOptionsExt::custom_flags).)
+///
+/// `fcntl` is a raw `extern "C"` entry point, and this whole folder is
+/// `unsafe`-free by construction (AAP §0.8.1 D-6), so the *decision* is made here
+/// and the *syscall* is made in `src/ffi/gz.rs`, the one module allowed to hold
+/// it. This type is the contract between the two: the safe layer reports what the
+/// mode asked for, together with the platform bit values, and the boundary layer
+/// applies it.
+#[cfg(unix)]
+pub(crate) struct DescriptorRequest {
+    /// `true` when the mode contained `'e'`, i.e. C put `O_CLOEXEC` into `oflag`.
+    ///
+    /// When this is `false` the descriptor must **not** be close-on-exec, which
+    /// is the one case that needs an explicit `fcntl` because a Rust [`File`] is
+    /// close-on-exec by default (finding M6-02).
+    pub(crate) cloexec: bool,
+    /// `true` when the mode contained `'N'`, i.e. C put `O_NONBLOCK` into
+    /// `oflag` (finding M6-03).
+    pub(crate) nonblock: bool,
+}
+
+#[cfg(unix)]
+impl DescriptorRequest {
+    /// The platform `O_NONBLOCK` bit, re-exported so the boundary layer does not
+    /// have to restate a platform constant this module already owns.
+    pub(crate) const O_NONBLOCK: i32 = O_NONBLOCK;
+
+    /// `FD_CLOEXEC`, the only flag POSIX defines for `fcntl`'s `F_SETFD`, and `1`
+    /// on every POSIX implementation.
+    pub(crate) const FD_CLOEXEC: i32 = 1;
+}
+
+/// Extracts the descriptor-level flags `mode` requests, with **no validation**.
+///
+/// C accumulates `oflag` in the same byte loop that parses everything else, but
+/// independently of the grammar checks that follow it (`gzlib.c` L113-L170
+/// precede the `state->mode == GZ_NONE` rejection at L173-L177), so this scan is
+/// deliberately total: an unrecognised or non-UTF-8 byte contributes nothing, and
+/// a mode this function accepts may still be rejected by [`parse_mode`].
+///
+/// This is the single home for both flags — [`parse_mode`] derives its own
+/// `nonblock` from here rather than repeating the scan.
+#[cfg(unix)]
+pub(crate) fn descriptor_request(mode: &[u8]) -> DescriptorRequest {
+    let mut cloexec = false;
+    let mut nonblock = false;
+    for byte in mode.iter().copied() {
+        match byte {
+            // `case 'e': oflag |= O_CLOEXEC;` (gzlib.c L134-L138).
+            b'e' => cloexec = true,
+            // `case 'N': oflag |= O_NONBLOCK;` (gzlib.c L162-L167).
+            b'N' => nonblock = true,
+            _ => {}
+        }
+    }
+    DescriptorRequest { cloexec, nonblock }
+}
+
 // ===========================================================================
 // Mode-string parsing (gzlib.c L150-197) — pure, no I/O.
 // ===========================================================================
@@ -119,15 +194,33 @@ struct ParsedMode {
 /// * `'r'` / `'w'` / `'a'` — open for reading / writing / appending.
 /// * `'+'` — **rejected**: reading and writing at once is not supported.
 /// * `'b'` — ignored (the stream is always binary).
-/// * `'e'` — request close-on-exec (`O_CLOEXEC`). A Rust [`File`] is already
-///   close-on-exec by default, so this flag needs no explicit handling.
+/// * `'e'` — request close-on-exec (`O_CLOEXEC`); reported by
+///   [`descriptor_request`] and applied at the FFI boundary, where its *absence*
+///   is what needs work (see [`DescriptorRequest`]).
 /// * `'x'` — exclusive create (`O_EXCL`).
 /// * `'f'` / `'h'` / `'R'` / `'F'` — strategy filtered / Huffman-only / RLE /
 ///   fixed.
 /// * `'G'` — force gzip-only (`direct = -1`); the last `'G'`/`'T'` wins.
 /// * `'T'` — request transparent (`direct = 1`); the last `'G'`/`'T'` wins.
-/// * `'N'` — non-blocking open (`O_NONBLOCK`, unix only).
+/// * `'N'` — non-blocking open (`O_NONBLOCK`, unix only); also reported by
+///   [`descriptor_request`], because an adopted descriptor needs it applied with
+///   `fcntl` rather than at open time.
 /// * anything else — ignored, exactly as the C code does.
+///
+/// # Why the mode is bytes, not a `&str`
+///
+/// C walks the mode with `while (*mode) { ... switch (*mode) ... mode++; }`
+/// (`gzlib.c` L113-L170), i.e. **one raw byte at a time**, and its `default:` arm
+/// carries the comment "could consider as an error, but just ignore". A byte that
+/// is not one of the recognised flags therefore has no effect at all, and that
+/// includes bytes that are not valid UTF-8: `gzopen(path, "rb\xff")` opens
+/// exactly the same stream as `gzopen(path, "rb")`.
+///
+/// Taking `&str` here would make the FFI shims reject such a mode outright
+/// (`CStr::to_str` fails), turning an accepted open into `NULL` — an observable
+/// divergence with no counterpart in C. The parameter is consequently `&[u8]`,
+/// fed straight from `CStr::to_bytes()`, and the public `&str` entry points
+/// forward through `str::as_bytes`.
 ///
 /// # Errors
 ///
@@ -138,46 +231,53 @@ struct ParsedMode {
 /// * no `'r'`/`'w'`/`'a'` is present;
 /// * a transparent read is forced (`'T'` while reading); or
 /// * `'G'` is given while writing or appending.
-fn parse_mode(mode: &str) -> Result<ParsedMode, ReturnCode> {
+fn parse_mode(mode: &[u8]) -> Result<ParsedMode, ReturnCode> {
     // Defaults mirror the C initialisation (gzlib.c L150-155).
     let mut gz_mode = GzMode::None;
     let mut level = Z_DEFAULT_COMPRESSION;
     let mut strategy = Z_DEFAULT_STRATEGY;
     let mut direct = 0i32;
     let mut exclusive = false;
+    // Both descriptor-level bits live in `descriptor_request`, which C
+    // accumulates in this same loop as `oflag`; deriving `nonblock` from there
+    // keeps one home for the `'e'`/`'N'` scan instead of two.
     #[cfg(unix)]
-    let mut nonblock = false;
+    let nonblock = descriptor_request(mode).nonblock;
 
-    // Interpret the mode string (gzlib.c L156-171).
-    for ch in mode.chars() {
-        match ch {
-            c @ '0'..='9' => level = c as i32 - '0' as i32,
-            'r' => gz_mode = GzMode::Read,
-            'w' => gz_mode = GzMode::Write,
-            'a' => gz_mode = GzMode::Append,
-            // Can't read and write at the same time (gzlib.c L120).
-            '+' => return Err(ReturnCode::StreamError),
+    // Interpret the mode string one byte at a time, exactly as C's
+    // `while (*mode) { ... } mode++;` loop does (gzlib.c L113-L170).
+    for byte in mode.iter().copied() {
+        match byte {
+            // C tests `*mode >= '0' && *mode <= '9'` before the switch; the last
+            // digit in the string wins.
+            c @ b'0'..=b'9' => level = i32::from(c - b'0'),
+            b'r' => gz_mode = GzMode::Read,
+            b'w' => gz_mode = GzMode::Write,
+            b'a' => gz_mode = GzMode::Append,
+            // Can't read and write at the same time (gzlib.c L129-L131).
+            b'+' => return Err(ReturnCode::StreamError),
             // Binary is implied; nothing to do.
-            'b' => {}
-            // `O_CLOEXEC`: a Rust `File` is close-on-exec by default, so honour
-            // the request implicitly with no extra work.
-            'e' => {}
+            b'b' => {}
+            // `O_CLOEXEC` — recognised here only so the flag is documented as
+            // handled; the bit itself is reported by `descriptor_request` and
+            // applied at the FFI boundary, because matching C means *clearing*
+            // close-on-exec when `'e'` is absent (a Rust `File` sets it
+            // unconditionally). See `DescriptorRequest`.
+            b'e' => {}
             // `O_EXCL` (exclusive create).
-            'x' => exclusive = true,
-            'f' => strategy = Z_FILTERED,
-            'h' => strategy = Z_HUFFMAN_ONLY,
-            'R' => strategy = Z_RLE,
-            'F' => strategy = Z_FIXED,
-            'G' => direct = -1,
-            'T' => direct = 1,
-            // `O_NONBLOCK` (unix only); applied when the descriptor is opened.
-            'N' => {
-                #[cfg(unix)]
-                {
-                    nonblock = true;
-                }
-            }
-            // Unknown flags are ignored, exactly as the C code does.
+            b'x' => exclusive = true,
+            b'f' => strategy = Z_FILTERED,
+            b'h' => strategy = Z_HUFFMAN_ONLY,
+            b'R' => strategy = Z_RLE,
+            b'F' => strategy = Z_FIXED,
+            b'G' => direct = -1,
+            b'T' => direct = 1,
+            // `O_NONBLOCK` (unix only); reported by `descriptor_request` above
+            // and applied either as an open flag (open-by-path) or with
+            // `fcntl(F_SETFL)` (adopted descriptor).
+            b'N' => {}
+            // Unknown bytes are ignored, exactly as C's `default:` arm does -
+            // including bytes that form no valid UTF-8 character.
             _ => {}
         }
     }
@@ -237,7 +337,27 @@ fn parse_mode(mode: &str) -> Result<ParsedMode, ReturnCode> {
 /// Exactly the errors [`parse_mode`] reports: [`ReturnCode::StreamError`] when
 /// the string contains `'+'`, carries no `'r'`/`'w'`/`'a'`, forces a transparent
 /// read (`'T'` while reading), or applies `'G'` while writing or appending.
-pub(crate) fn validate_mode(mode: &str) -> Result<(), ReturnCode> {
+///
+/// # Availability
+///
+/// Compiled only where a consumer exists, which is what keeps a warnings-denied
+/// build clean on every supported target without an `#[allow(dead_code)]`:
+///
+/// * `unix` / `windows` — the sole non-test caller is the
+///   `#[cfg(any(unix, windows))]` `gzdopen` shim, for the reason given above.
+///   Adopting a raw C `int` descriptor is `from_raw_fd` on Unix and
+///   `_get_osfhandle` plus `from_raw_handle` on Windows; on any other target
+///   there is no portable `std` equivalent, so `gzdopen` returns null
+///   unconditionally and never needs to pre-validate anything.
+/// * `test` — `tests::validate_mode_agrees_with_parse_mode` pins this helper
+///   against [`parse_mode`] on *every* target, so the equivalence stays covered
+///   where the library build omits the function. Dropping `test` from this
+///   predicate would silently delete that coverage rather than fail a build.
+///   (Named in prose rather than linked: that test lives behind `#[cfg(test)]`,
+///   which `cargo doc` does not set, so an intra-doc link to it would resolve
+///   nowhere under `--document-private-items`.)
+#[cfg(any(unix, windows, test))]
+pub(crate) fn validate_mode(mode: &[u8]) -> Result<(), ReturnCode> {
     parse_mode(mode).map(|_| ())
 }
 
@@ -320,7 +440,7 @@ fn gz_reset(state: &mut GzState) {
 ///   this failure creates, truncates or claims nothing (see the allocation-order
 ///   note in the body).
 /// * The underlying open fails — [`ReturnCode::ErrNo`] (the C errno path).
-fn gz_open(path: &Path, file: Option<File>, mode: &str) -> Result<Box<GzState>, ReturnCode> {
+fn gz_open(path: &Path, file: Option<File>, mode: &[u8]) -> Result<Box<GzState>, ReturnCode> {
     // Parse and validate the mode string before touching the file system
     // (gzlib.c L150-197). An invalid mode short-circuits to an error, mirroring
     // the C "return NULL".
@@ -357,7 +477,7 @@ fn gz_open(path: &Path, file: Option<File>, mode: &str) -> Result<Box<GzState>, 
         // identity / configuration
         mode: parsed.mode,
         file: GzFile::pending(),
-        path: String::new(),
+        path: Vec::new(),
         size: 0,
         want: GZBUFSIZE,
         in_buf: Vec::new(),
@@ -391,10 +511,10 @@ fn gz_open(path: &Path, file: Option<File>, mode: &str) -> Result<Box<GzState>, 
     // 2. The path name kept for error messages (C's `malloc(len + 1)` plus the
     //    `strcpy`/`wcstombs`). C frees the state before returning `NULL` here;
     //    the `Box` does that by dropping as this function returns.
-    let Some(path_string) = try_path_string(path) else {
+    let Some(path_bytes) = try_path_bytes(path) else {
         return Err(abandon_adopted(file, ReturnCode::MemError));
     };
-    state.path = path_string;
+    state.path = path_bytes;
 
     // Open (or adopt) the underlying descriptor, mapping the C `oflag`
     // combination onto `OpenOptions` (gzlib.c L228-262).
@@ -511,55 +631,46 @@ fn abandon_adopted(file: Option<File>, code: ReturnCode) -> ReturnCode {
     code
 }
 
-/// Renders `path` for the state's error-message field, returning [`None`] if the
-/// allocation cannot be satisfied — the fallible equivalent of C's
+/// Copies `path`'s bytes for the state's error-message field, returning [`None`]
+/// if the allocation cannot be satisfied — the fallible equivalent of C's
 /// `state->path = malloc(len + 1)` plus its `NULL` check.
+///
+/// # The bytes are retained verbatim
+///
+/// C stores the path with no transformation whatsoever:
+///
+/// ```c
+/// len = strlen(path);
+/// state->path = (char *)malloc(len + 1);
+/// if (state->path == NULL) { free(state); return NULL; }
+/// snprintf(state->path, len + 1, "%s", path);
+/// ```
+///
+/// (`gzlib.c` L196-L203.) Those exact bytes are what `gzerror` hands back inside
+/// `"{path}: {message}"`, so on unix — where a path is an arbitrary byte string
+/// that need not be UTF-8 — decoding them into a Rust [`String`] would replace
+/// each maximal invalid subsequence with U+FFFD and change the bytes a C caller
+/// reads. This function therefore keeps the raw bytes
+/// ([`std::ffi::OsStr::as_encoded_bytes`], which on unix *is* the path), and the
+/// lossy decoding happens only where a Rust [`String`] is genuinely required —
+/// [`GzState::msg`](crate::gz::state::GzState), whose C mirror
+/// `msg_c` is built from these raw bytes instead (finding M6-07).
 ///
 /// # Why not `path.display().to_string()`
 ///
 /// [`std::path::Display`] is rendered through [`ToString`], which allocates
 /// infallibly and **aborts the process** if the allocation fails. C checks that
 /// `malloc` and returns `NULL`, so an abort here would replace a recoverable
-/// `gzopen` failure with process death (AAP §0.6.5).
-///
-/// # Byte-for-byte equivalence with the replaced expression
-///
-/// The output must not change, because it is what `gzerror` reports. On unix a
-/// path is an arbitrary byte string that need not be UTF-8, and
-/// `Path::display()` renders invalid sequences the same way
-/// [`String::from_utf8_lossy`] does — each maximal invalid subsequence becomes
-/// one U+FFFD REPLACEMENT CHARACTER. [`std::str::Utf8Chunks`] exposes exactly
-/// that decomposition: for every chunk, the valid prefix followed by U+FFFD if
-/// (and only if) that chunk had invalid bytes. Iterating chunks and pushing
-/// those two pieces therefore reproduces `display().to_string()` exactly, while
-/// every growth step goes through [`String::try_reserve`].
-///
-/// C's path name is the raw byte string with no transformation at all; the lossy
-/// rendering is this port's pre-existing, deliberate choice (a Rust `String` is
-/// UTF-8 by definition) and is preserved unchanged here. Only the failure
-/// behavior differs from the code this replaces.
-fn try_path_string(path: &Path) -> Option<String> {
+/// `gzopen` failure with process death (AAP §0.6.5). The single
+/// [`Vec::try_reserve_exact`] below mirrors C's one checked `malloc`.
+fn try_path_bytes(path: &Path) -> Option<Vec<u8>> {
     let raw = path.as_os_str().as_encoded_bytes();
 
-    let mut out = String::new();
-    // One reservation for the common all-valid-UTF-8 case; the loop below still
-    // reserves for anything it appends, so a short reservation here is only a
-    // performance detail, never a correctness one.
-    out.try_reserve(raw.len()).ok()?;
-
-    for chunk in raw.utf8_chunks() {
-        let valid = chunk.valid();
-        out.try_reserve(valid.len()).ok()?;
-        out.push_str(valid);
-
-        if !chunk.invalid().is_empty() {
-            // `char::REPLACEMENT_CHARACTER` is 3 bytes in UTF-8.
-            out.try_reserve(char::REPLACEMENT_CHARACTER.len_utf8())
-                .ok()?;
-            out.push(char::REPLACEMENT_CHARACTER);
-        }
-    }
-
+    let mut out = Vec::new();
+    // Exactly C's `malloc(len + 1)` minus the NUL a `Vec<u8>` does not carry;
+    // `GzState::error` reserves that byte separately for the C mirror.
+    out.try_reserve_exact(raw.len()).ok()?;
+    out.extend_from_slice(raw);
     Some(out)
 }
 
@@ -583,6 +694,24 @@ fn try_path_string(path: &Path) -> Option<String> {
 /// for an invalid mode string, or [`ReturnCode::ErrNo`] if the underlying file
 /// could not be opened.
 pub fn gzopen<P: AsRef<Path>>(path: P, mode: &str) -> Result<Box<GzState>, ReturnCode> {
+    gzopen_bytes(path, mode.as_bytes())
+}
+
+/// Byte-oriented [`gzopen`] for the C-ABI boundary.
+///
+/// C parses the mode one raw byte at a time and ignores anything it does not
+/// recognise (`gzlib.c` L113-L170), so a mode containing non-UTF-8 bytes is
+/// perfectly legal there. The FFI shim therefore hands the mode straight through
+/// as `CStr::to_bytes()` rather than through `CStr::to_str`, which would reject
+/// it. See [`parse_mode`] for the full rationale.
+///
+/// # Errors
+///
+/// Identical to [`gzopen`].
+pub(crate) fn gzopen_bytes<P: AsRef<Path>>(
+    path: P,
+    mode: &[u8],
+) -> Result<Box<GzState>, ReturnCode> {
     gz_open(path.as_ref(), None, mode)
 }
 
@@ -598,6 +727,18 @@ pub fn gzopen<P: AsRef<Path>>(path: P, mode: &str) -> Result<Box<GzState>, Retur
 /// Identical to [`gzopen`].
 pub fn gzopen64<P: AsRef<Path>>(path: P, mode: &str) -> Result<Box<GzState>, ReturnCode> {
     gzopen(path, mode)
+}
+
+/// Byte-oriented [`gzopen64`] for the C-ABI boundary; see [`gzopen_bytes`].
+///
+/// # Errors
+///
+/// Identical to [`gzopen`].
+pub(crate) fn gzopen64_bytes<P: AsRef<Path>>(
+    path: P,
+    mode: &[u8],
+) -> Result<Box<GzState>, ReturnCode> {
+    gzopen_bytes(path, mode)
 }
 
 /// Wraps an already-open [`File`] in a gz reader/writer — the idiomatic port of
@@ -616,6 +757,15 @@ pub fn gzopen64<P: AsRef<Path>>(path: P, mode: &str) -> Result<Box<GzState>, Ret
 /// ([`ReturnCode::StreamError`]); the append fix-up seek is best-effort and does
 /// not fail the call.
 pub fn gzdopen(file: File, mode: &str) -> Result<Box<GzState>, ReturnCode> {
+    gzdopen_bytes(file, mode.as_bytes())
+}
+
+/// Byte-oriented [`gzdopen`] for the C-ABI boundary; see [`gzopen_bytes`].
+///
+/// # Errors
+///
+/// Identical to [`gzdopen`].
+pub(crate) fn gzdopen_bytes(file: File, mode: &[u8]) -> Result<Box<GzState>, ReturnCode> {
     // C's `gzdopen` allocates this name itself and bails out before calling
     // `gz_open` if that allocation fails: `if (fd == -1 || (path = malloc(7 + 3 *
     // sizeof(int))) == NULL) return NULL;`. It returns `NULL` without closing the
@@ -754,17 +904,19 @@ pub fn gzbuffer(state: &mut GzState, mut size: u32) -> i32 {
 ///
 /// Returns `0` (`Z_OK`) on success, or a negative C return code on failure
 /// (mirroring zlib): [`ReturnCode::StreamError`] if the file is not a live,
-/// non-transparent writer without a serious error, or if the writer has already
-/// begun compressing and `strategy` is not a valid strategy value; or the
-/// recorded stream error if a pending seek or the pre-flush fails.
+/// non-transparent writer without a serious error; or the recorded stream error
+/// if a pending seek or the pre-flush fails.
 ///
-/// # When an out-of-range argument is reported
+/// # An out-of-range argument is recorded, never rejected here
 ///
-/// C performs **no** range validation of its own here (`gzwrite.c` L630-L663):
-/// it records `level` and `strategy` and returns `Z_OK`, leaving `deflateInit2`
-/// / `deflateParams` to reject an out-of-range value later. This port keeps that
-/// timing exactly, so the point at which a bad argument is reported depends on
-/// whether the engine already exists:
+/// C performs **no** range validation of its own (`gzwrite.c` L630-L663): it
+/// records `level` and `strategy` verbatim and returns `Z_OK`. The only
+/// validation lives inside `deflateParams`, whose return value C deliberately
+/// **discards** (`gzwrite.c` L659). An argument the engine cannot honour
+/// therefore leaves the engine on its previous parameters while the raw request
+/// is still recorded, and the caller still observes `Z_OK`. This port reproduces
+/// that exactly, so the point at which a bad argument becomes visible depends
+/// only on whether the engine already exists:
 ///
 /// * **Before any I/O** (`size == 0`, no engine yet) both arguments are recorded
 ///   and `Z_OK` is returned. The value is validated when the deferred
@@ -773,27 +925,31 @@ pub fn gzbuffer(state: &mut GzState, mut size: u32) -> i32 {
 ///   `deflateInit2` rejection (C L37-L43); the write then returns `0`, `gzerror`
 ///   reports the failure, and `gzclose_w` propagates it. Nothing is silently
 ///   substituted for the caller's value.
-/// * **After the engine is live** (`size != 0`) the change is applied
-///   immediately, so an invalid `strategy` is refused here with
-///   [`ReturnCode::StreamError`] rather than deferred. Note that C reaches
-///   `Z_OK` on this path even for an out-of-range `strategy`, because it calls
-///   `deflateParams` for its side effect and discards the return value; refusing
-///   the call keeps a value the engine cannot honour from being recorded, and
-///   keeps `gzsetparams` from reporting success for a request it did not apply.
+/// * **After the engine is live** (`size != 0`) the change is handed to
+///   [`deflate_params`](crate::deflate::deflate_params), which range-checks the
+///   level itself; an out-of-range `strategy` has no [`Strategy`]
+///   representation, so the call is simply not made. Either way the engine keeps
+///   its working parameters, the raw values are still recorded, and `Z_OK` is
+///   returned — which is what C observes from `deflateParams`' discarded
+///   `Z_STREAM_ERROR`, returned before it touches any state
+///   (`deflate.c` L783-L785).
 ///
-/// # Behavioural note (vs. C)
+/// # Where the internal `Z_BLOCK` flush lands
 ///
-/// The reference C `gzsetparams` lets `deflateParams`' internal `Z_BLOCK` flush
-/// emit into the persistent output buffer, to be written by the *next*
-/// `gz_comp`. This port's `gz_comp` instead hands each `deflate` call's output to
-/// the file immediately, retaining across calls only what the destination
-/// declined to accept
-/// ([`GzState::out_pending`](crate::gz::state::GzState)). So — when the buffers
-/// are live — this function performs the block flush itself (via
-/// `gz_comp(Z_BLOCK)`) and delivers it to the file *before* calling
-/// [`deflate_params`](crate::deflate::deflate_params). The stream is then on a
-/// block boundary with nothing pending, so `deflate_params` emits no bytes and
-/// the observable output is byte-identical to C.
+/// The pre-flush is gated on buffered input exactly as C gates it on
+/// `strm->avail_in` (`gzwrite.c` L657): with nothing buffered there is nothing
+/// to flush with the previous parameters, and issuing one anyway would deliver
+/// bytes to the destination at a point reference zlib never touches it.
+///
+/// [`deflate_params`](crate::deflate::deflate_params) may then perform its own
+/// internal `Z_BLOCK` `deflate` call. Its output is written into the *free tail*
+/// of the gzip scratch area — from the produced-bytes frontier
+/// `out_start + out_pending` — and left pending for the next `gz_comp` to
+/// deliver, which is precisely where C's persistent
+/// `strm->next_out`/`strm->avail_out` leave it. If the area happens to be full
+/// that tail is empty, and `deflate_params` reports [`ReturnCode::BufError`]
+/// without applying the change — again exactly what C's discarded
+/// `deflateParams` does.
 #[must_use]
 pub fn gzsetparams(state: &mut GzState, level: i32, strategy: i32) -> i32 {
     // Require a live, non-transparent write stream with no *serious* error (a
@@ -824,21 +980,34 @@ pub fn gzsetparams(state: &mut GzState, level: i32, strategy: i32) -> i32 {
     // Change the compression parameters for subsequent input, but only once the
     // buffers (and hence the deflate engine) have been allocated (C L654-660).
     if state.size != 0 {
-        // Flush what has been produced so far with the previous parameters and
-        // drain it to the file. See the "Behavioural note" above for why this is
-        // unconditional here rather than gated on buffered input as in C.
-        if gz_comp(state, FlushMode::Block).is_err() {
+        // Flush previous input with the previous parameters before changing them
+        // (C L656-658), gated on buffered input exactly as C gates on
+        // `strm->avail_in`. See "Where the internal `Z_BLOCK` flush lands" above.
+        if state.have != 0 && gz_comp(state, FlushMode::Block).is_err() {
             return state.err.as_c_int();
         }
 
-        // Apply the change to the engine. `strategy` must be a valid value; an
-        // invalid one is rejected (matching the C `deflateParams` validation).
-        // Because the stream is fully flushed, `deflate_params` produces no
-        // output, so its return value is discarded exactly as C discards it.
-        let Some(strat) = Strategy::from_c_int(strategy) else {
-            return ReturnCode::StreamError.as_c_int();
-        };
-        let _ = deflate::deflate_params(&mut state.strm, &[], &mut state.out_buf, level, strat);
+        // Apply the change to the engine (C L659: `deflateParams(strm, level,
+        // strategy);` — called for its side effect, with the return value
+        // discarded). An out-of-range `strategy` has no `Strategy` representation,
+        // so the call is not made at all, which is exactly what C's
+        // `deflateParams` does with it: return `Z_STREAM_ERROR` before touching
+        // any state (`deflate.c` L783-L785). The level is range-checked by
+        // `deflate_params` itself, and its return value is discarded here too.
+        if let Some(strat) = Strategy::from_c_int(strategy) {
+            // The internal `Z_BLOCK` flush writes into the free tail of the
+            // scratch area and stays pending — where C's `next_out` leaves it.
+            let frontier = state.out_start + state.out_pending;
+            let size = state.size;
+            let outcome = deflate::deflate_params(
+                &mut state.strm,
+                &[],
+                &mut state.out_buf[frontier..size],
+                level,
+                strat,
+            );
+            state.out_pending += outcome.produced;
+        }
     }
 
     // Record the new parameters (C L661-662). C stores them unvalidated, and so
@@ -1264,6 +1433,8 @@ pub(crate) fn gt_off(x: usize) -> bool {
 mod tests {
     use super::*;
 
+    use crate::gz::test_temp::{TempDir, TempFile, create_new_file};
+
     /// Builds a `GzState` in `mode` backed by a real, seekable file (the running
     /// test binary, falling back to `/dev/null`) so the positioning and query
     /// helpers can be exercised with **no `unsafe`** and no external fixture.
@@ -1283,7 +1454,7 @@ mod tests {
             pos: 0,
             mode,
             file: GzFile::new(file),
-            path: String::from("test"),
+            path: b"test".to_vec(),
             size: 0,
             want: GZBUFSIZE,
             in_buf: Vec::new(),
@@ -1314,7 +1485,7 @@ mod tests {
 
     #[test]
     fn parse_mode_read_defaults_to_auto_detect() {
-        let p = parse_mode("rb").expect("valid read mode");
+        let p = parse_mode(b"rb").expect("valid read mode");
         assert_eq!(p.mode, GzMode::Read);
         assert_eq!(p.level, Z_DEFAULT_COMPRESSION);
         assert_eq!(p.strategy, Z_DEFAULT_STRATEGY);
@@ -1325,7 +1496,7 @@ mod tests {
 
     #[test]
     fn parse_mode_write_reads_level_and_strategy() {
-        let p = parse_mode("wb9h").expect("valid write mode");
+        let p = parse_mode(b"wb9h").expect("valid write mode");
         assert_eq!(p.mode, GzMode::Write);
         assert_eq!(p.level, 9);
         assert_eq!(p.strategy, Z_HUFFMAN_ONLY);
@@ -1335,62 +1506,65 @@ mod tests {
 
     #[test]
     fn parse_mode_last_digit_wins() {
-        assert_eq!(parse_mode("wb19").expect("valid").level, 9);
-        assert_eq!(parse_mode("w5").expect("valid").level, 5);
-        assert_eq!(parse_mode("w0").expect("valid").level, 0);
+        assert_eq!(parse_mode(b"wb19").expect("valid").level, 9);
+        // A junk byte between the digits changes nothing: C's `default:` arm
+        // simply advances (`gzlib.c` L167-L169).
+        assert_eq!(parse_mode(b"wb1\xff9").expect("valid").level, 9);
+        assert_eq!(parse_mode(b"w5").expect("valid").level, 5);
+        assert_eq!(parse_mode(b"w0").expect("valid").level, 0);
     }
 
     #[test]
     fn parse_mode_all_strategy_flags() {
-        assert_eq!(parse_mode("wf").expect("valid").strategy, Z_FILTERED);
-        assert_eq!(parse_mode("wh").expect("valid").strategy, Z_HUFFMAN_ONLY);
-        assert_eq!(parse_mode("wR").expect("valid").strategy, Z_RLE);
-        assert_eq!(parse_mode("wF").expect("valid").strategy, Z_FIXED);
+        assert_eq!(parse_mode(b"wf").expect("valid").strategy, Z_FILTERED);
+        assert_eq!(parse_mode(b"wh").expect("valid").strategy, Z_HUFFMAN_ONLY);
+        assert_eq!(parse_mode(b"wR").expect("valid").strategy, Z_RLE);
+        assert_eq!(parse_mode(b"wF").expect("valid").strategy, Z_FIXED);
     }
 
     #[test]
     fn parse_mode_exclusive_flag_is_recorded() {
-        assert!(parse_mode("wx").expect("valid").exclusive);
-        assert!(!parse_mode("wb").expect("valid").exclusive);
+        assert!(parse_mode(b"wx").expect("valid").exclusive);
+        assert!(!parse_mode(b"wb").expect("valid").exclusive);
     }
 
     #[test]
     fn parse_mode_rejects_read_write_plus() {
         // '+' (simultaneous read and write) is always rejected.
-        assert_eq!(parse_mode("rb+").unwrap_err(), ReturnCode::StreamError);
-        assert_eq!(parse_mode("wb+").unwrap_err(), ReturnCode::StreamError);
+        assert_eq!(parse_mode(b"rb+").unwrap_err(), ReturnCode::StreamError);
+        assert_eq!(parse_mode(b"wb+").unwrap_err(), ReturnCode::StreamError);
     }
 
     #[test]
     fn parse_mode_rejects_forced_transparent_read() {
         // 'T' while reading cannot force a transparent read.
-        assert_eq!(parse_mode("rT").unwrap_err(), ReturnCode::StreamError);
+        assert_eq!(parse_mode(b"rT").unwrap_err(), ReturnCode::StreamError);
     }
 
     #[test]
     fn parse_mode_rejects_gzip_only_write() {
         // 'G' has no meaning when writing or appending.
-        assert_eq!(parse_mode("wG").unwrap_err(), ReturnCode::StreamError);
-        assert_eq!(parse_mode("aG").unwrap_err(), ReturnCode::StreamError);
+        assert_eq!(parse_mode(b"wG").unwrap_err(), ReturnCode::StreamError);
+        assert_eq!(parse_mode(b"aG").unwrap_err(), ReturnCode::StreamError);
     }
 
     #[test]
     fn parse_mode_requires_a_direction() {
-        assert_eq!(parse_mode("b9").unwrap_err(), ReturnCode::StreamError);
-        assert_eq!(parse_mode("").unwrap_err(), ReturnCode::StreamError);
+        assert_eq!(parse_mode(b"b9").unwrap_err(), ReturnCode::StreamError);
+        assert_eq!(parse_mode(b"").unwrap_err(), ReturnCode::StreamError);
     }
 
     #[test]
     fn parse_mode_gzip_only_read_sets_direct_negative() {
-        let p = parse_mode("rG").expect("valid");
+        let p = parse_mode(b"rG").expect("valid");
         assert_eq!(p.mode, GzMode::Read);
         assert_eq!(p.direct, -1);
     }
 
     #[test]
     fn parse_mode_transparent_write_sets_direct_one() {
-        assert_eq!(parse_mode("wT").expect("valid").direct, 1);
-        let ap = parse_mode("aT").expect("valid");
+        assert_eq!(parse_mode(b"wT").expect("valid").direct, 1);
+        let ap = parse_mode(b"aT").expect("valid");
         assert_eq!(ap.mode, GzMode::Append);
         assert_eq!(ap.direct, 1);
     }
@@ -1398,9 +1572,9 @@ mod tests {
     #[test]
     fn parse_mode_last_of_g_or_t_wins() {
         // ...G then T while reading -> ends transparent (1) -> rejected.
-        assert_eq!(parse_mode("rGT").unwrap_err(), ReturnCode::StreamError);
+        assert_eq!(parse_mode(b"rGT").unwrap_err(), ReturnCode::StreamError);
         // ...T then G while reading -> ends gzip-only (-1) -> accepted.
-        assert_eq!(parse_mode("rTG").expect("valid").direct, -1);
+        assert_eq!(parse_mode(b"rTG").expect("valid").direct, -1);
     }
 
     /// [`validate_mode`] must accept and reject exactly what [`parse_mode`] does.
@@ -1415,7 +1589,19 @@ mod tests {
         // The six strings reference zlib rejects, verified against the C
         // conformance harness: read+write, forced-transparent read, gzip-only
         // write, and three with no r/w/a at all.
-        for mode in ["r+", "rT", "wG", "b", "", "9"] {
+        for mode in [
+            &b"r+"[..],
+            b"rT",
+            b"wG",
+            b"b",
+            b"",
+            b"9",
+            // Non-UTF-8 bytes must not change the verdict: these are the same
+            // three rejections with junk bytes woven in.
+            b"r\xff+",
+            b"\x80rT",
+            b"b\xfe\xfd",
+        ] {
             assert_eq!(
                 validate_mode(mode).unwrap_err(),
                 ReturnCode::StreamError,
@@ -1429,7 +1615,23 @@ mod tests {
 
         // Representative accepted strings across both directions and both
         // transparency settings.
-        for mode in ["rb", "wb", "ab", "wb9", "rG", "wT", "rTG", "wbx", "r"] {
+        for mode in [
+            &b"rb"[..],
+            b"wb",
+            b"ab",
+            b"wb9",
+            b"rG",
+            b"wT",
+            b"rTG",
+            b"wbx",
+            b"r",
+            // C ignores every unrecognised byte (`gzlib.c` L167-L169), so each of
+            // these is accepted and behaves exactly like its clean counterpart.
+            b"rb\xff",
+            b"\xffrb",
+            b"r\x80b",
+            b"wb9\xfe",
+        ] {
             assert!(
                 validate_mode(mode).is_ok(),
                 "validate_mode must accept {mode:?}"
@@ -1780,9 +1982,14 @@ mod tests {
 
     #[test]
     fn gz_open_applies_mode_and_resets_state() {
-        let path =
-            std::env::temp_dir().join(format!("blitzy_adhoc_gzopen_{}.gz", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        // A guard-owned name inside an exclusively created private directory. The
+        // previous fixed `temp_dir()/blitzy_adhoc_gzopen_<pid>.gz` was computable by
+        // any other user on the host, and the `remove_file`-then-`gzopen("wb9")`
+        // sequence that bracketed it opened `O_CREAT | O_TRUNC` without `O_EXCL` —
+        // so a symlink planted at that name was followed and its target truncated
+        // (CWE-377/CWE-59/CWE-367). The guard also cleans up while unwinding, which
+        // the trailing `remove_file` could not.
+        let path = TempFile::new("gzopen_mode");
 
         // Write open: gzip framing, parsed level, buffers not yet allocated.
         let st = gzopen(&path, "wb9").expect("gzopen wb9");
@@ -1807,14 +2014,15 @@ mod tests {
         let st = gzopen64(&path, "ab").expect("gzopen64 ab");
         assert_eq!(st.mode, GzMode::Write);
         drop(st);
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn gzopen_rejects_an_invalid_mode() {
-        let path =
-            std::env::temp_dir().join(format!("blitzy_adhoc_badmode_{}.gz", std::process::id()));
+        // Named but never created: the assertion below is that `gzopen` leaves it
+        // that way, and a guard-owned private directory is the only way to know the
+        // name was not already occupied by someone else before the test started.
+        let path = TempFile::new("gzopen_badmode");
+        assert!(!path.exists(), "the fixture starts absent");
         // '+' is rejected before the file is touched. Use `.err()` rather than
         // `.unwrap_err()` because the success type `Box<GzState>` does not
         // implement `Debug` (it owns a `File`/`ZStream`), so `unwrap_err` — which
@@ -1825,24 +2033,19 @@ mod tests {
 
     #[test]
     fn gzdopen_uses_a_synthetic_fd_path() {
-        let path =
-            std::env::temp_dir().join(format!("blitzy_adhoc_gzdopen_{}.gz", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .expect("create temp file");
+        // `create(true).truncate(true)` follows a final-component symlink and
+        // truncates whatever it finds; `create_new` cannot, and the enclosing
+        // private directory guarantees the name was unoccupied a moment ago.
+        let path = TempFile::new("gzopen_dopen");
+        let file = create_new_file(path.path());
         let st = gzdopen(file, "wb").expect("gzdopen wb");
         assert_eq!(st.mode, GzMode::Write);
         assert!(
-            st.path.starts_with("<fd"),
+            st.path.starts_with(b"<fd"),
             "expected a synthetic <fd..> path, got {:?}",
-            st.path
+            String::from_utf8_lossy(&st.path)
         );
         drop(st);
-        let _ = std::fs::remove_file(&path);
     }
     // -----------------------------------------------------------------------
     // Allocation-failure parity for the two `gz_open` allocations
@@ -1851,15 +2054,16 @@ mod tests {
     // or truncated a file.
     // -----------------------------------------------------------------------
 
-    /// `try_path_string` replaced `path.display().to_string()`, so it must render
-    /// byte-for-byte identically — the value is what `gzerror` reports.
+    /// `try_path_bytes` retains the path **verbatim**, exactly as C's
+    /// `snprintf(state->path, len + 1, "%s", path)` does (`gzlib.c` L196-L203),
+    /// because those bytes are what `gzerror` reports (finding M6-07).
     ///
-    /// Both branches of the lossy decoder are covered: a plain UTF-8 path, and (on
-    /// unix, where a path is an arbitrary byte string) a path containing an
-    /// invalid sequence, which must collapse to exactly one U+FFFD per maximal
-    /// invalid subsequence just as `Display` does.
+    /// A UTF-8 path is trivially unchanged. The load-bearing cases are on unix,
+    /// where a path is an arbitrary byte string: the retained bytes must be the
+    /// original ones, **not** the U+FFFD-substituted rendering
+    /// `path.display().to_string()` produces.
     #[test]
-    fn try_path_string_matches_display_to_string() {
+    fn try_path_bytes_retains_the_raw_path_verbatim() {
         for p in [
             "",
             "/tmp/plain.gz",
@@ -1869,8 +2073,8 @@ mod tests {
         ] {
             let path = Path::new(p);
             assert_eq!(
-                try_path_string(path).expect("a short path always allocates"),
-                path.display().to_string(),
+                try_path_bytes(path).expect("a short path always allocates"),
+                p.as_bytes(),
                 "rendering of {p:?} must not change"
             );
         }
@@ -1880,8 +2084,9 @@ mod tests {
             use std::ffi::OsStr;
             use std::os::unix::ffi::OsStrExt;
 
-            // Each case pairs valid bytes with invalid ones so the chunk iterator
-            // has to interleave `push_str` and the replacement character.
+            // Each case pairs valid bytes with invalid ones, which is exactly
+            // where a lossy decoding would differ — it would collapse the invalid
+            // run into a three-byte U+FFFD.
             for raw in [
                 &b"/tmp/\xff.gz"[..],
                 &b"\xff"[..],
@@ -1891,13 +2096,66 @@ mod tests {
                 &b"\xf0\x9f\x98\x80\xff"[..],
             ] {
                 let path = Path::new(OsStr::from_bytes(raw));
-                assert_eq!(
-                    try_path_string(path).expect("a short path always allocates"),
-                    path.display().to_string(),
-                    "lossy rendering of {raw:?} must match Display exactly"
+                let kept = try_path_bytes(path).expect("a short path always allocates");
+                assert_eq!(kept, raw, "the raw bytes of {raw:?} must be retained");
+                assert_ne!(
+                    kept,
+                    path.display().to_string().into_bytes(),
+                    "a lossy rendering of {raw:?} would have changed the bytes"
                 );
             }
         }
+    }
+
+    /// A real `gzopen` of a path whose bytes are not valid UTF-8 retains those
+    /// bytes on the state, end to end, so the C `gzerror` message built from them
+    /// is byte-identical to reference zlib's (finding M6-07).
+    ///
+    /// Unix only: on other platforms a path is not an arbitrary byte string, so
+    /// there is nothing to lose.
+    #[cfg(unix)]
+    #[test]
+    fn gzopen_retains_a_non_utf8_path_verbatim() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        // A caller-private 0700 directory created with `create` (never
+        // `create_dir_all`), matching the discipline of the sibling tests.
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "zlib_rs_gzopen_rawpath_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(&dir)
+            .expect("exclusively create a private directory");
+
+        // `\xff` is never a valid UTF-8 byte, so this name cannot survive a
+        // round trip through a Rust `String`.
+        let mut raw = dir.as_os_str().as_encoded_bytes().to_vec();
+        raw.extend_from_slice(b"/pay\xffload.gz");
+        let path = Path::new(OsStr::from_bytes(&raw));
+
+        let st = gzopen(path, "wb").expect("wb opens a non-UTF-8 path");
+        assert_eq!(
+            st.path, raw,
+            "the state retains the caller's own path bytes"
+        );
+        assert_ne!(
+            st.path,
+            path.display().to_string().into_bytes(),
+            "a lossy rendering would have changed them"
+        );
+        drop(st);
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The `<fd:N>` name must be unchanged, and the one reservation it makes must
@@ -1989,25 +2247,13 @@ mod tests {
         // `create_dir_all`): it fails rather than adopting a name another user may
         // have planted, and on unix it is mode 0700 from the instant it exists, so
         // there is no window in which the payload below could be enumerated or
-        // replaced (CWE-377/CWE-59/CWE-367) — the same discipline the write-side
-        // tests apply.
-        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "zlib_rs_gzopen_order_{}_{}",
-            std::process::id(),
-            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder
-            .create(&dir)
-            .expect("exclusively create a private directory");
-        let path = dir.join("payload.gz");
-        std::fs::write(&path, b"PRECIOUS").expect("seed the file");
+        // replaced (CWE-377/CWE-59/CWE-367). The shared guard now supplies that
+        // discipline, and adds the part the hand-rolled version lacked: cleanup is
+        // owned by [`Drop`], so it runs when one of the assertions below unwinds
+        // rather than being skipped by the `remove_dir_all` that used to sit at the
+        // end of this function.
+        let dir = TempDir::new("gzopen_order");
+        let path = dir.write_child("payload.gz", b"PRECIOUS");
 
         // A mode with no direction is rejected before any `OpenOptions::open`.
         assert_eq!(
@@ -2029,7 +2275,5 @@ mod tests {
             std::fs::read(&path).expect("read back").is_empty(),
             "the success path must still truncate"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

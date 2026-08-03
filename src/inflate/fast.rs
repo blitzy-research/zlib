@@ -173,14 +173,6 @@ pub fn inflate_fast(
     let mut in_idx = *in_pos;
     let mut out_idx = *out_pos;
 
-    // The input index this call started from. The epilogue needs it to bound how
-    // many whole bytes it may hand back to the input: bits that were already
-    // buffered *before* this call came from bytes at or before `in_start`, and
-    // those bytes are not ours to return a second time. C omits this bound
-    // because its entry comment claims `bits < 8`, under which the bound can
-    // never bind (see the `# Entry assumptions` note above).
-    let in_start = *in_pos;
-
     // Loop bounds. `last_safe_in`: while `in_idx < last_safe_in`, at least six
     // input bytes remain. `end_safe`: while `out_idx < end_safe`, at least 258
     // output bytes remain. Both mirror the C `last`/`end` markers.
@@ -426,21 +418,35 @@ pub fn inflate_fast(
 
     // ---- epilogue: return unused whole bytes to the input (C L290-L294) ------
     // C is `len = bits >> 3; in -= len; bits -= len << 3; hold &= (1U << bits) - 1;`
-    // and relies on its (comment-only) `bits < 8` entry claim so that `in` cannot
-    // move before where it started. Because that claim is not actually enforced by
-    // the C driver — a whole buffered byte on entry is ordinary — the byte count is
-    // clamped here to the bytes this call itself pulled. Under C's stated entry
-    // condition the clamp is provably inert: fewer than eight bits are carried in,
-    // so every whole byte still sitting in `hold` at exit was pulled by this call
-    // and `bits >> 3` can never exceed `in_idx - in_start`. When the entry
-    // condition does not hold, the clamp returns exactly the bytes this call
-    // consumed and leaves the pre-existing bits in `hold` untouched, which is the
-    // same net state C would compute had it been able to address bytes it does not
-    // own. Either way `hold`/`bits` stay mutually consistent, so no decode
-    // decision — and therefore no output byte — changes.
-    let unused = ((bits >> 3) as usize).min(in_idx - in_start);
-    in_idx -= unused;
-    bits -= (unused as u32) << 3;
+    // — an unconditional rewind of a raw pointer, justified by the comment-only
+    // claim that `bits < 8` on entry. That claim is *not* enforced by the C driver:
+    // entering with whole bytes already buffered is ordinary (`inflatePrime` alone
+    // guarantees it), and C then moves `in` to before `strm->next_in`, handing back
+    // bytes that a previous call consumed. It never dereferences them, so C gets
+    // away with it.
+    //
+    // `in_idx` is an index into `input`, so "before the slice" is not expressible
+    // here. The rewind is therefore split in two:
+    //
+    // * `give` — the part that lands inside `input`. Bounded by `in_idx` (index
+    //   zero), NOT by the fast-path entry offset: every byte of `input` already
+    //   consumed by *this* `inflate` call is legitimately returnable, and bounding
+    //   by the entry offset was under-returning on exactly those bytes.
+    // * `rewound` — the remainder, which belongs to the caller's buffer *behind*
+    //   `input`. Only a caller whose buffer really extends backwards can honour it,
+    //   so it is published in `state.rewound` for the C ABI boundary to apply to
+    //   `next_in`/`avail_in`/`total_in` (see `inflate_take_input_history_rewind`).
+    //
+    // The bits for `rewound` deliberately stay in `hold` here. Dropping them would
+    // desynchronise the bitstream for any caller that cannot re-feed the bytes they
+    // came from; the boundary drops them at the same moment it moves the pointer
+    // back, so the two halves of C's `in -= len; bits -= len << 3;` pair always
+    // commit together.
+    let owed = (bits >> 3) as usize;
+    let give = owed.min(in_idx);
+    in_idx -= give;
+    bits -= (give as u32) << 3;
+    state.rewound = (owed - give) as u32;
     // `bits == 32` (a completely full accumulator) makes `1u32 << bits` overflow,
     // so the all-ones mask is produced without shifting: `checked_shl` yields
     // `None`, and `0u32.wrapping_sub(1)` is `u32::MAX`.
@@ -1014,23 +1020,33 @@ mod tests {
         }
     }
 
-    /// The epilogue must never hand back bytes this call did not pull.
+    /// The epilogue splits C's give-back into an in-slice move and a recorded
+    /// residue; it must never underflow the slice, and must never *lose* the debt.
     ///
-    /// C's byte-return step is `len = bits >> 3; in -= len;`, justified solely by
-    /// its unenforced `bits < 8` entry claim. When bits *are* carried in — which
-    /// happens across an `inflate()` call boundary, because the driver's
-    /// `inf_leave` does not normalize `bits` the way this routine's epilogue does —
-    /// the buffered bytes came from the *previous* input buffer and are not this
-    /// call's to return. This models exactly that: the accumulator is preloaded
-    /// from bytes the routine cannot address, and `in_pos` starts at 0.
+    /// C's byte-return step is `len = bits >> 3; in -= len;` (`inffast.c` L291),
+    /// justified solely by its unenforced `bits < 8` entry claim. When bits *are*
+    /// carried in — which happens across an `inflate()` call boundary, because the
+    /// driver's `inf_leave` does not normalize `bits` the way this routine's
+    /// epilogue does — C walks `strm->next_in` *behind* the buffer the caller
+    /// handed to this call, into bytes an earlier call consumed. A Rust slice index
+    /// cannot go there, so the part that fits moves `in_pos` and the remainder is
+    /// recorded in [`InflateState::rewound`] for the driver to settle against the
+    /// caller's `z_stream` (`crate::inflate::inflate_take_input_history_rewind`).
+    ///
+    /// Discarding that remainder — the obvious "clamp and move on" reading — is a
+    /// silent divergence: a C caller observes `next_in` before its own buffer,
+    /// `avail_in` *larger* than it passed in, and a `total_in` that wrapped at
+    /// 2^32. Only the pairing is what makes the split sound; the bits backing the
+    /// residue deliberately stay in `hold` so both halves of C's
+    /// `in -= len; bits -= len << 3;` still commit together.
     ///
     /// The stream is chosen so the loop pulls **nothing** (29 bits carried in cover
     /// both the literal and the end-of-block code), leaving `in_pos == 0` with a
-    /// whole byte still buffered. Unclamped, `in_pos -= 1` underflows: a
-    /// subtract-overflow panic in a debug build, and in a release build a wrapped
-    /// `usize` that the driver then indexes with.
+    /// whole byte still buffered — the exact case in which C's unclamped
+    /// `in_pos -= 1` would underflow: a subtract-overflow panic in a debug build,
+    /// and in a release build a wrapped `usize` the driver then indexes with.
     #[test]
-    fn never_returns_input_bytes_it_did_not_pull() {
+    fn give_back_never_underflows_the_slice_and_records_the_residue() {
         // One literal plus end-of-block: 3 header + 8 literal + 7 EOB = 18 bits.
         // The pad guarantees the six addressable input bytes this routine requires
         // even after four bytes have been set aside as the "previous" buffer.
@@ -1051,14 +1067,32 @@ mod tests {
         assert_eq!(out, b"Q", "the literal must be emitted");
         assert_eq!(
             in_pos, 0,
-            "no addressable input byte was pulled, so none may be returned",
+            "no addressable input byte was pulled, so none may be moved out of the \
+             slice; index zero is the floor",
         );
-        // 3 header + 8 literal + 7 end-of-block = 18 bits consumed out of the 29
-        // carried in, leaving 11 buffered — and none of the 29 came from `input`.
+        // The block header was consumed setting the state up, so this call spends
+        // 8 (literal) + 7 (end-of-block) = 15 of the 29 bits carried in, leaving
+        // 14 buffered — and none of the 29 came from `input`.
         assert_eq!(
             bits,
             29 - 15,
             "the bits still buffered must be exactly those the decode did not use",
+        );
+        // 14 buffered bits is one whole byte owed. `in_pos` could not absorb it, so
+        // the whole debt must be recorded rather than dropped: this is the
+        // assertion that distinguishes the C-faithful split from a silent clamp.
+        assert_eq!(
+            state.rewound, 1,
+            "the give-back that did not fit in the slice must be recorded for the \
+             driver to settle",
+        );
+        // The residue's bits stay in `hold` until settlement, so the pair
+        // `in -= len; bits -= len << 3;` is still applied atomically.
+        assert_eq!(
+            (bits / 8) as usize,
+            state.rewound as usize,
+            "every recorded byte must still be backed by whole bits in the \
+             accumulator",
         );
     }
 }

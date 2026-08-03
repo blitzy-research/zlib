@@ -43,7 +43,8 @@
 # `components: clippy, rustfmt`, which a dated nightly does not ship by default.
 #
 # Reproducing a CI result locally means naming the same dated channel; the date
-# lives on that install step and in its assertion, and the two move together.
+# lives on that install step and in its `expected_nightly` assertion, the two
+# move together, and `CONTRIBUTING.md` names it as well.
 
 [package]
 name = "zlib-rs-fuzz"

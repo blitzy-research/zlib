@@ -124,7 +124,9 @@ use zlib_rs::ffi::{
     inflate as ffi_inflate, inflateBack, inflateBackEnd, inflateBackInit_, inflateCopy, inflateEnd,
     inflateInit_, inflateInit2_, inflateSetDictionary, z_stream,
 };
-use zlib_rs::inflate::back::{InFunc, OutFunc, inflate_back, inflate_back_end, inflate_back_init};
+use zlib_rs::inflate::back::{
+    BackMsg, InFunc, OutFunc, inflate_back, inflate_back_end, inflate_back_init,
+};
 #[cfg(feature = "gzip")]
 use zlib_rs::inflate::inflate_get_header;
 use zlib_rs::inflate::tables::{CodeType, InflateTableError};
@@ -208,22 +210,34 @@ fn zeroed_stream() -> z_stream {
 struct OneShot<'a> {
     data: &'a [u8],
     done: bool,
+    /// The chunk made current by the most recent successful `advance`. The engine
+    /// reads straight out of `data` through this window; nothing is copied.
+    cur: &'a [u8],
 }
 
 impl<'a> OneShot<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self { data, done: false }
+        Self {
+            data,
+            done: false,
+            cur: &[],
+        }
     }
 }
 
 impl InFunc for OneShot<'_> {
-    fn next_input(&mut self) -> &[u8] {
+    fn advance(&mut self) -> bool {
         if self.done {
-            &[]
+            false
         } else {
             self.done = true;
-            self.data
+            self.cur = self.data;
+            true
         }
+    }
+
+    fn chunk(&self) -> &[u8] {
+        self.cur
     }
 }
 
@@ -468,18 +482,34 @@ fn try_stream(hex: &str, id: &str, err: i32) {
         let mut state = inflate_back_init(15).expect("inflate_back_init(15)");
         let mut src = OneShot::new(&input);
         let mut sink = SinkAccept;
-        let code = inflate_back(&mut state, &mut src, &mut sink);
-        // C: `assert(ret != Z_STREAM_ERROR)`.
-        assert_ne!(code, ReturnCode::StreamError, "{id}: back stream error");
+        let outcome = inflate_back(&mut state, &mut src, &mut sink);
+        // C: `assert(ret != Z_STREAM_ERROR)` (`infcover.c` L565).
+        assert_ne!(
+            outcome.code,
+            ReturnCode::StreamError,
+            "{id}: back stream error"
+        );
         if err != 0 {
-            // inflateBack exposes no z_stream, hence no msg to compare (C compares
-            // strm.msg only because inflateBack borrows the same z_stream; the
-            // idiomatic API returns just the code).
             assert_eq!(
-                code,
+                outcome.code,
                 ReturnCode::DataError,
                 "{id}: expected DataError (back)"
             );
+            // C `infcover.c` L567: `assert(strcmp(id, strm.msg) == 0);` — the
+            // diagnostic `inflateBack` leaves must be the very string this vector
+            // is named after, byte for byte. `BackMsg` is how the engine reports
+            // what C stores in `strm->msg`, so the official assertion applies
+            // here unchanged.
+            match outcome.msg {
+                // The literal `strcmp` C performs: the diagnostic text must equal
+                // the vector's id.
+                BackMsg::Set(m) => assert_eq!(m, id, "{id}: message (back)"),
+                other => panic!("{id}: expected a diagnostic, got {other:?}"),
+            }
+        } else {
+            // A well-formed vector must leave the diagnostic cleared, which is
+            // what C's `strm->msg = Z_NULL` at `infback.c` L214 does.
+            assert_eq!(outcome.msg, BackMsg::Cleared, "{id}: message (back, ok)");
         }
         assert_eq!(inflate_back_end(state), ReturnCode::Ok, "{id}: back end");
     }
@@ -728,10 +758,9 @@ fn cover_back() {
         let mut state = inflate_back_init(15).expect("inflate_back_init(15)");
         let mut src = OneShot::new(&[0x03, 0x00]);
         let mut sink = SinkAccept;
-        assert_eq!(
-            inflate_back(&mut state, &mut src, &mut sink),
-            ReturnCode::StreamEnd,
-        );
+        let outcome = inflate_back(&mut state, &mut src, &mut sink);
+        assert_eq!(outcome.code, ReturnCode::StreamEnd);
+        assert_eq!(outcome.msg, BackMsg::Cleared);
         assert_eq!(inflate_back_end(state), ReturnCode::Ok);
     }
 
@@ -740,10 +769,10 @@ fn cover_back() {
         let mut state = inflate_back_init(15).expect("inflate_back_init(15)");
         let mut src = OneShot::new(&[0x63, 0x00, 0x00]);
         let mut sink = SinkReject;
-        assert_eq!(
-            inflate_back(&mut state, &mut src, &mut sink),
-            ReturnCode::BufError,
-        );
+        let outcome = inflate_back(&mut state, &mut src, &mut sink);
+        assert_eq!(outcome.code, ReturnCode::BufError);
+        // C never assigns a diagnostic on the output-abort path.
+        assert_eq!(outcome.msg, BackMsg::Cleared);
         assert_eq!(inflate_back_end(state), ReturnCode::Ok);
     }
 
@@ -1581,9 +1610,14 @@ unsafe extern "C" fn cap_free(opaque: *mut c_void, address: *mut c_void) {
 ///    window — the outcome `infcover.c` pins under its tight allocation limit.
 #[test]
 fn mem_limit_forces_mem_error() {
-    // Size of the inflate state, which reference zlib and zlib-rs both reserve
-    // through the caller's `zalloc` at `inflateInit2_`.
-    const STATE_SIZE: usize = zlib_rs::inflate::InflateState::C_LAYOUT_SIZE;
+    // Bytes the inflate state reservation charges the caller's `zalloc` at
+    // `inflateInit2_`. Reference zlib passes `sizeof(struct inflate_state)`; this
+    // port passes `size_of::<InflateState>()` because the region it gets back is
+    // where the state actually lives, and this port's state is legitimately larger
+    // than C's — see `external_allocator_observes_every_deflate_request` for the
+    // full argument. Only the request *count* and the failure *timing* are fixed
+    // by AAP §0.6.5, and both still match C exactly.
+    const STATE_SIZE: usize = core::mem::size_of::<zlib_rs::inflate::InflateState>();
     // The raw 8-bit inflate window (`1 << 8`) allocated lazily by `inflate`.
     const WINDOW_8: usize = 1 << 8;
 
@@ -1754,8 +1788,9 @@ fn compress_with_dictionary(payload: &[u8], dictionary: &[u8]) -> (Vec<u8>, u32)
 /// dictionary-compressed payload that must decode byte-exactly.
 #[test]
 fn set_dictionary_window_allocation_failure_is_a_mem_error() {
-    // Reserved through the caller's `zalloc` by `inflateInit2_`.
-    const STATE_SIZE: usize = zlib_rs::inflate::InflateState::C_LAYOUT_SIZE;
+    // Reserved through the caller's `zalloc` by `inflateInit2_`, sized by this
+    // port's own state rather than C's (see `mem_limit_forces_mem_error`).
+    const STATE_SIZE: usize = core::mem::size_of::<zlib_rs::inflate::InflateState>();
     // `windowBits = 8` => the 256-byte window `updatewindow` allocates lazily.
     const WINDOW_8: usize = 1 << 8;
     // C's `inf("8 b8 0 0 0 1", "need dictionary", 0, 8, 0, Z_NEED_DICT)` fixture:
@@ -1948,7 +1983,7 @@ fn set_dictionary_window_allocation_failure_is_a_mem_error() {
         const PAYLOAD: &[u8] =
             b"the quick brown fox jumps over the lazy dog, and the lazy dog naps on";
         let (compressed, dict_id) = compress_with_dictionary(PAYLOAD, DICTIONARY);
-        let state_size = zlib_rs::inflate::InflateState::C_LAYOUT_SIZE;
+        let state_size = core::mem::size_of::<zlib_rs::inflate::InflateState>();
         // `windowBits = 15` => a 32 KiB window, requested as C's
         // `ZALLOC(strm, 1U << wbits, sizeof(unsigned char))`.
         let window_15 = 1usize << 15;
@@ -2044,7 +2079,7 @@ fn set_dictionary_window_allocation_failure_is_a_mem_error() {
 ///    nothing on the destination.
 #[test]
 fn inflate_copy_honors_the_caller_allocator_budget() {
-    const STATE_SIZE: usize = zlib_rs::inflate::InflateState::C_LAYOUT_SIZE;
+    const STATE_SIZE: usize = core::mem::size_of::<zlib_rs::inflate::InflateState>();
 
     /// Initializes `strm` as a raw 8-bit-window inflate stream on `cap`.
     ///
@@ -2278,12 +2313,23 @@ fn external_allocator_observes_every_deflate_request() {
 
     // C charges the state object first and checks it immediately
     // (`deflate.c` L440-L442), so the very first request an external allocator
-    // sees is the `(1, sizeof(deflate_state))` pair.
+    // sees is the one-item engine-state pair.
+    //
+    // The `size` argument is `size_of::<DeflateState>()` rather than C's
+    // `sizeof(deflate_state)` (`DeflateState::C_LAYOUT_SIZE`, 5968 on LP64)
+    // because the region this request secures *is* where the state lives
+    // (AAP §0.6.3 has-hook clause), and this port's state is legitimately larger
+    // than C's — a block of C's `sizeof` could not hold it, so holding the state
+    // in the caller's memory and advertising C's byte count are mutually
+    // exclusive. AAP §0.6.5 fixes the allocation **count** and the **failure
+    // timing**, both of which still match; no zlib contract lets a caller assert
+    // a particular `size` argument, and C's own value moves with `LIT_MEM` and
+    // pointer width.
     assert_eq!(
         requests.first().copied(),
-        Some((1, DeflateState::C_LAYOUT_SIZE)),
+        Some((1, core::mem::size_of::<DeflateState>())),
         "the engine-state footprint must be the first request, as in C, and it must \
-         carry C's own `sizeof(deflate_state)` rather than this Rust type's size"
+         be the one-item region the state itself occupies"
     );
 
     // The doubled sliding window, the `prev` chain, and the `head` hash table
@@ -2311,7 +2357,7 @@ fn external_allocator_observes_every_deflate_request() {
     assert_eq!(
         requests,
         vec![
-            (1, DeflateState::C_LAYOUT_SIZE),
+            (1, core::mem::size_of::<DeflateState>()),
             (w_size, 2),
             (w_size, 2),
             (hash_size, 2),
@@ -2328,8 +2374,11 @@ fn external_allocator_observes_every_deflate_request() {
         .iter()
         .map(|(items, size)| items * size)
         .sum::<usize>();
-    let minimum =
-        DeflateState::C_LAYOUT_SIZE + 2 * w_size + 2 * w_size + 2 * hash_size + 4 * lit_bufsize;
+    let minimum = core::mem::size_of::<DeflateState>()
+        + 2 * w_size
+        + 2 * w_size
+        + 2 * hash_size
+        + 4 * lit_bufsize;
     assert!(
         charged >= minimum,
         "the allocator was charged {charged} bytes but the deflate footprint is at least {minimum}"
@@ -2343,7 +2392,7 @@ fn external_allocator_observes_every_deflate_request() {
 /// working buffer (`deflate.c` L440-L442).
 #[test]
 fn external_allocator_refusal_fails_deflate_init() {
-    let state_size = DeflateState::C_LAYOUT_SIZE;
+    let state_size = core::mem::size_of::<DeflateState>();
     let alloc = ExternalAllocator::with_budget(state_size - 1);
     let mut strm = ZStream::with_allocator(alloc);
 
@@ -2373,7 +2422,7 @@ fn external_allocator_refusal_fails_deflate_init() {
 /// the two makes init succeed and the first `inflate` fail.
 #[test]
 fn external_allocator_refusal_fails_inflate_init_then_window() {
-    let state_size = zlib_rs::inflate::InflateState::C_LAYOUT_SIZE;
+    let state_size = core::mem::size_of::<zlib_rs::inflate::InflateState>();
     // The raw 8-bit window (`1 << 8`) `inflate` grows on first use.
     let window_8 = 1usize << 8;
     // A minimal raw-DEFLATE fragment that drives the engine to grow its window
@@ -3135,7 +3184,7 @@ fn need_dict_leaves_the_running_byte_totals_behind() {
 /// here — or that discarded the delivered bytes — would diverge observably.
 #[test]
 fn window_allocation_failure_keeps_the_bytes_but_not_the_totals() {
-    const STATE_SIZE: usize = zlib_rs::inflate::InflateState::C_LAYOUT_SIZE;
+    const STATE_SIZE: usize = core::mem::size_of::<zlib_rs::inflate::InflateState>();
     // `windowBits = -9` => a 512-byte raw window, allocated lazily by `inflate`.
     const WINDOW_9: usize = 1 << 9;
 

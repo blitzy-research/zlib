@@ -1429,6 +1429,147 @@ mod tests {
         );
     }
 
+    /// Every `deflate*`/`inflate*` shim validates the stream **before** it
+    /// touches any auxiliary caller pointer.
+    ///
+    /// Reference zlib establishes this order for every entry point that takes
+    /// something alongside the stream: `deflateStateCheck(strm) || dictionary ==
+    /// Z_NULL` is a single expression (`deflate.c` L602-L603), `inflateSync`
+    /// opens with `inflateStateCheck` before it reaches `strm->next_in`
+    /// (`inflate.c` L1349-L1351), `inflateGetHeader` writes `head->done` only
+    /// after both of its guards pass (`inflate.c` L1219-L1230), and
+    /// `deflate`/`inflate` put the state clause first in their entry test
+    /// (`deflate.c` L981-L1010, `inflate.c` L474).
+    ///
+    /// In C, getting that order wrong reads a stale pointer. In Rust it is worse:
+    /// `slice::from_raw_parts` over a stale pointer, or `&*head` on a dangling
+    /// header, is undefined behavior *at the moment the reference is created*,
+    /// even if it is never read and even though the shim is about to return
+    /// `Z_STREAM_ERROR`. A behavioral test cannot catch that — the wrong order
+    /// still returns the right code — so the ordering is asserted structurally,
+    /// here, the same way the crate asserts its layer graph.
+    ///
+    /// Both files are scanned per exported shim. A shim that mentions any
+    /// auxiliary-access marker must mention a state-validation marker *earlier* in
+    /// its body. Comments are stripped first, so the prose above cannot satisfy
+    /// its own assertion.
+    #[test]
+    fn state_validation_precedes_every_auxiliary_pointer_access() {
+        /// Markers for "the installed engine state has now been validated".
+        ///
+        /// Every one of these runs the whole of the relevant C predicate and
+        /// borrows nothing outside the `z_stream` and its own handle.
+        const VALIDATED: [&str; 9] = [
+            "deflate_state_check(",
+            "deflate_state(",
+            "deflate_take(",
+            "inflate_state_check(",
+            "inflate_handle(",
+            "inflate_take(",
+            "inflate_back_state_check(",
+            "inflate_back_handle(",
+            "inflate_back_take(",
+        ];
+
+        /// Markers for "a pointer that is not the `z_stream` itself is now being
+        /// turned into a reference, a slice, or written through".
+        const AUXILIARY: [&str; 13] = [
+            "slice::from_raw_parts",
+            "input_slice(",
+            "output_slice(",
+            "&*head",
+            "&mut *head",
+            "&*dest",
+            "&mut *dest",
+            "&*source",
+            "&mut *source",
+            "unsafe { *bits",
+            "unsafe { *pending",
+            "unsafe { *dict_length",
+            "unsafe { *value",
+        ];
+
+        let mut inspected = 0usize;
+        let mut with_auxiliary = 0usize;
+        let mut violations: std::vec::Vec<std::string::String> = std::vec::Vec::new();
+
+        for relative in ["src/ffi/deflate.rs", "src/ffi/inflate.rs"] {
+            let source = strip_line_comments(&repo_file(relative));
+            // Split on the exported-shim boundary. Everything before the first
+            // `pub unsafe extern "C" fn` is module-level helper code, which is
+            // covered by the shims that call it.
+            let marker = "pub unsafe extern \"C\" fn ";
+            let mut starts: std::vec::Vec<usize> = std::vec::Vec::new();
+            let mut from = 0usize;
+            while let Some(rel) = source[from..].find(marker) {
+                let at = from + rel;
+                // Column 0 only: a nested or indented occurrence is not a shim.
+                if at == 0 || source.as_bytes()[at - 1] == b'\n' {
+                    starts.push(at);
+                }
+                from = at + marker.len();
+            }
+            assert!(
+                starts.len() >= 15,
+                "{relative}: expected at least 15 exported shims, found {}",
+                starts.len()
+            );
+
+            for (i, &start) in starts.iter().enumerate() {
+                let end = starts.get(i + 1).copied().unwrap_or(source.len());
+                let body = &source[start..end];
+                let name: std::string::String = body[marker.len()..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                inspected += 1;
+
+                let earliest_aux = AUXILIARY.iter().filter_map(|m| body.find(m)).min();
+                let Some(aux_at) = earliest_aux else {
+                    continue;
+                };
+                with_auxiliary += 1;
+
+                let earliest_check = VALIDATED.iter().filter_map(|m| body.find(m)).min();
+                match earliest_check {
+                    Some(check_at) if check_at < aux_at => {}
+                    _ => {
+                        let offender = AUXILIARY
+                            .iter()
+                            .find(|m| body.find(*m) == Some(aux_at))
+                            .copied()
+                            .unwrap_or("<unknown>");
+                        violations.push(std::format!(
+                            "{relative}: `{name}` reaches `{offender}` before any \
+                             state validation"
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Anti-vacuity: the scan must actually have seen the shims and must
+        // actually have classified a substantial number of them as taking an
+        // auxiliary pointer. A refactor that renamed the markers out from under
+        // this test would otherwise pass by finding nothing.
+        assert!(
+            inspected >= 35,
+            "expected at least 35 exported deflate/inflate shims, inspected {inspected}"
+        );
+        assert!(
+            with_auxiliary >= 12,
+            "expected at least 12 shims to take an auxiliary pointer, found \
+             {with_auxiliary} — the AUXILIARY markers have probably drifted"
+        );
+        assert!(
+            violations.is_empty(),
+            "state validation must precede every auxiliary pointer access \
+             (AAP §0.6.2; C: deflate.c L538-L556, inflate.c L88-L97, infback.c \
+             L208-L219):\n{}",
+            violations.join("\n")
+        );
+    }
+
     /// Every exported C symbol resolves to a live, distinct code address **in
     /// the configuration under test**.
     ///

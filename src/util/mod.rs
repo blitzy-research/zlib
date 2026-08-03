@@ -224,19 +224,16 @@ const _: () = assert!(
 // namespace) coexist without conflict.
 // ---------------------------------------------------------------------------
 
-/// One-call compression entry points: `compress` and `compress2`, plus the
-/// output-bound helper `compress_bound` and its C-parity alias `compressBound`.
-pub use compress::{compress, compress_bound, compress2, compressBound};
-
-// Crate-internal only: the tracked variant of `compress2` that also reports the
-// produced byte count on the error paths, as C `compress2_z` does
-// (`compress.c` L63). The C-ABI shims in `src/ffi/util.rs` need it to publish a
-// partial `*destLen`; it is deliberately not part of the public Rust surface,
-// whose `compress2` already carries the count in its `Ok` arm.
-pub(crate) use compress::compress2_tracked;
-
-/// One-call decompression entry points: `uncompress` and `uncompress2`.
-pub use uncompress::{uncompress, uncompress2};
+/// The output-bound helper `compress_bound` and its C-parity alias
+/// `compressBound` — the engine-free half of `compress.c`.
+///
+/// The engine-driving entry points `compress` / `compress2` are **not**
+/// re-exported here. They live one layer up in [`crate::deflate`] (and
+/// `uncompress` / `uncompress2` in [`crate::inflate`]) because driving an engine
+/// from layer 3 would be an upward import (AAP §0.3.1, §0.4.2 B2); the crate root
+/// re-exports all six under their `zlib.h` names, so `zlib_rs::compress` and
+/// friends are unaffected.
+pub use compress::{compress_bound, compressBound};
 
 /// Version, compile-flag, and error-string reporting entry points, each paired
 /// with its camelCase C-parity alias (`zlibVersion`, `zlibCompileFlags`,
@@ -275,27 +272,6 @@ mod tests {
         assert_eq!(MAX_MATCH - MIN_MATCH, 255);
     }
 
-    /// The differently-typed aliases the engines keep for arithmetic locality
-    /// still agree with the canonical values above.
-    ///
-    /// Without this guard the two sets could drift silently: nothing in the
-    /// compiler relates `crate::deflate::trees::STORED_BLOCK` (an `i32`, needed
-    /// by `send_bits`) or `crate::deflate::state::MIN_MATCH` (a `usize`, needed
-    /// for window indexing) to the `u8`/`usize` values published here.
-    #[test]
-    fn engine_aliases_agree_with_the_canonical_values() {
-        use crate::deflate::state::{MAX_MATCH as ST_MAX, MIN_MATCH as ST_MIN};
-        use crate::deflate::trees::{
-            DYN_TREES as TR_DYN, STATIC_TREES as TR_STATIC, STORED_BLOCK as TR_STORED,
-        };
-
-        assert_eq!(TR_STORED, i32::from(STORED_BLOCK), "trees::STORED_BLOCK");
-        assert_eq!(TR_STATIC, i32::from(STATIC_TREES), "trees::STATIC_TREES");
-        assert_eq!(TR_DYN, i32::from(DYN_TREES), "trees::DYN_TREES");
-        assert_eq!(ST_MIN, MIN_MATCH, "state::MIN_MATCH");
-        assert_eq!(ST_MAX, MAX_MATCH, "state::MAX_MATCH");
-    }
-
     /// The expected gzip OS byte for the target this test is compiled for,
     /// derived from the same `cfg` predicates `OS_CODE` itself uses.
     ///
@@ -332,80 +308,5 @@ mod tests {
             [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13, 16, 18, 19].contains(&OS_CODE),
             "OS_CODE {OS_CODE} is not one of the codes zutil.h defines"
         );
-    }
-
-    /// The gzip header this crate emits carries the canonical [`OS_CODE`] — the
-    /// one platform-selected definition — at RFC 1952 offset 9.
-    ///
-    /// This is the assertion that catches the defect the test exists for: if
-    /// `crate::deflate` were to hard-code an `OS_CODE = 3` of its own, then on
-    /// Windows or Apple it would emit `3` where reference zlib emits `10` or
-    /// `19` — diverging from byte-identity on those targets while every
-    /// Linux-only gate stayed green.
-    #[cfg(feature = "gzip")]
-    #[test]
-    fn gzip_header_emits_the_canonical_os_code() {
-        use crate::constants::{Strategy, Z_DEFLATED, Z_FINISH};
-        use crate::error::ReturnCode;
-        use crate::stream::ZStream;
-
-        const DATA: &[u8] = b"gzip header operating-system byte";
-
-        let mut strm: ZStream = ZStream::new();
-        // windowBits 31 == 15 + 16: gzip framing.
-        crate::deflate::deflate_init2(&mut strm, 6, Z_DEFLATED, 31, 8, Strategy::Default)
-            .expect("init");
-        let mut out = alloc::vec![0u8; DATA.len() * 2 + 128];
-        let r = crate::deflate::deflate(&mut strm, DATA, &mut out, Z_FINISH);
-        assert_eq!(r.code, ReturnCode::StreamEnd);
-        out.truncate(r.produced);
-        crate::deflate::deflate_end(&mut strm).expect("end");
-
-        // RFC 1952 §2.3: ID1 ID2 CM FLG MTIME[4] XFL OS -> OS is byte 9.
-        assert!(out.len() > 9, "a gzip member has at least a 10-byte header");
-        assert_eq!(out[0], 0x1f, "ID1");
-        assert_eq!(out[1], 0x8b, "ID2");
-        assert_eq!(out[2], 8, "CM == Z_DEFLATED");
-        assert_eq!(
-            out[9], OS_CODE,
-            "the emitted OS byte must be the single canonical OS_CODE"
-        );
-        assert_eq!(
-            out[9], EXPECTED_OS_CODE,
-            "and it must be the platform value"
-        );
-    }
-
-    /// A caller-supplied [`GzHeader`](crate::gz_header::GzHeader) overrides the
-    /// OS byte, exactly as C writes `s->gzhead->os & 0xff` (`deflate.c` L1105)
-    /// instead of `OS_CODE` (L1081) when a header is installed. The override path
-    /// must therefore *not* be rewired to the canonical constant.
-    #[cfg(feature = "gzip")]
-    #[test]
-    fn supplied_header_overrides_the_os_code() {
-        use crate::constants::{Strategy, Z_DEFLATED, Z_FINISH};
-        use crate::error::ReturnCode;
-        use crate::gz_header::GzHeader;
-        use crate::stream::ZStream;
-
-        const DATA: &[u8] = b"explicit gzip header";
-        const CUSTOM_OS: u8 = 7; // old Mac OS, zutil.h L149
-
-        let mut strm: ZStream = ZStream::new();
-        crate::deflate::deflate_init2(&mut strm, 6, Z_DEFLATED, 31, 8, Strategy::Default)
-            .expect("init");
-        let head = GzHeader {
-            os: i32::from(CUSTOM_OS),
-            ..GzHeader::default()
-        };
-        crate::deflate::deflate_set_header(&mut strm, Some(head)).expect("set header");
-
-        let mut out = alloc::vec![0u8; DATA.len() * 2 + 128];
-        let r = crate::deflate::deflate(&mut strm, DATA, &mut out, Z_FINISH);
-        assert_eq!(r.code, ReturnCode::StreamEnd);
-        out.truncate(r.produced);
-        crate::deflate::deflate_end(&mut strm).expect("end");
-
-        assert_eq!(out[9], CUSTOM_OS, "a supplied header wins over OS_CODE");
     }
 }

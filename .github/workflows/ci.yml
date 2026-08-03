@@ -174,9 +174,12 @@
 # That pin is a rustup DIRECTORY-FILE override at precedence rank 4, and it
 # outranks `rustup default` at rank 5 - which is exactly what
 # `dtolnay/rust-toolchain` sets. The action runs
-# `rustup toolchain install <ref> --profile minimal --no-self-update` followed by
-# `rustup default <ref>`; it does NOT export `RUSTUP_TOOLCHAIN`. So INSTALLING a
-# toolchain is not the same as SELECTING it: installing `@stable` leaves a bare
+# `rustup toolchain install <channel> --profile minimal --no-self-update` followed
+# by `rustup default <channel>`, where `<channel>` comes from the explicit
+# `toolchain:` input every call site here passes - the action's own ref is a
+# pinned SHA, so that input is the only thing naming a channel. It does NOT export
+# `RUSTUP_TOOLCHAIN`. So INSTALLING a toolchain is not the same as SELECTING it:
+# installing `stable` leaves a bare
 # `cargo build` in this repository resolving to 1.85.0. Measured locally, from
 # this repository root:
 #
@@ -215,7 +218,7 @@
 # Prefixing them would make the assertion vacuous. Do NOT "simplify" this by
 # deleting the pin from `rust-toolchain.toml` - that reopens the local/CI
 # asymmetry the pin exists to close. The rationale is recorded once more, in the
-# "VERSION RESOLUTION" section of `rust-toolchain.toml`.
+# "THIS FILE IS NOT A STRAITJACKET" section of `rust-toolchain.toml`.
 #
 # ASCII PUNCTUATION - THIS FILE CONTAINS NO NON-ASCII BYTE
 # =======================================================
@@ -316,19 +319,21 @@ jobs:
         #
         # THE FLOORS ARE NOT ALL EXACT, ON PURPOSE. The five ubuntu rows carry
         # their exact measured totals, because they are reproducible on the
-        # development host: 860 for the three rows whose feature set includes
-        # `gz-io` (default, `gzip + gz-io`, and `simd` - `simd` changes which CRC
-        # backend runs, not how many tests exist), 873 with every feature on
-        # (`--all-features` adds the 13 `c-oracle` tests), and 0 for the
-        # build-only row that runs no test step.
+        # development host: the two rows whose feature set includes `gz-io`
+        # (`Default features` and `gzip + gz-io`) share one total; `All features`
+        # is that total plus the 13 `c-oracle` tests; `std + simd` is LOWER than
+        # either, because that row deliberately runs with `gzip`/`gz-io` off (see
+        # the row's own note) so `tests/gzip_compat.rs` and the gzip-gated unit
+        # tests are absent; and the build-only row carries 0 because it runs no
+        # test step at all.
         #
-        # The two native rows carry a deliberately conservative 845 - fifteen
+        # The two native rows carry a deliberately conservative 941 - fifteen
         # below the Linux total, the same margin they have always carried,
         # because their totals differ from the Linux total by
         # platform-conditional tests (`#[cfg(unix)]` drops three,
         # `#[cfg(windows)]` adds the `gzopen_w` round trip plus its guards) and
         # CANNOT be measured from a Linux host, so an exact floor there would be
-        # a guess that breaks the build. 845 still catches the failure this gate
+        # a guess that breaks the build. 941 still catches the failure this gate
         # exists for: a whole target or suite disappearing. Raise any floor when
         # the suite grows; never lower one to make a red row green.
         include:
@@ -339,7 +344,7 @@ jobs:
             arch: X64
             features: ''
             test: true
-            min_tests: 860
+            min_tests: 956
           # Every feature turned on at once.
           - name: All features
             os: ubuntu-latest
@@ -347,7 +352,7 @@ jobs:
             arch: X64
             features: '--all-features'
             test: true
-            min_tests: 873
+            min_tests: 969
           # gzip framing + gz file-I/O layer on top of std.
           - name: gzip + gz-io
             os: ubuntu-latest
@@ -355,18 +360,36 @@ jobs:
             arch: X64
             features: '--no-default-features --features std,gzip,gz-io'
             test: true
-            min_tests: 860
-          # simd-enabled CRC-32 configuration (pulls in crc32fast). Whether
-          # `crc32fast`'s accelerated code is actually selected is a target/CPU
-          # question that `crc32_backend()` reports; this row exercises the
-          # feature wiring, not a guaranteed speed-up.
-          - name: simd
+            min_tests: 956
+          # simd-enabled CRC-32 on top of std, with the gzip framing and gz
+          # file-I/O layers OFF. That combination is what makes this row distinct
+          # rather than a second copy of another one: `Default features` already
+          # resolves to std + gzip + gz-io + simd, so a row selecting the same four
+          # features by name would repeat this job's debug build, release build and
+          # both test runs while covering nothing new (finding PERF-03). Dropping
+          # `gzip`/`gz-io` here is the only place the suite runs with `crc32fast`
+          # compiled in and no gzip consumer of CRC-32 present, which is what pins
+          # `simd` as independent of `gzip` - the checksum surface
+          # (`crc32`/`crc32_z`/`crc32_combine` and their FFI exports) is
+          # always-present, unlike the gzip framing that normally drives it.
+          # `c-abi-linkage`'s `std-off + simd` row is a different claim again: it has
+          # no `std`, so `crc32fast` gets a compile-time feature test instead of the
+          # run-time probe this row exercises, and that job only links a C consumer
+          # rather than running the suite. Whether `crc32fast`'s accelerated code is
+          # actually selected remains a target/CPU question that `crc32_backend()`
+          # reports; this row exercises the feature wiring, not a guaranteed
+          # speed-up.
+          - name: std + simd
             os: ubuntu-latest
             host: x86_64-unknown-linux-gnu
             arch: X64
-            features: '--no-default-features --features std,gzip,gz-io,simd'
+            features: '--no-default-features --features std,simd'
             test: true
-            min_tests: 860
+            # Measured on this feature row specifically, and well below the other
+            # ubuntu rows because `gz-io` is off: `tests/gzip_compat.rs`
+            # contributes nothing and the `cfg(feature = "gzip")` /
+            # `cfg(feature = "gz-io")` unit tests do not exist.
+            min_tests: 703
           # Core-only (no_std) LIBRARY build. `test: false` is what makes this row
           # distinct rather than redundant: `mod no_std_support` in `src/lib.rs` is
           # gated on `all(not(feature = "std"), not(test), panic = "abort")`, so a
@@ -428,7 +451,7 @@ jobs:
             arch: X64
             features: ''
             test: true
-            min_tests: 845
+            min_tests: 941
           # Native macOS: builds for the runner's own triple and, unlike a cross
           # row, EXECUTES the suite. This row PINS both that triple
           # (`aarch64-apple-darwin`) and the architecture GitHub reports
@@ -449,12 +472,49 @@ jobs:
             arch: ARM64
             features: ''
             test: true
-            min_tests: 845
+            min_tests: 941
     steps:
     - name: Checkout repository
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
+    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
+    # commit, and a log that does not name that commit is unattributable evidence:
+    # it cannot be told apart from a run against a different tree, a different
+    # clone, or artifacts that predate the commit under review. That is not
+    # hypothetical - a checkpoint review found the retained runtime logs for this
+    # project pointing at another clone, which left the commit actually under
+    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
+    # (finding M8-01). Naming the commit FIRST is what makes every line that
+    # follows self-describing.
+    #
+    # THREE WITNESSES, deliberately, because they can disagree and each
+    # disagreement means something different. `github.sha` is what the EVENT
+    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
+    # hash is what the FILES actually contain. Only the tree hash moves if a later
+    # step edits the working tree, and only the first two can reveal a checkout
+    # that resolved somewhere else entirely.
+    #
+    # The assertion accepts the pull-request head sha as well as `github.sha`,
+    # because on a `pull_request` event the two legitimately differ: `github.sha`
+    # names the ephemeral merge commit, so a checkout configured for the branch
+    # tip would land on the head sha instead. Both are attributable. A third
+    # value is not, and is what fails the job.
+    - name: Record the commit under test
+      run: |
+        set -euo pipefail
+        head="$(git rev-parse HEAD)"
+        echo "event sha : ${{ github.sha }}"
+        echo "head sha  : $head"
+        echo "tree hash : $(git rev-parse 'HEAD^{tree}')"
+        echo "ref       : ${{ github.ref }}"
+        echo "job       : ${{ github.workflow }} / ${{ github.job }}"
+        case "$head" in
+          "${{ github.sha }}"|"${{ github.event.pull_request.head.sha }}") ;;
+          *) echo "::error::checked-out HEAD $head is neither the event sha nor the"\
+             " pull-request head sha, so this job's verdict would describe a commit"\
+             " nobody asked about."; exit 1 ;;
+        esac
     - name: Install Rust stable toolchain
       uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, 2026-07-16
       with:
@@ -523,6 +583,33 @@ jobs:
       run: cargo +stable build --locked --verbose ${{ matrix.features }}
     - name: Build (release)
       run: cargo +stable build --locked --release --verbose ${{ matrix.features }}
+    # WARNINGS ARE DENIED ON THE NON-LINUX ROWS, WHERE NOTHING ELSE DENIED THEM.
+    #
+    # `cargo build` above prints a warning and exits 0, and the `lint` job - the
+    # only other place `-D warnings` appears - runs on `ubuntu-latest` alone. So
+    # every diagnostic reachable only under a non-Linux `cfg` was advisory: the
+    # Windows row really did carry three of them (two unused `pub(crate) use`
+    # re-exports in `src/gz/mod.rs` and a `validate_mode` dead on that target,
+    # since `gzdopen` adopts a raw `int` descriptor only on Unix) and the row
+    # still went green.
+    #
+    # `if: runner.os != 'Linux'` is a division of labour, not a carve-out: on
+    # Linux this exact gate already runs in `lint`, with `--all-features`, so
+    # repeating it here would only lengthen every Linux row. What is NOT repeated
+    # anywhere is this row's own feature selection on this row's own OS, which is
+    # why the step passes `${{ matrix.features }}` rather than `--all-features` -
+    # the wider Windows surface is covered from Linux by `cross-targets`, which
+    # cross-lints `x86_64-pc-windows-msvc` with every feature on. The two lanes
+    # are deliberately different: this one is native and narrow, that one is
+    # cross and wide, and a regression has to evade both.
+    #
+    # `--all-targets` is required for the same reason it is in `lint`: without it
+    # the test and bench units are never linted, and a `cfg`-divergent cast or an
+    # unused platform import in a test module is exactly the kind of thing that
+    # only a non-host target sees.
+    - name: Clippy (warnings denied, native non-Linux row)
+      if: ${{ runner.os != 'Linux' }}
+      run: cargo +stable clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
     # THE TEST COUNT IS ASSERTED, NOT ASSUMED (finding TEST-08).
     #
     # `cargo test` exits 0 when tests are silently LOST. A `#[cfg]` predicate that
@@ -546,7 +633,8 @@ jobs:
       if: ${{ matrix.test }}
       run: |
         set -euo pipefail
-        log="$(mktemp)"
+        mkdir -p "$RUNNER_TEMP/ci-logs"
+        log="$RUNNER_TEMP/ci-logs/test-debug.log"
         cargo +stable test --locked --verbose ${{ matrix.features }} 2>&1 | tee "$log"
         set -- $(awk '/^test result:/ { b += 1; p += $4; f += $6; i += $8 }
                       END { printf "%d %d %d %d", b, p, f, i }' "$log")
@@ -568,7 +656,8 @@ jobs:
       if: ${{ matrix.test }}
       run: |
         set -euo pipefail
-        log="$(mktemp)"
+        mkdir -p "$RUNNER_TEMP/ci-logs"
+        log="$RUNNER_TEMP/ci-logs/test-release.log"
         cargo +stable test --locked --release --verbose ${{ matrix.features }} 2>&1 | tee "$log"
         set -- $(awk '/^test result:/ { b += 1; p += $4; f += $6; i += $8 }
                       END { printf "%d %d %d %d", b, p, f, i }' "$log")
@@ -594,7 +683,8 @@ jobs:
       if: ${{ runner.os == 'Windows' }}
       run: |
         set -euo pipefail
-        log="$(mktemp)"
+        mkdir -p "$RUNNER_TEMP/ci-logs"
+        log="$RUNNER_TEMP/ci-logs/gzopen-w-round-trip.log"
         cargo +stable test --locked --lib -- --exact --nocapture \
           ffi::gz::tests::wide_path_open_round_trip 2>&1 | tee "$log"
         set -- $(awk '/^test result:/ { p += $4; f += $6 } END { printf "%d %d", p, f }' "$log")
@@ -604,12 +694,30 @@ jobs:
           " ffi::gz::tests::wide_path_open_round_trip was renamed, removed, or its"\
           " cfg(windows) gate no longer matches - gzopen_w would then be compiled but"\
           " never executed anywhere"; exit 1; }
+    # Failure diagnostics for THIS row. The name says "build logs", so it uploads
+    # build logs: the three test steps above tee into `$RUNNER_TEMP/ci-logs`
+    # precisely so there is something to collect here. Previously this step's only
+    # `path` was `Cargo.lock`, which is not a log - on a red row it produced an
+    # artifact that could not explain the failure, and the honest reading of its own
+    # name was unavailable.
+    #
+    # `Cargo.lock` is still uploaded, because it IS the evidence for the one failure
+    # mode that leaves no test log: a `--locked` command rewriting the lockfile,
+    # asserted by the step that follows. `retention-days: 7` and
+    # `if-no-files-found: ignore` are kept - a row that fails before any test step
+    # runs (a compile error, say) legitimately has no log to attach, and that must
+    # not turn into a second, misleading failure.
+    #
+    # Logs live under `$RUNNER_TEMP`, never in the checkout, so they cannot dirty
+    # the working tree that the `Cargo.lock` assertion below inspects.
     - name: Upload build logs
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       if: failure()
       with:
         name: ${{ matrix.name }} (ci)
-        path: Cargo.lock
+        path: |
+          ${{ runner.temp }}/ci-logs/
+          Cargo.lock
         retention-days: 7
         if-no-files-found: ignore
 
@@ -644,13 +752,61 @@ jobs:
     timeout-minutes: 30
     # Current stable, not the MSRV floor pinned by rust-toolchain.toml. See
     # "TOOLCHAIN SELECTION" in the header.
+    #
+    # STD_OFF_FLOOR is the SINGLE SOURCE OF TRUTH for all four std-off test steps
+    # below: each one interpolates it into the summary it logs, the comparison it
+    # enforces, and the message it prints on failure. It is declared here, once, at
+    # job scope because the floor is the same for every one of the four - and because
+    # the alternative had already failed: the steps used to log `floor=633` while
+    # enforcing `-ge 629`, with the error text saying 629 twice and 633 twice, so
+    # four tests could disappear with CI green and the log reassuring (P3-F1).
+    # `the_ci_test_floors_are_internally_consistent` in `src/lib.rs` asserts that no
+    # bare numeric floor comes back.
     env:
       RUSTUP_TOOLCHAIN: stable
+      STD_OFF_FLOOR: 695
     steps:
     - name: Checkout repository
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
+    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
+    # commit, and a log that does not name that commit is unattributable evidence:
+    # it cannot be told apart from a run against a different tree, a different
+    # clone, or artifacts that predate the commit under review. That is not
+    # hypothetical - a checkpoint review found the retained runtime logs for this
+    # project pointing at another clone, which left the commit actually under
+    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
+    # (finding M8-01). Naming the commit FIRST is what makes every line that
+    # follows self-describing.
+    #
+    # THREE WITNESSES, deliberately, because they can disagree and each
+    # disagreement means something different. `github.sha` is what the EVENT
+    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
+    # hash is what the FILES actually contain. Only the tree hash moves if a later
+    # step edits the working tree, and only the first two can reveal a checkout
+    # that resolved somewhere else entirely.
+    #
+    # The assertion accepts the pull-request head sha as well as `github.sha`,
+    # because on a `pull_request` event the two legitimately differ: `github.sha`
+    # names the ephemeral merge commit, so a checkout configured for the branch
+    # tip would land on the head sha instead. Both are attributable. A third
+    # value is not, and is what fails the job.
+    - name: Record the commit under test
+      run: |
+        set -euo pipefail
+        head="$(git rev-parse HEAD)"
+        echo "event sha : ${{ github.sha }}"
+        echo "head sha  : $head"
+        echo "tree hash : $(git rev-parse 'HEAD^{tree}')"
+        echo "ref       : ${{ github.ref }}"
+        echo "job       : ${{ github.workflow }} / ${{ github.job }}"
+        case "$head" in
+          "${{ github.sha }}"|"${{ github.event.pull_request.head.sha }}") ;;
+          *) echo "::error::checked-out HEAD $head is neither the event sha nor the"\
+             " pull-request head sha, so this job's verdict would describe a commit"\
+             " nobody asked about."; exit 1 ;;
+        esac
     - name: Install Rust stable toolchain
       uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, 2026-07-16
       with:
@@ -673,46 +829,57 @@ jobs:
     # tests are silently lost, and AAP directive D-5 fixes the suite at
     # "preserved and only ever increased, zero ignored" (finding TEST-08).
     #
-    # The floor is 634 on all four, which is the measured std-off total. ONE
-    # number governs every one of the four steps below - the value echoed in the
-    # summary line, the value compared against, and the value named in the error
-    # message are the same 634 in all four, so a reader can never be told one
-    # floor while a different one is enforced.
-    #
-    # It is LOWER than the default-feature total by design: `gz-io` is off, so
-    # the `tests/gzip_compat.rs` target contributes nothing and several
+    # The floor is STD_OFF_FLOOR (695) on all four, the measured std-off total. It is
+    # LOWER than the default-feature total by design: `gz-io` is off, so the
+    # `tests/gzip_compat.rs` target contributes nothing and several
     # `cfg(feature = "gz-io")` unit tests do not exist. That gap is the reason
     # this job has its own floor instead of reusing `build-test`'s.
+    #
+    # THE FLOOR IS NAMED ONCE FOR ALL FOUR BRANCHES, in the job-scoped
+    # `STD_OFF_FLOOR` above, which the summary line, the predicate and the failure
+    # diagnostic of every branch all read. That is not style. When the number is
+    # typed out three times per branch a branch can - and did - end up announcing
+    # one floor while enforcing a lower one, which is strictly worse than having no
+    # floor at all: the log looks like a gate and the predicate is not one. One
+    # declaration makes the announced floor and the enforced floor the same value by
+    # construction, for every branch at once, and `package-verify` follows the same
+    # rule with its own `PACKAGED_FLOOR`.
     - name: Test (no default features)
       run: |
         set -euo pipefail
+        # The floor is the job-scoped `STD_OFF_FLOOR` declared once in this job's
+        # `env:` - read by the summary echoed below, by the predicate that enforces
+        # it, and by the failure message, so the three cannot disagree.
         log="$(mktemp)"
         cargo +stable test --locked --no-default-features 2>&1 | tee "$log"
         set -- $(awk '/^test result:/ { b += 1; p += $4; f += $6; i += $8 }
                       END { printf "%d %d %d %d", b, p, f, i }' "$log")
-        echo "test summary: blocks=$1 passed=$2 failed=$3 ignored=$4 floor=634"
+        echo "test summary: blocks=$1 passed=$2 failed=$3 ignored=$4 floor=$STD_OFF_FLOOR"
         [ "$1" -ge 1 ] || { echo "::error::no 'test result:' line was produced -"\
           " the harness never ran, so nothing was verified"; exit 1; }
         [ "$3" -eq 0 ] || { echo "::error::$3 test(s) failed"; exit 1; }
         [ "$4" -eq 0 ] || { echo "::error::$4 test(s) were ignored; AAP directive D-5"\
           " requires zero ignored tests"; exit 1; }
-        [ "$2" -ge 634 ] || { echo "::error::only $2 std-off tests ran, below the floor"\
-          " of 634 - tests were lost, not merely skipped"; exit 1; }
+        [ "$2" -ge "$STD_OFF_FLOOR" ] || { echo "::error::only $2 std-off tests ran, below the floor"\
+          " of $STD_OFF_FLOOR - tests were lost, not merely skipped"; exit 1; }
     - name: Test (no-std feature)
       run: |
         set -euo pipefail
+        # The floor is the job-scoped `STD_OFF_FLOOR` declared once in this job's
+        # `env:` - read by the summary echoed below, by the predicate that enforces
+        # it, and by the failure message, so the three cannot disagree.
         log="$(mktemp)"
         cargo +stable test --locked --no-default-features --features no-std 2>&1 | tee "$log"
         set -- $(awk '/^test result:/ { b += 1; p += $4; f += $6; i += $8 }
                       END { printf "%d %d %d %d", b, p, f, i }' "$log")
-        echo "test summary: blocks=$1 passed=$2 failed=$3 ignored=$4 floor=634"
+        echo "test summary: blocks=$1 passed=$2 failed=$3 ignored=$4 floor=$STD_OFF_FLOOR"
         [ "$1" -ge 1 ] || { echo "::error::no 'test result:' line was produced -"\
           " the harness never ran, so nothing was verified"; exit 1; }
         [ "$3" -eq 0 ] || { echo "::error::$3 test(s) failed"; exit 1; }
         [ "$4" -eq 0 ] || { echo "::error::$4 test(s) were ignored; AAP directive D-5"\
           " requires zero ignored tests"; exit 1; }
-        [ "$2" -ge 634 ] || { echo "::error::only $2 no-std tests ran, below the floor"\
-          " of 634 - tests were lost, not merely skipped"; exit 1; }
+        [ "$2" -ge "$STD_OFF_FLOOR" ] || { echo "::error::only $2 no-std tests ran, below the floor"\
+          " of $STD_OFF_FLOOR - tests were lost, not merely skipped"; exit 1; }
     # Both std-off rows again under the SHIPPED profile. See the rationale on the
     # `build-test` job's release step: `[profile.release]`'s `opt-level = 3` +
     # `codegen-units = 1` can decide whether an assertion holds, so the profile
@@ -720,34 +887,40 @@ jobs:
     - name: Test (no default features, release profile)
       run: |
         set -euo pipefail
+        # The floor is the job-scoped `STD_OFF_FLOOR` declared once in this job's
+        # `env:` - read by the summary echoed below, by the predicate that enforces
+        # it, and by the failure message, so the three cannot disagree.
         log="$(mktemp)"
         cargo +stable test --locked --release --no-default-features 2>&1 | tee "$log"
         set -- $(awk '/^test result:/ { b += 1; p += $4; f += $6; i += $8 }
                       END { printf "%d %d %d %d", b, p, f, i }' "$log")
-        echo "test summary: blocks=$1 passed=$2 failed=$3 ignored=$4 floor=634"
+        echo "test summary: blocks=$1 passed=$2 failed=$3 ignored=$4 floor=$STD_OFF_FLOOR"
         [ "$1" -ge 1 ] || { echo "::error::no 'test result:' line was produced -"\
           " the harness never ran, so nothing was verified"; exit 1; }
         [ "$3" -eq 0 ] || { echo "::error::$3 test(s) failed"; exit 1; }
         [ "$4" -eq 0 ] || { echo "::error::$4 test(s) were ignored; AAP directive D-5"\
           " requires zero ignored tests"; exit 1; }
-        [ "$2" -ge 634 ] || { echo "::error::only $2 std-off release tests ran, below the"\
-          " floor of 634 - tests were lost, not merely skipped"; exit 1; }
+        [ "$2" -ge "$STD_OFF_FLOOR" ] || { echo "::error::only $2 std-off release tests ran, below the"\
+          " floor of $STD_OFF_FLOOR - tests were lost, not merely skipped"; exit 1; }
     - name: Test (no-std feature, release profile)
       run: |
         set -euo pipefail
+        # The floor is the job-scoped `STD_OFF_FLOOR` declared once in this job's
+        # `env:` - read by the summary echoed below, by the predicate that enforces
+        # it, and by the failure message, so the three cannot disagree.
         log="$(mktemp)"
         cargo +stable test --locked --release --no-default-features --features no-std 2>&1 \
           | tee "$log"
         set -- $(awk '/^test result:/ { b += 1; p += $4; f += $6; i += $8 }
                       END { printf "%d %d %d %d", b, p, f, i }' "$log")
-        echo "test summary: blocks=$1 passed=$2 failed=$3 ignored=$4 floor=634"
+        echo "test summary: blocks=$1 passed=$2 failed=$3 ignored=$4 floor=$STD_OFF_FLOOR"
         [ "$1" -ge 1 ] || { echo "::error::no 'test result:' line was produced -"\
           " the harness never ran, so nothing was verified"; exit 1; }
         [ "$3" -eq 0 ] || { echo "::error::$3 test(s) failed"; exit 1; }
         [ "$4" -eq 0 ] || { echo "::error::$4 test(s) were ignored; AAP directive D-5"\
           " requires zero ignored tests"; exit 1; }
-        [ "$2" -ge 634 ] || { echo "::error::only $2 no-std release tests ran, below the"\
-          " floor of 634 - tests were lost, not merely skipped"; exit 1; }
+        [ "$2" -ge "$STD_OFF_FLOOR" ] || { echo "::error::only $2 no-std release tests ran, below the"\
+          " floor of $STD_OFF_FLOOR - tests were lost, not merely skipped"; exit 1; }
 
     - name: Assert Cargo.lock is unchanged
       if: ${{ !cancelled() }}
@@ -784,6 +957,43 @@ jobs:
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
+    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
+    # commit, and a log that does not name that commit is unattributable evidence:
+    # it cannot be told apart from a run against a different tree, a different
+    # clone, or artifacts that predate the commit under review. That is not
+    # hypothetical - a checkpoint review found the retained runtime logs for this
+    # project pointing at another clone, which left the commit actually under
+    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
+    # (finding M8-01). Naming the commit FIRST is what makes every line that
+    # follows self-describing.
+    #
+    # THREE WITNESSES, deliberately, because they can disagree and each
+    # disagreement means something different. `github.sha` is what the EVENT
+    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
+    # hash is what the FILES actually contain. Only the tree hash moves if a later
+    # step edits the working tree, and only the first two can reveal a checkout
+    # that resolved somewhere else entirely.
+    #
+    # The assertion accepts the pull-request head sha as well as `github.sha`,
+    # because on a `pull_request` event the two legitimately differ: `github.sha`
+    # names the ephemeral merge commit, so a checkout configured for the branch
+    # tip would land on the head sha instead. Both are attributable. A third
+    # value is not, and is what fails the job.
+    - name: Record the commit under test
+      run: |
+        set -euo pipefail
+        head="$(git rev-parse HEAD)"
+        echo "event sha : ${{ github.sha }}"
+        echo "head sha  : $head"
+        echo "tree hash : $(git rev-parse 'HEAD^{tree}')"
+        echo "ref       : ${{ github.ref }}"
+        echo "job       : ${{ github.workflow }} / ${{ github.job }}"
+        case "$head" in
+          "${{ github.sha }}"|"${{ github.event.pull_request.head.sha }}") ;;
+          *) echo "::error::checked-out HEAD $head is neither the event sha nor the"\
+             " pull-request head sha, so this job's verdict would describe a commit"\
+             " nobody asked about."; exit 1 ;;
+        esac
     - name: Install Rust stable toolchain
       uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, 2026-07-16
       with:
@@ -850,10 +1060,24 @@ jobs:
     # itself. `#[ignore = "..."]` and `#[ ignore ]` are both caught; a mention
     # inside a doc comment or a string is not.
     #
-    # `cfg_attr` is checked separately because `#[cfg_attr(<pred>, ignore)]` is an
-    # `#[ignore]` that only shows itself under one configuration - the exact
-    # failure mode the summary-line check cannot see.
-    - name: Assert no test is disabled with #[ignore]
+    # `cfg_attr` CANNOT BE CHECKED WITH A GREP, and is delegated to the crate in
+    # the step below. `#[cfg_attr(<pred>, ignore)]` is an `#[ignore]` that only
+    # shows itself under one configuration - the exact failure mode the
+    # summary-line check cannot see - but a line-oriented regex cannot recognise
+    # it. The pattern used here previously,
+    # `#\[[[:space:]]*cfg_attr\([^)]*[^a-z_]ignore`, missed the two forms most
+    # likely to be written by accident, and both were verified to slip through:
+    #
+    #   * a NESTED predicate. `[^)]*` cannot cross a `)`, so in
+    #     `cfg_attr(all(unix, target_pointer_width = "64"), ignore)` the class
+    #     stops at the `)` closing `all(..)` and never reaches the `ignore`.
+    #   * a MULTILINE attribute, which rustfmt produces whenever the predicate is
+    #     long. `grep` matches within one line and cannot see it at all.
+    #
+    # Recognising those needs Rust's nesting, so the check lives in the crate,
+    # where it blanks comments and literals first and then reads each attribute as
+    # a BALANCED bracket group spanning any number of lines.
+    - name: 'Assert no test is disabled with #[ignore]'
       run: |
         set -euo pipefail
         roots='src tests benches build.rs fuzz/fuzz_targets'
@@ -864,16 +1088,45 @@ jobs:
           echo "$hits"
           status=1
         fi
-        if hits="$(grep -rnE '#\[[[:space:]]*cfg_attr\([^)]*[^a-z_]ignore' $roots)"; then
-          echo "::error::a conditional #[cfg_attr(..., ignore)] was added, which disables a"\
-               " test under one configuration only:"
-          echo "$hits"
-          status=1
-        fi
         if [ "$status" -eq 0 ]; then
-          echo "no #[ignore] or #[cfg_attr(..., ignore)] attribute anywhere in $roots"
+          echo "no unconditional #[ignore] attribute anywhere in $roots"
         fi
         exit "$status"
+
+    # The `cfg_attr` half of the same gate, delegated to the crate for the reasons
+    # given above. Run by name so the coverage is legible in the log, and the
+    # summary line is ASSERTED rather than trusted: a renamed or deleted test makes
+    # a filter match nothing, and `cargo test` reports "0 passed" and exits 0, so
+    # the count is the only thing standing between this step and silent vacuity.
+    #
+    #   * `no_test_in_the_repository_is_disabled_with_ignore` is the balanced,
+    #     comment-aware scan over the same `roots` as the grep above.
+    #   * `the_conditional_ignore_scanner_catches_simple_nested_and_multiline_forms`
+    #     is the scanner's own fixture set, including the nested and multiline forms
+    #     the old regex missed - it proves the scan still BITES, not merely that it
+    #     runs.
+    #   * `the_ignore_scan_covers_the_same_roots_as_ci` asserts that the `roots`
+    #     list above and the crate's `IGNORE_SCAN_ROOTS` are the same set, so a root
+    #     added to one and not the other cannot become a silently unscanned tree.
+    - name: 'Assert no test is disabled with #[cfg_attr(..., ignore)]'
+      run: |
+        set -euo pipefail
+        log="$(mktemp)"
+        cargo +stable test --locked --lib -- \
+          tests::no_test_in_the_repository_is_disabled_with_ignore \
+          tests::the_conditional_ignore_scanner_catches_simple_nested_and_multiline_forms \
+          tests::the_ignore_scan_covers_the_same_roots_as_ci 2>&1 | tee "$log"
+        set -- $(awk '/^test result:/ { p += $4; f += $6; i += $8 } END { printf "%d %d %d", p, f, i }' "$log")
+        if [ "$2" -ne 0 ] || [ "$3" -ne 0 ]; then
+          echo "::error::conditional-ignore scan reported $2 failed and $3 ignored; both must be 0"
+          exit 1
+        fi
+        if [ "$1" -ne 3 ]; then
+          echo "::error::expected exactly 3 conditional-ignore scan tests to run, got $1;"\
+               " a test was renamed or removed and the filter silently matched nothing"
+          exit 1
+        fi
+        echo "conditional-ignore scan: $1 passed, 0 failed, 0 ignored"
 
   # Documentation gates (finding TEST-02). README.md, CONTRIBUTING.md and
   # `doc/technical-specifications.md` all describe rustdoc-with-warnings-denied
@@ -891,11 +1144,18 @@ jobs:
   #            is what makes a broken intra-doc link or an undocumented public
   #            item fail rather than warn. `--all-features` is required for the
   #            same reason the `lint` job needs it: the feature-gated surface
-  #            (`c-oracle`, `inflate_strict`, the std-off runtime block) is
-  #            otherwise never documented, and `#![warn(missing_docs)]` cannot
-  #            speak about code that was not compiled. `--no-deps` keeps the gate
-  #            about THIS crate: a warning in a dependency's documentation is not
-  #            this repository's defect and must not be able to fail its CI.
+  #            (`c-oracle`, `inflate_strict`) is otherwise never documented, and
+  #            `#![warn(missing_docs)]` cannot speak about code that was not
+  #            compiled. What `--all-features` CANNOT reach is the freestanding
+  #            `no_std_support` runtime block: enabling every feature turns
+  #            `std` on, and that block's predicate requires
+  #            `not(feature = "std")`, so this gate never documents it and no
+  #            spelling of this job could. The std-off library builds are what
+  #            compile it - the `no_std library (build only)` row in
+  #            `build-test` and the `bare-metal-no-std` job. `--no-deps` keeps
+  #            the gate about THIS crate: a warning in a dependency's
+  #            documentation is not this repository's defect and must not be
+  #            able to fail its CI.
   #   MkDocs   `--strict` turns a nav entry pointing at a missing page, a broken
   #            relative link and an unrecognised config key into errors. That is
   #            the check that would have caught `docs/index.md` being orphaned
@@ -940,6 +1200,43 @@ jobs:
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
+    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
+    # commit, and a log that does not name that commit is unattributable evidence:
+    # it cannot be told apart from a run against a different tree, a different
+    # clone, or artifacts that predate the commit under review. That is not
+    # hypothetical - a checkpoint review found the retained runtime logs for this
+    # project pointing at another clone, which left the commit actually under
+    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
+    # (finding M8-01). Naming the commit FIRST is what makes every line that
+    # follows self-describing.
+    #
+    # THREE WITNESSES, deliberately, because they can disagree and each
+    # disagreement means something different. `github.sha` is what the EVENT
+    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
+    # hash is what the FILES actually contain. Only the tree hash moves if a later
+    # step edits the working tree, and only the first two can reveal a checkout
+    # that resolved somewhere else entirely.
+    #
+    # The assertion accepts the pull-request head sha as well as `github.sha`,
+    # because on a `pull_request` event the two legitimately differ: `github.sha`
+    # names the ephemeral merge commit, so a checkout configured for the branch
+    # tip would land on the head sha instead. Both are attributable. A third
+    # value is not, and is what fails the job.
+    - name: Record the commit under test
+      run: |
+        set -euo pipefail
+        head="$(git rev-parse HEAD)"
+        echo "event sha : ${{ github.sha }}"
+        echo "head sha  : $head"
+        echo "tree hash : $(git rev-parse 'HEAD^{tree}')"
+        echo "ref       : ${{ github.ref }}"
+        echo "job       : ${{ github.workflow }} / ${{ github.job }}"
+        case "$head" in
+          "${{ github.sha }}"|"${{ github.event.pull_request.head.sha }}") ;;
+          *) echo "::error::checked-out HEAD $head is neither the event sha nor the"\
+             " pull-request head sha, so this job's verdict would describe a commit"\
+             " nobody asked about."; exit 1 ;;
+        esac
     - name: Install Rust stable toolchain
       uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, 2026-07-16
       with:
@@ -974,17 +1271,68 @@ jobs:
         [ -s "$page" ] || { echo "::error::rustdoc exited 0 but produced no ${page}."\
           " The gate above did not document this crate."; exit 1; }
         echo "rustdoc produced ${page} with warnings denied"
+    # A FULL PATCH RELEASE, not the `3.12` series. A series request resolves to
+    # whatever patch the runner's tool cache happens to hold on the day, so the
+    # interpreter running the docs gate would change without a commit - the same
+    # defect `--locked` exists to prevent on the Rust side. It also has a concrete
+    # consequence here: `docs-requirements.txt` carries `cp312` wheel digests, so
+    # the interpreter minor version is part of what that lock is a lock FOR.
+    #
+    # Refreshing the patch is ordinary maintenance: bump it here and in the
+    # assertion in the next step, in the same commit.
     - name: Install Python for the documentation site
       uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
       with:
-        python-version: '3.12'
+        python-version: '3.12.13'
+    # THE PYTHON GRAPH IS HASH-LOCKED, for the same reason every cargo invocation
+    # in this file carries `--locked`.
+    #
+    # Naming the three direct requirements pinned three packages and floated the
+    # other forty-three, every one of which executes on the runner with read
+    # access to the checkout. A new compatible release of any of them - or a
+    # compromised maintainer account - changed what CI ran with no diff in this
+    # repository and no review. `==` alone would not close it either: a version
+    # binds a name to a release, a digest binds it to the exact bytes.
+    #
+    # `--require-hashes` does two things, and the second is the one that makes
+    # this a gate rather than a gesture: it verifies every artifact against the
+    # committed digest, AND it refuses to resolve any requirement that is not
+    # pinned - so a dependency that appears in a later release cannot enter the
+    # install unnoticed, it fails the job. `--only-binary=:all:` keeps that
+    # airtight, because building a source distribution would pull unhashed
+    # build-time dependencies that `--require-hashes` cannot cover.
+    #
+    # The interpreter and the three direct versions are asserted AFTER the
+    # install, so the log states what actually landed instead of what was asked
+    # for. See `.github/workflows/docs-requirements.txt` for the closure, the
+    # target environment it is pinned against, and the regeneration recipe.
     - name: Install the pinned MkDocs toolchain
       run: |
         set -euo pipefail
-        python -m pip install --disable-pip-version-check \
-          'mkdocs==1.6.1' \
-          'mkdocs-techdocs-core==1.7.0' \
-          'mkdocs-mermaid2-plugin==1.2.3'
+        python -VV
+        want_python='3.12.13'
+        got_python="$(python -c 'import platform; print(platform.python_version())')"
+        [ "$got_python" = "$want_python" ] || { echo "::error::the docs job resolved"\
+          " CPython $got_python, not the pinned $want_python. The setup-python input"\
+          " above and the cp312 wheel digests in docs-requirements.txt no longer"\
+          " describe the same interpreter"; exit 1; }
+        python -m pip install --disable-pip-version-check --no-input \
+          --require-hashes --only-binary=:all: \
+          -r .github/workflows/docs-requirements.txt
+        # The lock is the source of truth for the whole closure; these three are
+        # the requirements this project chose deliberately, so they are read back
+        # by name. A lock edit that moved one of them without a decision fails
+        # here instead of quietly changing the published site.
+        for pin in 'mkdocs==1.6.1' 'mkdocs-techdocs-core==1.7.0' \
+                   'mkdocs-mermaid2-plugin==1.2.3'; do
+          name="${pin%%==*}"
+          want="${pin##*==}"
+          got="$(python -m pip show "$name" 2>/dev/null | sed -n 's/^Version: //p' || true)"
+          [ "$got" = "$want" ] || { echo "::error::$name resolved to ${got:-nothing},"\
+            " not the pinned $want. docs-requirements.txt and this assertion have"\
+            " drifted apart"; exit 1; }
+          echo "pinned and verified: $name $got"
+        done
         mkdocs --version
     # `--site-dir` points OUTSIDE the checkout on purpose. A default `mkdocs
     # build` writes 60 generated files into `<repo>/site`. `/site/` IS in
@@ -1052,6 +1400,43 @@ jobs:
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
+    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
+    # commit, and a log that does not name that commit is unattributable evidence:
+    # it cannot be told apart from a run against a different tree, a different
+    # clone, or artifacts that predate the commit under review. That is not
+    # hypothetical - a checkpoint review found the retained runtime logs for this
+    # project pointing at another clone, which left the commit actually under
+    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
+    # (finding M8-01). Naming the commit FIRST is what makes every line that
+    # follows self-describing.
+    #
+    # THREE WITNESSES, deliberately, because they can disagree and each
+    # disagreement means something different. `github.sha` is what the EVENT
+    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
+    # hash is what the FILES actually contain. Only the tree hash moves if a later
+    # step edits the working tree, and only the first two can reveal a checkout
+    # that resolved somewhere else entirely.
+    #
+    # The assertion accepts the pull-request head sha as well as `github.sha`,
+    # because on a `pull_request` event the two legitimately differ: `github.sha`
+    # names the ephemeral merge commit, so a checkout configured for the branch
+    # tip would land on the head sha instead. Both are attributable. A third
+    # value is not, and is what fails the job.
+    - name: Record the commit under test
+      run: |
+        set -euo pipefail
+        head="$(git rev-parse HEAD)"
+        echo "event sha : ${{ github.sha }}"
+        echo "head sha  : $head"
+        echo "tree hash : $(git rev-parse 'HEAD^{tree}')"
+        echo "ref       : ${{ github.ref }}"
+        echo "job       : ${{ github.workflow }} / ${{ github.job }}"
+        case "$head" in
+          "${{ github.sha }}"|"${{ github.event.pull_request.head.sha }}") ;;
+          *) echo "::error::checked-out HEAD $head is neither the event sha nor the"\
+             " pull-request head sha, so this job's verdict would describe a commit"\
+             " nobody asked about."; exit 1 ;;
+        esac
     - name: Install Rust 1.85.0 toolchain
       uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, 2026-07-16
       with:
@@ -1105,6 +1490,43 @@ jobs:
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
+    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
+    # commit, and a log that does not name that commit is unattributable evidence:
+    # it cannot be told apart from a run against a different tree, a different
+    # clone, or artifacts that predate the commit under review. That is not
+    # hypothetical - a checkpoint review found the retained runtime logs for this
+    # project pointing at another clone, which left the commit actually under
+    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
+    # (finding M8-01). Naming the commit FIRST is what makes every line that
+    # follows self-describing.
+    #
+    # THREE WITNESSES, deliberately, because they can disagree and each
+    # disagreement means something different. `github.sha` is what the EVENT
+    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
+    # hash is what the FILES actually contain. Only the tree hash moves if a later
+    # step edits the working tree, and only the first two can reveal a checkout
+    # that resolved somewhere else entirely.
+    #
+    # The assertion accepts the pull-request head sha as well as `github.sha`,
+    # because on a `pull_request` event the two legitimately differ: `github.sha`
+    # names the ephemeral merge commit, so a checkout configured for the branch
+    # tip would land on the head sha instead. Both are attributable. A third
+    # value is not, and is what fails the job.
+    - name: Record the commit under test
+      run: |
+        set -euo pipefail
+        head="$(git rev-parse HEAD)"
+        echo "event sha : ${{ github.sha }}"
+        echo "head sha  : $head"
+        echo "tree hash : $(git rev-parse 'HEAD^{tree}')"
+        echo "ref       : ${{ github.ref }}"
+        echo "job       : ${{ github.workflow }} / ${{ github.job }}"
+        case "$head" in
+          "${{ github.sha }}"|"${{ github.event.pull_request.head.sha }}") ;;
+          *) echo "::error::checked-out HEAD $head is neither the event sha nor the"\
+             " pull-request head sha, so this job's verdict would describe a commit"\
+             " nobody asked about."; exit 1 ;;
+        esac
     - name: Install Rust stable toolchain
       uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, 2026-07-16
       with:
@@ -1157,6 +1579,43 @@ jobs:
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
+    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
+    # commit, and a log that does not name that commit is unattributable evidence:
+    # it cannot be told apart from a run against a different tree, a different
+    # clone, or artifacts that predate the commit under review. That is not
+    # hypothetical - a checkpoint review found the retained runtime logs for this
+    # project pointing at another clone, which left the commit actually under
+    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
+    # (finding M8-01). Naming the commit FIRST is what makes every line that
+    # follows self-describing.
+    #
+    # THREE WITNESSES, deliberately, because they can disagree and each
+    # disagreement means something different. `github.sha` is what the EVENT
+    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
+    # hash is what the FILES actually contain. Only the tree hash moves if a later
+    # step edits the working tree, and only the first two can reveal a checkout
+    # that resolved somewhere else entirely.
+    #
+    # The assertion accepts the pull-request head sha as well as `github.sha`,
+    # because on a `pull_request` event the two legitimately differ: `github.sha`
+    # names the ephemeral merge commit, so a checkout configured for the branch
+    # tip would land on the head sha instead. Both are attributable. A third
+    # value is not, and is what fails the job.
+    - name: Record the commit under test
+      run: |
+        set -euo pipefail
+        head="$(git rev-parse HEAD)"
+        echo "event sha : ${{ github.sha }}"
+        echo "head sha  : $head"
+        echo "tree hash : $(git rev-parse 'HEAD^{tree}')"
+        echo "ref       : ${{ github.ref }}"
+        echo "job       : ${{ github.workflow }} / ${{ github.job }}"
+        case "$head" in
+          "${{ github.sha }}"|"${{ github.event.pull_request.head.sha }}") ;;
+          *) echo "::error::checked-out HEAD $head is neither the event sha nor the"\
+             " pull-request head sha, so this job's verdict would describe a commit"\
+             " nobody asked about."; exit 1 ;;
+        esac
     # `s390x-unknown-linux-gnu` is declared through this action's `targets:` input,
     # the single sanctioned mechanism for naming a triple in this file (see
     # "NATIVE vs CROSS" in the header). The big-endian step below only `cargo
@@ -1206,7 +1665,32 @@ jobs:
         echo "compiling build.rs as a test binary (edition $edition)"
         rustc +stable --edition "$edition" --test build.rs -o "$RUNNER_TEMP/buildrs_tests" \
               --deny warnings
-        "$RUNNER_TEMP/buildrs_tests" --test-threads 4
+        # THE SUMMARY IS ASSERTED, NOT TRUSTED. A harness that ran no test at all
+        # prints "0 passed" and exits 0, so the exit status alone cannot distinguish
+        # "every build-script test passed" from "the tests were deleted" or "a filter
+        # matched nothing". The floor below is the measured population of `build.rs`'s
+        # own `#[cfg(test)]` module; it is a FLOOR, so adding tests never breaks it,
+        # while removing them does.
+        log="$(mktemp)"
+        "$RUNNER_TEMP/buildrs_tests" --test-threads 4 2>&1 | tee "$log"
+        summaries="$(grep -c '^test result:' "$log" || true)"
+        if [ "$summaries" -ne 1 ]; then
+          echo "::error::expected exactly 1 summary line from the build-script test"\
+               " binary, got $summaries; the harness did not run to completion"
+          exit 1
+        fi
+        set -- $(awk '/^test result:/ { printf "%d %d %d", $4, $6, $8 }' "$log")
+        if [ "$2" -ne 0 ] || [ "$3" -ne 0 ]; then
+          echo "::error::build-script tests reported $2 failed and $3 ignored; AAP"\
+               " directive D-5 requires both to be 0"
+          exit 1
+        fi
+        if [ "$1" -lt 30 ]; then
+          echo "::error::expected at least 30 build-script tests, got $1; tests were"\
+               " removed, or the harness silently filtered them out"
+          exit 1
+        fi
+        echo "build-script tests: $1 passed, 0 failed, 0 ignored"
     - name: Verify the big-endian table selection compiles
       run: |
         set -euo pipefail
@@ -1229,22 +1713,85 @@ jobs:
         # Two independent builds must emit a byte-identical generated file: the
         # tables are pure constants, so any difference means the generator has
         # become environment-dependent.
+        #
+        # THE FILE LIST IS MATERIALIZED AND ASSERTED NON-EMPTY BEFORE ANYTHING IS
+        # HASHED, because the obvious spelling of this check passes VACUOUSLY when
+        # there is nothing to hash. `find ... -print0 | xargs -0 sha256sum` over
+        # zero matches does not fail: `xargs` still runs `sha256sum` once with no
+        # operands, `sha256sum` then reads stdin, and stdin is empty - so the
+        # pipeline prints the canonical empty-input digest
+        # e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 as a
+        # single line. One line satisfies the "feature rows agree" check, and the
+        # second build prints the identical constant, so the reproducibility
+        # comparison succeeds as well. Both guards would then be green over a table
+        # that was never generated at all. `-r` stops `xargs` invoking the command
+        # on empty input, and the explicit count assertion is what turns "no tables"
+        # into a red step instead of a false green one. That is also exactly what a
+        # renamed output file or a moved `OUT_DIR` produces, which is why the count
+        # is reported per phase and carried back out for the cross-build comparison
+        # below.
+        hash_tables() {
+          phase="$1"
+          count_out="$2"
+          if [ ! -d target/debug/build ]; then
+            echo "::error::the ${phase} build produced no target/debug/build"\
+                 " directory, so no build script ran and there is nothing to hash" >&2
+            return 1
+          fi
+          list="$(mktemp)"
+          find target/debug/build -name crc32_tables.rs -print0 > "$list"
+          count="$(tr -cd '\0' < "$list" | wc -c | tr -d '[:space:]')"
+          echo "${phase} build: ${count} generated crc32_tables.rs file(s)" >&2
+          # The count leaves through a file rather than a variable: the caller reads
+          # this function through `$(...)`, which runs it in a subshell, so an
+          # assignment made here would not survive the return.
+          printf '%s' "$count" > "$count_out"
+          if [ "$count" -lt 1 ]; then
+            echo "::error::the ${phase} build produced no crc32_tables.rs under"\
+                 " target/debug/build. Either build.rs did not run or it no longer"\
+                 " writes that file, so this check has nothing to compare and must"\
+                 " not report success" >&2
+            return 1
+          fi
+          xargs -0 -r sha256sum < "$list" | awk '{print $1}' | sort -u
+        }
+        # BOTH HALVES START FROM THE SAME CLEAN STATE. `target/debug/build`
+        # accumulates one directory per build-script invocation, so earlier steps in
+        # this job (the big-endian `--profile test` check in particular) leave
+        # directories behind. Wiping only before the second build would compare an
+        # inherited directory set against a fresh one and the counts could never be
+        # expected to agree - measured locally as 14 then 1. Wiping before both makes
+        # the comparison deterministic and the count assertion meaningful.
+        rm -rf target/debug/build
         cargo +stable build --locked --quiet
-        first=$(find target/debug/build -name crc32_tables.rs -print0 \
-                | xargs -0 sha256sum | awk '{print $1}' | sort -u)
+        first_count="$(mktemp)"
+        first="$(hash_tables first "$first_count")"
+        first_n="$(cat "$first_count")"
         if [ "$(printf '%s\n' "$first" | wc -l)" -ne 1 ]; then
           echo "::error::feature rows disagree on the generated tables"
           exit 1
         fi
+        echo "first build: $first_n generated file(s), sha256 $first"
         rm -rf target/debug/build
         cargo +stable build --locked --quiet
-        second=$(find target/debug/build -name crc32_tables.rs -print0 \
-                 | xargs -0 sha256sum | awk '{print $1}' | sort -u)
+        second_count="$(mktemp)"
+        second="$(hash_tables second "$second_count")"
+        second_n="$(cat "$second_count")"
+        if [ "$(printf '%s\n' "$second" | wc -l)" -ne 1 ]; then
+          echo "::error::the second build emitted more than one distinct table digest"
+          exit 1
+        fi
+        if [ "$second_n" -ne "$first_n" ]; then
+          echo "::error::the two builds emitted a different number of generated"\
+               " files ($first_n then $second_n); the generator is"\
+               " environment-dependent"
+          exit 1
+        fi
         if [ "$first" != "$second" ]; then
           echo "::error::generated tables are not reproducible: $first vs $second"
           exit 1
         fi
-        echo "generated tables reproducible: sha256 $first"
+        echo "generated tables reproducible across $first_n file(s): sha256 $first"
     - name: Assert Cargo.lock is unchanged
       if: ${{ !cancelled() }}
       run: |
@@ -1287,6 +1834,43 @@ jobs:
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
+    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
+    # commit, and a log that does not name that commit is unattributable evidence:
+    # it cannot be told apart from a run against a different tree, a different
+    # clone, or artifacts that predate the commit under review. That is not
+    # hypothetical - a checkpoint review found the retained runtime logs for this
+    # project pointing at another clone, which left the commit actually under
+    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
+    # (finding M8-01). Naming the commit FIRST is what makes every line that
+    # follows self-describing.
+    #
+    # THREE WITNESSES, deliberately, because they can disagree and each
+    # disagreement means something different. `github.sha` is what the EVENT
+    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
+    # hash is what the FILES actually contain. Only the tree hash moves if a later
+    # step edits the working tree, and only the first two can reveal a checkout
+    # that resolved somewhere else entirely.
+    #
+    # The assertion accepts the pull-request head sha as well as `github.sha`,
+    # because on a `pull_request` event the two legitimately differ: `github.sha`
+    # names the ephemeral merge commit, so a checkout configured for the branch
+    # tip would land on the head sha instead. Both are attributable. A third
+    # value is not, and is what fails the job.
+    - name: Record the commit under test
+      run: |
+        set -euo pipefail
+        head="$(git rev-parse HEAD)"
+        echo "event sha : ${{ github.sha }}"
+        echo "head sha  : $head"
+        echo "tree hash : $(git rev-parse 'HEAD^{tree}')"
+        echo "ref       : ${{ github.ref }}"
+        echo "job       : ${{ github.workflow }} / ${{ github.job }}"
+        case "$head" in
+          "${{ github.sha }}"|"${{ github.event.pull_request.head.sha }}") ;;
+          *) echo "::error::checked-out HEAD $head is neither the event sha nor the"\
+             " pull-request head sha, so this job's verdict would describe a commit"\
+             " nobody asked about."; exit 1 ;;
+        esac
     - name: Install Rust stable toolchain
       uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, 2026-07-16
       with:
@@ -1306,10 +1890,31 @@ jobs:
         esac
     - name: Boundary tests (in-crate)
       run: |
+        set -euo pipefail
+        # THE COUNT IS ASSERTED, NOT INFERRED FROM THE EXIT STATUS. These three
+        # tests are selected by name, and a name filter that matches nothing is not
+        # an error: `cargo test` prints "0 passed" and exits 0. So renaming or
+        # deleting any one of them would silently reduce this gate - a BLOCKING gate
+        # for User Constraint 3 - to a no-op that still reports success. Asserting
+        # the exact population is what keeps that from happening, and the number is
+        # exact rather than a floor because the filters name exactly three tests.
+        log="$(mktemp)"
         cargo +stable test --locked --lib -- \
           tests::executable_unsafe_is_confined_to_the_designated_boundary \
           tests::unsafe_code_denial_has_exactly_two_scoped_carve_outs \
-          tests::boundary_scanner_classifies_tokens_correctly
+          tests::boundary_scanner_classifies_tokens_correctly 2>&1 | tee "$log"
+        set -- $(awk '/^test result:/ { p += $4; f += $6; i += $8 } END { printf "%d %d %d", p, f, i }' "$log")
+        if [ "$2" -ne 0 ] || [ "$3" -ne 0 ]; then
+          echo "::error::unsafe-boundary tests reported $2 failed and $3 ignored;"\
+               " both must be 0"
+          exit 1
+        fi
+        if [ "$1" -ne 3 ]; then
+          echo "::error::expected exactly 3 unsafe-boundary tests to run, got $1;"\
+               " a test was renamed or removed and the name filter matched nothing"
+          exit 1
+        fi
+        echo "unsafe-boundary tests: $1 passed, 0 failed, 0 ignored"
     - name: Boundary assertion (source scan)
       run: |
         set -euo pipefail
@@ -1433,6 +2038,43 @@ jobs:
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
+    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
+    # commit, and a log that does not name that commit is unattributable evidence:
+    # it cannot be told apart from a run against a different tree, a different
+    # clone, or artifacts that predate the commit under review. That is not
+    # hypothetical - a checkpoint review found the retained runtime logs for this
+    # project pointing at another clone, which left the commit actually under
+    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
+    # (finding M8-01). Naming the commit FIRST is what makes every line that
+    # follows self-describing.
+    #
+    # THREE WITNESSES, deliberately, because they can disagree and each
+    # disagreement means something different. `github.sha` is what the EVENT
+    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
+    # hash is what the FILES actually contain. Only the tree hash moves if a later
+    # step edits the working tree, and only the first two can reveal a checkout
+    # that resolved somewhere else entirely.
+    #
+    # The assertion accepts the pull-request head sha as well as `github.sha`,
+    # because on a `pull_request` event the two legitimately differ: `github.sha`
+    # names the ephemeral merge commit, so a checkout configured for the branch
+    # tip would land on the head sha instead. Both are attributable. A third
+    # value is not, and is what fails the job.
+    - name: Record the commit under test
+      run: |
+        set -euo pipefail
+        head="$(git rev-parse HEAD)"
+        echo "event sha : ${{ github.sha }}"
+        echo "head sha  : $head"
+        echo "tree hash : $(git rev-parse 'HEAD^{tree}')"
+        echo "ref       : ${{ github.ref }}"
+        echo "job       : ${{ github.workflow }} / ${{ github.job }}"
+        case "$head" in
+          "${{ github.sha }}"|"${{ github.event.pull_request.head.sha }}") ;;
+          *) echo "::error::checked-out HEAD $head is neither the event sha nor the"\
+             " pull-request head sha, so this job's verdict would describe a commit"\
+             " nobody asked about."; exit 1 ;;
+        esac
     - name: Install Rust stable toolchain
       uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, 2026-07-16
       with:
@@ -1504,9 +2146,11 @@ jobs:
                 for tok in s.split():
                     if tok != "_*" and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', tok):
                         (g if mode == "g" else l).add(tok)
-        assert (len(nodes), len(g), len(l)) == (16, 54, 10), \
+        EXPECTED_MAP_SHAPE = (16, 54, 10)   # nodes / global: / local:, declared once
+        assert (len(nodes), len(g), len(l)) == EXPECTED_MAP_SHAPE, \
             f"zlib.map parsed as {len(nodes)} nodes / {len(g)} global / {len(l)} local, " \
-            "expected 16 / 54 / 10 - the version script changed or the parser drifted"
+            f"expected {EXPECTED_MAP_SHAPE[0]} / {EXPECTED_MAP_SHAPE[1]} / " \
+            f"{EXPECTED_MAP_SHAPE[2]} - the version script changed or the parser drifted"
         out = subprocess.run(["nm", "-D", "--defined-only", so],
                              capture_output=True, text=True, check=True).stdout
         T = {p[2] for p in (line.split() for line in out.splitlines())
@@ -1519,9 +2163,16 @@ jobs:
         # `gzopen_w`. Identical on every feature row: `pub mod ffi` is declared
         # unconditionally so the artifact always presents the full C symbol table,
         # and anything inside it that needs `std` is gated in the function body.
-        if len(T) != 95:
-            print(f"::error::expected 95 dynamic T symbols, found {len(T)}. The exported "
-                  "surface must not vary with a Cargo feature - that is an ABI break.")
+        #
+        # Declared ONCE and read by both the predicate and its message, for the
+        # same reason the test floors are: a number written out twice is a number
+        # that can drift, and an error message advertising a count the check does
+        # not enforce reports confidence it has not earned.
+        EXPECTED_EXPORTS = 95
+        if len(T) != EXPECTED_EXPORTS:
+            print(f"::error::expected {EXPECTED_EXPORTS} dynamic T symbols, found {len(T)}. "
+                  "The exported surface must not vary with a Cargo feature - that is an "
+                  "ABI break.")
             failed = True
         if missing:
             print(f"::error::zlib.map global: symbols absent from the artifact: {missing}")
@@ -1666,19 +2317,22 @@ jobs:
 
   # Cross-target type-check (gap D3, the half that cannot be run natively).
   #
-  # SCOPE: this job COMPILES the crate and its whole test/bench surface for three
+  # SCOPE: this job COMPILES the crate and its whole test/bench surface for four
   # foreign triples and executes NOTHING. `cargo check` does not link, which is why
   # no cross linker, emulator or apt step is needed - and equally why the result
   # must never be described as those platforms being "tested". `--all-targets` is
   # the point: the library alone would leave `tests/**` and `benches/**` unchecked.
   #
-  #   * aarch64-unknown-linux-gnu - the aarch64 ELF/glibc flavour, and the only
-  #     place this project states an aarch64 triple at all. It is type-checked
-  #     here, not executed. The `macos-latest` row runs natively on whatever
-  #     architecture GitHub currently provisions for that label, which is neither
-  #     pinned nor asserted anywhere, so it is not treated as aarch64 coverage -
-  #     and even were it arm64 it would be Mach-O with Apple's `target_vendor`
-  #     rather than this ELF/glibc combination.
+  #   * aarch64-unknown-linux-gnu - the aarch64 ELF/glibc flavour. It is
+  #     type-checked here, not executed. This is NOT the project's only aarch64
+  #     triple, nor its only aarch64 coverage: `build-test`'s macOS row runs
+  #     natively on `aarch64-apple-darwin`, which that row PINS (its `host:` and
+  #     `arch:` keys) and which its "Verify the host triple and runner
+  #     architecture match the row" step ASSERTS against two independent
+  #     witnesses, `rustc -vV`'s host line and `runner.arch`. This row is still
+  #     not redundant with that one, for the reason that matters to the code -
+  #     Apple's aarch64 is Mach-O with Apple's `target_vendor`, not this
+  #     ELF/glibc combination, so the two reach different `cfg` surfaces.
   #   * i686-unknown-linux-gnu - 32-bit `usize`/pointer width across the library,
   #     the integration suite and the benches. `bare-metal-no-std` is also 32-bit
   #     but builds only the library, so it type-checks none of the test surface.
@@ -1699,6 +2353,10 @@ jobs:
   #     versus 86 of 89 with the nine triples it used to carry). There is
   #     therefore no s390x-shaped hole in the supply-chain policy to align, and
   #     adding triples back to that key would REOPEN one.
+  #   * x86_64-pc-windows-msvc - the whole `cfg(windows)` surface, cross-checked
+  #     FROM Linux, which is why no MSVC linker is needed to reach it. Its
+  #     rationale runs longer than a bullet and is stated on the matrix entry
+  #     itself, beside the row it justifies.
   #
   # `--all-features` IS PART OF THAT CLAIM, not decoration (finding TEST-11).
   # `--all-targets` alone silently omits `tests/c_oracle.rs`, which declares
@@ -1717,7 +2375,7 @@ jobs:
   # truncates the preceding job's block early. Never end a 2-space comment line
   # with a colon.
   cross-targets:
-    name: Cross type-check (${{ matrix.target }})
+    name: Cross type-check + clippy (${{ matrix.target }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # Rank-2 override: beats the rank-4 `rust-toolchain.toml` repository pin,
@@ -1729,18 +2387,69 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: stable
     strategy:
-      # One triple's failure must not hide the other two.
+      # One triple's failure must not hide the others.
       fail-fast: false
       matrix:
         include:
           - target: aarch64-unknown-linux-gnu
           - target: i686-unknown-linux-gnu
           - target: s390x-unknown-linux-gnu
+          # Windows, cross-checked FROM Linux, which is the point: the native
+          # `windows-latest` row in `build-test` runs on one OS with one feature
+          # selection, so a diagnostic reachable only with `--all-features` under
+          # `target_os = "windows"` had no gate at all. Neither `check` nor
+          # `clippy` links, so no MSVC linker is needed to reach the whole
+          # `cfg(windows)` surface from an Ubuntu runner - including the
+          # `#[cfg(windows)]` `gzopen_w` and the `OS_CODE = 10` arm.
+          #
+          # This row is also the reason the clippy step below is not redundant
+          # with the native one: `c_ulong` is 32-bit here and 64-bit on LP64, so
+          # `uLong as u32` is a real truncation on Linux and an identity cast
+          # here. `unnecessary_cast` fires on exactly one of those two, and no
+          # Linux-host lane can see which.
+          - target: x86_64-pc-windows-msvc
     steps:
     - name: Checkout repository
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
+    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
+    # commit, and a log that does not name that commit is unattributable evidence:
+    # it cannot be told apart from a run against a different tree, a different
+    # clone, or artifacts that predate the commit under review. That is not
+    # hypothetical - a checkpoint review found the retained runtime logs for this
+    # project pointing at another clone, which left the commit actually under
+    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
+    # (finding M8-01). Naming the commit FIRST is what makes every line that
+    # follows self-describing.
+    #
+    # THREE WITNESSES, deliberately, because they can disagree and each
+    # disagreement means something different. `github.sha` is what the EVENT
+    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
+    # hash is what the FILES actually contain. Only the tree hash moves if a later
+    # step edits the working tree, and only the first two can reveal a checkout
+    # that resolved somewhere else entirely.
+    #
+    # The assertion accepts the pull-request head sha as well as `github.sha`,
+    # because on a `pull_request` event the two legitimately differ: `github.sha`
+    # names the ephemeral merge commit, so a checkout configured for the branch
+    # tip would land on the head sha instead. Both are attributable. A third
+    # value is not, and is what fails the job.
+    - name: Record the commit under test
+      run: |
+        set -euo pipefail
+        head="$(git rev-parse HEAD)"
+        echo "event sha : ${{ github.sha }}"
+        echo "head sha  : $head"
+        echo "tree hash : $(git rev-parse 'HEAD^{tree}')"
+        echo "ref       : ${{ github.ref }}"
+        echo "job       : ${{ github.workflow }} / ${{ github.job }}"
+        case "$head" in
+          "${{ github.sha }}"|"${{ github.event.pull_request.head.sha }}") ;;
+          *) echo "::error::checked-out HEAD $head is neither the event sha nor the"\
+             " pull-request head sha, so this job's verdict would describe a commit"\
+             " nobody asked about."; exit 1 ;;
+        esac
     # The cross target is installed through this action's `targets:` input. That
     # is the single sanctioned mechanism: `rust-toolchain.toml` deliberately
     # carries no `targets` key (it would force every contributor to download a
@@ -1751,6 +2460,7 @@ jobs:
       with:
         toolchain: stable
         targets: ${{ matrix.target }}
+        components: clippy
     # Fails the job if the rank-2 `RUSTUP_TOOLCHAIN` override above is ever lost,
     # rather than letting the gate silently run on the MSRV floor.
     - name: Verify the resolved toolchain is stable
@@ -1776,6 +2486,31 @@ jobs:
       run: |
         cargo +stable check --locked --all-targets --all-features --verbose \
           --target '${{ matrix.target }}'
+    # THE TYPE-CHECK ABOVE EXITS 0 ON A WARNING. THIS STEP DOES NOT.
+    #
+    # `cargo check` reports a `cfg`-divergent diagnostic and still succeeds, so
+    # before this step every lint reachable only under a non-host `cfg` was
+    # advisory - and this job's whole reason to exist is non-host `cfg`s. Three
+    # separate real defects were invisible to a `check`-only gate:
+    #
+    #   * `uLong as u32` is a truncation where `c_ulong` is 64-bit and an identity
+    #     cast where it is 32-bit, so `unnecessary_cast` fires on Windows and i686
+    #     but never on x86_64 Linux;
+    #   * `*mut c_char as *mut u8` is a sign change where `c_char` is `i8` and an
+    #     identity cast on aarch64 and s390x, where it is `u8`;
+    #   * a `pub(crate) use` consumed only from a `#[cfg(unix)]` shim is dead code
+    #     on Windows and perfectly live everywhere else.
+    #
+    # Each is a one-line fix and none is detectable from the host, which is the
+    # argument for spending a clippy run per triple rather than trusting review.
+    #
+    # `--all-features` and `--all-targets` match the `lint` job's gate for the
+    # reasons documented there; the only difference is `--target`. `--locked`
+    # keeps the linted graph the pinned one, exactly as in the step above.
+    - name: Cross clippy with warnings denied
+      run: |
+        cargo +stable clippy --locked --all-targets --all-features --verbose \
+          --target '${{ matrix.target }}' -- -D warnings
 
     - name: Assert Cargo.lock is unchanged
       if: ${{ !cancelled() }}
@@ -1840,6 +2575,43 @@ jobs:
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
+    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
+    # commit, and a log that does not name that commit is unattributable evidence:
+    # it cannot be told apart from a run against a different tree, a different
+    # clone, or artifacts that predate the commit under review. That is not
+    # hypothetical - a checkpoint review found the retained runtime logs for this
+    # project pointing at another clone, which left the commit actually under
+    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
+    # (finding M8-01). Naming the commit FIRST is what makes every line that
+    # follows self-describing.
+    #
+    # THREE WITNESSES, deliberately, because they can disagree and each
+    # disagreement means something different. `github.sha` is what the EVENT
+    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
+    # hash is what the FILES actually contain. Only the tree hash moves if a later
+    # step edits the working tree, and only the first two can reveal a checkout
+    # that resolved somewhere else entirely.
+    #
+    # The assertion accepts the pull-request head sha as well as `github.sha`,
+    # because on a `pull_request` event the two legitimately differ: `github.sha`
+    # names the ephemeral merge commit, so a checkout configured for the branch
+    # tip would land on the head sha instead. Both are attributable. A third
+    # value is not, and is what fails the job.
+    - name: Record the commit under test
+      run: |
+        set -euo pipefail
+        head="$(git rev-parse HEAD)"
+        echo "event sha : ${{ github.sha }}"
+        echo "head sha  : $head"
+        echo "tree hash : $(git rev-parse 'HEAD^{tree}')"
+        echo "ref       : ${{ github.ref }}"
+        echo "job       : ${{ github.workflow }} / ${{ github.job }}"
+        case "$head" in
+          "${{ github.sha }}"|"${{ github.event.pull_request.head.sha }}") ;;
+          *) echo "::error::checked-out HEAD $head is neither the event sha nor the"\
+             " pull-request head sha, so this job's verdict would describe a commit"\
+             " nobody asked about."; exit 1 ;;
+        esac
     # Installed through the action's `targets:` input, for the same reason as in
     # `cross-targets`: `rust-toolchain.toml` deliberately has no `targets` key.
     - name: Install Rust stable toolchain
@@ -1994,13 +2766,59 @@ jobs:
     timeout-minutes: 60
     # Rank-2 override: beats the rank-4 `rust-toolchain.toml` repository pin,
     # which would otherwise force this job onto the MSRV floor.
+    #
+    # PACKAGED_FLOOR is the SINGLE SOURCE OF TRUTH for the packaged suite's count,
+    # interpolated into the logged summary, the enforced comparison and the failure
+    # message alike. It previously logged 859 while enforcing 845, so fourteen tests
+    # could vanish from the published archive with the row green (P3-F1). The value is
+    # the measured default-feature total, because a packaged `cargo test` runs exactly
+    # the default features - `tests/c_oracle.rs` ships in the archive but contributes
+    # nothing, since `c-oracle` is not a default feature.
     env:
       RUSTUP_TOOLCHAIN: stable
+      PACKAGED_FLOOR: 956
     steps:
     - name: Checkout repository
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
+    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
+    # commit, and a log that does not name that commit is unattributable evidence:
+    # it cannot be told apart from a run against a different tree, a different
+    # clone, or artifacts that predate the commit under review. That is not
+    # hypothetical - a checkpoint review found the retained runtime logs for this
+    # project pointing at another clone, which left the commit actually under
+    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
+    # (finding M8-01). Naming the commit FIRST is what makes every line that
+    # follows self-describing.
+    #
+    # THREE WITNESSES, deliberately, because they can disagree and each
+    # disagreement means something different. `github.sha` is what the EVENT
+    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
+    # hash is what the FILES actually contain. Only the tree hash moves if a later
+    # step edits the working tree, and only the first two can reveal a checkout
+    # that resolved somewhere else entirely.
+    #
+    # The assertion accepts the pull-request head sha as well as `github.sha`,
+    # because on a `pull_request` event the two legitimately differ: `github.sha`
+    # names the ephemeral merge commit, so a checkout configured for the branch
+    # tip would land on the head sha instead. Both are attributable. A third
+    # value is not, and is what fails the job.
+    - name: Record the commit under test
+      run: |
+        set -euo pipefail
+        head="$(git rev-parse HEAD)"
+        echo "event sha : ${{ github.sha }}"
+        echo "head sha  : $head"
+        echo "tree hash : $(git rev-parse 'HEAD^{tree}')"
+        echo "ref       : ${{ github.ref }}"
+        echo "job       : ${{ github.workflow }} / ${{ github.job }}"
+        case "$head" in
+          "${{ github.sha }}"|"${{ github.event.pull_request.head.sha }}") ;;
+          *) echo "::error::checked-out HEAD $head is neither the event sha nor the"\
+             " pull-request head sha, so this job's verdict would describe a commit"\
+             " nobody asked about."; exit 1 ;;
+        esac
     - name: Install Rust stable toolchain
       uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, 2026-07-16
       with:
@@ -2200,28 +3018,39 @@ jobs:
         # count read rather than assumed - the packaged suite is exactly where a
         # lost target is hardest to notice, because an `exclude` entry can delete
         # a whole fixture and `cargo test` will still report `ok` over what
-        # remains (finding TEST-08). The floor is 860, the measured
-        # default-feature total, and the SAME 860 is echoed in the summary line,
-        # compared against, and named in the error message, so the number a
-        # reader is shown is always the number enforced. `tests/c_oracle.rs` is
-        # absent from that total by design, since `c-oracle` is not a default
-        # feature. Not `--no-fail-fast`; a single failure here is a broken
-        # published crate.
+        # remains (finding TEST-08). The floor is PACKAGED_FLOOR, declared once at
+        # job scope; `tests/c_oracle.rs` contributes nothing to it by design, since
+        # `c-oracle` is not a default feature. Not `--no-fail-fast`; a single failure here is
+        # a broken published crate.
+        # The floor is the measured default-feature total, which is exactly what the
+        # unpacked archive runs - `.github/workflows/*.yml` IS packaged, so even the
+        # workflow-parsing tests are present and the packaged count equals the
+        # `Default features` row rather than sitting below it. Both the
+        # summary echoed below and the predicate that enforces it read THIS
+        # variable - the job-scoped `PACKAGED_FLOOR` declared once in this job's
+        # `env:`. Written out twice they drifted - in an earlier revision the
+        # summary advertised 859 while the predicate accepted 845, so fourteen
+        # tests could vanish from the published archive and this job would still
+        # report the higher number. The `no-std-tests` job's four branches follow the
+        # same single-source rule, for the same reason: a gate that announces one
+        # floor while enforcing a lower one reads as a gate in the log without
+        # being one, which is worse than no floor at all.
         log="$RUNNER_TEMP/packaged-full.log"
         cargo +stable test --locked --target-dir "$RUNNER_TEMP/packaged-target" \
           2>&1 | tee "$log"
         set -- $(awk '/^test result:/ { b += 1; p += $4; f += $6; i += $8 }
                       END { printf "%d %d %d %d", b, p, f, i }' "$log")
-        echo "packaged test summary: blocks=$1 passed=$2 failed=$3 ignored=$4 floor=860"
+        echo "packaged test summary: blocks=$1 passed=$2 failed=$3 ignored=$4 floor=$PACKAGED_FLOOR"
         [ "$1" -ge 1 ] || { echo "::error::the packaged crate produced no 'test result:'"\
           " line - its harness never ran"; exit 1; }
         [ "$3" -eq 0 ] || { echo "::error::$3 test(s) failed inside the packaged crate";
           exit 1; }
         [ "$4" -eq 0 ] || { echo "::error::$4 test(s) were ignored inside the packaged"\
           " crate; AAP directive D-5 requires zero ignored tests"; exit 1; }
-        [ "$2" -ge 860 ] || { echo "::error::only $2 tests ran inside the packaged crate,"\
-          " below the floor of 860 - the archive is missing part of the suite, so an"\
-          " exclude entry removed a test target or a fixture it needs"; exit 1; }
+        [ "$2" -ge "$PACKAGED_FLOOR" ] || { echo "::error::only $2 tests ran inside the"\
+          " packaged crate, below the floor of $PACKAGED_FLOOR - the archive is missing"\
+          " part of the suite, so an exclude entry removed a test target or a fixture"\
+          " it needs"; exit 1; }
         # Belt and braces: prove the two suites PASSED BY DEGRADING rather than
         # by having been silently filtered out or renamed away. `--nocapture` is
         # required because a passing test's stdout is swallowed by default.

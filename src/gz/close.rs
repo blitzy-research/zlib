@@ -353,41 +353,55 @@ mod tests {
     use super::*;
 
     use crate::gz::state::{GzFile, How};
+    use crate::gz::test_temp::{TempFile, create_new_file};
     use crate::gz::write::gz_write;
     use crate::stream::ZStream;
     use std::fs::File;
     use std::io::Read;
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::path::Path;
 
     use flate2::read::GzDecoder;
 
-    /// Generates a unique, process- and counter-tagged temporary file path. The
-    /// `blitzy_adhoc_test_` prefix keeps these files out of any commit and makes
-    /// them trivial to clean up.
-    fn temp_path(tag: &str) -> PathBuf {
-        static CTR: AtomicU32 = AtomicU32::new(0);
-        let n = CTR.fetch_add(1, Ordering::Relaxed);
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "blitzy_adhoc_test_gzclose_{tag}_{}_{n}.gz",
-            std::process::id()
-        ));
-        p
+    /// Names a temporary `.gz` file inside a freshly created, caller-private
+    /// directory, removed together with that directory when the guard drops.
+    ///
+    /// # Why not a bare path in the shared temporary directory
+    ///
+    /// The previous helper returned `temp_dir()/blitzy_adhoc_test_gzclose_<tag>_<pid>_<n>.gz`
+    /// and the state builders below then opened it with a truncating
+    /// [`File::create`]. Both halves are computable by any other user on the host,
+    /// and `File::create` opens `O_CREAT | O_TRUNC` *without* `O_EXCL`, following a
+    /// final-component symlink — so a link planted at the predicted name redirects
+    /// the finalized gzip member to a target of the planter's choosing and truncates
+    /// it first (CWE-377, CWE-59). The trailing `remove_file` calls made it worse
+    /// rather than better: a failing assertion unwinds straight past them, leaving
+    /// the name in place for the next run to reuse.
+    ///
+    /// Uniqueness now rides on a directory created with `mkdir(2)` create-new
+    /// semantics — atomic, never following a symlink, and skipping rather than
+    /// adopting or deleting an occupied name — with [`Drop`]-owned cleanup that also
+    /// runs while unwinding. See [`crate::gz::test_temp`] for the full rationale.
+    ///
+    /// Callers keep the returned guard bound for the whole test and must **not** call
+    /// `remove_file` themselves.
+    fn temp_gz(tag: &str) -> TempFile {
+        TempFile::new(&std::format!("gzclose_{tag}"))
     }
 
     /// Builds a fresh write-mode [`GzState`] backed by a real, truncated temp
     /// file. `size` is left `0` so the finalize path lazily allocates buffers
     /// and initializes the deflate stream, exactly as a real `gzopen` would.
     fn write_state(path: &Path) -> Box<GzState> {
-        let file = File::create(path).expect("create writable temp file");
+        // Exclusive creation inside the guard's private directory: nothing is
+        // truncated and no symlink at this name is followed.
+        let file = create_new_file(path);
         Box::new(GzState {
             have: 0,
             next: 0,
             pos: 0,
             mode: GzMode::Write,
             file: GzFile::new(file),
-            path: path.display().to_string(),
+            path: path.as_os_str().as_encoded_bytes().to_vec(),
             size: 0,
             want: 8192,
             in_buf: Vec::new(),
@@ -418,7 +432,7 @@ mod tests {
     /// opened read-only, with the given last-recorded error code so the status
     /// mapping can be exercised.
     fn read_state(path: &Path, err: ReturnCode) -> Box<GzState> {
-        File::create(path).expect("materialize temp file");
+        drop(create_new_file(path));
         let file = File::open(path).expect("open readable temp file");
         Box::new(GzState {
             have: 0,
@@ -426,7 +440,7 @@ mod tests {
             pos: 0,
             mode: GzMode::Read,
             file: GzFile::new(file),
-            path: path.display().to_string(),
+            path: path.as_os_str().as_encoded_bytes().to_vec(),
             size: 0,
             want: 8192,
             in_buf: Vec::new(),
@@ -453,11 +467,13 @@ mod tests {
         })
     }
 
-    /// Reads the whole file at `path`, then removes it, returning the bytes.
-    fn read_and_remove(path: &Path) -> Vec<u8> {
-        let bytes = std::fs::read(path).expect("read compressed output");
-        let _ = std::fs::remove_file(path);
-        bytes
+    /// Reads the whole file at `path`.
+    ///
+    /// Deliberately does *not* remove it: the [`TempFile`] guard owns cleanup and
+    /// performs it on the unwinding path too, which a manual `remove_file` here
+    /// could not.
+    fn read_output(path: &Path) -> Vec<u8> {
+        std::fs::read(path).expect("read compressed output")
     }
 
     /// Decompresses a complete gzip member with the reference `flate2` decoder.
@@ -474,14 +490,14 @@ mod tests {
     fn gzclose_w_finalizes_empty_member() {
         // Closing a write handle that received no data must still emit a valid,
         // empty gzip member (header + empty block + zeroed trailer).
-        let path = temp_path("empty");
+        let path = temp_gz("empty");
         let ret = gzclose_w(write_state(&path));
         assert_eq!(
             ret,
             ReturnCode::Ok.as_c_int(),
             "an empty finalize returns Z_OK"
         );
-        let bytes = read_and_remove(&path);
+        let bytes = read_output(&path);
         assert_eq!(
             gunzip(&bytes),
             Vec::<u8>::new(),
@@ -494,7 +510,7 @@ mod tests {
         // `gzclose` on a write handle must dispatch to `gzclose_w`, whose
         // `Z_FINISH` flush yields a member decodable by an independent decoder.
         const DATA: &[u8] = b"The quick brown fox jumps over the lazy dog.\n";
-        let path = temp_path("data");
+        let path = temp_gz("data");
         let mut file = write_state(&path);
         let n = gz_write(&mut file, DATA);
         assert_eq!(n, DATA.len(), "all input bytes are accepted");
@@ -506,50 +522,45 @@ mod tests {
             "finalize through gzclose returns Z_OK"
         );
 
-        let bytes = read_and_remove(&path);
+        let bytes = read_output(&path);
         assert_eq!(gunzip(&bytes), DATA, "the data round-trips exactly");
     }
 
     #[test]
     fn gzclose_r_returns_ok_on_clean_read() {
-        let path = temp_path("read_ok");
+        let path = temp_gz("read_ok");
         let ret = gzclose_r(read_state(&path, ReturnCode::Ok));
         assert_eq!(ret, ReturnCode::Ok.as_c_int());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn gzclose_r_preserves_buf_error() {
         // C L662: a lingering Z_BUF_ERROR is the one code preserved across close.
-        let path = temp_path("read_buf");
+        let path = temp_gz("read_buf");
         let ret = gzclose_r(read_state(&path, ReturnCode::BufError));
         assert_eq!(ret, ReturnCode::BufError.as_c_int());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn gzclose_r_maps_other_errors_to_ok() {
         // C L662: any non-buffer error collapses to Z_OK at close time.
-        let path = temp_path("read_data_err");
+        let path = temp_gz("read_data_err");
         let ret = gzclose_r(read_state(&path, ReturnCode::DataError));
         assert_eq!(ret, ReturnCode::Ok.as_c_int());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn gzclose_r_rejects_a_write_handle() {
-        let path = temp_path("wrongdir_r");
+        let path = temp_gz("wrongdir_r");
         let ret = gzclose_r(write_state(&path));
         assert_eq!(ret, ReturnCode::StreamError.as_c_int());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn gzclose_w_rejects_a_read_handle() {
-        let path = temp_path("wrongdir_w");
+        let path = temp_gz("wrongdir_w");
         let ret = gzclose_w(read_state(&path, ReturnCode::Ok));
         assert_eq!(ret, ReturnCode::StreamError.as_c_int());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -557,10 +568,9 @@ mod tests {
         // Routing proof: a read handle carrying Z_BUF_ERROR must come back as
         // Z_BUF_ERROR (the reader's contract); had it gone to `gzclose_w` the
         // wrong-direction check would have produced Z_STREAM_ERROR instead.
-        let path = temp_path("dispatch_read");
+        let path = temp_gz("dispatch_read");
         let ret = gzclose(read_state(&path, ReturnCode::BufError));
         assert_eq!(ret, ReturnCode::BufError.as_c_int());
-        let _ = std::fs::remove_file(&path);
     }
 
     // -- the descriptor-releasing variants ----------------------------------
@@ -577,7 +587,7 @@ mod tests {
 
     #[test]
     fn gzclose_w_release_finalizes_and_hands_back_the_descriptor() {
-        let path = temp_path("release_w");
+        let path = temp_gz("release_w");
         let mut state = write_state(&path);
         assert_eq!(gz_write(&mut state, b"released write path"), 19);
 
@@ -588,27 +598,22 @@ mod tests {
         drop(file);
 
         // The finalize flush ran, so the member on disk is complete.
-        assert_eq!(
-            gunzip(&read_and_remove(&path)),
-            b"released write path".to_vec()
-        );
+        assert_eq!(gunzip(&read_output(&path)), b"released write path".to_vec());
     }
 
     #[test]
     fn gzclose_r_release_hands_back_the_descriptor_and_maps_the_status() {
         // Clean read -> Z_OK, descriptor released and still open.
-        let path = temp_path("release_r_ok");
+        let path = temp_gz("release_r_ok");
         let (ret, released) = gzclose_r_release(read_state(&path, ReturnCode::Ok));
         assert_eq!(ret, ReturnCode::Ok.as_c_int());
         assert_still_open(&released.expect("a reader releases its descriptor"));
-        let _ = std::fs::remove_file(&path);
 
         // A pending Z_BUF_ERROR is preserved, exactly as in the non-release form.
-        let path = temp_path("release_r_buf");
+        let path = temp_gz("release_r_buf");
         let (ret, released) = gzclose_r_release(read_state(&path, ReturnCode::BufError));
         assert_eq!(ret, ReturnCode::BufError.as_c_int());
         assert_still_open(&released.expect("a reader releases its descriptor"));
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -616,36 +621,33 @@ mod tests {
         // C tests `state->mode` before any teardown, so a refusal releases nothing
         // and the FFI layer's `finish_close` has no descriptor to close — which is
         // what makes `Z_STREAM_ERROR` outrank a close failure.
-        let path = temp_path("release_wrong_r");
+        let path = temp_gz("release_wrong_r");
         let (ret, released) = gzclose_r_release(write_state(&path));
         assert_eq!(ret, ReturnCode::StreamError.as_c_int());
         assert!(released.is_none(), "a refusal must release no descriptor");
-        let _ = std::fs::remove_file(&path);
 
-        let path = temp_path("release_wrong_w");
+        let path = temp_gz("release_wrong_w");
         let (ret, released) = gzclose_w_release(read_state(&path, ReturnCode::Ok));
         assert_eq!(ret, ReturnCode::StreamError.as_c_int());
         assert!(released.is_none(), "a refusal must release no descriptor");
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn gzclose_release_dispatches_like_gzclose() {
         // Reader: routed to the read finalizer, so a pending Z_BUF_ERROR survives.
-        let path = temp_path("release_dispatch_r");
+        let path = temp_gz("release_dispatch_r");
         let (ret, released) = gzclose_release(read_state(&path, ReturnCode::BufError));
         assert_eq!(ret, ReturnCode::BufError.as_c_int());
         assert_still_open(&released.expect("reader releases its descriptor"));
-        let _ = std::fs::remove_file(&path);
 
         // Writer: routed to the write finalizer, which finalizes the member.
-        let path = temp_path("release_dispatch_w");
+        let path = temp_gz("release_dispatch_w");
         let mut state = write_state(&path);
         assert_eq!(gz_write(&mut state, b"dispatch"), 8);
         let (ret, released) = gzclose_release(state);
         assert_eq!(ret, ReturnCode::Ok.as_c_int());
         assert_still_open(&released.expect("writer releases its descriptor"));
-        assert_eq!(gunzip(&read_and_remove(&path)), b"dispatch".to_vec());
+        assert_eq!(gunzip(&read_output(&path)), b"dispatch".to_vec());
     }
 
     /// The public wrappers must remain byte-for-byte equivalent to the release
@@ -654,18 +656,18 @@ mod tests {
     fn public_wrappers_match_the_release_variants() {
         let payload = b"wrapper equivalence";
 
-        let path_a = temp_path("equiv_wrapper");
+        let path_a = temp_gz("equiv_wrapper");
         let mut state = write_state(&path_a);
         assert_eq!(gz_write(&mut state, payload), payload.len());
         let wrapper_ret = gzclose_w(state);
 
-        let path_b = temp_path("equiv_release");
+        let path_b = temp_gz("equiv_release");
         let mut state = write_state(&path_b);
         assert_eq!(gz_write(&mut state, payload), payload.len());
         let (release_ret, released) = gzclose_w_release(state);
         drop(released);
 
         assert_eq!(wrapper_ret, release_ret);
-        assert_eq!(read_and_remove(&path_a), read_and_remove(&path_b));
+        assert_eq!(read_output(&path_a), read_output(&path_b));
     }
 }

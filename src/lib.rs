@@ -460,7 +460,23 @@ pub const ZLIB_VER_SUBREVISION: u32 = 1;
 //
 // `lib.rs` only DECLARES these modules; each is implemented in its own file.
 // The graph mirrors the C `#include` layering exactly (AAP §0.3.1) with no
-// extra top-level modules.
+// extra top-level modules, and it is ACYCLIC: every `use crate::…` in the
+// shipped library points at a strictly lower layer of
+//
+//     error / constants -> util -> checksum -> stream / gz_header
+//                       -> {deflate, inflate} -> gz -> ffi
+//
+// so `stream`/`gz_header` and `deflate`/`inflate` are strict peers that never
+// name each other. Nothing in the compiler enforces that — a Rust crate is one
+// compilation unit, so an upward `use` would compile silently — which is why
+// `tests::the_module_graph_has_no_upward_edges` re-derives the whole edge set
+// from the source text and fails on any reference that does not point downward
+// (AAP §0.4.2 B2). Two decisions keep it one-way: `stream` owns the engine
+// state as an opaque `Box<dyn EngineState>` and names neither engine type, and
+// the one-call façades are split into layer-3 C driver logic behind the
+// `OneCallDeflate`/`OneCallInflate` port traits plus layer-6 engine-owning
+// entry points, mirroring how `compress.c` and `uncompr.c` include `zlib.h`
+// and drive the engine rather than sitting beside `zutil.h`.
 // ===========================================================================
 
 pub mod checksum;
@@ -527,8 +543,14 @@ pub use gz_header::GzHeader;
 
 // One-call, whole-buffer wrappers (ported from `compress.c`/`uncompr.c`). Both
 // the idiomatic snake_case names and the zlib-style `compressBound` alias are
-// surfaced.
-pub use util::{compress, compress_bound, compress2, compressBound, uncompress, uncompress2};
+// surfaced. `compress.c` and `uncompr.c` are C translation units that include
+// `zlib.h` and drive the engines, so their engine-owning halves live with the
+// engines (`deflate` / `inflate`) while the engine-free sizing formula stays in
+// `util`; the six names published here are exactly the `zlib.h` spellings
+// regardless (AAP §0.3.1, §0.4.2 B2).
+pub use deflate::{compress, compress2};
+pub use inflate::{uncompress, uncompress2};
+pub use util::{compress_bound, compressBound};
 
 // Version, compile-flag, and error-string reporting (ported from `zutil.c`),
 // each paired with its zlib-style camelCase alias.
@@ -958,6 +980,83 @@ mod tests {
         );
     }
 
+    /// Every allocation on the hook-backed placement path is **fallible**.
+    ///
+    /// zlib answers heap exhaustion with `Z_MEM_ERROR`; it never aborts. The two
+    /// modules that own hook-backed placement must therefore reach the global
+    /// allocator only through the fallible `try_box`, never through `Box::new`,
+    /// whose failure path is `handle_alloc_error` and hence process abort:
+    ///
+    /// * `src/stream.rs` holds the ownership model — `AllocBuffer`, `EngineBox`
+    ///   and `EngineReservation`;
+    /// * `src/ffi/alloc.rs` supplies its `ForeignBuffer` / `ForeignEngineHome` /
+    ///   `ForeignEngine` implementations, the only code that touches the region a
+    ///   caller's `zalloc` returned.
+    ///
+    /// Preserving C's allocation *count* means the small owning handles this port
+    /// needs cannot become extra `zalloc` requests, so they come from the global
+    /// heap — which is exactly why their failure has to be reportable (AAP
+    /// §0.6.5).
+    ///
+    /// This port shipped precisely that defect: `CEngineHome::fill` ended in
+    /// `Box::new(CEngine { .. })`, so a caller with a healthy bounded arena but an
+    /// exhausted global heap would have been aborted instead of receiving
+    /// `Z_MEM_ERROR`. Ordering the fallible allocation *before* the region is
+    /// committed is what makes the failure recoverable: the reservation is still
+    /// owned, so it goes back through the caller's `zfree`.
+    ///
+    /// One occurrence is sanctioned — the zero-sized fast path *inside* `try_box`
+    /// itself, where the allocator is provably never consulted.
+    #[test]
+    fn hook_backed_placement_never_uses_infallible_box_new() {
+        let sources = crate_sources();
+        let mut scanned = 0usize;
+
+        for (rel, text) in &sources {
+            let is_model = rel.as_str() == "src/stream.rs";
+            let is_boundary = rel.as_str() == "src/ffi/alloc.rs";
+            if !is_model && !is_boundary {
+                continue;
+            }
+            scanned += 1;
+
+            let shipped = blank_cfg_test_items(&blank_comments_and_literals(text));
+            let hits = shipped.matches("Box::new").count();
+            let expected = usize::from(is_boundary);
+            assert_eq!(
+                hits, expected,
+                "{rel} has {hits} shipped `Box::new` occurrence(s) but must have \
+                 {expected}. Hook-backed placement allocates only through \
+                 `try_box`: `Box::new` aborts the process on heap exhaustion, \
+                 whereas zlib reports it as Z_MEM_ERROR (AAP §0.6.5)."
+            );
+        }
+        assert_eq!(
+            scanned, 2,
+            "both placement modules must have been scanned; the paths in this test \
+             are stale if they were renamed"
+        );
+
+        // Pin the one sanctioned occurrence in place, so it cannot be joined by
+        // another that merely inherits its exemption.
+        let boundary = sources
+            .iter()
+            .find(|(rel, _)| rel.as_str() == "src/ffi/alloc.rs")
+            .map(|(_, text)| blank_cfg_test_items(&blank_comments_and_literals(text)))
+            .expect("src/ffi/alloc.rs is part of the crate");
+        let at = boundary
+            .find("Box::new")
+            .expect("the sanctioned occurrence must still be present");
+        let opens = boundary[..at]
+            .rfind("fn try_box")
+            .expect("the sanctioned `Box::new` must sit inside `try_box` itself");
+        assert!(
+            boundary[opens..at].contains("layout.size() == 0"),
+            "the sanctioned `Box::new` must be guarded by the zero-size test that \
+             makes it allocation-free"
+        );
+    }
+
     /// The enforcement attributes themselves are pinned: the crate root denies
     /// `unsafe_code`, nothing re-enables it crate- or module-wide, and exactly two
     /// narrowly scoped carve-outs exist — both in `src/lib.rs`.
@@ -1111,6 +1210,476 @@ mod tests {
             "the crate `no_std` gate must use the same predicate as the \
              runtime-support module it keeps in lockstep"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Layer architecture — the acyclic seven-layer module graph (AAP §0.3.1,
+    // §0.4.2 B2)
+    //
+    // The module-declaration comment above claims the graph "mirrors the C
+    // `#include` layering exactly ... with no extra top-level modules", and the
+    // AAP fixes the ordering as
+    //
+    //     error / constants -> util -> checksum -> stream / gz_header
+    //                       -> {deflate, inflate} -> gz -> ffi
+    //
+    // where every arrow means "the right side may name the left side". Nothing in
+    // the compiler enforces that: a Rust crate is one compilation unit, so an
+    // upward `use` compiles perfectly and the layering silently degrades into a
+    // cycle. The check below re-derives the whole edge set from the source text
+    // and fails on any reference that does not point strictly downward, which is
+    // what turns the documented architecture into an enforced one.
+    //
+    // The scan is deliberately two-tiered, because the shipped library and the
+    // `#[cfg(test)]` configuration are different compilation units with different
+    // obligations:
+    //
+    //   * Shipped code — every `.rs` file with its `#[cfg(test)]` items removed —
+    //     must be *strictly* one-way. No upward edge and no same-layer edge, so
+    //     the library that is actually built, linked, and published has an
+    //     acyclic graph in which each layer can be read, reviewed, and reasoned
+    //     about without the layers above it. This is the claim AAP §0.3.1 makes
+    //     and the only tier the published artifacts depend on.
+    //
+    //   * `#[cfg(test)]` code may hold a small, *enumerated* set of exceptions
+    //     (`TEST_ONLY_CROSS_LAYER_EXCEPTIONS`). Two facts make a blanket ban
+    //     counter-productive there: a caller-hook test needs a real C
+    //     `alloc_func`/`free_func` pair, which requires `unsafe` and therefore
+    //     may only be built inside `src/ffi/**`; and an engine round-trip test
+    //     needs the inverse engine, which is the only way to verify emitted bytes
+    //     without `std` or a third-party codec. Neither can place an edge in the
+    //     shipped graph. The exceptions are an allow-list rather than a blanket
+    //     exemption precisely so a *new* test-only inversion fails this test
+    //     until it is justified here, and so a stale entry fails it too.
+    // -----------------------------------------------------------------------
+
+    /// The ten top-level modules of the crate and their AAP §0.3.1 layer numbers.
+    ///
+    /// `stream` and `gz_header` share layer 5, and `deflate` and `inflate` share
+    /// layer 6 — they are strict peers, so neither may name the other either.
+    /// A reference is legal only when it points at a *strictly lower* number.
+    const MODULE_LAYERS: [(&str, u8); 10] = [
+        ("error", 1),
+        ("constants", 2),
+        ("util", 3),
+        ("checksum", 4),
+        ("stream", 5),
+        ("gz_header", 5),
+        ("deflate", 6),
+        ("inflate", 6),
+        ("gz", 7),
+        ("ffi", 8),
+    ];
+
+    /// The complete set of `(from, to, why)` module references that are permitted
+    /// **only** inside `#[cfg(test)]` code, and never in the shipped library.
+    ///
+    /// Every entry must be exercised — a stale one fails
+    /// [`the_module_graph_has_no_upward_edges`](fn@the_module_graph_has_no_upward_edges)
+    /// just as loudly as an unlisted one — so this list cannot drift away from
+    /// the code it describes.
+    const TEST_ONLY_CROSS_LAYER_EXCEPTIONS: [(&str, &str, &str); 3] = [
+        (
+            "stream",
+            "ffi",
+            "the has-hook contract (AAP §0.6.3) can only be asserted against a real C \
+             alloc_func/free_func pair, and building one needs raw-pointer `unsafe`, \
+             which is permitted only under src/ffi/** (AAP §0.6.2); the counting hook \
+             therefore lives in crate::ffi::alloc::test_hook and is merely driven from \
+             the layer-5 tests",
+        ),
+        (
+            "deflate",
+            "inflate",
+            "emitted-byte assertions decode with the crate's own inflate engine, which \
+             keeps the deflate unit tests free of `std` and of any third-party codec so \
+             they run in every feature configuration",
+        ),
+        (
+            "inflate",
+            "deflate",
+            "decoder fixtures are produced by the crate's own deflate engine for the \
+             same reason, rather than by baking a second copy of the reference vectors",
+        ),
+    ];
+
+    /// The top-level module a `src/`-relative path belongs to, or [`None`] for
+    /// `src/lib.rs` itself.
+    ///
+    /// `src/lib.rs` is the crate root — the API curator that declares every
+    /// module and therefore legitimately names all of them — so it is excluded
+    /// from the edge scan. Every other file resolves to exactly one module:
+    /// `src/stream.rs` to `stream`, `src/deflate/state.rs` to `deflate`.
+    fn owning_module(rel: &str) -> Option<&'static str> {
+        let tail = rel.strip_prefix("src/")?;
+        if tail == "lib.rs" {
+            return None;
+        }
+        let name = match tail.split_once('/') {
+            Some((dir, _)) => dir,
+            None => tail.strip_suffix(".rs")?,
+        };
+        MODULE_LAYERS
+            .iter()
+            .find(|(m, _)| *m == name)
+            .map(|(m, _)| *m)
+    }
+
+    /// The layer number of a top-level module.
+    fn layer_of(module: &str) -> u8 {
+        MODULE_LAYERS
+            .iter()
+            .find(|(m, _)| *m == module)
+            .map(|(_, l)| *l)
+            .unwrap_or_else(|| panic!("{module} is not one of the crate's top-level modules"))
+    }
+
+    /// Every `crate::<module>` reference in `blanked`, as
+    /// `(byte offset, 1-based line, module)`.
+    ///
+    /// The input must already have had comments and string literals blanked, so a
+    /// doc comment that *mentions* `[`crate::deflate`]` — `src/stream.rs` has
+    /// several — is not mistaken for a dependency. A path such as
+    /// `crate::compress2` names a crate-root re-export rather than a module and is
+    /// skipped, because the root sits above every layer.
+    ///
+    /// The byte offset is returned alongside the line so a caller can ask whether
+    /// the reference survives [`blank_cfg_test_items`] and therefore whether it
+    /// belongs to the shipped library or only to the test configuration.
+    fn crate_path_edges(blanked: &str) -> alloc::vec::Vec<(usize, usize, &'static str)> {
+        let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let bytes = blanked.as_bytes();
+        let mut edges = alloc::vec::Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = blanked[from..].find("crate::") {
+            let at = from + rel;
+            from = at + "crate::".len();
+            // Whole-word `crate` only: `my_crate::x` is a different crate.
+            if at > 0 && ident(bytes[at - 1]) {
+                continue;
+            }
+            let rest = &blanked[from..];
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            let head = &rest[..end];
+            if let Some((module, _)) = MODULE_LAYERS.iter().find(|(m, _)| *m == head) {
+                let line = blanked[..at].bytes().filter(|&c| c == b'\n').count() + 1;
+                edges.push((at, line, *module));
+            }
+            from += end;
+        }
+        edges
+    }
+
+    /// Blanks every `#[cfg(test)]`-gated item, leaving exactly the text the
+    /// shipped library is compiled from.
+    ///
+    /// Offsets and line numbers are preserved — each removed byte becomes a space
+    /// and newlines are kept — so an offset taken from the input still addresses
+    /// the same source position in the output, which is what lets one
+    /// [`crate_path_edges`] scan be classified against both texts.
+    ///
+    /// An attribute counts as test-gating when its predicate names `test` as a
+    /// whole word and does not negate it. That covers every form the crate
+    /// actually uses — `#[cfg(test)]`, `#[cfg(all(test, feature = "std"))]` and
+    /// `#[cfg(all(test, target_endian = "big"))]` — while leaving the
+    /// `#[cfg(not(test))]` and `#[cfg(all(not(feature = "std"), not(test), ...))]`
+    /// production items in place. The gated item ends at the first `;` or the
+    /// first brace-balanced `{ ... }` after the attribute, which is the shape of
+    /// every gated item here: a `mod`, a `fn`, a `use`, or a `const`.
+    fn blank_cfg_test_items(blanked: &str) -> std::string::String {
+        let bytes = blanked.as_bytes();
+        let mut out = bytes.to_vec();
+        // Whole-word search, so neither `latest` nor `test_hook` counts as `test`.
+        let names_test = |attr: &str| {
+            let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+            let a = attr.as_bytes();
+            let mut i = 0usize;
+            while let Some(rel) = attr[i..].find("test") {
+                let at = i + rel;
+                i = at + "test".len();
+                let before_ok = at == 0 || !ident(a[at - 1]);
+                let after_ok = i >= a.len() || !ident(a[i]);
+                if before_ok && after_ok {
+                    return true;
+                }
+            }
+            false
+        };
+        let mut from = 0usize;
+        while let Some(rel) = blanked[from..].find("#[cfg(") {
+            let at = from + rel;
+            // End of the attribute: the `]` closing the opening `#[`.
+            let mut depth = 0i32;
+            let mut i = at + 1;
+            let mut attr_end = None;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'[' | b'(' => depth += 1,
+                    b']' | b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            attr_end = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            let Some(attr_end) = attr_end else { break };
+            from = attr_end + 1;
+            let attr = &blanked[at..=attr_end];
+            if !names_test(attr) || attr.contains("not(test)") {
+                continue;
+            }
+            // End of the gated item: the first `;`, or the first balanced `{...}`.
+            let mut j = attr_end + 1;
+            let mut item_end = None;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b';' => {
+                        item_end = Some(j);
+                        break;
+                    }
+                    b'{' => {
+                        let mut d = 0i32;
+                        let mut k = j;
+                        while k < bytes.len() {
+                            match bytes[k] {
+                                b'{' => d += 1,
+                                b'}' => {
+                                    d -= 1;
+                                    if d == 0 {
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            k += 1;
+                        }
+                        item_end = Some(k.min(bytes.len().saturating_sub(1)));
+                        break;
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            let Some(item_end) = item_end else { break };
+            for b in &mut out[at..=item_end] {
+                if *b != b'\n' {
+                    *b = b' ';
+                }
+            }
+            from = item_end + 1;
+        }
+        std::string::String::from_utf8(out)
+            .expect("only ASCII bytes are overwritten, so the text stays valid UTF-8")
+    }
+
+    /// The `inflateBack` decode path must contain no owned buffer and perform no
+    /// allocation, exactly as `infback.c` allocates only inside
+    /// `inflateBackInit_` (its one `ZALLOC`, L51) and nothing thereafter.
+    ///
+    /// A previous shape copied every provider chunk into an infallibly growing
+    /// `Vec`, which turned a caller-driven input pattern into caller-driven heap
+    /// pressure and, on the `no_std` `cdylib`, into `malloc` traffic during
+    /// decode. The two-method [`crate::inflate::InFunc`] split removed the buffer
+    /// entirely; this is the mechanical guard that keeps it removed, because a
+    /// behavioural test cannot see an allocation that merely *could* happen on a
+    /// larger input.
+    ///
+    /// Scope is the shipped body of `src/inflate/back.rs` only: `#[cfg(test)]`
+    /// items legitimately build `Vec`s to hold expected output, and the single
+    /// `Box` that owns the state is C's own allocation.
+    #[test]
+    fn the_back_inflate_decode_path_owns_no_buffer() {
+        let sources = crate_sources();
+        let (_, text) = sources
+            .iter()
+            .find(|(rel, _)| rel == "src/inflate/back.rs")
+            .expect("src/inflate/back.rs must be part of the crate");
+
+        // Comments and string literals are blanked so prose describing the old
+        // shape cannot trip the scan, then `#[cfg(test)]` items are removed so only
+        // the shipped decoder is examined.
+        let shipped = blank_cfg_test_items(&blank_comments_and_literals(text));
+
+        // Every construct that would put an owned, growable buffer on the decode
+        // path. `Box` is deliberately absent from this list: it is how the state
+        // itself is held, matching C's single `ZALLOC`.
+        const ALLOCATING: [&str; 8] = [
+            "Vec<",
+            "Vec::",
+            "vec!",
+            ".to_vec()",
+            "extend_from_slice",
+            "with_capacity",
+            "String",
+            ".reserve(",
+        ];
+        let mut found = alloc::vec::Vec::new();
+        for (n, line) in shipped.lines().enumerate() {
+            for needle in ALLOCATING {
+                if line.contains(needle) {
+                    found.push(alloc::format!(
+                        "src/inflate/back.rs:{}: `{needle}` on the decode path",
+                        n + 1
+                    ));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "the inflateBack decode path must allocate nothing (infback.c allocates \
+             only in inflateBackInit_); found {} occurrence(s):\n{}",
+            found.len(),
+            found.join("\n")
+        );
+
+        // Non-vacuity: the scan must actually have seen the decoder, not an empty
+        // string produced by an over-eager blanker.
+        assert!(
+            shipped.contains("fn pull(&mut self)") && shipped.contains("fn inflate_back<"),
+            "the blanked source no longer contains the decoder; the scan would \
+             pass vacuously"
+        );
+        // And the cursor-only `BackCtx` must still read through the provider
+        // rather than from a field of its own.
+        assert!(
+            shipped.contains("self.src.chunk()"),
+            "the decoder must read input through InFunc::chunk, not from an owned \
+             buffer"
+        );
+    }
+
+    /// **No `use` in the shipped library points upward, or sideways, in the layer
+    /// graph — and every test-only exception is one of three enumerated ones.**
+    ///
+    /// This is the mechanical form of AAP §0.4.2 B2. It scans every `.rs` file
+    /// under `src/` twice: once with the `#[cfg(test)]` items removed, which is
+    /// the library that is actually built and published and must be *strictly*
+    /// one-way; and once whole, so that a test-only reference is checked against
+    /// [`TEST_ONLY_CROSS_LAYER_EXCEPTIONS`] rather than ignored. Every violation
+    /// is reported at once with its file, line, tier and both layer numbers, so a
+    /// regression is diagnosable without re-running the analysis by hand.
+    ///
+    /// Four structural facts are asserted alongside it, each closing a way the
+    /// check could pass while measuring nothing:
+    ///
+    /// 1. every `src/` file classifies into one of the ten declared modules, so a
+    ///    new top-level module cannot slip in unscanned;
+    /// 2. the shipped graph is non-trivial (> 40 inter-module edges), so a
+    ///    blanking bug that erases the source cannot masquerade as compliance;
+    /// 3. `#[cfg(test)]` blanking removed something but not everything, so the
+    ///    two tiers are genuinely different texts;
+    /// 4. every entry in the exception list is actually exercised, so a stale
+    ///    exemption fails just as loudly as an unlisted violation.
+    #[test]
+    fn the_module_graph_has_no_upward_edges() {
+        let sources = crate_sources();
+
+        // Guard 1: every `src/` file must classify into a known module, so the
+        // scan cannot be silently incomplete.
+        let mut classified = 0usize;
+        for (rel, _) in &sources {
+            if rel == "src/lib.rs" {
+                continue;
+            }
+            assert!(
+                owning_module(rel).is_some(),
+                "{rel} does not belong to any of the {} declared top-level modules; \
+                 add it to MODULE_LAYERS with its AAP §0.3.1 layer",
+                MODULE_LAYERS.len()
+            );
+            classified += 1;
+        }
+        assert!(
+            classified > 30,
+            "expected the whole module tree, classified only {classified} files"
+        );
+
+        // Guard 2: collect the edge set, tier by tier.
+        let mut violations = alloc::vec::Vec::new();
+        let mut shipped_edges = 0usize;
+        let mut test_edges = 0usize;
+        let mut exceptions_used = [0usize; TEST_ONLY_CROSS_LAYER_EXCEPTIONS.len()];
+        for (rel, text) in &sources {
+            let Some(from) = owning_module(rel) else {
+                continue;
+            };
+            let blanked = blank_comments_and_literals(text);
+            let shipped = blank_cfg_test_items(&blanked);
+            let shipped_bytes = shipped.as_bytes();
+            for (at, line, to) in crate_path_edges(&blanked) {
+                if to == from {
+                    continue; // an intra-module path is not a graph edge
+                }
+                // The blanker preserves offsets, so the reference belongs to the
+                // shipped library exactly when its first byte survived.
+                let in_shipped = shipped_bytes[at] == b'c';
+                let (lf, lt) = (layer_of(from), layer_of(to));
+                if in_shipped {
+                    shipped_edges += 1;
+                    if lt >= lf {
+                        let direction = if lt == lf { "SAME-LAYER" } else { "UPWARD" };
+                        violations.push(alloc::format!(
+                            "{rel}:{line}: SHIPPED {direction} \
+                             {from}(layer {lf}) -> {to}(layer {lt})"
+                        ));
+                    }
+                    continue;
+                }
+                test_edges += 1;
+                if lt < lf {
+                    continue; // a downward reference needs no exemption
+                }
+                match TEST_ONLY_CROSS_LAYER_EXCEPTIONS
+                    .iter()
+                    .position(|(f, t, _)| *f == from && *t == to)
+                {
+                    Some(idx) => exceptions_used[idx] += 1,
+                    None => violations.push(alloc::format!(
+                        "{rel}:{line}: CFG(TEST) {from}(layer {lf}) -> {to}(layer {lt}) \
+                         is not in TEST_ONLY_CROSS_LAYER_EXCEPTIONS — either point it \
+                         downward or justify it there"
+                    )),
+                }
+            }
+        }
+
+        // Guard 3: the scan must actually have seen the shipped graph, and the two
+        // tiers must be genuinely distinct texts.
+        assert!(
+            shipped_edges > 40,
+            "only {shipped_edges} shipped inter-module edges found — the scan is not \
+             seeing the graph"
+        );
+        assert!(
+            test_edges > 0,
+            "no #[cfg(test)] inter-module edge was seen at all, so blank_cfg_test_items \
+             is removing more than the test configuration"
+        );
+
+        assert!(
+            violations.is_empty(),
+            "the seven-layer module graph must be strictly one-way (AAP §0.3.1, \
+             §0.4.2 B2); found {} violation(s):\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
+
+        // Guard 4: no stale exemption. An entry that stops being needed must be
+        // deleted, or the list stops describing the code.
+        for (idx, (from, to, why)) in TEST_ONLY_CROSS_LAYER_EXCEPTIONS.iter().enumerate() {
+            assert!(
+                exceptions_used[idx] > 0,
+                "TEST_ONLY_CROSS_LAYER_EXCEPTIONS still exempts {from} -> {to} but no \
+                 #[cfg(test)] code needs it any more; delete the entry (rationale on \
+                 record: {why})"
+            );
+        }
     }
 
     /// The freestanding runtime block supplies **all three** items a std-off
@@ -1438,6 +2007,9 @@ mod tests {
 
     #[test]
     fn every_toolchain_specific_ci_job_pins_and_asserts_its_toolchain() {
+        // Counts the jobs clause 4 below actually inspected, so that clause cannot
+        // quietly stop matching and assert nothing.
+        let mut lints = 0usize;
         for (workflow, job, channel) in TOOLCHAIN_JOBS {
             let block = workflow_job_block(workflow, job);
 
@@ -1476,6 +2048,174 @@ mod tests {
                 block.contains("exit 1"),
                 "{workflow} job `{job}`'s toolchain assertion must `exit 1` on \
                  mismatch, or it cannot fail the job"
+            );
+
+            // 4. A job that LINTS needs more than a channel: `cargo fmt` and
+            //    `cargo clippy` live in components the install step provisions
+            //    only when it names them. Reading non-comment lines only, because
+            //    these files narrate each other's commands in prose — `fuzz.yml`'s
+            //    header quotes `ci.yml`'s `cargo fmt --all -- --check` while
+            //    running neither.
+            let mut commands = std::string::String::new();
+            for line in block.lines() {
+                if line.trim_start().starts_with('#') {
+                    continue;
+                }
+                commands.push_str(line);
+                commands.push('\n');
+            }
+            if !commands.contains("cargo fmt") && !commands.contains("cargo clippy") {
+                continue;
+            }
+            lints += 1;
+            // `(component, the probe that proves it resolved, the shim rustup
+            // names when it did not)`.
+            for (component, probe, shim) in [
+                ("rustfmt", "cargo fmt --version", "cargo-fmt"),
+                ("clippy", "cargo clippy --version", "cargo-clippy"),
+            ] {
+                assert!(
+                    commands
+                        .lines()
+                        .filter_map(|line| line.trim().strip_prefix("components:"))
+                        .any(|named| named.split(',').any(|one| one.trim() == component)),
+                    "{workflow} job `{job}` runs cargo fmt/clippy, so its toolchain \
+                     step must name `{component}` in `components:`; without it the \
+                     subcommand has no `{shim}` to dispatch to, and the gate fails \
+                     on a missing component instead of on the sources it exists to \
+                     read"
+                );
+                assert!(
+                    commands.contains(probe),
+                    "{workflow} job `{job}` must run `{probe}` in its toolchain \
+                     verification step, so a dropped `components:` entry is named \
+                     right there instead of surfacing minutes later as \
+                     `'{shim}' is not installed`"
+                );
+            }
+        }
+        assert_eq!(
+            lints, 2,
+            "expected exactly two linting jobs among the toolchain-pinned ones \
+             (ci.yml `lint` and fuzz.yml `cargo-fuzz`), saw {lints} — either a job \
+             started linting without being held to this contract (name the \
+             components, probe them, raise this count) or the scan stopped matching \
+             and clause 4 now asserts nothing"
+        );
+    }
+
+    /// Every `ci.yml` job must name the commit it is judging, before it judges it.
+    ///
+    /// A green verdict is only evidence if the log says which commit it describes.
+    /// A checkpoint review of this project found the retained runtime artifacts and
+    /// C-oracle logs pointing at a DIFFERENT clone, which left the commit actually
+    /// under assessment with no build, test, lint, MSRV, symbol or oracle proof at
+    /// all — the reviewer could not attribute a single passing gate to the tree
+    /// being reviewed (finding M8-01). Prose cannot fix that, because the defect is
+    /// the absence of an identifier in the log itself. So the remedy is structural:
+    /// every job emits its commit identity as its FIRST act after checkout, which
+    /// makes every line that follows self-describing.
+    ///
+    /// ORDER IS THE WHOLE POINT, and is asserted rather than assumed. Provenance
+    /// printed at the END of a job is worthless precisely when it matters most —
+    /// a job that dies in its third step produces a log with a failure and no
+    /// commit. Hence the check is positional: checkout first, provenance second,
+    /// gates afterwards.
+    ///
+    /// SCOPED TO `ci.yml` DELIBERATELY. These twelve jobs are exactly the ones
+    /// whose missing proof the finding enumerates. `audit.yml` and `fuzz.yml`
+    /// number their steps in prose comments (`# 2.`, `# 3.`, …), so inserting a
+    /// step there would mean renumbering commentary unrelated to this contract —
+    /// churn that buys no additional attributability for the gates named.
+    ///
+    /// The job list is read from the file, not hard-coded, so a newly added job
+    /// cannot escape the requirement by not being mentioned here.
+    #[test]
+    fn every_ci_job_records_the_commit_it_is_judging() {
+        const WORKFLOW: &str = ".github/workflows/ci.yml";
+        let jobs = workflow_job_names(WORKFLOW);
+        assert_eq!(
+            jobs.len(),
+            12,
+            "expected 12 `ci.yml` jobs to hold to the provenance contract, found \
+             {}: {jobs:?}",
+            jobs.len()
+        );
+
+        for job in &jobs {
+            let block = workflow_job_block(WORKFLOW, job);
+
+            // 1. Positional: checkout, then provenance, then everything else.
+            //    Reading the step names in order is what makes this an ordering
+            //    assertion rather than a mere presence check.
+            //
+            //    INDENTATION IS THE DISCRIMINATOR, exactly as it is for the job
+            //    keys themselves. Steps are the FOUR-space-indented sequence
+            //    items; `build-test`'s `matrix.include:` rows are also `- name:`
+            //    entries but sit deeper, so trimming the leading whitespace would
+            //    read a matrix row as the job's first step.
+            let steps: alloc::vec::Vec<&str> = block
+                .lines()
+                .filter_map(|l| l.strip_prefix("    - name: "))
+                .collect();
+            assert_eq!(
+                steps.first().copied(),
+                Some("Checkout repository"),
+                "`ci.yml` job `{job}` must begin by checking out the repository"
+            );
+            assert_eq!(
+                steps.get(1).copied(),
+                Some("Record the commit under test"),
+                "`ci.yml` job `{job}` must record the commit under test \
+                 IMMEDIATELY after checkout, so a job that fails early still \
+                 leaves an attributable log; found {:?}",
+                steps.get(1)
+            );
+
+            // 2. All three witnesses. They answer different questions — what the
+            //    event named, what the checkout produced, and what the files
+            //    actually contain — and any one alone leaves a gap the review
+            //    already walked through.
+            //
+            //    EACH IS MATCHED AS A WHOLE `echo` STATEMENT, not as a bare token.
+            //    `${{ github.sha }}` also appears in the step's own `case` arm, so
+            //    searching for the token alone stays satisfied after the line that
+            //    PRINTS it is deleted — the witness would then be compared against
+            //    but never recorded, which is precisely the unattributable log
+            //    this contract exists to prevent. (Verified by mutation: the token
+            //    form lets a removed `event sha` line through.)
+            for needle in [
+                "head=\"$(git rev-parse HEAD)\"",
+                "echo \"event sha : ${{ github.sha }}\"",
+                "echo \"head sha  : $head\"",
+                "echo \"tree hash : $(git rev-parse 'HEAD^{tree}')\"",
+                "echo \"ref       : ${{ github.ref }}\"",
+            ] {
+                assert!(
+                    block.contains(needle),
+                    "`ci.yml` job `{job}`'s provenance step must emit `{needle}`"
+                );
+            }
+
+            // 3. The mismatch check must actually fail the job. A branch that only
+            //    prints is indistinguishable from no check at all, and it is
+            //    latent: the arm is not taken while the checkout is correct, so
+            //    nothing else would ever reveal that it does not bite.
+            //
+            //    THE DIAGNOSTIC AND THE `exit 1` ARE ASSERTED AS ONE STRING, not
+            //    as two independent `contains` calls. Every job here already runs
+            //    some other `exit 1` — the toolchain assertion, at least — so a
+            //    free-standing search for `exit 1` is satisfied by a completely
+            //    different branch and would pass with the provenance failure
+            //    deleted. Requiring them adjacent is what binds the failure to
+            //    this arm. (Verified by mutation: splitting the two lets a
+            //    print-only provenance branch through.)
+            assert!(
+                block.contains("nobody asked about.\"; exit 1 ;;"),
+                "`ci.yml` job `{job}`'s provenance step must reject a HEAD that is \
+                 neither the event sha nor the pull-request head sha, and must \
+                 `exit 1` in that same branch — otherwise the check cannot fail \
+                 the job"
             );
         }
     }
@@ -2140,6 +2880,509 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Conditional-ignore scanning (AAP directive D-5)
+    //
+    // `ci.yml` asserts that no test in this repository is disabled. The plain
+    // `#[ignore]` half of that gate is a single anchored grep and is sound. The
+    // `#[cfg_attr(<pred>, ignore)]` half cannot be, and the regex that used to
+    // stand in for it — `#\[[[:space:]]*cfg_attr\([^)]*[^a-z_]ignore` — missed
+    // both of the forms most likely to be written by accident:
+    //
+    //   * a NESTED predicate. `[^)]*` cannot cross a `)`, so in
+    //     `cfg_attr(all(unix, target_pointer_width = "64"), ignore)` the
+    //     character class stops at the `)` that closes `all(..)` and never
+    //     reaches the `ignore`.
+    //   * a MULTILINE attribute. `grep` matches within one line, and rustfmt
+    //     wraps a long `cfg_attr` across several.
+    //
+    // Either form disables a test under one configuration while the summary-line
+    // `ignored=0` check stays green, because a test that is not compiled is not
+    // reported as ignored. So the gate has to understand Rust's nesting, which a
+    // line-oriented regex cannot, and that is what the scanner below does:
+    // comments and literals are blanked first (so the many prose mentions of
+    // `#[ignore]` in this repository are invisible to it), then each attribute is
+    // read as a BALANCED bracket group that may span any number of lines.
+    // -----------------------------------------------------------------------
+
+    /// The trees the conditional-ignore scan covers.
+    ///
+    /// Kept identical to the `roots` list in `ci.yml`'s "Assert no test is
+    /// disabled with #[ignore]" step, and asserted so by
+    /// `the_ignore_scan_covers_the_same_roots_as_ci` below: a root added to one
+    /// and not the other is a silently unscanned tree. That name is not an
+    /// intra-doc link because a `#[cfg(test)]` item is not in the documented
+    /// graph, so linking it would be an unresolved reference under
+    /// `--document-private-items`.
+    const IGNORE_SCAN_ROOTS: [&str; 5] =
+        ["src", "tests", "benches", "build.rs", "fuzz/fuzz_targets"];
+
+    /// The roots that `[Cargo.toml] exclude` keeps out of the published archive.
+    ///
+    /// The fuzz tree is a DETACHED workspace and is deliberately excluded, so it is
+    /// present in a git checkout and absent from a packaged crate. The scan must
+    /// therefore treat its absence as expected when — and only when — it is running
+    /// inside an unpacked archive, without weakening the staleness check that makes
+    /// a genuinely wrong root name fail loudly in the repository.
+    const IGNORE_SCAN_ROOTS_ABSENT_WHEN_PACKAGED: [&str; 1] = ["fuzz/fuzz_targets"];
+
+    /// True when the crate is being tested from an unpacked `.crate` archive rather
+    /// than from a git checkout.
+    ///
+    /// `Cargo.toml.orig` is written by `cargo package` and exists nowhere else, which
+    /// makes it an exact witness: it is not a heuristic about which files happen to
+    /// be missing, so it cannot mask a real omission.
+    fn running_from_packaged_crate(root: &std::path::Path) -> bool {
+        root.join("Cargo.toml.orig").is_file()
+    }
+
+    /// True when `bytes[at..]` begins with `word` as a standalone identifier —
+    /// neither preceded nor followed by an identifier byte.
+    ///
+    /// This is what keeps `ignore_without_reason`, `should_ignore` and
+    /// `crate::ignored` from being mistaken for the `ignore` attribute.
+    fn is_word_at(bytes: &[u8], at: usize, word: &[u8]) -> bool {
+        let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        if !bytes[at..].starts_with(word) {
+            return false;
+        }
+        if at > 0 && ident(bytes[at - 1]) {
+            return false;
+        }
+        !bytes.get(at + word.len()).copied().is_some_and(ident)
+    }
+
+    /// Index just past the bracket/paren/brace group that opens at `open`, or
+    /// `None` if it is never closed.
+    ///
+    /// Counts all three bracket kinds so a `cfg_attr(all(..), ignore)` predicate
+    /// and an attribute body containing a block both close at the right place.
+    /// Newlines are ordinary bytes here, which is precisely how a multiline
+    /// attribute becomes visible to this scan and invisible to a `grep`.
+    fn balanced_end(bytes: &[u8], open: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        let mut i = open;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'[' | b'(' | b'{' => depth += 1,
+                b']' | b')' | b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Every `#[ignore]` and `#[cfg_attr(.., ignore)]` attribute in `text`, as
+    /// `(1-based line, form)` where `form` is `"ignore"` or `"cfg_attr"`.
+    ///
+    /// Operates on the comment- and literal-blanked text, so a mention inside a
+    /// doc comment or a string is not a hit — which matters because this
+    /// repository documents "no ignored tests" as a property in several files and
+    /// carries this scanner's own fixtures in `src/lib.rs`.
+    fn conditional_ignore_hits(text: &str) -> alloc::vec::Vec<(usize, &'static str)> {
+        let blanked = blank_comments_and_literals(text);
+        let b = blanked.as_bytes();
+        let mut hits = alloc::vec::Vec::new();
+        let mut i = 0usize;
+        while i < b.len() {
+            if b[i] != b'#' {
+                i += 1;
+                continue;
+            }
+            // `#[..]` or the inner-attribute form `#![..]`.
+            let mut j = i + 1;
+            if b.get(j) == Some(&b'!') {
+                j += 1;
+            }
+            if b.get(j) != Some(&b'[') {
+                i += 1;
+                continue;
+            }
+            let Some(end) = balanced_end(b, j) else {
+                break;
+            };
+            // The attribute body, without its brackets.
+            let body_start = j + 1;
+            let body = &b[body_start..end - 1];
+            let first = body
+                .iter()
+                .position(|c| !c.is_ascii_whitespace())
+                .unwrap_or(body.len());
+            let line = 1 + blanked[..i].bytes().filter(|c| *c == b'\n').count();
+            if is_word_at(body, first, b"ignore") {
+                // `#[ignore]`, `#[ignore = "reason"]`.
+                hits.push((line, "ignore"));
+            } else if is_word_at(body, first, b"cfg_attr") {
+                // `#[cfg_attr(<predicate>, <attrs..>)]`. Search the whole paren
+                // group: a standalone `ignore` token anywhere inside it is an
+                // ignore applied under some configuration, and the predicate
+                // cannot contain that token itself — a `cfg` predicate is built
+                // from `all`/`any`/`not`/`feature`/`target_*` keys and string
+                // values, and the values were blanked before this scan.
+                if let Some(paren) = body[first..].iter().position(|c| *c == b'(') {
+                    let open = first + paren;
+                    if let Some(close) = balanced_end(body, open) {
+                        let group = &body[open..close];
+                        if (0..group.len()).any(|k| is_word_at(group, k, b"ignore")) {
+                            hits.push((line, "cfg_attr"));
+                        }
+                    }
+                }
+            }
+            i = end;
+        }
+        hits
+    }
+
+    /// The scanner must catch all three shapes of disabled test, including the two
+    /// the previous `grep` could not see.
+    ///
+    /// Every fixture is assembled with [`concat!`] rather than written as a single
+    /// literal. That is not stylistic: `ci.yml` greps this very tree for a line
+    /// whose first non-whitespace is `#[ignore`, so a fixture spelled out in full
+    /// would match the repository's own gate and turn it permanently red. Splitting
+    /// the token means the matching text exists only at run time.
+    #[test]
+    fn the_conditional_ignore_scanner_catches_simple_nested_and_multiline_forms() {
+        let plain = concat!("#[", "ignore]\nfn t() {}\n");
+        let plain_reason = concat!("#[", "ignore = \"flaky\"]\nfn t() {}\n");
+        let spaced = concat!("#[ ", "ignore ]\nfn t() {}\n");
+        let simple_cfg = concat!("#[cfg_", "attr(unix, ignore)]\nfn t() {}\n");
+        // The nested predicate: the old regex's `[^)]*` stopped at the `)` that
+        // closes `all(..)` and never reached the `ignore`.
+        let nested = concat!(
+            "#[cfg_",
+            "attr(all(unix, target_pointer_width = \"64\"), ignore)]\nfn t() {}\n"
+        );
+        let doubly_nested = concat!(
+            "#[cfg_",
+            "attr(any(all(unix, not(target_os = \"macos\")), windows), ignore)]\nfn t() {}\n"
+        );
+        // The multiline form: rustfmt wraps a long predicate, and `grep` matches
+        // within a single line.
+        let multiline = concat!(
+            "#[cfg_",
+            "attr(\n    all(unix, target_pointer_width = \"64\"),\n    ignore\n)]\nfn t() {}\n"
+        );
+        for (label, src) in [
+            ("plain", plain),
+            ("plain with reason", plain_reason),
+            ("spaced", spaced),
+            ("simple cfg_attr", simple_cfg),
+            ("nested cfg_attr", nested),
+            ("doubly nested cfg_attr", doubly_nested),
+            ("multiline cfg_attr", multiline),
+        ] {
+            let hits = conditional_ignore_hits(src);
+            assert_eq!(
+                hits.len(),
+                1,
+                "the {label} form must be caught exactly once, got {hits:?} for:\n{src}"
+            );
+        }
+
+        // And it must NOT fire on the things this repository legitimately
+        // contains, or the gate would be unusable.
+        let benign = [
+            (
+                "prose in a doc comment",
+                "/// This suite has no #[ignore] tests.\nfn t() {}\n",
+            ),
+            (
+                "prose in a line comment",
+                "// never add #[ignore] here\nfn t() {}\n",
+            ),
+            (
+                "prose in a block comment",
+                "/* a #[cfg_attr(unix, ignore)] would be a defect */\nfn t() {}\n",
+            ),
+            (
+                "a string literal",
+                "let pattern = \"#[cfg_attr(unix, ignore)]\";\n",
+            ),
+            (
+                "a longer identifier",
+                "#[allow(clippy::ignored_unit_patterns)]\nfn t() {}\n",
+            ),
+            (
+                "an unrelated cfg_attr",
+                "#[cfg_attr(docsrs, doc(cfg(feature = \"gzip\")))]\nfn t() {}\n",
+            ),
+            (
+                "an ordinary cfg",
+                "#[cfg(all(unix, feature = \"gz-io\"))]\nfn t() {}\n",
+            ),
+            (
+                "a feature literally named ignore",
+                "#[cfg_attr(feature = \"ignore\", doc = \"x\")]\nfn t() {}\n",
+            ),
+        ];
+        for (label, src) in benign {
+            let hits = conditional_ignore_hits(src);
+            assert!(
+                hits.is_empty(),
+                "the scanner must not fire on {label}, got {hits:?} for:\n{src}"
+            );
+        }
+
+        // The line number is reported from the attribute, so a failure names the
+        // right place even for a multiline form.
+        let offset = concat!("fn a() {}\nfn b() {}\n#[", "ignore]\nfn c() {}\n");
+        assert_eq!(conditional_ignore_hits(offset), alloc::vec![(3, "ignore")]);
+    }
+
+    /// No test anywhere in the repository is disabled, by either form.
+    ///
+    /// This is the in-crate half of `ci.yml`'s D-5 gate, and it is the half that
+    /// understands Rust: the workflow keeps the cheap anchored grep for plain
+    /// `#[ignore]` (no compilation, one pass) and defers the `cfg_attr` form to
+    /// this test, which it runs by name so the coverage is legible in the log.
+    #[test]
+    fn no_test_in_the_repository_is_disabled_with_ignore() {
+        fn walk(dir: &std::path::Path, out: &mut alloc::vec::Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            let mut paths: alloc::vec::Vec<_> =
+                entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+            paths.sort();
+            for path in paths {
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = alloc::vec::Vec::new();
+        for entry in IGNORE_SCAN_ROOTS {
+            let path = root.join(entry);
+            if path.is_dir() {
+                walk(&path, &mut files);
+            } else if path.is_file() {
+                files.push(path);
+            } else if IGNORE_SCAN_ROOTS_ABSENT_WHEN_PACKAGED.contains(&entry)
+                && running_from_packaged_crate(root)
+            {
+                // Excluded from the published archive by design; nothing to scan.
+                // Still asserted in a checkout, where the tree does exist.
+            } else {
+                panic!("ignore-scan root {entry} does not exist; IGNORE_SCAN_ROOTS is stale");
+            }
+        }
+        // A scan that found nothing to scan proves nothing.
+        assert!(
+            files.len() > 40,
+            "expected the whole source tree, found only {} files",
+            files.len()
+        );
+
+        let mut offenders = alloc::vec::Vec::new();
+        for path in &files {
+            let text = std::fs::read_to_string(path).expect("source file is UTF-8");
+            for (line, form) in conditional_ignore_hits(&text) {
+                let rel = path.strip_prefix(root).unwrap_or(path);
+                offenders.push(std::format!("{}:{line} ({form})", rel.display()));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "AAP directive D-5 requires zero ignored tests, but {} attribute(s) \
+             disable one: {:?}",
+            offenders.len(),
+            offenders
+        );
+    }
+
+    /// The scan roots in this crate and in `ci.yml` must be the same set.
+    ///
+    /// The workflow's grep and this crate's scanner are two halves of one gate; a
+    /// root added to only one of them is a tree that looks covered and is not.
+    #[test]
+    fn the_ignore_scan_covers_the_same_roots_as_ci() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
+            .expect("ci.yml must be readable");
+        let line = text
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("roots="))
+            .expect("ci.yml must declare the ignore-scan roots as `roots=...`");
+        let declared = line
+            .trim_start_matches("roots=")
+            .trim_matches('\'')
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>();
+        assert_eq!(
+            declared,
+            IGNORE_SCAN_ROOTS.as_slice(),
+            "ci.yml's ignore-scan roots and IGNORE_SCAN_ROOTS must match exactly"
+        );
+    }
+
+    /// Join the shell string concatenations that `ci.yml` wraps across lines.
+    ///
+    /// A step writes `echo "... below the floor"\` then `" of $VAR - ..."`, which the
+    /// shell concatenates into one message. Collapsing `"\` + newline + indent + `"`
+    /// reconstructs the text the operator actually sees, so an assertion about wording
+    /// is not accidentally an assertion about where rustfmt-style wrapping fell.
+    fn join_shell_continuations(block: &str) -> alloc::string::String {
+        let mut out = alloc::string::String::with_capacity(block.len());
+        let mut rest = block;
+        while let Some(at) = rest.find("\"\\\n") {
+            out.push_str(&rest[..at]);
+            // Skip the closing quote, the backslash, the newline, the indent and the
+            // reopening quote of the next fragment.
+            let after = &rest[at + 3..];
+            let trimmed = after.trim_start_matches([' ', '\t']);
+            rest = trimmed.strip_prefix('"').unwrap_or(trimmed);
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Every CI test-count floor is declared once and used consistently.
+    ///
+    /// This is the mechanical form of the rule that a floor's DECLARATION, the value
+    /// it LOGS, and the value it ENFORCES must be the same number. They had drifted
+    /// in two places at once: the four `no-std-tests` steps logged `floor=633` while
+    /// enforcing `-ge 629` (four tests could vanish), and `package-verify` logged 859
+    /// while enforcing 845 (fourteen could). In both cases the log was reassuring and
+    /// the gate was not, which is worse than having no floor at all.
+    ///
+    /// The fix was to route each floor through one variable — `matrix.min_tests` for
+    /// the `build-test` rows, and job-scoped `STD_OFF_FLOOR` / `PACKAGED_FLOOR` for
+    /// the other two jobs — so the three uses cannot disagree. This test asserts that
+    /// property directly: it fails if any count-enforcing comparison comes back as a
+    /// bare numeric literal, which is the only way the drift can recur.
+    #[test]
+    fn the_ci_test_floors_are_internally_consistent() {
+        let text = read_workflow(".github/workflows/ci.yml");
+
+        // 1. Every floor comparison must read a variable, never a literal. The shape
+        //    is `[ "$2" -ge <operand> ]`, the assertion being over <operand>.
+        let mut literal_floors = alloc::vec::Vec::new();
+        for (lineno, line) in text.lines().enumerate() {
+            let Some(rest) = line.split_once("-ge ").map(|(_, r)| r) else {
+                continue;
+            };
+            if !line.contains("\"$2\"") {
+                continue;
+            }
+            let operand: alloc::string::String = rest
+                .trim_start()
+                .trim_start_matches('"')
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != '"' && *c != ']')
+                .collect();
+            if operand.chars().all(|c| c.is_ascii_digit()) {
+                literal_floors.push(std::format!("ci.yml:{}: -ge {operand}", lineno + 1));
+            }
+        }
+        assert!(
+            literal_floors.is_empty(),
+            "a test-count floor is enforced against a bare literal instead of the \
+             variable that is also logged, which is exactly how the log and the gate \
+             drifted apart before: {literal_floors:?}"
+        );
+
+        // 2. Each job that declares a floor variable must USE it in the logged
+        //    summary, the comparison and the failure message of every counting step.
+        for (job, var) in [
+            ("no-std-tests", "STD_OFF_FLOOR"),
+            ("package-verify", "PACKAGED_FLOOR"),
+        ] {
+            let block = workflow_job_block(".github/workflows/ci.yml", job);
+            let declared = block
+                .lines()
+                .find_map(|l| l.trim().strip_prefix(&std::format!("{var}:")))
+                .map(|v| v.trim().to_string())
+                .unwrap_or_else(|| std::panic!("job `{job}` must declare {var} at job scope"));
+            assert!(
+                declared.chars().all(|c| c.is_ascii_digit()) && !declared.is_empty(),
+                "job `{job}`: {var} must be a plain integer, got {declared:?}"
+            );
+            let logs = block.matches(&std::format!("floor=${var}")).count();
+            let enforces = block.matches(&std::format!("-ge \"${var}\"")).count();
+            assert!(
+                logs > 0 && logs == enforces,
+                "job `{job}`: {var} is logged {logs} time(s) but enforced {enforces} \
+                 time(s); every counting step must do both so the log cannot promise \
+                 a floor the gate does not apply"
+            );
+            // The failure message must quote the same variable, or a red row would
+            // name a number nobody can trace back to the declaration. The block is
+            // normalised first: these messages are shell string concatenations split
+            // across continuation lines (`... floor"\` / `" of $VAR ...`), so the
+            // phrase is only contiguous once the continuations are joined. Matching
+            // the raw text would assert about line wrapping rather than about wording.
+            let joined = join_shell_continuations(&block);
+            let in_message = joined.matches(&std::format!("floor of ${var}")).count();
+            assert_eq!(
+                in_message, enforces,
+                "job `{job}`: {var} appears in {in_message} failure message(s) but is \
+                 enforced {enforces} time(s); the message must cite the same source"
+            );
+        }
+
+        // 3. The `build-test` rows: every row declares a floor, and the counting steps
+        //    reference `matrix.min_tests` rather than any literal.
+        let block = workflow_job_block(".github/workflows/ci.yml", "build-test");
+        let declared: alloc::vec::Vec<u32> = block
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("min_tests:"))
+            .map(|v| v.trim().parse().expect("min_tests must be an integer"))
+            .collect();
+        assert_eq!(
+            declared.len(),
+            7,
+            "expected one min_tests per build-test row, got {declared:?}"
+        );
+        // Exactly one row runs no test step and therefore carries a zero floor.
+        assert_eq!(
+            declared.iter().filter(|v| **v == 0).count(),
+            1,
+            "exactly one build-test row (the no_std library row) may carry a zero \
+             floor; got {declared:?}"
+        );
+        assert!(
+            declared.iter().filter(|v| **v > 0).all(|v| *v >= 600),
+            "a non-zero build-test floor is implausibly low, which would make the \
+             row's count assertion vacuous: {declared:?}"
+        );
+
+        // 4. Ordering that must hold by construction: the all-features row exercises a
+        //    superset of the default row, and every std-off floor is below even the
+        //    LOWEST row floor, because `gz-io` being off removes a whole integration
+        //    target plus several cfg-gated unit tests.
+        let lowest_row_floor = *declared.iter().filter(|v| **v > 0).min().expect("a floor");
+        let max_floor = *declared.iter().max().expect("a floor");
+        assert!(
+            max_floor >= lowest_row_floor,
+            "the all-features floor must be at least the lowest row floor"
+        );
+        let std_off: u32 = workflow_job_block(".github/workflows/ci.yml", "no-std-tests")
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("STD_OFF_FLOOR:"))
+            .and_then(|v| v.trim().parse().ok())
+            .expect("STD_OFF_FLOOR");
+        assert!(
+            std_off < lowest_row_floor,
+            "the std-off floor ({std_off}) must be below the lowest non-zero \
+             build-test row floor ({lowest_row_floor}): turning `gz-io` off removes \
+             the tests/gzip_compat.rs target and several cfg-gated unit tests, so an \
+             equal or higher value would mean the std-off rows are not actually \
+             running with std off"
+        );
+    }
     /// Every cargo invocation in `ci.yml` that resolves the dependency graph must
     /// pass `--locked`.
     ///

@@ -23,7 +23,8 @@
 //! | `int fd`                         | owned [`File`] (RAII close)            |
 //! | `unsigned char *in` / `*out`     | owned [`Vec<u8>`] buffers             |
 //! | `unsigned char *next` (moving)   | [`usize`] index into `out_buf`        |
-//! | `char *path` / `char *msg`       | [`String`] / [`Option<String>`]       |
+//! | `char *path`                     | owned [`Vec<u8>`] (raw bytes)         |
+//! | `char *msg`                      | [`CString`] + [`Option<String>`]      |
 //! | `z_stream strm` (in place)       | owned [`ZStream`] (in place)          |
 //! | `free`/`inflateEnd`/`close(fd)`  | `Drop` (RAII)                          |
 //!
@@ -268,7 +269,17 @@ pub struct GzState {
 
     /// The path (or synthetic `<fd:N>` name from `gzdopen`) used when building
     /// error messages (C `char *path`).
-    pub(crate) path: String,
+    ///
+    /// Held as **raw bytes**, not a [`String`], because these bytes are handed
+    /// back verbatim through the C `gzerror` message. On unix a path is an
+    /// arbitrary byte string that need not be UTF-8, and C stores it with no
+    /// transformation at all (`gzlib.c` L196-L203: `malloc(len + 1)` plus a
+    /// `snprintf(..., "%s", path)`). Decoding it into a [`String`] would replace
+    /// every invalid subsequence with U+FFFD and therefore change the bytes a C
+    /// caller reads out of `gzerror` (finding M6-07). The lossy rendering still
+    /// exists — [`error`](Self::error) produces it for the idiomatic
+    /// [`msg`](Self::msg) — but it is no longer what the C mirror is built from.
+    pub(crate) path: Vec<u8>,
 
     /// The size of each allocated I/O buffer, or `0` when the buffers have not
     /// been allocated yet (C `unsigned size`).
@@ -405,8 +416,9 @@ pub struct GzState {
     /// flow-controlled pipe or socket can provoke from ordinary input. Advancing
     /// an offset instead touches no bytes at all.
     ///
-    /// `deflate` is never invoked while this is non-zero, so the engine always
-    /// receives the whole `out_buf[..size]` scratch area.
+    /// `deflate` receives only the free tail beyond the frontier,
+    /// `out_buf[out_start + out_pending .. size]`, so output that is still
+    /// pending is never handed back to the engine as scratch space.
     pub(crate) out_pending: usize,
 
     /// Offset into [`out_buf`](Self::out_buf) of the first *compressed* byte the
@@ -420,18 +432,28 @@ pub struct GzState {
     ///   `out_buf[out_start .. out_start + out_pending]`, which is always within
     ///   bounds because [`out_pending`](Self::out_pending) only ever counts bytes
     ///   `deflate` produced into `out_buf[..size]`.
-    /// * `out_pending == 0` implies `out_start == 0`: the drain loop re-anchors
-    ///   the window at the front the moment it empties, mirroring C's buffer
-    ///   reclaim (`strm->next_out = state->out; state->x.next = state->out;`,
-    ///   `gzwrite.c` L125-L128). Because of this, `deflate` — which is only ever
-    ///   called with an empty pending window — always receives the whole
-    ///   `out_buf[..size]` scratch area starting at index `0`, so the compressed
-    ///   byte sequence handed to the file is independent of how many short writes
-    ///   preceded it and gzip output stays byte-identical to reference zlib.
+    /// * `out_start + out_pending` is the *produced-bytes frontier* — C's
+    ///   `strm->next_out` — and never exceeds `size`. `deflate` is handed
+    ///   `out_buf[out_start + out_pending .. size]`, i.e. C's `avail_out`, so it
+    ///   can never overwrite a byte the operating system has not accepted.
+    /// * `out_start` returns to `0` only when the scratch area is both **full**
+    ///   and **fully written** — C's `if (strm->avail_out == 0) { strm->avail_out
+    ///   = state->size; strm->next_out = state->out; state->x.next = state->out; }`
+    ///   (`gzwrite.c` L125-L128). A drain provoked by a *flush* leaves the
+    ///   frontier exactly where it was, precisely as C leaves `next_out`.
+    ///   `out_pending == 0` therefore does **not** imply `out_start == 0`: it
+    ///   implies only that the operating system has accepted everything produced
+    ///   so far, i.e. C's `state->x.next == strm->next_out`.
     ///
-    /// Only `write.rs`'s drain loop advances this; it is reset to `0` there when
-    /// the window empties, by `gz_init` when the buffers are (re)allocated, and by
-    /// `open.rs`'s `gz_reset` when a stream starts over.
+    /// Because the reclaim is governed solely by the frontier reaching `size` —
+    /// never by how the destination chunked its acceptance — the sequence of
+    /// output slices handed to the engine, and hence the compressed byte
+    /// sequence, is identical to reference zlib's.
+    ///
+    /// Only `write.rs` mutates this: its drain loop advances it as the operating
+    /// system accepts bytes, and its compress loop performs the reclaim under C's
+    /// guard. It is additionally zeroed by `gz_init` when the buffers are
+    /// (re)allocated and by `open.rs`'s `gz_reset` when a stream starts over.
     pub(crate) out_start: usize,
 
     // -- shared --------------------------------------------------------------
@@ -447,7 +469,10 @@ pub struct GzState {
     /// The last error message (C `char *msg`), or [`None`] when there is no
     /// message.
     ///
-    /// Populated by [`error`](Self::error) as `"{path}: {message}"`. For
+    /// Populated by [`error`](Self::error) as `"{path}: {message}"`, with any
+    /// non-UTF-8 bytes in the path rendered lossily (U+FFFD). The exact C bytes
+    /// live in [`msg_c`](Self::msg_c); this field is the idiomatic Rust view of
+    /// the same message. For
     /// [`ReturnCode::MemError`] this is deliberately left [`None`]: the public
     /// `gzerror` synthesises the literal `"out of memory"` instead of storing a
     /// heap string, matching the C behaviour of not allocating while out of
@@ -513,6 +538,38 @@ impl Drop for GzState {
     }
 }
 
+/// Decodes `raw` as UTF-8, replacing each maximal invalid subsequence with a
+/// single U+FFFD, **fallibly**.
+///
+/// This is the [`String::from_utf8_lossy`] transformation with every growth step
+/// routed through [`String::try_reserve`], so an exhausted allocator produces
+/// [`None`] instead of the process abort an infallible allocation would cause.
+/// It exists because the raw bytes are the authority — [`GzState::path`] holds a
+/// path exactly as the caller supplied it — while the idiomatic
+/// [`GzState::msg`] must still be a Rust [`String`].
+fn try_lossy_string(raw: &[u8]) -> Option<String> {
+    let mut out = String::new();
+    // One reservation for the common all-valid-UTF-8 case; the loop still
+    // reserves for anything it appends, so a short reservation here is only a
+    // performance detail, never a correctness one.
+    out.try_reserve(raw.len()).ok()?;
+
+    for chunk in raw.utf8_chunks() {
+        let valid = chunk.valid();
+        out.try_reserve(valid.len()).ok()?;
+        out.push_str(valid);
+
+        if !chunk.invalid().is_empty() {
+            // `char::REPLACEMENT_CHARACTER` is 3 bytes in UTF-8.
+            out.try_reserve(char::REPLACEMENT_CHARACTER.len_utf8())
+                .ok()?;
+            out.push(char::REPLACEMENT_CHARACTER);
+        }
+    }
+
+    Some(out)
+}
+
 impl GzState {
     /// Records an error on this file — the port of the internal C
     /// `gz_error(gz_statep, int, const char *)` from `gzlib.c`.
@@ -539,7 +596,11 @@ impl GzState {
     ///    out of memory is exactly what must be avoided); the public `gzerror`
     ///    returns the literal `"out of memory"` for that code.
     /// 6. Otherwise the stored message is `"{path}: {message}"`, matching the C
-    ///    `snprintf(..., "%s%s%s", path, ": ", msg)`.
+    ///    `snprintf(..., "%s%s%s", path, ": ", msg)`. The C-facing
+    ///    [`msg_c`](Self::msg_c) is assembled from the **raw** path bytes, so it
+    ///    is byte-identical to what C produces even for a path that is not valid
+    ///    UTF-8; the idiomatic [`msg`](Self::msg) is a lossy decoding of exactly
+    ///    those bytes.
     ///
     /// # Parameters
     ///
@@ -594,36 +655,37 @@ impl GzState {
         //    plus `": "` plus the NUL. A Rust `String` carries no NUL, so the
         //    exact requirement is two fewer than C's by one byte for the
         //    terminator; `msg_c` below reserves that byte separately.
-        let detail_len = self.path.len() + 2 + msg.len();
-        let mut detail = String::new();
-        if detail.try_reserve_exact(detail_len).is_err() {
-            self.err = ReturnCode::MemError;
-            return;
-        }
-        // Infallible from here: the exact capacity is already reserved.
-        detail.push_str(&self.path);
-        detail.push_str(": ");
-        detail.push_str(msg);
-        debug_assert_eq!(detail.len(), detail_len);
-
-        // Keep the FFI-facing NUL-terminated mirror in lockstep with `msg`. The
-        // detail is `path` + `": "` + `msg`; a real gzip path and error detail
-        // contain no interior NUL, so `CString::new` succeeds. Were an interior
-        // NUL ever present, `.ok()` yields `None` and the FFI `gzerror` falls
-        // back to the empty string rather than exposing a truncated pointer.
+        //    The C-facing bytes are assembled first, from the **raw** path, so
+        //    that `gzerror` reports exactly what C reports even when the path is
+        //    not valid UTF-8 (finding M6-07). A real gzip path and error detail
+        //    contain no interior NUL, so `CString::new` succeeds; were one ever
+        //    present, `.ok()` yields `None` and the FFI `gzerror` falls back to
+        //    the empty string rather than exposing a truncated pointer.
         //
-        // The byte buffer is reserved with room for that terminator, so
-        // `CString::new` — which appends the NUL to the `Vec` it is given — does
-        // not reallocate and cannot abort. C makes one allocation for both roles
-        // because a C string *is* the message; this port needs the second buffer
-        // only because it also keeps a native `String`, and it is held to the same
-        // "check it, do not abort" rule.
+        //    The byte buffer is reserved with room for the terminator, so
+        //    `CString::new` — which appends the NUL to the `Vec` it is given —
+        //    does not reallocate and cannot abort.
+        let detail_len = self.path.len() + 2 + msg.len();
         let mut c_bytes: Vec<u8> = Vec::new();
         if c_bytes.try_reserve_exact(detail_len + 1).is_err() {
             self.err = ReturnCode::MemError;
             return;
         }
-        c_bytes.extend_from_slice(detail.as_bytes());
+        // Infallible from here: the exact capacity is already reserved.
+        c_bytes.extend_from_slice(&self.path);
+        c_bytes.extend_from_slice(b": ");
+        c_bytes.extend_from_slice(msg.as_bytes());
+        debug_assert_eq!(c_bytes.len(), detail_len);
+
+        // The idiomatic Rust view is the same bytes, decoded lossily. C makes one
+        // allocation because a C string *is* the message; this port needs the
+        // second buffer only because it also keeps a native `String`, and it is
+        // held to the same "check it, do not abort" rule.
+        let Some(detail) = try_lossy_string(&c_bytes) else {
+            self.err = ReturnCode::MemError;
+            return;
+        };
+
         self.msg_c = CString::new(c_bytes).ok();
         self.msg = Some(detail);
     }
@@ -665,7 +727,7 @@ mod tests {
             pos: 0,
             mode: GzMode::Read,
             file: GzFile::new(file),
-            path: String::from(path),
+            path: path.as_bytes().to_vec(),
             size: 0,
             want: 0,
             in_buf: Vec::new(),
@@ -776,6 +838,48 @@ mod tests {
         s.error(ReturnCode::StreamError, Some("boom"));
         // Format is exactly "{path}: {msg}" (C snprintf "%s%s%s", path, ": ", msg).
         assert_eq!(s.msg.as_deref(), Some("/tmp/data.gz: boom"));
+    }
+
+    /// The C-facing message is assembled from the **raw** path bytes, so a path
+    /// that is not valid UTF-8 reaches `gzerror` unchanged (finding M6-07).
+    ///
+    /// C stores the path verbatim (`gzlib.c` L196-L203) and renders the message
+    /// with `snprintf(..., "%s%s%s", path, ": ", msg)`, so the bytes a C caller
+    /// reads back are the caller's own. Decoding the path into a Rust `String`
+    /// first would replace each invalid run with U+FFFD (`ef bf bd`) and change
+    /// those bytes.
+    #[test]
+    fn the_c_message_carries_the_raw_path_bytes() {
+        let mut s = test_state("placeholder");
+        s.path = b"/tmp/\xff\xfe.gz".to_vec();
+        s.error(ReturnCode::DataError, Some("boom"));
+
+        let c_msg = s
+            .msg_c
+            .as_ref()
+            .expect("a C mirror is stored for a non-OOM error")
+            .as_bytes();
+        assert_eq!(
+            c_msg, b"/tmp/\xff\xfe.gz: boom",
+            "the C message is the raw path bytes, then \": \", then the detail"
+        );
+        assert!(
+            !c_msg.windows(3).any(|w| w == [0xef, 0xbf, 0xbd]),
+            "no U+FFFD may appear anywhere in the C message"
+        );
+
+        // The idiomatic Rust view is exactly those bytes, decoded lossily.
+        assert_eq!(
+            s.msg.as_deref(),
+            Some(String::from_utf8_lossy(c_msg).as_ref()),
+            "`msg` is the lossy decoding of the C bytes"
+        );
+        assert_ne!(
+            s.msg.as_deref().map(str::as_bytes),
+            Some(c_msg),
+            "the two renderings genuinely differ here, so the C mirror cannot be \
+             the Rust string re-encoded"
+        );
     }
 
     #[test]
@@ -1163,7 +1267,7 @@ mod tests {
             pos: 0,
             mode: GzMode::Write,
             file: GzFile::new(file),
-            path: path.display().to_string(),
+            path: path.as_os_str().as_encoded_bytes().to_vec(),
             size: 0,
             want: DROP_CONTRACT_WANT,
             in_buf: Vec::new(),

@@ -114,19 +114,163 @@ const SEEK_CUR: i32 = 1;
 // Temporary-file scaffolding (std only — no `tempfile` dependency).
 // ===========================================================================
 
-/// A uniquely named temporary directory for a single test, removed on drop.
+/// Reduces an arbitrary string to a single safe path component.
 ///
-/// Paths are built under [`std::env::temp_dir`] and made unique with the process
-/// id, a per-process monotonic counter, and a nanosecond timestamp, so parallel
-/// test binaries — and the parallel test threads within one binary — never
-/// collide. Cleanup is best-effort: [`Drop`] removes the whole directory tree,
-/// and any error (e.g. a test already removed a file) is ignored.
+/// Tags reach [`Scratch::new`] as literals, but `CLONE_INDEX` is ambient input read
+/// from the environment and therefore outside this suite's control. Interpolating
+/// such a value into a path unfiltered is a directory-traversal defect (CWE-22): a
+/// value like `slot/../../security_target` escapes the temporary directory
+/// lexically and resolves somewhere else entirely.
+///
+/// Only ASCII alphanumerics, `_`, and `-` survive, which drops every character that
+/// could terminate the component or refer to a parent — `/`, `\`, `.` (so `..`
+/// collapses away), `:`, NUL, and every non-ASCII byte. The result is truncated so
+/// an over-long value cannot push the path past a filesystem limit, and an input
+/// that filters down to nothing becomes `x`, so the function is total.
+fn safe_component(raw: &str) -> String {
+    let filtered: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(32)
+        .collect();
+    if filtered.is_empty() {
+        "x".to_owned()
+    } else {
+        filtered
+    }
+}
+
+/// Creates `path` as a new, owner-private directory, failing if anything already
+/// occupies the name.
+///
+/// Non-recursive by construction. This is the whole point: [`fs::create_dir_all`]
+/// returns `Ok` when the path is *already* a directory — or a **symlink to one** —
+/// silently adopting a tree this suite did not create, which [`Drop`] would then
+/// remove recursively. One `mkdir(2)` instead reports [`AlreadyExists`], which lets
+/// [`Scratch::new`] skip to the next candidate rather than following the link or
+/// deleting it. On Unix the `0o700` mode is handed to that same syscall, so the
+/// directory is never even briefly group- or world-accessible and there is no
+/// `set_permissions` window to race. On other platforms the mode is the platform
+/// default and this function asserts no privacy property.
+///
+/// [`AlreadyExists`]: std::io::ErrorKind::AlreadyExists
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    // Explicit even though it is the default: this single flag is what makes the
+    // call one `mkdir(2)` — an atomic create-or-fail — and it must never be
+    // relaxed to `recursive(true)`.
+    builder.recursive(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+/// Creates `path` exclusively for writing: it must not already exist, no symlink at
+/// that name is followed, and nothing is truncated.
+///
+/// # Panics
+///
+/// If the file cannot be created exclusively. Inside a [`Scratch`]-owned directory
+/// that is a genuine environment failure, since the directory did not exist a
+/// moment earlier.
+fn create_new_file(path: &Path) -> fs::File {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .unwrap_or_else(|e| panic!("exclusively create {}: {e}", path.display()))
+}
+
+/// Number of candidate names [`create_first_free`] will try before giving up.
+const MAX_ATTEMPTS: u32 = 64;
+
+/// Creates the first unoccupied `{parent}/{stem}_{n}` as an owner-private directory
+/// and returns its path.
+///
+/// An occupied candidate is **skipped, never deleted and never entered**: that is the
+/// entire security value of the loop. Deleting a colliding name would destroy
+/// whatever another user had planted there (and could be turned into an
+/// attacker-directed delete); adopting it would hand this suite a directory it does
+/// not own, which [`Scratch`]'s recursive [`Drop`] would later remove. Advancing to
+/// the next ordinal does neither.
+///
+/// The attempt ordinal exists for genuine same-nanosecond collisions between
+/// parallel test binaries; it is a liveness device, not the source of unpredictability
+/// (see [`Scratch::new`] — the name is never treated as a secret).
+///
+/// # Panics
+///
+/// If no candidate is free within [`MAX_ATTEMPTS`], or if `mkdir(2)` fails for any
+/// reason other than the name being taken. Only [`AlreadyExists`] is retried, so a
+/// permission or ENOSPC failure surfaces immediately instead of being spun on.
+///
+/// [`AlreadyExists`]: std::io::ErrorKind::AlreadyExists
+fn create_first_free(parent: &Path, stem: &str) -> PathBuf {
+    for attempt in 0..MAX_ATTEMPTS {
+        let dir = parent.join(format!("{stem}_{attempt}"));
+        match create_private_dir(&dir) {
+            Ok(()) => return dir,
+            Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => panic!("create private directory {}: {e}", dir.display()),
+        }
+    }
+    panic!(
+        "no private directory available under {} after {MAX_ATTEMPTS} attempts",
+        parent.display()
+    );
+}
+
+/// An exclusively created, owner-private temporary directory for a single test,
+/// removed with its contents when the guard drops.
+///
+/// # Why creation is create-new rather than create-if-absent
+///
+/// This guard's [`Drop`] removes the directory **recursively**, so a directory it
+/// did not itself create is not safe for it to own. The previous implementation
+/// called [`fs::create_dir_all`], which succeeds when the path already exists — as a
+/// directory *or as a symlink to one* — so on a shared, world-writable
+/// [`std::env::temp_dir`] it could adopt a tree another user had planted at the
+/// predicted name, write fixtures through it, truncate whatever was already inside,
+/// and then recursively delete the lot (CWE-377 insecure temporary file, CWE-59 link
+/// following, CWE-367 time-of-check/time-of-use).
+///
+/// [`create_private_dir`] removes all of that: a single `mkdir(2)` is atomic, never
+/// follows a final-component symlink, and reports [`AlreadyExists`] instead of
+/// adopting. An occupied candidate is **skipped, never deleted**, so a planted name
+/// is neither followed nor destroyed. Children are created with
+/// [`create_new_file`], which cannot truncate and cannot follow a link.
+///
+/// The *name* is not a secret — process id, counter, timestamp and `CLONE_INDEX` are
+/// all guessable — so privacy rests on the mode and on create-new semantics, never
+/// on the name. Both are properties of the instant of creation: the guard holds a
+/// path rather than an open handle, so it makes no claim that the entry is still the
+/// same object later.
+///
+/// [`AlreadyExists`]: std::io::ErrorKind::AlreadyExists
 struct Scratch {
+    /// Absolute path of the directory.
+    ///
+    /// Invariant, and the premise the recursive delete in [`Drop`] rests on: the
+    /// only constructor is [`Scratch::new`], which returns solely after
+    /// [`create_private_dir`] created this exact path.
     dir: PathBuf,
 }
 
 impl Scratch {
-    /// Creates a fresh, uniquely named scratch directory tagged with `tag`.
+    /// Creates a fresh, owner-private scratch directory tagged with `tag`.
+    ///
+    /// Uniqueness combines the process id, a per-process monotonic counter, a
+    /// nanosecond timestamp, the sanitized `CLONE_INDEX`, and the attempt ordinal,
+    /// so parallel test binaries, the parallel test threads within one binary, and
+    /// sibling clones of this repository sharing one `/tmp` never collide.
+    ///
+    /// # Panics
+    ///
+    /// Propagates [`create_first_free`]'s panics: exhausting [`MAX_ATTEMPTS`], or a
+    /// `mkdir(2)` failure other than the name being taken.
     fn new(tag: &str) -> Self {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -135,23 +279,54 @@ impl Scratch {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = env::temp_dir().join(format!(
-            "zlib_rs_gzip_compat_{tag}_{}_{nanos}_{seq}",
-            process::id()
-        ));
-        fs::create_dir_all(&dir).expect("create unique scratch directory");
-        Self { dir }
+        let clone = safe_component(&env::var("CLONE_INDEX").unwrap_or_default());
+        let tag = safe_component(tag);
+        let pid = process::id();
+        let stem = format!("blitzy_adhoc_test_gzip_compat_{tag}_{clone}_{pid}_{nanos}_{seq}");
+        Self {
+            dir: create_first_free(&env::temp_dir(), &stem),
+        }
     }
 
-    /// Returns the path to `name` inside this scratch directory.
+    /// The scratch directory itself.
+    fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Names — without creating — `name` inside this scratch directory.
+    ///
+    /// Plain names are safe here precisely because the directory was created
+    /// exclusively a moment ago, so nothing inside it can have been pre-placed.
     fn path(&self, name: &str) -> PathBuf {
         self.dir.join(name)
+    }
+
+    /// Creates `name` inside this scratch directory with create-new semantics and
+    /// writes `contents` into it, returning its path.
+    ///
+    /// Replaces [`fs::write`], which opens `O_CREAT | O_TRUNC` without `O_EXCL`.
+    ///
+    /// # Panics
+    ///
+    /// If the file already exists, cannot be created, or cannot be written.
+    fn write_new(&self, name: &str, contents: &[u8]) -> PathBuf {
+        let path = self.path(name);
+        let mut file = create_new_file(&path);
+        file.write_all(contents)
+            .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        file.flush()
+            .unwrap_or_else(|e| panic!("flush {}: {e}", path.display()));
+        path
     }
 }
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        // Best-effort cleanup; a failure here must never mask a test result.
+        // The recursion rests on `dir` not having existed before `new` created it
+        // with create-new semantics, so the removal set starts from a path this guard
+        // brought into existence rather than one it adopted, and on Unix from one no
+        // other user could enter. Best-effort on every route out, including an
+        // unwinding one: a failure here must never mask a test result.
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
@@ -392,12 +567,14 @@ fn file_compress_then_uncompress() {
         v.extend_from_slice(b"\n-- trailing distinct bytes --\n");
         v
     };
-    let src = scratch.path("foo");
-    fs::write(&src, &original).expect("write plaintext source `foo`");
+    let src = scratch.write_new("foo", &original);
 
     for mode in ["wb", "wb1", "wb9"] {
-        // file_compress equivalent: read `foo`, produce `foo.gz`.
-        let gz_path = scratch.path(&format!("foo{GZ_SUFFIX}"));
+        // file_compress equivalent: read `foo`, produce `foo.gz`. Each mode gets its
+        // own name so no iteration ever truncates a file a previous one created —
+        // create-new semantics all the way down, and no manual cleanup to be skipped
+        // by an unwinding assertion.
+        let gz_path = scratch.path(&format!("foo_{mode}{GZ_SUFFIX}"));
         let input = fs::read(&src).expect("read plaintext source");
         {
             let mut out = gzopen(&gz_path, mode).expect("gzopen `foo.gz` for writing");
@@ -407,21 +584,16 @@ fn file_compress_then_uncompress() {
 
         // file_uncompress equivalent: read `foo.gz`, produce `foo2`. Closed via
         // the `gzclose` dispatcher (which routes a reader to `gzclose_r`).
-        let dst = scratch.path("foo2");
         let mut inp = gzopen(&gz_path, "rb").expect("gzopen `foo.gz` for reading");
         let restored = gz_read_all(&mut inp);
         assert_eq!(gzclose(inp), Z_OK, "close `foo.gz` reader at mode {mode}");
-        fs::write(&dst, &restored).expect("write decompressed `foo2`");
+        let dst = scratch.write_new(&format!("foo2_{mode}"), &restored);
 
         let final_bytes = fs::read(&dst).expect("read decompressed `foo2`");
         assert_eq!(
             final_bytes, original,
             "named-file round trip mismatch at mode {mode}"
         );
-
-        // Drop the intermediate `.gz` before the next mode (the scratch dir is
-        // removed on drop regardless).
-        let _ = fs::remove_file(&gz_path);
     }
 }
 
@@ -464,7 +636,8 @@ fn gz_output_is_valid_gzip() {
     // Reverse: flate2 writes the `.gz`, zlib_rs reads it.
     let reverse = scratch.path("reverse.gz");
     {
-        let f = fs::File::create(&reverse).expect("create flate2 `.gz`");
+        // Exclusive: `File::create` would truncate through a planted symlink.
+        let f = create_new_file(&reverse);
         let mut enc = GzEncoder::new(f, Compression::best());
         enc.write_all(&payload).expect("flate2 encode payload");
         enc.finish().expect("flate2 finalize gzip stream");
@@ -516,8 +689,7 @@ fn gzread_on_truncated_is_error() {
     );
     let crc_pos = bytes.len() - 8;
     bytes[crc_pos] ^= 0xFF;
-    let bad = scratch.path("bad.gz");
-    fs::write(&bad, &bytes).expect("write corrupted `.gz`");
+    let bad = scratch.write_new("bad.gz", &bytes);
 
     // Reading must surface an error: some call to `gzread` returns a negative
     // value, exactly as `gz_uncompress` detects with `if (len < 0)`.
@@ -698,10 +870,12 @@ fn minigzip_outmode_level_and_strategy_flags() {
 /// level, write, change both level and strategy, write more, and prove the
 /// resulting single member still decodes to the concatenation byte-for-byte.
 ///
-/// The C contract's rejections are pinned alongside the success path: an invalid
-/// strategy and a call on a read handle must both be `Z_STREAM_ERROR`, and
-/// neither may poison the stream — the writer must still finalize cleanly
-/// afterwards.
+/// The C contract's edge cases are pinned alongside the success path. A call on a
+/// read handle must be `Z_STREAM_ERROR`; an out-of-range strategy on a *live*
+/// writer must be `Z_OK`, because C validates nothing itself and discards
+/// `deflateParams`' `Z_STREAM_ERROR` (`gzwrite.c` L659) — the engine simply keeps
+/// its working parameters. Neither may poison the stream: the writer must still
+/// finalize cleanly afterwards and the member must still decode.
 #[test]
 fn gzsetparams_midstream_round_trip() {
     let scratch = Scratch::new("setparams");
@@ -733,19 +907,22 @@ fn gzsetparams_midstream_round_trip() {
             "a second mid-stream reconfiguration must also succeed"
         );
 
-        // An out-of-range strategy is rejected without disturbing the stream.
-        // `Z_FIXED` is the largest valid strategy, so one past it is the first
-        // invalid value.
+        // An out-of-range strategy on a live writer is *recorded*, not rejected:
+        // C's `gzsetparams` calls `deflateParams` purely for its side effect and
+        // throws the return value away (`gzwrite.c` L659), so the engine keeps its
+        // working parameters and the caller still sees `Z_OK`. `Z_FIXED` is the
+        // largest valid strategy, so one past it is the first invalid value.
         assert_eq!(
             gzsetparams(&mut out, Z_BEST_SPEED, Z_FIXED + 1),
-            ReturnCode::StreamError.as_c_int(),
-            "an invalid strategy must be rejected with Z_STREAM_ERROR"
+            Z_OK,
+            "C records an out-of-range strategy and returns Z_OK (gzwrite.c L659 \
+             discards deflateParams' Z_STREAM_ERROR)"
         );
 
         assert_eq!(
             gzclose_w(out),
             Z_OK,
-            "the writer must still finalize after a rejected gzsetparams"
+            "the writer must still finalize after an unhonourable gzsetparams"
         );
     }
 
@@ -1073,12 +1250,10 @@ fn gzdopen_adopts_an_open_descriptor() {
     // Write through an adopted descriptor, at an explicit level, exactly as the
     // C client does with its `outmode`.
     {
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .expect("open the target file for writing");
+        // `create(true).truncate(true)` follows a final-component symlink and
+        // truncates its target; `create_new` cannot, and the enclosing scratch
+        // directory guarantees this name was unoccupied a moment ago.
+        let file = create_new_file(&path);
         let mut out = gzdopen(file, "wb9").expect("gzdopen for writing should succeed");
         gz_write_all(&mut out, &payload);
         assert_eq!(gzclose_w(out), Z_OK, "finalize the adopted writer");
@@ -1312,8 +1487,7 @@ fn gzeof_gzdirect_and_transparent_copy_path() {
     // ---- A file that is not gzip at all (transparent read) -----------------
     // `minigzip`'s reader copies such input straight through rather than
     // erroring, which is what `gzdirect == 1` reports.
-    let plain_path = scratch.path("status_plain.txt");
-    fs::write(&plain_path, &payload).expect("write the plaintext file");
+    let plain_path = scratch.write_new("status_plain.txt", &payload);
 
     let mut plain = gzopen(&plain_path, "rb").expect("gzopen the plaintext file");
     assert_eq!(
@@ -1503,12 +1677,14 @@ fn gzrewind_gzseek_and_gztell_cursor_arithmetic() {
 /// member it leaves, then proves the identical payload survives intact once
 /// `gzclose_w` is called.
 ///
-/// `expect_flushed_output` selects how much the payload's own compressibility
-/// lets us claim. A highly compressible payload stays inside the write buffer,
-/// so a bare drop leaves only the eagerly written 10-byte header; an
-/// incompressible payload forces real `Z_NO_FLUSH` output to the file first, so
-/// the stronger claim "a real member was *started* and then abandoned" can be
-/// made. Both must end up unfinished, which is the point.
+/// `expect_flushed_output` selects which on-disk shape is asserted, and both are
+/// reference-C measurements rather than guesses. Produced bytes leave the gzip
+/// scratch area only when the area fills or a flush arrives (`gzwrite.c`
+/// L112-L114), so a compressible payload under `Z_NO_FLUSH` reaches the file
+/// **not at all** — reference zlib leaves a zero-byte file when such a handle is
+/// abandoned — whereas an incompressible payload overflows the area repeatedly
+/// and leaves real compressed output behind. Both must end up unfinished, which
+/// is the point.
 ///
 /// Deliberately size-agnostic beyond that: the exact byte count of a truncated
 /// member depends on the level, the strategy, and the payload, none of which this
@@ -1533,24 +1709,33 @@ fn assert_bare_drop_leaves_member_unfinished(
 
     let bytes = fs::read(&abandoned).expect("read the abandoned `.gz`");
 
-    // A member really was started: the header is written eagerly, so the RFC 1952
-    // magic and the DEFLATE method byte are present. This is asserted, not
-    // merely assumed, so the test cannot pass because nothing at all was written.
-    assert!(
-        bytes.len() >= 10,
-        "[{tag}] the eagerly written gzip header must be on disk, got {} bytes",
-        bytes.len()
-    );
-    assert_eq!(
-        &bytes[..3],
-        &[0x1f, 0x8b, 0x08],
-        "[{tag}] the RFC 1952 magic and CM=deflate must be present"
-    );
+    // What reached the file is exactly what C's write checkpoint would have
+    // carried, and no more. This is asserted, not assumed, so the test cannot
+    // pass because the wrong amount was written.
     if expect_flushed_output {
+        // The area overflowed repeatedly, so a member really was started: the
+        // RFC 1952 magic and the DEFLATE method byte are on disk, followed by far
+        // more than one buffer's worth of compressed output.
         assert!(
             bytes.len() > GZBUFSIZE,
             "[{tag}] an incompressible payload must have driven real compressed \
              output to the file before the drop, got only {} bytes",
+            bytes.len()
+        );
+        assert_eq!(
+            &bytes[..3],
+            &[0x1f, 0x8b, 0x08],
+            "[{tag}] the RFC 1952 magic and CM=deflate must be present"
+        );
+    } else {
+        // Nothing filled the area, so nothing was written — including the gzip
+        // header, which reference zlib does *not* emit eagerly. Were `Drop` ever
+        // to finish the stream, a complete member would be here instead.
+        assert!(
+            bytes.is_empty(),
+            "[{tag}] a compressible payload never fills the scratch area, so an \
+             abandoned writer must leave a zero-byte file (reference zlib leaves \
+             0 bytes here), got {} bytes",
             bytes.len()
         );
     }
@@ -1585,12 +1770,15 @@ fn assert_bare_drop_leaves_member_unfinished(
     );
 
     // The trailer specifically is absent — the eight bytes `gzclose_w` would have
-    // appended are not at the end of the file.
-    assert_ne!(
-        &bytes[bytes.len() - 8..],
-        &gzip_trailer(payload)[..],
-        "[{tag}] no CRC-32/ISIZE trailer may be present after a bare drop"
-    );
+    // appended are not at the end of the file. (A file too short to hold them
+    // trivially cannot end with them.)
+    if bytes.len() >= 8 {
+        assert_ne!(
+            &bytes[bytes.len() - 8..],
+            &gzip_trailer(payload)[..],
+            "[{tag}] no CRC-32/ISIZE trailer may be present after a bare drop"
+        );
+    }
 
     // This crate's own reader agrees, and reports it the way the C layer does.
     // Note the *measured* failure mode: `gzread` does not return a negative
@@ -1729,4 +1917,173 @@ fn dropping_writer_without_gzclose_leaves_incomplete_member() {
         &incompressible_payload(GZBUFSIZE * 8, 0x5EED_1234_C0FF_EE01),
         true,
     );
+}
+
+/// Pins the security properties of the scratch-directory helpers, so the CWE-377 /
+/// CWE-59 / CWE-367 hardening cannot silently regress.
+///
+/// Every fixture in this suite lives inside a [`Scratch`] directory, so the guard
+/// itself is the whole trust boundary: if it can be made to adopt a directory it did
+/// not create, or to compose a path outside [`std::env::temp_dir`], every `gzopen`
+/// below it is writing somewhere unintended and the recursive [`Drop`] is deleting
+/// somewhere unintended. Each assertion below fails against the previous
+/// `fs::create_dir_all` implementation, which is what makes this test a gate rather
+/// than a restatement.
+#[test]
+fn scratch_directories_are_created_exclusively_and_cannot_traverse() {
+    // `safe_component` must be total, and must strip every character that could
+    // terminate a component or refer to a parent.
+    for raw in [
+        "slot/../../security_target",
+        "../../../etc/passwd",
+        "..",
+        ".",
+        "/absolute",
+        "back\\slash",
+        "with space",
+        "nul\0byte",
+        "\u{00e9}\u{4f60}\u{597d}",
+        "",
+    ] {
+        let got = safe_component(raw);
+        assert!(!got.is_empty(), "{raw:?} must yield a usable component");
+        assert!(
+            got.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "{raw:?} yielded {got:?}, which still contains a disallowed character"
+        );
+        assert!(
+            !got.contains(".."),
+            "{raw:?} yielded {got:?}, still traversing"
+        );
+        assert!(
+            Path::new("/tmp").join(&got).parent() == Some(Path::new("/tmp")),
+            "{raw:?} yielded {got:?}, which does not compose to a single component"
+        );
+    }
+
+    // The composed directory is what actually matters: a hostile tag must still land
+    // exactly one level below the temporary directory.
+    let scratch = Scratch::new("../../escape");
+    assert_eq!(
+        scratch.dir().parent(),
+        Some(env::temp_dir().as_path()),
+        "{} must sit directly under the temp directory",
+        scratch.dir().display()
+    );
+    assert!(
+        !scratch.dir().to_string_lossy().contains(".."),
+        "{} must contain no parent-directory reference",
+        scratch.dir().display()
+    );
+
+    // Exclusive creation, not adoption. This is the property `fs::create_dir_all`
+    // did not have: it returned `Ok` for an existing directory — or a symlink to
+    // one — which is precisely how a planted tree got adopted, written through, and
+    // then recursively removed. One `mkdir(2)` reports `AlreadyExists` instead, which
+    // is what lets `Scratch::new` skip the candidate rather than follow it.
+    assert_eq!(
+        create_private_dir(scratch.dir())
+            .expect_err("an occupied name must not be adopted")
+            .kind(),
+        std::io::ErrorKind::AlreadyExists,
+        "re-creating an occupied scratch name must be refused, never adopted"
+    );
+
+    // On Unix the directory is owner-only from `mkdir(2)` onwards, with no
+    // `set_permissions` window in which another user could enter it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = fs::metadata(scratch.dir())
+            .expect("stat the scratch directory")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "the scratch directory must be owner-only, got {mode:#o}"
+        );
+    }
+
+    // Children are created exclusively too, and carry exactly what was written.
+    // The complementary half — that an *occupied* child is refused rather than
+    // truncated — is
+    // [`scratch_children_are_never_truncated_over`], which has to be a separate
+    // `#[should_panic]` test because `create_new_file` reports that refusal by
+    // panicking.
+    let child = scratch.write_new("fixture.bin", b"first");
+    assert_eq!(
+        fs::read(&child).expect("read the exclusively created child"),
+        b"first",
+        "the child must contain exactly what was written"
+    );
+
+    // The collision loop skips an occupied candidate rather than deleting it or
+    // entering it, and it advances by exactly one ordinal per collision. Both halves
+    // matter: were it to adopt on collision, the guard would own a directory it did
+    // not create; were it to delete, a planted name would be destroyed instead of
+    // avoided.
+    let first = create_first_free(scratch.dir(), "probe");
+    assert_eq!(
+        first,
+        scratch.path("probe_0"),
+        "the first candidate must be ordinal 0"
+    );
+    let sentinel = first.join("planted.txt");
+    create_new_file(&sentinel)
+        .write_all(b"do not touch")
+        .expect("plant a sentinel in the first candidate");
+    let second = create_first_free(scratch.dir(), "probe");
+    assert_eq!(
+        second,
+        scratch.path("probe_1"),
+        "an occupied candidate must be skipped to the next ordinal, not adopted"
+    );
+    assert!(
+        first.is_dir(),
+        "the skipped candidate must survive: {}",
+        first.display()
+    );
+    assert_eq!(
+        fs::read(&sentinel).expect("the skipped candidate's contents must survive"),
+        b"do not touch",
+        "the skipped candidate must not be entered, truncated, or removed"
+    );
+
+    // Cleanup is scoped to the directory the guard created, and takes its contents
+    // with it.
+    let dir = scratch.dir().to_path_buf();
+    drop(scratch);
+    assert!(
+        !dir.exists(),
+        "{} must be removed when its guard drops",
+        dir.display()
+    );
+    assert!(
+        !child.exists(),
+        "{} must be removed with its parent",
+        child.display()
+    );
+}
+
+/// The complement to [`scratch_directories_are_created_exclusively_and_cannot_traverse`]:
+/// [`create_new_file`] must refuse an occupied name rather than truncate it.
+///
+/// This needs its own test because the refusal is reported by panicking, and it needs
+/// to run *through* [`Scratch::write_new`] rather than through a hand-rolled
+/// [`OpenOptions`] chain — otherwise it would assert that `create_new` behaves like
+/// `create_new`, which is true of the standard library regardless of what this file
+/// does. Driving the real helper is what makes the assertion bite: relaxing
+/// `create_new(true)` back to `create(true).truncate(true)` — the shape this suite
+/// used at the adopted-descriptor writer and in every `fs::write` call — makes the
+/// second write succeed, and this test then fails for want of a panic.
+#[test]
+#[should_panic(expected = "exclusively create")]
+fn scratch_children_are_never_truncated_over() {
+    let scratch = Scratch::new("no_truncate");
+    scratch.write_new("fixture.bin", b"first");
+    // Must panic: the name is occupied, and `create_new` neither truncates it nor
+    // follows a symlink planted at it.
+    scratch.write_new("fixture.bin", b"second");
 }

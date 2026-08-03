@@ -64,14 +64,15 @@ pub mod tables;
 
 // Public re-exports: the state model and the table-builder surface the rest of
 // the crate consumes, plus the raw-callback back-inflate API.
-pub use back::{InFunc, OutFunc, inflate_back, inflate_back_end, inflate_back_init};
+pub use back::{
+    BackMsg, BackOutcome, InFunc, OutFunc, inflate_back, inflate_back_end, inflate_back_init,
+};
 pub use state::{InflateMode, InflateState};
 pub use tables::{Code, ENOUGH, ENOUGH_DISTS, ENOUGH_LENS, MAXBITS, inflate_table};
 
 // ---------------------------------------------------------------------------
 // Imports.
 // ---------------------------------------------------------------------------
-use alloc::boxed::Box;
 
 use crate::checksum::adler32;
 #[cfg(feature = "gzip")]
@@ -79,16 +80,20 @@ use crate::checksum::crc32;
 use crate::constants::{DEF_WBITS, MAX_WBITS, Z_BLOCK, Z_DEFLATED, Z_FINISH, Z_TREES};
 use crate::error::{ReturnCode, ZlibError};
 #[cfg(feature = "gzip")]
+use crate::gz_header::ForeignGzHeaderSink;
+#[cfg(feature = "gzip")]
 use crate::gz_header::GzHeader;
 #[cfg(feature = "gzip")]
 use crate::gz_header::HeaderDone;
 use crate::gz_header::HeaderPublication;
-use crate::stream::{AllocBuffer, Allocator, StreamState, ZStream, ZeroValid, try_box};
+use crate::stream::{AllocBuffer, Allocator, BoxedEngine, EngineReservation, ZStream, ZeroValid};
 
 use crate::inflate::fast::inflate_fast;
 use crate::inflate::fixed::{DISTFIX, LENFIX};
-use crate::inflate::state::TableSource;
+use crate::inflate::state::{InflateStream, TableSource};
 use crate::inflate::tables::CodeType;
+use crate::util::compress::OneCallStep;
+use crate::util::uncompress::{OneCallInflate, uncompress2_with};
 
 // ---------------------------------------------------------------------------
 // Result / outcome types.
@@ -639,64 +644,60 @@ pub fn inflate_reset2<A: Allocator>(strm: &mut ZStream<A>, window_bits: i32) -> 
 /// C `inflateInit2_` allocates the state struct through the caller's
 /// allocator (`ZALLOC(strm, 1, sizeof(struct inflate_state))`) before any
 /// window is needed, so a null/failing `zalloc` fails the init with
-/// `Z_MEM_ERROR`. The idiomatic state here lives in a Rust [`Box`], but to
-/// preserve that observable contract this path *also* reserves the equivalent
-/// footprint through the caller's [`AllocHook`](crate::stream::AllocHook) (parked in
-/// [`InflateState::state_alloc`]) whenever a hook is active. A hook whose
-/// `zalloc` reports out-of-memory therefore surfaces [`ZlibError::MemError`]
-/// here — matching C's allocation count (one at init for a single-shot inflate)
-/// and failure timing. Under the global allocator no extra allocation is made,
-/// keeping the crate's ~7 KB inflate memory-bounds parity (AAP §0.6.5). The
-/// `inflateBack` init path does not go through here, so its single
-/// (window-only) allocation is unaffected.
+/// `Z_MEM_ERROR`. This path reproduces that literally: when a hook is active it
+/// asks the hook for the state's storage *first* and the state is then built
+/// **inside the region the hook returned**, so a caller-supplied arena really
+/// holds the `inflate_state` and gets it back through `zfree`
+/// (AAP §0.6.3 has-hook clause). A hook whose `zalloc` reports out-of-memory
+/// therefore surfaces [`ZlibError::MemError`] here — matching C's allocation
+/// count (one at init for a single-shot inflate) and its failure timing. Under
+/// the global allocator no hook request is made and the state is boxed as
+/// before, keeping the crate's ~7 KB inflate memory-bounds parity (AAP §0.6.5).
+/// The `inflateBack` init path does not go through here, so its single
+/// (state-only) allocation is unaffected.
 ///
 /// # Errors
 /// Returns [`ZlibError::MemError`] when an active caller hook's `zalloc` reports
-/// out-of-memory for the state reservation, and propagates
-/// [`ZlibError::StreamError`] from [`inflate_reset2`] for an invalid
-/// `window_bits`; the partially-installed state is torn down on error.
+/// out-of-memory for the state, and propagates [`ZlibError::StreamError`] from
+/// [`inflate_reset2`] for an invalid `window_bits`; the partially-installed state
+/// is torn down on error.
 pub fn inflate_init2<A: Allocator>(strm: &mut ZStream<A>, window_bits: i32) -> InflateResult {
     strm.msg = None;
-    // `new_in` sets mode = Head so the state passes reset2's inflate-state
+    // Charge the state to the caller's allocator *first*, exactly where C does
+    // (`inflate.c` L198-L200: `state = ZALLOC(strm, 1, sizeof(struct
+    // inflate_state)); if (state == Z_NULL) return Z_MEM_ERROR;`). The region this
+    // secures becomes the finished state's actual home — `fill` below moves the
+    // state into it — so a caller's arena really does hold the `inflate_state`
+    // and gets it back through `zfree` (AAP §0.6.3 has-hook clause, §0.6.5).
+    //
+    // Whether to charge at all is the allocator's decision
+    // (`Allocator::reserves_state_footprint`): the global default declines,
+    // because there the `Box` already *is* the allocation and a second region
+    // would change the ~7 KB inflate memory-bounds parity (AAP §0.6.5); a custom
+    // Rust allocator and an active C hook both take it. Reservation and
+    // construction are two steps because the charge has to happen before the
+    // state value exists, which is the only way to fail where C fails.
+    let reservation =
+        EngineReservation::<InflateState>::take(strm.allocator()).ok_or(ZlibError::MemError)?;
+    // `build_in` sets mode = Head so the state passes reset2's inflate-state
     // guard; wrap/wbits are (re)assigned by inflate_reset2 below. The caller's
     // allocator hook (the `zalloc`/`zfree` installed via the FFI `z_stream`, or
     // a no-op under the global allocator) is threaded in so the lazily-allocated
     // window is later routed through it (AAP §0.6.3).
     let hook = strm.allocator().hook();
-    // `try_new_in` boxes the state through a checked global allocation, so heap
-    // exhaustion becomes `Z_MEM_ERROR` rather than an abort.
-    let mut state = InflateState::try_new_in(hook, 0, 0).ok_or(ZlibError::MemError)?;
-    // Route the inflate *state* allocation through the caller's hook, mirroring
-    // C `inflateInit2_`'s `ZALLOC(strm, 1, sizeof(struct inflate_state))`. The
-    // idiomatic state lives in a global `Box`; this reserves the equivalent
-    // footprint through an active caller hook so a limited/failing `zalloc`
-    // surfaces `Z_MEM_ERROR` at init — before the window is needed — matching
-    // C's allocation count and failure timing (AAP §0.6.3/§0.6.5). The
-    // `(1, size_of)` split is the exact argument pair C passes, so a caller that
-    // inspects `items`/`size` sees the same values. Whether to make the request
-    // is the allocator's decision (`Allocator::reserves_state_footprint`): the
-    // global default declines it, because there the state `Box` already *is* the
-    // allocation and a second region would change the ~7 KB inflate
-    // memory-bounds parity (AAP §0.6.5); a custom Rust allocator and an active
-    // C hook both take it.
-    if strm.allocator().reserves_state_footprint() {
-        match strm
-            .allocator()
-            .allocate_zeroed_items::<u8>(1, InflateState::C_LAYOUT_SIZE)
-        {
-            Some(cell) => state.state_alloc = cell,
-            // The state was not installed on the stream yet, so nothing to tear
-            // down; report OOM exactly as C's failed state `ZALLOC` does.
-            None => return Err(ZlibError::MemError),
-        }
-    }
+    // Filling is fallible only on the global path, where it boxes through a
+    // checked allocation so heap exhaustion becomes `Z_MEM_ERROR` rather than an
+    // abort; a reserved region was already secured above and cannot fail here.
+    let state = reservation
+        .fill(InflateState::build_in(hook, 0, 0))
+        .ok_or(ZlibError::MemError)?;
     strm.set_inflate_state(state);
     match inflate_reset2(strm, window_bits) {
         Ok(rc) => Ok(rc),
         Err(e) => {
             // Mirror C freeing the state and nulling strm->state on failure. The
-            // `state_alloc` reservation drops with the state, releasing it
-            // through the caller's `zfree`.
+            // state's storage drops with it, returning through the caller's
+            // `zfree` when the hook supplied it.
             strm.clear_state();
             Err(e)
         }
@@ -790,6 +791,30 @@ pub fn inflate<A: Allocator>(
     inflate_tracked(strm, input, output, flush).outcome
 }
 
+/// [`inflate_tracked`] without a lent header sink — the shape every idiomatic
+/// caller uses.
+///
+/// The idiomatic API lends the decoder an owned [`GzHeader`] through
+/// [`inflate_get_header`], so there is no caller-owned buffer to write into and
+/// the sink is always absent here. The C ABI calls
+/// [`inflate_tracked_lending`] directly.
+#[inline]
+pub(crate) fn inflate_tracked<A: Allocator>(
+    strm: &mut ZStream<A>,
+    input: &[u8],
+    output: &mut [u8],
+    flush: i32,
+) -> TrackedInflateOutcome {
+    inflate_tracked_lending(
+        strm,
+        input,
+        output,
+        flush,
+        #[cfg(feature = "gzip")]
+        None,
+    )
+}
+
 /// The full implementation of [`inflate`], additionally reporting whether the C
 /// `z_stream` `total_in`/`total_out` mirrors may be advanced.
 ///
@@ -798,11 +823,12 @@ pub fn inflate<A: Allocator>(
 /// flag out of [`InflateOutcome`] preserves that type's public
 /// `{code, consumed, produced}` shape (see [`TrackedInflateOutcome`]).
 #[allow(clippy::too_many_lines)]
-pub(crate) fn inflate_tracked<A: Allocator>(
+pub(crate) fn inflate_tracked_lending<A: Allocator>(
     strm: &mut ZStream<A>,
     input: &[u8],
     output: &mut [u8],
     flush: i32,
+    #[cfg(feature = "gzip")] mut sink: Option<&mut ForeignGzHeaderSink<'_>>,
 ) -> TrackedInflateOutcome {
     // ---- guard: an inflate state must be installed (C `inflateStateCheck`) ---
     //
@@ -810,27 +836,26 @@ pub(crate) fn inflate_tracked<A: Allocator>(
     // decouples the borrows: `strm` stays fully available for `strm.msg`,
     // `strm.total_*`, and `strm.adler`, while the owned `state` is mutated
     // freely. Every exit path reinstalls the state via `set_inflate_state`.
-    let mut state: Box<InflateState> = match strm.take_state() {
-        StreamState::Inflate(s) => s,
-        // Not an inflate stream — put back whatever we removed and error out.
-        StreamState::Deflate(d) => {
-            strm.set_deflate_state(d);
-            return TrackedInflateOutcome::committed(
-                ReturnCode::StreamError,
-                0,
-                0,
-                HeaderPublication::default(),
-            );
-        }
-        StreamState::None => {
-            return TrackedInflateOutcome::committed(
-                ReturnCode::StreamError,
-                0,
-                0,
-                HeaderPublication::default(),
-            );
-        }
+    // `take_inflate_state` removes the engine only when it really is a
+    // decompressor: an installed *compression* engine is left exactly where it
+    // was found, which is C `inflateStateCheck` refusing a stream it must not
+    // disturb (`inflate.c` L88-L97).
+    let Some(mut placed) = strm.take_inflate_state() else {
+        return TrackedInflateOutcome::committed(
+            ReturnCode::StreamError,
+            0,
+            0,
+            HeaderPublication::default(),
+        );
     };
+
+    // Reborrow the placed engine as a plain `&mut InflateState`. The engine may
+    // live in a caller-supplied region rather than on the Rust heap, so the value
+    // taken above is a placement wrapper; going through it on every access would
+    // borrow the whole wrapper and defeat the disjoint field borrows this loop
+    // relies on (the decode tables are read while `codes`/`work` are written).
+    // One reborrow here restores them, and each exit path hands `placed` back.
+    let state: &mut InflateState = &mut placed;
 
     // C: "if (state->mode == TYPE) state->mode = TYPEDO;  /* skip check */".
     // On re-entry at a block boundary, advance past the Z_BLOCK/Z_TREES early
@@ -838,6 +863,10 @@ pub(crate) fn inflate_tracked<A: Allocator>(
     if state.mode == InflateMode::Type {
         state.mode = InflateMode::TypeDo;
     }
+
+    // The fast path's input debt is strictly per-call output: zero it now so a
+    // value left by an earlier call can never be mistaken for this one's.
+    state.rewound = 0;
 
     // LOAD(): pull the bit accumulator into the local I/O context.
     let mut io = InflateIo {
@@ -1041,6 +1070,18 @@ pub(crate) fn inflate_tracked<A: Allocator>(
                     // of the public `GzHeader`.
                     if state.head.is_some() {
                         header_pub.extra_len = Some(io.hold);
+                        // C's `state->head->extra_len = (unsigned)hold` lands in
+                        // the caller's struct *immediately*, and the `EXTRA` state
+                        // derives its write offset from that very field — often in
+                        // the same pass, via the fallthrough below. The lent view
+                        // must therefore see the value now; the boundary publishes
+                        // the identical value into the caller's `extra_len` when
+                        // this call returns, so the next call's freshly
+                        // materialized view reads it back from exactly where C
+                        // keeps it.
+                        if let Some(sk) = sink.as_deref_mut() {
+                            sk.extra_len = io.hold;
+                        }
                     }
                     if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 {
                         crc2(&mut state.check, io.hold);
@@ -1076,7 +1117,29 @@ pub(crate) fn inflate_tracked<A: Allocator>(
                         // request is reserved first and exhaustion is reported as
                         // `Z_MEM_ERROR` instead (AAP §0.6.5).
                         let mut capture_oom = false;
-                        if let Some(head) = state.head.as_mut() {
+                        if state.head_foreign {
+                            // C ABI path: the bytes go straight into the
+                            // caller's buffer, re-reading its live pointer,
+                            // `extra_len` and `extra_max` on every pass, and
+                            // allocating nothing — so `capture_oom` can never be
+                            // set and no `Z_MEM_ERROR` exists here, exactly as in
+                            // C (`inflate.c` L610-L621).
+                            //
+                            // The write offset is C's `len = head->extra_len -
+                            // state->length`, computed in the same wrapping
+                            // `unsigned` arithmetic: a caller who shrinks
+                            // `extra_len` below the remaining count makes C's
+                            // subtraction wrap to a huge value that fails the
+                            // `len < head->extra_max` guard, storing nothing.
+                            // `store_extra` reaches the same conclusion by
+                            // rejecting an out-of-range offset.
+                            if state.head.is_some() {
+                                if let Some(sk) = sink.as_deref_mut() {
+                                    let offset = sk.extra_len.wrapping_sub(state.length) as usize;
+                                    sk.store_extra(offset, &io.input[io.next..io.next + copy]);
+                                }
+                            }
+                        } else if let Some(head) = state.head.as_mut() {
                             let extra_max = head.extra_max as usize;
                             if let Some(extra) = head.extra.as_mut() {
                                 if extra.len() < extra_max {
@@ -1143,7 +1206,23 @@ pub(crate) fn inflate_tracked<A: Allocator>(
                         // *is* C's `state->length` and the terminator is recorded
                         // as a flag for the boundary to write. A name that exactly
                         // fills `name_max` therefore stays unterminated, as in C.
-                        if let Some(head) = state.head.as_mut() {
+                        if state.head_foreign {
+                            // C ABI path: `head->name[state->length++] = byte`
+                            // straight into the caller's buffer, bounded by the
+                            // live `name_max`, with the index advancing only on a
+                            // store (`inflate.c` L632-L637). The terminating NUL
+                            // is one of those bytes, so a name that exactly fills
+                            // the buffer stays unterminated — no separate
+                            // `name_terminated` publication is needed, and
+                            // nothing can allocate.
+                            if state.head.is_some() {
+                                if let Some(sk) = sink.as_deref_mut() {
+                                    if sk.store_name(state.length as usize, last_byte) {
+                                        state.length += 1;
+                                    }
+                                }
+                            }
+                        } else if let Some(head) = state.head.as_mut() {
                             let name_max = head.name_max as usize;
                             if let Some(name) = head.name.as_mut() {
                                 if name.len() < name_max {
@@ -1200,7 +1279,19 @@ pub(crate) fn inflate_tracked<A: Allocator>(
                         // one of C's counted bytes against `comm_max`
                         // (`inflate.c` L654-L659), so it is recorded as a flag
                         // rather than pushed into the content `Vec`.
-                        if let Some(head) = state.head.as_mut() {
+                        if state.head_foreign {
+                            // C ABI path: `head->comment[state->length++]`
+                            // straight into the caller's buffer, bounded by the
+                            // live `comm_max` (`inflate.c` L654-L659). Same
+                            // accounting as `NAME` above; allocation-free.
+                            if state.head.is_some() {
+                                if let Some(sk) = sink.as_deref_mut() {
+                                    if sk.store_comment(state.length as usize, last_byte) {
+                                        state.length += 1;
+                                    }
+                                }
+                            }
+                        } else if let Some(head) = state.head.as_mut() {
                             let comm_max = head.comm_max as usize;
                             if let Some(comment) = head.comment.as_mut() {
                                 if comment.len() < comm_max {
@@ -1319,7 +1410,7 @@ pub(crate) fn inflate_tracked<A: Allocator>(
                     state.bits = io.bits;
                     let consumed = io.next;
                     let produced = io.put;
-                    strm.set_inflate_state(state);
+                    strm.set_inflate_state(placed);
                     return TrackedInflateOutcome {
                         outcome: InflateOutcome {
                             code: ReturnCode::NeedDict,
@@ -1372,7 +1463,7 @@ pub(crate) fn inflate_tracked<A: Allocator>(
                     }
                     1 => {
                         // fixed Huffman block
-                        fixedtables(&mut state);
+                        fixedtables(state);
                         state.mode = InflateMode::LenUnderscore;
                         if flush == Z_TREES {
                             io.drop_bits(2);
@@ -1652,7 +1743,7 @@ pub(crate) fn inflate_tracked<A: Allocator>(
                     state.hold = io.hold;
                     state.bits = io.bits;
                     let msg = inflate_fast(
-                        &mut state,
+                        state,
                         io.input,
                         &mut io.next,
                         io.output,
@@ -1976,12 +2067,12 @@ pub(crate) fn inflate_tracked<A: Allocator>(
                 // fallible whenever it is served by a caller-supplied hook or a
                 // custom `Allocator` that refuses it, both at `inf_leave` below
                 // and inside [`inflate_set_dictionary`].
-                strm.set_inflate_state(state);
+                strm.set_inflate_state(placed);
                 return TrackedInflateOutcome::committed(ReturnCode::MemError, 0, 0, header_pub);
             }
             InflateMode::Sync => {
                 // C `case SYNC: default: return Z_STREAM_ERROR;`.
-                strm.set_inflate_state(state);
+                strm.set_inflate_state(placed);
                 return TrackedInflateOutcome::committed(ReturnCode::StreamError, 0, 0, header_pub);
             }
         }
@@ -2012,7 +2103,7 @@ pub(crate) fn inflate_tracked<A: Allocator>(
     // exactly when the condition holds; the body runs only on an OOM failure.
     if needs_window_update
         && updatewindow(
-            &mut state,
+            state,
             strm.allocator(),
             &io.output[..],
             io.put,
@@ -2026,7 +2117,7 @@ pub(crate) fn inflate_tracked<A: Allocator>(
         // committed progress, matching both the C control flow and the
         // `InflateMode::Mem` arm above.
         state.mode = InflateMode::Mem;
-        strm.set_inflate_state(state);
+        strm.set_inflate_state(placed);
         return TrackedInflateOutcome {
             header: header_pub,
             outcome: InflateOutcome {
@@ -2094,7 +2185,7 @@ pub(crate) fn inflate_tracked<A: Allocator>(
     // state so subsequent calls resume where this one left off.
     strm.total_in += consumed as u64;
     strm.total_out += produced as u64;
-    strm.set_inflate_state(state);
+    strm.set_inflate_state(placed);
 
     // The normal epilogue path: C advances the cursors and the totals together
     // (`inflate.c` L1139-L1142).
@@ -2192,9 +2283,12 @@ pub fn inflate_set_dictionary<A: Allocator>(
 ///
 /// Ownership of `head` is transferred to the decoder: its `extra`/`name`/
 /// `comment` capacities and buffers (if `Some`) bound what is captured while the
-/// gzip header modes run, and `done` is cleared. The higher-level FFI shim in
-/// `src/ffi/inflate.rs` bridges this owned model back to C's borrowed
-/// `gz_headerp`.
+/// gzip header modes run, and `done` is cleared.
+///
+/// This is the *idiomatic* registration. The C ABI does not use it: a
+/// `gz_headerp` names buffers in the caller's own memory that C writes through
+/// live, so `src/ffi/inflate.rs` registers the borrowed form instead and lends the
+/// decoder a per-call view of those buffers.
 ///
 /// # Retrieving the parsed fields
 ///
@@ -2216,7 +2310,112 @@ pub fn inflate_get_header<A: Allocator>(strm: &mut ZStream<A>, head: GzHeader) -
     let mut head = head;
     head.done = false;
     state.head = Some(head);
+    // The idiomatic API lends the decoder an *owned* header, so payload bytes are
+    // accumulated in its vectors rather than written through to caller memory.
+    state.head_foreign = false;
     Ok(ReturnCode::Ok)
+}
+
+/// Registers a **caller-owned** gzip header for [`inflate`] to fill, the C ABI's
+/// counterpart of [`inflate_get_header`].
+///
+/// Port of C `inflateGetHeader` (`inflate.c` L1219-L1230) on the path where the
+/// header — and every one of its output buffers — lives in the caller's memory.
+/// `present` mirrors `head != Z_NULL`.
+///
+/// Only the *registration* is recorded here: no pointer, no capacity, and no
+/// content. The decoder writes each decoded byte through the
+/// [`ForeignGzHeaderSink`] the boundary lends it on every [`inflate`] call, which
+/// is re-materialized from the caller's live struct each time. That is what makes
+/// a sink installed (or resized, or withdrawn) *after* registration take effect,
+/// as it does in C, and what keeps the header path allocation-free — C allocates
+/// nothing here, so no `Z_MEM_ERROR` may arise from it.
+///
+/// The header's decoded *scalars* still land in an engine-side [`GzHeader`], from
+/// which the boundary replays C's incremental publication schedule; only the
+/// variable-length payloads bypass it.
+///
+/// # Errors
+/// Returns [`ZlibError::StreamError`] if `strm` has no inflate state or the
+/// stream is not gzip-capable — both exactly as C.
+#[cfg(feature = "gzip")]
+pub(crate) fn inflate_get_header_foreign<A: Allocator>(
+    strm: &mut ZStream<A>,
+    present: bool,
+) -> InflateResult {
+    let state = strm.inflate_state_mut().ok_or(ZlibError::StreamError)?;
+    if (state.wrap & 2) == 0 {
+        return Err(ZlibError::StreamError);
+    }
+    if present {
+        // Scalars only: every payload slot stays `None`, so nothing is ever
+        // appended and nothing is ever allocated.
+        state.head = Some(GzHeader::default());
+        state.head_foreign = true;
+    } else {
+        // C's assignment of a null `head` simply clears the registration.
+        state.head = None;
+        state.head_foreign = false;
+    }
+    Ok(ReturnCode::Ok)
+}
+
+/// Settles the input debt the fast path could not pay, and reports how many
+/// whole bytes the caller must rewind its own input cursor by.
+///
+/// # Why this exists
+///
+/// C's `inflate_fast` ends with `len = bits >> 3; in -= len; bits -= len << 3;`
+/// (`inffast.c` L290-L294): a single unconditional operation on a raw pointer.
+/// When it enters holding whole bytes — which `inflatePrime` alone guarantees —
+/// `in` legitimately moves to before `strm->next_in`, un-consuming bytes an
+/// earlier call took. C never dereferences them, so the only trace is in
+/// `next_in`, `avail_in`, `total_in` and `data_type`.
+///
+/// An index into a `&[u8]` cannot go before that slice, so
+/// [`crate::inflate::fast::inflate_fast`] pays the part that lands inside the
+/// slice and records the rest in [`InflateState::rewound`], leaving those bits in
+/// `hold`. Deferring rather than discarding them is deliberate: a caller that
+/// hands over an independent slice per call could never re-feed the bytes the
+/// bits came from, and dropping them would desynchronise the bitstream.
+///
+/// This function is the settlement, for callers whose input really is one
+/// contiguous buffer — that is, the C ABI. It drops the deferred bits and returns
+/// the byte count, so that the two halves of C's `in -= len; bits -= len << 3;`
+/// pair still commit together. [`ZStream::data_type`] is re-derived from the
+/// reduced `bits` with C's exact formula (`inflate.c` L1147-L1149), because the
+/// decode epilogue computed it before this settlement.
+///
+/// Returns `0` — leaving the stream untouched — when there is no debt, which is
+/// every ordinary call.
+pub(crate) fn inflate_take_input_history_rewind<A: Allocator>(strm: &mut ZStream<A>) -> usize {
+    let Some(state) = strm.inflate_state_mut() else {
+        return 0;
+    };
+    let rewound = core::mem::take(&mut state.rewound);
+    if rewound == 0 {
+        return 0;
+    }
+    // C's `bits -= len << 3` for the deferred half. The fast path only ever defers
+    // whole bytes it actually had, so this cannot underflow; `saturating_sub` keeps
+    // that guarantee local rather than trusting it from a distance.
+    state.bits = state.bits.saturating_sub(rewound << 3);
+    // C's `hold &= (1U << bits) - 1`. `bits == 32` would overflow the shift, so the
+    // all-ones mask is produced without shifting (as in the fast path itself).
+    state.hold &= 1u32.checked_shl(state.bits).unwrap_or(0).wrapping_sub(1);
+    let (bits, last, mode) = (state.bits, state.last, state.mode);
+    // Re-derive C's `strm->data_type` (`inflate.c` L1147-L1149) from the reduced
+    // accumulator: the decode epilogue already published a value computed from the
+    // pre-settlement `bits`, and the low seven bits of `data_type` *are* `bits`.
+    strm.data_type = bits as i32
+        + if last { 64 } else { 0 }
+        + if mode == InflateMode::Type { 128 } else { 0 }
+        + if mode == InflateMode::LenUnderscore || mode == InflateMode::CopyUnderscore {
+            256
+        } else {
+            0
+        };
+    rewound as usize
 }
 
 /// Borrows the [`GzHeader`] previously registered with [`inflate_get_header`],
@@ -2467,53 +2666,28 @@ pub fn inflate_sync_point<A: Allocator>(strm: &ZStream<A>) -> Result<bool, ZlibE
     Ok(state.mode == InflateMode::Stored && state.bits == 0)
 }
 
-/// Deep-clones an [`InflateState`] into a fresh [`Box`], or returns
-/// [`ZlibError::MemError`] if the copy's buffers cannot be allocated.
+/// Duplicates one owned buffer through `alloc` — the `ZALLOC` + `zmemcpy` pair C
+/// `inflateCopy` performs for the window
+/// (`ZALLOC(strm, 1U << wbits, sizeof(unsigned char))`, `inflate.c` L1346).
 ///
-/// This is the safe-Rust replacement for the pointer fix-up dance in C
-/// `inflateCopy`: because the state records the active decode tables as `usize`
-/// offsets into [`InflateState::codes`] plus a fixed/dynamic discriminator
-/// ([`TableSource`]) — rather than self-referential raw pointers — copying the
-/// fields verbatim already yields a correct, independent clone. No offsets need
-/// to be re-based. (`InflateState` deliberately does not derive [`Clone`], so
+/// It is what makes the deep copy behind [`inflate_copy`] allocator-faithful:
+/// the destination buffer comes from the same allocator that backs the source,
+/// with one request, so a caller-supplied arena serves the copy as well as the
+/// original (AAP §0.6.3, §0.6.5).
+///
+/// The rest of the clone needs no such help. Because the state records the active
+/// decode tables as `usize` offsets into [`InflateState::codes`] plus a
+/// fixed/dynamic discriminator ([`TableSource`]) — rather than self-referential
+/// raw pointers — copying the fields verbatim already yields a correct,
+/// independent clone, and the pointer fix-up dance C `inflateCopy` performs has no
+/// counterpart here. (`InflateState` deliberately does not derive [`Clone`], so
 /// the copy is written out explicitly.)
-///
-/// # Allocator fidelity
-///
-/// Allocates a destination buffer of `items * item_size` bytes through `alloc`
-/// and copies `src` into it — the `ZALLOC` + `zmemcpy` pair C `inflateCopy`
-/// performs for one buffer.
 ///
 /// # Errors
 ///
 /// [`ZlibError::MemError`] if the allocation is refused, or if it produced a
 /// length other than `src.len()` (which would mean the geometry fields and the
 /// buffer disagreed).
-fn clone_buffer_items<A: Allocator, T>(
-    alloc: &A,
-    src: &AllocBuffer<T>,
-    items: usize,
-    item_size: usize,
-) -> Result<AllocBuffer<T>, ZlibError>
-where
-    T: Copy + Default + ZeroValid + 'static,
-{
-    let mut dst = alloc
-        .allocate_zeroed_items::<T>(items, item_size)
-        .ok_or(ZlibError::MemError)?;
-    if dst.len() != src.len() {
-        return Err(ZlibError::MemError);
-    }
-    dst.copy_from_slice(src);
-    Ok(dst)
-}
-
-/// Element-shaped counterpart of [`clone_buffer_items`], for C's
-/// `ZALLOC(strm, 1U << wbits, sizeof(unsigned char))` window request.
-///
-/// # Errors
-///
-/// As [`clone_buffer_items`].
 fn clone_buffer<A: Allocator, T>(
     alloc: &A,
     src: &AllocBuffer<T>,
@@ -2535,10 +2709,11 @@ where
 /// C `inflateCopy` allocates the destination state and its window through the
 /// source stream's own `zalloc` and returns `Z_MEM_ERROR` if either fails
 /// (`inflate.c` L1340-L1350, including the `ZFREE(copy)` that releases the state
-/// when the window allocation fails). The window and the state reservation are
-/// therefore copied through [`AllocBuffer::try_clone`], which re-allocates through
-/// the allocator that backs them, and the state itself is boxed with
-/// [`try_box`] so global-heap exhaustion is reported rather than aborting.
+/// when the window allocation fails). The destination state is therefore charged
+/// to `alloc` first — becoming the copy's real home, so a caller-supplied arena
+/// owns the copy — and the window is re-allocated through the same allocator,
+/// each with one request, in C's order. On the global-allocator path the state is
+/// boxed fallibly instead, so heap exhaustion is reported rather than aborting.
 ///
 /// A caller-supplied `zalloc` reporting out-of-memory fails the copy with
 /// [`ZlibError::MemError`] — exactly what C does — instead of completing it with
@@ -2551,78 +2726,77 @@ where
 fn try_clone_inflate_state<A: Allocator>(
     s: &InflateState,
     alloc: &A,
-) -> Result<Box<InflateState>, ZlibError> {
+) -> Result<BoxedEngine<InflateState>, ZlibError> {
     // Fallible work first, so a failure abandons the copy before any state is
     // built; the partial clone is released by its own `Drop` (C's `ZFREE(copy)`).
-    // C's order: the state reservation first (`inflate.c` L1340), then the window
-    // (L1346).
-    //
-    // Both are requested from `alloc` with the same `(items, size)` split C uses
-    // — `(1, sizeof(struct inflate_state))` and `(1 << wbits, 1)` — rather than
-    // duplicated in place, so a custom Rust allocator serves the copy as well as
-    // the original (AAP §0.6.3, §0.6.5). An empty source buffer stays empty: C
-    // has nothing to copy either when the window was never allocated, and the
-    // state reservation is only taken when a C-style hook is installed.
-    let state_alloc = if s.state_alloc.is_empty() {
-        AllocBuffer::default()
-    } else {
-        clone_buffer_items(alloc, &s.state_alloc, 1, InflateState::C_LAYOUT_SIZE)?
-    };
+    // C's order: the destination state first (`inflate.c` L1340), then the window
+    // (L1346). Taking the reservation before the window clone is what makes a
+    // bounded destination allocator refuse at C's request rather than a later one.
+    let reservation = EngineReservation::<InflateState>::take(alloc).ok_or(ZlibError::MemError)?;
+    // The window is requested from `alloc` with the same `(items, size)` split C
+    // uses — `(1 << wbits, 1)` — rather than duplicated in place, so a custom Rust
+    // allocator serves the copy as well as the original (AAP §0.6.3, §0.6.5). An
+    // empty source buffer stays empty: C has nothing to copy either when the
+    // window was never allocated.
     let window = if s.window.is_empty() {
         AllocBuffer::default()
     } else {
         clone_buffer(alloc, &s.window, 1usize << s.wbits)?
     };
 
-    try_box(InflateState {
-        mode: s.mode,
-        last: s.last,
-        wrap: s.wrap,
-        havedict: s.havedict,
-        flags: s.flags,
-        dmax: s.dmax,
-        check: s.check,
-        total: s.total,
-        head: s.head.clone(),
-        wbits: s.wbits,
-        wsize: s.wsize,
-        whave: s.whave,
-        wnext: s.wnext,
-        window,
-        hold: s.hold,
-        bits: s.bits,
-        length: s.length,
-        offset: s.offset,
-        extra: s.extra,
-        lencode: s.lencode,
-        distcode: s.distcode,
-        lentable: s.lentable,
-        disttable: s.disttable,
-        lenbits: s.lenbits,
-        distbits: s.distbits,
-        ncode: s.ncode,
-        nlen: s.nlen,
-        ndist: s.ndist,
-        have: s.have,
-        next: s.next,
-        lens: s.lens,
-        work: s.work,
-        codes: s.codes,
-        sane: s.sane,
-        back: s.back,
-        was: s.was,
-        // Carry the caller's allocator hook into the clone so the copied
-        // window (already re-allocated through the same hook by
-        // `AllocBuffer::try_clone`) and any future re-allocation stay routed
-        // through the caller's `zalloc`/`zfree` (AAP §0.6.3).
-        alloc_hook: s.alloc_hook,
-        // The copy's own state reservation, re-allocated through the same hook —
-        // mirroring C `inflateCopy`, which `ZALLOC`s a fresh state for the
-        // destination. It is empty when the source has none (global-allocator
-        // streams), so no-hook copies stay allocation-free.
-        state_alloc,
-    })
-    .ok_or(ZlibError::MemError)
+    // Moving the finished value into the reserved region puts the copy in the
+    // caller's own memory when a hook is active, and boxes it fallibly otherwise.
+    reservation
+        .fill(InflateState {
+            mode: s.mode,
+            last: s.last,
+            wrap: s.wrap,
+            havedict: s.havedict,
+            flags: s.flags,
+            dmax: s.dmax,
+            check: s.check,
+            total: s.total,
+            head: s.head.clone(),
+            // C's `zmemcpy(copy, state, sizeof(struct inflate_state))`
+            // (`inflate.c` L1272-L1273) duplicates `head` verbatim, so the clone
+            // reads the *same* caller-owned buffers; the marker travels with it.
+            #[cfg(feature = "gzip")]
+            head_foreign: s.head_foreign,
+            wbits: s.wbits,
+            wsize: s.wsize,
+            whave: s.whave,
+            wnext: s.wnext,
+            window,
+            hold: s.hold,
+            bits: s.bits,
+            rewound: s.rewound,
+            length: s.length,
+            offset: s.offset,
+            extra: s.extra,
+            lencode: s.lencode,
+            distcode: s.distcode,
+            lentable: s.lentable,
+            disttable: s.disttable,
+            lenbits: s.lenbits,
+            distbits: s.distbits,
+            ncode: s.ncode,
+            nlen: s.nlen,
+            ndist: s.ndist,
+            have: s.have,
+            next: s.next,
+            lens: s.lens,
+            work: s.work,
+            codes: s.codes,
+            sane: s.sane,
+            back: s.back,
+            was: s.was,
+            // Carry the caller's allocator hook into the clone so the copied
+            // window (already re-allocated through the same hook) and any future
+            // re-allocation stay routed through the caller's `zalloc`/`zfree`
+            // (AAP §0.6.3).
+            alloc_hook: s.alloc_hook,
+        })
+        .ok_or(ZlibError::MemError)
 }
 
 /// Copies a complete inflate stream — the Rust port of C `inflateCopy`
@@ -2745,6 +2919,154 @@ pub fn inflate_end<A: Allocator>(strm: &mut ZStream<A>) -> InflateResult {
     }
     strm.clear_state();
     Ok(ReturnCode::Ok)
+}
+
+// ===========================================================================
+// One-call façade — the engine-owning half of C `uncompr.c`
+//
+// C `uncompr.c` is a separate translation unit that `#include`s `zlib.h` and
+// calls `inflateInit`/`inflate`/`inflateEnd`, so in the `#include` order it sits
+// ABOVE the engine, not beside `zutil.h`. The Rust layering reflects that: the
+// complete `uncompress2_z` driver — the decode loop, the consumed/produced
+// accounting, and the `uncompr.c` L78-L81 return-code folding — lives in
+// `crate::util::uncompress` (layer 3, engine-free and generic over the
+// `OneCallInflate` port it declares), and the engine adapter plus the two
+// C-named entry points live here (layer 6). That is what keeps the module graph
+// one-way — layer 3 never names an engine (AAP §0.3.1, §0.4.2 B2) — while the
+// crate root still re-exports `uncompress` and `uncompress2` under exactly the
+// names `zlib.h` publishes.
+// ===========================================================================
+
+/// The [`OneCallInflate`] adapter: a private, self-contained stream driven by the
+/// layer-3 `uncompress2_z` transcription.
+///
+/// It exists only for the duration of one `uncompress`/`uncompress2` call and
+/// holds nothing beyond the stream itself, so the three trait methods are
+/// literally the three C calls `uncompress2_z` makes.
+struct OneCallInflateEngine {
+    /// The stream this call owns, initialised by [`OneCallInflate::begin`].
+    strm: ZStream,
+}
+
+impl OneCallInflate for OneCallInflateEngine {
+    /// C `inflateInit(&stream)` (`uncompr.c` L50).
+    ///
+    /// `ZStream::new` installs the default (global) allocator, exactly as C
+    /// `uncompress2_z` zeroes `zalloc`/`zfree`/`opaque` so `inflateInit`
+    /// substitutes its own, and `inflate_init` defaults `windowBits` to
+    /// `DEF_WBITS` (15).
+    fn begin() -> Result<Self, ReturnCode> {
+        let mut strm = ZStream::new();
+        match inflate_init(&mut strm) {
+            Ok(_) => Ok(Self { strm }),
+            Err(err) => Err(err.as_return_code()),
+        }
+    }
+
+    /// C `inflate(&stream, Z_NO_FLUSH)` (`uncompr.c` L58).
+    fn step(&mut self, input: &[u8], output: &mut [u8], flush: i32) -> OneCallStep {
+        let outcome = inflate(&mut self.strm, input, output, flush);
+        OneCallStep {
+            consumed: outcome.consumed,
+            produced: outcome.produced,
+            code: outcome.code,
+        }
+    }
+
+    /// C `inflateEnd(&stream)` (`uncompr.c` L76).
+    ///
+    /// C ignores the return value, and so does this: the outcome of the call has
+    /// already been decided. Dropping the stream afterwards is safe because
+    /// `inflate_end` clears the state, so the `Drop` is a no-op (no double free).
+    fn end(&mut self) {
+        let _ = inflate_end(&mut self.strm);
+    }
+}
+
+/// Decompresses the whole zlib stream in `source` into `dest`, reporting the
+/// number of source bytes consumed.
+///
+/// This is the idiomatic port of C `uncompress2` / `uncompress2_z`
+/// (`uncompr.c` L29-L90); see
+/// `crate::util::uncompress::uncompress2_with` for the
+/// parameter contract, which this function forwards verbatim.
+///
+/// # Errors
+///
+/// Reproduces `uncompr.c` L78-L81 verbatim: [`ReturnCode::DataError`] for
+/// corrupt, truncated, or dictionary-requiring input, [`ReturnCode::BufError`]
+/// when `dest` is too small while input remains, [`ReturnCode::MemError`] on
+/// allocation failure, and any other engine code unchanged.
+///
+/// # Examples
+///
+/// ```
+/// # use zlib_rs::{compress, compress_bound, uncompress2};
+/// // Build a valid zlib stream; `plain_len` is its decompressed size.
+/// let plain = b"the quick brown fox";
+/// let mut zlib = vec![0u8; compress_bound(plain.len())];
+/// let m = compress(&mut zlib, plain).unwrap();
+/// zlib.truncate(m);
+/// let plain_len = plain.len();
+///
+/// let mut out = vec![0u8; plain_len];
+/// let mut consumed = zlib.len();
+/// let mut produced = out.len();
+/// let n = uncompress2(&mut out, &zlib, &mut consumed, &mut produced).unwrap();
+/// assert_eq!(n, plain_len);
+/// assert_eq!(produced, plain_len);   // output count reported on all paths
+/// assert_eq!(consumed, zlib.len());  // whole stream read
+/// assert_eq!(&out[..], plain);
+/// ```
+pub fn uncompress2(
+    dest: &mut [u8],
+    source: &[u8],
+    source_len: &mut usize,
+    dest_len: &mut usize,
+) -> Result<usize, ReturnCode> {
+    uncompress2_with::<OneCallInflateEngine>(dest, source, source_len, dest_len)
+}
+
+/// Decompresses the whole zlib stream in `source` into `dest`.
+///
+/// This is the classic convenience wrapper — the port of C `uncompress`
+/// (`uncompr.c` L92-L101) — for callers that do not care how many input bytes
+/// were consumed. It treats the *entire* `source` slice as the available input
+/// and forwards to [`uncompress2`], discarding the consumed-length report.
+///
+/// # Returns
+///
+/// * `Ok(produced)` — `produced` bytes were written to the front of `dest`.
+/// * `Err(code)` — see [`uncompress2`] for the exact error mapping.
+///
+/// # Errors
+///
+/// Identical to [`uncompress2`]: [`ReturnCode::DataError`] for corrupt or
+/// incomplete input (or a needed preset dictionary), [`ReturnCode::BufError`]
+/// when `dest` is too small, and [`ReturnCode::MemError`] on allocation failure.
+///
+/// # Examples
+///
+/// ```
+/// # use zlib_rs::{compress, compress_bound, uncompress};
+/// let plain = b"the quick brown fox";
+/// let mut zlib = vec![0u8; compress_bound(plain.len())];
+/// let m = compress(&mut zlib, plain).unwrap();
+/// zlib.truncate(m);
+/// let plain_len = plain.len();
+///
+/// let mut out = vec![0u8; plain_len];
+/// let n = uncompress(&mut out, &zlib).unwrap();
+/// assert_eq!(n, plain_len);
+/// assert_eq!(&out[..], plain);
+/// ```
+pub fn uncompress(dest: &mut [u8], source: &[u8]) -> Result<usize, ReturnCode> {
+    // C `uncompress` seeds a local `used = sourceLen` and calls `uncompress2`,
+    // then throws the updated `used` away. The produced-count out-parameter is
+    // likewise discarded here (the `Ok(produced)` return still carries it).
+    let mut used = source.len();
+    let mut produced = dest.len();
+    uncompress2(dest, source, &mut used, &mut produced)
 }
 
 #[cfg(test)]
@@ -3083,6 +3405,338 @@ mod tests {
         assert_eq!(inflate_prime(&mut strm, 17, 0), Err(ZlibError::StreamError));
     }
 
+    /// C `inflateGetDictionary` (`inflate.c` L1167-L1185) always reports the
+    /// history length and copies the history only when the caller's buffer can
+    /// hold all of it — which is what makes the C two-call idiom (query with
+    /// `Z_NULL`, allocate, fetch) work.
+    ///
+    /// Four cases with no other witness in the suite: no installed state, a
+    /// stream that has decoded nothing, a short un-wrapped history, and a buffer
+    /// too small for the history (length still reported, nothing copied). The
+    /// wrapped-history case needs a small window and is asserted separately.
+    #[test]
+    fn inflate_get_dictionary_reports_the_length_and_copies_only_when_it_fits() {
+        // Without an installed state there is nothing to report; the length
+        // out-parameter must be left exactly as the caller set it, because C
+        // returns before it writes `*dictLength`.
+        let bare = ZStream::new();
+        let mut sink = [0xa5u8; 8];
+        let mut len = usize::MAX;
+        assert_eq!(
+            inflate_get_dictionary(&bare, &mut sink, &mut len),
+            Err(ZlibError::StreamError)
+        );
+        assert_eq!(len, usize::MAX, "a rejected call writes no length");
+        assert_eq!(sink, [0xa5u8; 8], "a rejected call writes no bytes");
+
+        // A stream that has decoded nothing has an empty history: the length is
+        // reported as 0 and the `whave != 0` guard suppresses the copy.
+        let mut strm = ZStream::new();
+        assert_eq!(inflate_init2(&mut strm, 15), Ok(ReturnCode::Ok));
+        let mut len = 7usize;
+        assert_eq!(
+            inflate_get_dictionary(&strm, &mut sink, &mut len),
+            Ok(ReturnCode::Ok)
+        );
+        assert_eq!(len, 0, "nothing decoded yet means no history");
+        assert_eq!(sink, [0xa5u8; 8], "an empty history writes no bytes");
+
+        // Decode PART of the reference message: a 20-byte output buffer stops the
+        // call for output space, so it returns `Z_OK` with the window updated and
+        // the history contiguous (`whave == wnext == 20`, far below the 32 KiB
+        // window). Stopping short is deliberate - see the completed-stream case
+        // at the end of this test for why finishing would report NO history.
+        const PART: usize = 20;
+        assert!(PART < MSG.len());
+        let mut out = alloc::vec![0u8; PART];
+        let outcome = inflate(&mut strm, ZLIB_STREAM, &mut out, Z_NO_FLUSH);
+        assert_eq!(
+            outcome.code,
+            ReturnCode::Ok,
+            "the call must stop for output space, not end"
+        );
+        assert_eq!(outcome.produced, PART);
+        assert_eq!(&out[..], &MSG[..PART]);
+        {
+            let s = strm.inflate_state().expect("init installs a state");
+            assert_eq!(s.whave as usize, PART, "history length");
+            assert_eq!(
+                s.wnext as usize, PART,
+                "the circular cursor has not wrapped"
+            );
+        }
+
+        // A buffer exactly the size of the history receives all of it.
+        let mut exact = alloc::vec![0u8; PART];
+        let mut len = 0usize;
+        assert_eq!(
+            inflate_get_dictionary(&strm, &mut exact, &mut len),
+            Ok(ReturnCode::Ok)
+        );
+        assert_eq!(len, PART);
+        assert_eq!(exact, MSG[..PART], "the decoded bytes come back verbatim");
+
+        // A larger buffer receives exactly `whave` bytes; the tail is untouched.
+        let mut oversized = alloc::vec![0x5au8; PART + 16];
+        let mut len = 0usize;
+        assert_eq!(
+            inflate_get_dictionary(&strm, &mut oversized, &mut len),
+            Ok(ReturnCode::Ok)
+        );
+        assert_eq!(len, PART);
+        assert_eq!(&oversized[..PART], &MSG[..PART]);
+        assert!(
+            oversized[PART..].iter().all(|&b| b == 0x5a),
+            "bytes beyond the history length must be left untouched"
+        );
+
+        // A buffer one byte too small: the length is still reported (this is the
+        // sizing half of the two-call idiom) and NOT a single byte is copied.
+        let mut small = alloc::vec![0xa5u8; PART - 1];
+        let mut len = 0usize;
+        assert_eq!(
+            inflate_get_dictionary(&strm, &mut small, &mut len),
+            Ok(ReturnCode::Ok)
+        );
+        assert_eq!(
+            len, PART,
+            "the length is reported even when it does not fit"
+        );
+        assert!(
+            small.iter().all(|&b| b == 0xa5),
+            "a too-small buffer must be left entirely untouched"
+        );
+
+        assert_eq!(inflate_end(&mut strm), Ok(ReturnCode::Ok));
+
+        // The counter-intuitive C behaviour, pinned deliberately: a stream small
+        // enough to decode COMPLETELY in one call reports NO history at all.
+        // C folds the produced bytes into the check value in the `CHECK` state and
+        // then resets its progress counter (`out = left`, `inflate.c` L1121), so
+        // `inf_leave`'s window-update condition (`state->wsize ||
+        // (out != strm->avail_out && ...)`, L1133-L1136) is false on both clauses:
+        // nothing was produced *since the fold*, and the window was never
+        // allocated. A port that updated the window unconditionally would report a
+        // dictionary here where reference zlib reports none.
+        let mut whole = ZStream::new();
+        assert_eq!(inflate_init2(&mut whole, 15), Ok(ReturnCode::Ok));
+        let mut out = alloc::vec![0u8; 256];
+        let outcome = inflate(&mut whole, ZLIB_STREAM, &mut out, Z_NO_FLUSH);
+        assert_eq!(outcome.code, ReturnCode::StreamEnd);
+        assert_eq!(&out[..outcome.produced], MSG);
+        let mut sink = [0xa5u8; 8];
+        let mut len = 7usize;
+        assert_eq!(
+            inflate_get_dictionary(&whole, &mut sink, &mut len),
+            Ok(ReturnCode::Ok)
+        );
+        assert_eq!(
+            len, 0,
+            "a stream decoded entirely within one call leaves the window untouched"
+        );
+        assert_eq!(sink, [0xa5u8; 8]);
+        assert_eq!(inflate_end(&mut whole), Ok(ReturnCode::Ok));
+    }
+
+    /// Once the circular history window has wrapped, the dictionary must come
+    /// back in **chronological** order: the older tail of the buffer
+    /// (`window[wnext..whave]`) first, then the newer head (`window[..wnext]`).
+    ///
+    /// This is the single defect this API is most likely to carry, and it is
+    /// invisible to a round-trip test: the two halves are both present, so a
+    /// port that emitted them in buffer order rather than chronological order
+    /// returns exactly the right bytes in exactly the wrong sequence, and every
+    /// decode still succeeds.
+    ///
+    /// Reaching the case needs a small window (`windowBits = 9`, 512 bytes) so it
+    /// fills quickly, more decoded output than the window, the output delivered
+    /// in **small chunks**, and the query taken **mid-stream**. Every obvious
+    /// shortcut skips the wrap entirely: a single call producing at least `wsize`
+    /// bytes takes C's `copy >= wsize` branch, which resets `wnext` to 0; and the
+    /// call that reaches `CHECK` updates the window with `copy == 0`, because C
+    /// folds the produced bytes into the check value and then resets its progress
+    /// counter (`out = left`, `inflate.c` L1121), so driving to `Z_STREAM_END`
+    /// leaves the history one chunk behind the decoded output. Stopping the moment
+    /// the wrap is observed keeps the expected bytes exactly derivable from what
+    /// was decoded, and both `whave == wsize` and `wnext != 0` are asserted so the
+    /// test cannot silently stop exercising the wrap.
+    #[test]
+    fn inflate_get_dictionary_returns_a_wrapped_history_in_chronological_order() {
+        const W_BITS: i32 = 9;
+        const CHUNK: usize = 100;
+        let w_size = 1usize << W_BITS;
+
+        // A non-repeating ramp: any misordering is unmistakable. Comfortably more
+        // than two windows, so the wrap is reached well before the stream ends.
+        let payload: Vec<u8> = (0..1000u32)
+            .map(|i| (i.wrapping_mul(29) % 251) as u8)
+            .collect();
+        let comp = zlib_compress_wb(&payload, W_BITS);
+
+        let mut strm = ZStream::new();
+        assert_eq!(inflate_init2(&mut strm, W_BITS), Ok(ReturnCode::Ok));
+
+        // Feed the whole compressed stream but take the output in fixed chunks, so
+        // every call updates the window with fewer than `wsize` bytes, and stop as
+        // soon as the cursor has wrapped.
+        let mut decoded = Vec::new();
+        let mut in_off = 0usize;
+        let mut buf = alloc::vec![0u8; CHUNK];
+        let (whave, wnext) = loop {
+            let r = inflate(&mut strm, &comp[in_off..], &mut buf, Z_NO_FLUSH);
+            in_off += r.consumed;
+            decoded.extend_from_slice(&buf[..r.produced]);
+            let (whave, wnext) = {
+                let s = strm.inflate_state().expect("init installs a state");
+                (s.whave as usize, s.wnext as usize)
+            };
+            if whave == w_size && wnext != 0 {
+                break (whave, wnext);
+            }
+            assert_eq!(
+                r.code,
+                ReturnCode::Ok,
+                "the window must wrap before the stream ends (whave {whave}, wnext {wnext})"
+            );
+        };
+        assert_eq!(
+            decoded,
+            payload[..decoded.len()],
+            "the decoded prefix round-trips"
+        );
+        assert!(
+            decoded.len() > w_size,
+            "more than one window must have passed through (decoded {})",
+            decoded.len()
+        );
+        assert!(
+            wnext < whave,
+            "the wrapped cursor stays inside the history (wnext {wnext}, whave {whave})"
+        );
+
+        let mut got = alloc::vec![0u8; whave];
+        let mut len = 0usize;
+        assert_eq!(
+            inflate_get_dictionary(&strm, &mut got, &mut len),
+            Ok(ReturnCode::Ok)
+        );
+        assert_eq!(len, whave);
+        assert_eq!(
+            got,
+            decoded[decoded.len() - whave..],
+            "a wrapped history must be returned oldest byte first"
+        );
+
+        // The independent statement of the same requirement, in terms of the raw
+        // buffer: the two halves, spliced at `wnext`, are what was returned.
+        {
+            let s = strm.inflate_state().expect("init installs a state");
+            let mut spliced = Vec::with_capacity(whave);
+            spliced.extend_from_slice(&s.window[wnext..whave]);
+            spliced.extend_from_slice(&s.window[..wnext]);
+            assert_eq!(got, spliced, "window[wnext..whave] then window[..wnext]");
+        }
+
+        assert_eq!(inflate_end(&mut strm), Ok(ReturnCode::Ok));
+    }
+
+    /// C `inflateValidate` (`inflate.c` L1385-L1395) toggles bit 2 of `wrap`,
+    /// which is the bit every trailer comparison in the decoder is guarded on.
+    ///
+    /// Both halves are asserted: the bit arithmetic (`wrap |= 4` only for a
+    /// wrapped stream, `wrap &= ~4` otherwise, with the wrapper bits preserved
+    /// either way) and the behaviour it buys — a zlib stream whose Adler-32
+    /// trailer has been corrupted is rejected with validation on and accepted,
+    /// with the payload intact, with validation off. Asserting only the bit
+    /// would be satisfied by an implementation nothing reads.
+    #[test]
+    fn inflate_validate_toggles_the_check_bit_and_governs_trailer_verification() {
+        // No installed state: rejected before anything is touched.
+        let mut bare = ZStream::new();
+        assert_eq!(
+            inflate_validate(&mut bare, true),
+            Err(ZlibError::StreamError)
+        );
+        assert_eq!(
+            inflate_validate(&mut bare, false),
+            Err(ZlibError::StreamError)
+        );
+
+        // A zlib stream starts at `wrap == 5`: bit 0 selects the RFC 1950
+        // wrapper, bit 2 enables trailer validation (`inflate.c` L246-L253).
+        let mut strm = ZStream::new();
+        assert_eq!(inflate_init2(&mut strm, 15), Ok(ReturnCode::Ok));
+        let wrap = |s: &ZStream| s.inflate_state().expect("state").wrap;
+        assert_eq!(wrap(&strm), 5, "zlib framing validates by default");
+
+        assert_eq!(inflate_validate(&mut strm, false), Ok(ReturnCode::Ok));
+        assert_eq!(
+            wrap(&strm),
+            1,
+            "turning validation off clears exactly bit 2, keeping the wrapper"
+        );
+        // Idempotent: clearing an already-clear bit changes nothing.
+        assert_eq!(inflate_validate(&mut strm, false), Ok(ReturnCode::Ok));
+        assert_eq!(wrap(&strm), 1);
+
+        assert_eq!(inflate_validate(&mut strm, true), Ok(ReturnCode::Ok));
+        assert_eq!(wrap(&strm), 5, "turning it back on restores exactly bit 2");
+        assert_eq!(inflate_end(&mut strm), Ok(ReturnCode::Ok));
+
+        // A raw stream has `wrap == 0`, so there is no check value to validate and
+        // `check && state->wrap` is false: enabling validation must be a no-op
+        // rather than setting a bit that would make the decoder look for a
+        // trailer that does not exist.
+        let mut raw = ZStream::new();
+        assert_eq!(inflate_init2(&mut raw, -15), Ok(ReturnCode::Ok));
+        assert_eq!(wrap(&raw), 0, "raw framing carries no wrapper");
+        assert_eq!(inflate_validate(&mut raw, true), Ok(ReturnCode::Ok));
+        assert_eq!(
+            wrap(&raw),
+            0,
+            "a raw stream must not acquire the validate bit"
+        );
+        assert_eq!(inflate_end(&mut raw), Ok(ReturnCode::Ok));
+
+        // ---- the behaviour the bit buys ----------------------------------
+        // Corrupt only the final byte of the Adler-32 trailer, leaving the
+        // compressed body and the header byte-exact.
+        let mut corrupt = ZLIB_STREAM.to_vec();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xff;
+
+        // Validation on (the default): Z_DATA_ERROR from the trailer comparison.
+        let mut checked = ZStream::new();
+        assert_eq!(inflate_init2(&mut checked, 15), Ok(ReturnCode::Ok));
+        let mut out = alloc::vec![0u8; 256];
+        let outcome = inflate(&mut checked, &corrupt, &mut out, Z_NO_FLUSH);
+        assert_eq!(
+            outcome.code,
+            ReturnCode::DataError,
+            "a corrupted Adler-32 trailer must be rejected while validation is on"
+        );
+        assert_eq!(inflate_end(&mut checked), Ok(ReturnCode::Ok));
+
+        // Validation off: the same bytes decode to Z_STREAM_END and the payload is
+        // recovered exactly. This is the whole point of the API.
+        let mut unchecked = ZStream::new();
+        assert_eq!(inflate_init2(&mut unchecked, 15), Ok(ReturnCode::Ok));
+        assert_eq!(inflate_validate(&mut unchecked, false), Ok(ReturnCode::Ok));
+        let mut out = alloc::vec![0u8; 256];
+        let outcome = inflate(&mut unchecked, &corrupt, &mut out, Z_NO_FLUSH);
+        assert_eq!(
+            outcome.code,
+            ReturnCode::StreamEnd,
+            "with validation off the corrupted trailer is accepted"
+        );
+        assert_eq!(
+            &out[..outcome.produced],
+            MSG,
+            "the payload is still recovered exactly"
+        );
+        assert_eq!(inflate_end(&mut unchecked), Ok(ReturnCode::Ok));
+    }
+
     /// A payload that forces the decoder onto its realistic paths: the repeated
     /// phrases guarantee length/distance back-references into the history window,
     /// while the varied vocabulary makes a **dynamic** Huffman block the cheapest
@@ -3114,9 +3768,22 @@ mod tests {
     /// Compresses `data` as a zlib stream at level 6 with the crate's own
     /// encoder, whose output is byte-identical to reference zlib.
     fn zlib_compress(data: &[u8]) -> Vec<u8> {
+        zlib_compress_wb(data, 15)
+    }
+
+    /// Compresses `data` as a zlib stream at level 6 with the given
+    /// `window_bits`.
+    ///
+    /// The encoder's window size bounds the largest match distance it will emit,
+    /// so a decoder opened with the **same** `window_bits` can never meet a
+    /// distance its window cannot satisfy. That matters for the small-window
+    /// history tests below: compressing at 15 and decoding at 9 would be a
+    /// legitimately invalid pairing, and the resulting `Z_DATA_ERROR` would look
+    /// like a decoder defect rather than a fixture mistake.
+    fn zlib_compress_wb(data: &[u8], window_bits: i32) -> Vec<u8> {
         use crate::constants::{Strategy, Z_DEFLATED};
         let mut strm = ZStream::new();
-        crate::deflate::deflate_init2(&mut strm, 6, Z_DEFLATED, 15, 8, Strategy::Default)
+        crate::deflate::deflate_init2(&mut strm, 6, Z_DEFLATED, window_bits, 8, Strategy::Default)
             .expect("deflate init");
         let mut out = alloc::vec![0u8; data.len() * 2 + 128];
         let r = crate::deflate::deflate(&mut strm, data, &mut out, Z_FINISH);
@@ -3617,5 +4284,241 @@ mod tests {
         );
         assert!(inflate_header(&raw).is_none());
         assert_eq!(inflate_end(&mut raw), Ok(ReturnCode::Ok));
+    }
+
+    // =======================================================================
+    // One-call façade — `uncompress` / `uncompress2` against fixed C vectors
+    //
+    // Relocated here with the entry points themselves: `crate::util::uncompress`
+    // is layer 3 and may not name an engine, so the tests that drive the real
+    // engine belong in the layer that owns it (AAP §0.3.1, §0.4.2 B2).
+    //
+    // The streams below were produced by reference zlib (level 6). Using fixed
+    // vectors keeps the tests self-contained — they depend on neither the
+    // compression side nor any external crate — while still exercising the real
+    // decoder end-to-end.
+    // =======================================================================
+
+    // -----------------------------------------------------------------------
+    // Deterministic zlib streams produced by reference zlib (level 6). Using
+    // fixed vectors keeps the tests self-contained — they neither depend on the
+    // sibling `compress` module nor on any external crate — while still
+    // exercising the real `crate::inflate` engine end-to-end.
+    // -----------------------------------------------------------------------
+
+    /// `zlib.compress(b"hello, world")`.
+    const HELLO_PLAIN: &[u8] = b"hello, world";
+    const HELLO_ZLIB: [u8; 20] = [
+        0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0xd7, 0x51, 0x28, 0xcf, 0x2f, 0xca, 0x49, 0x01,
+        0x00, 0x1d, 0x54, 0x04, 0x89,
+    ];
+
+    /// `zlib.compress(b"A" * 300)` — highly compressible.
+    const BIG_ZLIB: [u8; 13] = [
+        0x78, 0x9c, 0x73, 0x74, 0x1c, 0x05, 0xc4, 0x02, 0x00, 0xcb, 0x9e, 0x4c, 0x2d,
+    ];
+    const BIG_PLAIN_LEN: usize = 300;
+
+    /// `zlib.compress(b"")` — the empty payload (8-byte stream).
+    const EMPTY_ZLIB: [u8; 8] = [0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
+
+    /// `zlib.compress(bytes(0..64))`.
+    const MIXED_ZLIB: [u8; 72] = [
+        0x78, 0x9c, 0x63, 0x60, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6,
+        0xe1, 0xe5, 0xe3, 0x17, 0x10, 0x14, 0x12, 0x16, 0x11, 0x15, 0x13, 0x97, 0x90, 0x94, 0x92,
+        0x96, 0x91, 0x95, 0x93, 0x57, 0x50, 0x54, 0x52, 0x56, 0x51, 0x55, 0x53, 0xd7, 0xd0, 0xd4,
+        0xd2, 0xd6, 0xd1, 0xd5, 0xd3, 0x37, 0x30, 0x34, 0x32, 0x36, 0x31, 0x35, 0x33, 0xb7, 0xb0,
+        0xb4, 0xb2, 0xb6, 0xb1, 0xb5, 0xb3, 0x07, 0x00, 0xaa, 0xe0, 0x07, 0xe1,
+    ];
+
+    /// `zlib.compress(<256 pseudo-random bytes>)` — incompressible, so the
+    /// compressed form is *larger* than a small output buffer and filling that
+    /// buffer leaves input unconsumed.
+    const INCOMP_ZLIB: [u8; 267] = [
+        0x78, 0x9c, 0x01, 0x00, 0x01, 0xff, 0xfe, 0xe1, 0x3b, 0x03, 0x2e, 0x11, 0x2a, 0x32, 0xb5,
+        0x79, 0x08, 0x0f, 0x08, 0xb1, 0xf7, 0xed, 0x4c, 0x2e, 0x5d, 0x3a, 0x07, 0xf9, 0x7f, 0x21,
+        0xee, 0x23, 0x2d, 0x17, 0x8a, 0x20, 0x9a, 0xf6, 0xb5, 0x88, 0x7f, 0x66, 0xe8, 0x09, 0x24,
+        0x02, 0xaa, 0x49, 0xf2, 0xc1, 0x55, 0x1b, 0x27, 0xfe, 0x53, 0x26, 0x6e, 0x49, 0x0d, 0xb1,
+        0x38, 0x48, 0x9c, 0xe8, 0x14, 0xd5, 0x8d, 0x14, 0x5a, 0x8b, 0x4f, 0x99, 0x4f, 0xed, 0x15,
+        0xc5, 0xb2, 0xfd, 0xae, 0xef, 0xf3, 0x17, 0xf1, 0x57, 0xe1, 0xe0, 0x97, 0x8c, 0x3f, 0x5f,
+        0xd5, 0xdf, 0x3d, 0x34, 0xf8, 0xc0, 0x82, 0x62, 0xb0, 0x37, 0x50, 0x89, 0x4f, 0xa5, 0xe4,
+        0x24, 0x28, 0xca, 0x6d, 0x18, 0x92, 0x13, 0x70, 0x2c, 0xa2, 0x9c, 0xeb, 0x21, 0x83, 0x25,
+        0xda, 0x67, 0x33, 0xcb, 0x63, 0xeb, 0x78, 0xb8, 0x69, 0xd7, 0x59, 0x68, 0x9a, 0x1e, 0xb4,
+        0x4e, 0xff, 0xf1, 0xaa, 0x47, 0x43, 0x18, 0x54, 0x4a, 0x23, 0xa6, 0x57, 0x00, 0x1f, 0x2c,
+        0x4b, 0x6f, 0x14, 0xdd, 0xc8, 0xa6, 0x6a, 0xc3, 0x8f, 0x9b, 0xd8, 0xa3, 0x4d, 0x2f, 0x85,
+        0x8e, 0xd2, 0xcc, 0x8d, 0x3a, 0xc0, 0x8c, 0x6d, 0x98, 0xcb, 0x1a, 0xb2, 0xe1, 0x77, 0xfb,
+        0x54, 0xc2, 0x9d, 0x01, 0x25, 0xf5, 0xca, 0x98, 0xdb, 0xf5, 0x5f, 0xcd, 0xf4, 0x50, 0x90,
+        0xbd, 0xb1, 0x69, 0x56, 0xea, 0xf2, 0x0e, 0xef, 0x35, 0x0d, 0xbb, 0xf3, 0x21, 0x47, 0xa9,
+        0xb2, 0x94, 0x98, 0xa9, 0x96, 0x63, 0x8e, 0x25, 0x68, 0xad, 0xab, 0xa4, 0xea, 0x88, 0x2b,
+        0x3d, 0x7d, 0x83, 0xbe, 0x46, 0x0e, 0xca, 0x13, 0x16, 0x6a, 0x4f, 0xa0, 0xb5, 0xde, 0x23,
+        0x9c, 0x85, 0xf8, 0x70, 0xb2, 0x2a, 0x09, 0xa9, 0x75, 0x53, 0xf4, 0xff, 0x47, 0x22, 0x4a,
+        0x7c, 0x54, 0xc9, 0xa7, 0x42, 0xe4, 0x14, 0xbe, 0xeb, 0xaa, 0x7e, 0x17,
+    ];
+    const INCOMP_PLAIN: [u8; 256] = [
+        0xe1, 0x3b, 0x03, 0x2e, 0x11, 0x2a, 0x32, 0xb5, 0x79, 0x08, 0x0f, 0x08, 0xb1, 0xf7, 0xed,
+        0x4c, 0x2e, 0x5d, 0x3a, 0x07, 0xf9, 0x7f, 0x21, 0xee, 0x23, 0x2d, 0x17, 0x8a, 0x20, 0x9a,
+        0xf6, 0xb5, 0x88, 0x7f, 0x66, 0xe8, 0x09, 0x24, 0x02, 0xaa, 0x49, 0xf2, 0xc1, 0x55, 0x1b,
+        0x27, 0xfe, 0x53, 0x26, 0x6e, 0x49, 0x0d, 0xb1, 0x38, 0x48, 0x9c, 0xe8, 0x14, 0xd5, 0x8d,
+        0x14, 0x5a, 0x8b, 0x4f, 0x99, 0x4f, 0xed, 0x15, 0xc5, 0xb2, 0xfd, 0xae, 0xef, 0xf3, 0x17,
+        0xf1, 0x57, 0xe1, 0xe0, 0x97, 0x8c, 0x3f, 0x5f, 0xd5, 0xdf, 0x3d, 0x34, 0xf8, 0xc0, 0x82,
+        0x62, 0xb0, 0x37, 0x50, 0x89, 0x4f, 0xa5, 0xe4, 0x24, 0x28, 0xca, 0x6d, 0x18, 0x92, 0x13,
+        0x70, 0x2c, 0xa2, 0x9c, 0xeb, 0x21, 0x83, 0x25, 0xda, 0x67, 0x33, 0xcb, 0x63, 0xeb, 0x78,
+        0xb8, 0x69, 0xd7, 0x59, 0x68, 0x9a, 0x1e, 0xb4, 0x4e, 0xff, 0xf1, 0xaa, 0x47, 0x43, 0x18,
+        0x54, 0x4a, 0x23, 0xa6, 0x57, 0x00, 0x1f, 0x2c, 0x4b, 0x6f, 0x14, 0xdd, 0xc8, 0xa6, 0x6a,
+        0xc3, 0x8f, 0x9b, 0xd8, 0xa3, 0x4d, 0x2f, 0x85, 0x8e, 0xd2, 0xcc, 0x8d, 0x3a, 0xc0, 0x8c,
+        0x6d, 0x98, 0xcb, 0x1a, 0xb2, 0xe1, 0x77, 0xfb, 0x54, 0xc2, 0x9d, 0x01, 0x25, 0xf5, 0xca,
+        0x98, 0xdb, 0xf5, 0x5f, 0xcd, 0xf4, 0x50, 0x90, 0xbd, 0xb1, 0x69, 0x56, 0xea, 0xf2, 0x0e,
+        0xef, 0x35, 0x0d, 0xbb, 0xf3, 0x21, 0x47, 0xa9, 0xb2, 0x94, 0x98, 0xa9, 0x96, 0x63, 0x8e,
+        0x25, 0x68, 0xad, 0xab, 0xa4, 0xea, 0x88, 0x2b, 0x3d, 0x7d, 0x83, 0xbe, 0x46, 0x0e, 0xca,
+        0x13, 0x16, 0x6a, 0x4f, 0xa0, 0xb5, 0xde, 0x23, 0x9c, 0x85, 0xf8, 0x70, 0xb2, 0x2a, 0x09,
+        0xa9, 0x75, 0x53, 0xf4, 0xff, 0x47, 0x22, 0x4a, 0x7c, 0x54, 0xc9, 0xa7, 0x42, 0xe4, 0x14,
+        0xbe,
+    ];
+
+    #[test]
+    fn roundtrip_small() {
+        let mut out = [0u8; 32];
+        let n = uncompress(&mut out, &HELLO_ZLIB).expect("valid stream decompresses");
+        assert_eq!(n, HELLO_PLAIN.len());
+        assert_eq!(&out[..n], HELLO_PLAIN);
+    }
+
+    #[test]
+    fn roundtrip_empty() {
+        // An empty payload decodes to zero bytes.
+        let mut out = [0u8; 8];
+        let n = uncompress(&mut out, &EMPTY_ZLIB).expect("empty stream decompresses");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn roundtrip_empty_into_zero_length_dest() {
+        // The C `next_out == NULL` scratch trick is unnecessary in safe Rust:
+        // an empty `&mut []` output is a valid, non-null buffer, and an empty
+        // payload needs no output space at all.
+        let mut out: [u8; 0] = [];
+        let n = uncompress(&mut out, &EMPTY_ZLIB).expect("empty stream, empty dest");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn roundtrip_highly_compressible() {
+        let mut out = [0u8; BIG_PLAIN_LEN];
+        let n = uncompress(&mut out, &BIG_ZLIB).expect("valid stream decompresses");
+        assert_eq!(n, BIG_PLAIN_LEN);
+        assert!(out.iter().all(|&b| b == b'A'), "all bytes are 'A'");
+    }
+
+    #[test]
+    fn roundtrip_mixed() {
+        let mut expected = [0u8; 64];
+        for (i, b) in expected.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let mut out = [0u8; 64];
+        let n = uncompress(&mut out, &MIXED_ZLIB).expect("valid stream decompresses");
+        assert_eq!(n, expected.len());
+        assert_eq!(&out[..n], &expected[..]);
+    }
+
+    #[test]
+    fn roundtrip_incompressible() {
+        let mut out = [0u8; 256];
+        let n = uncompress(&mut out, &INCOMP_ZLIB).expect("valid stream decompresses");
+        assert_eq!(n, INCOMP_PLAIN.len());
+        assert_eq!(&out[..n], &INCOMP_PLAIN[..]);
+    }
+
+    #[test]
+    fn uncompress2_reports_consumed_length() {
+        let mut out = [0u8; 32];
+        let mut consumed = HELLO_ZLIB.len();
+        let mut produced = out.len();
+        let n = uncompress2(&mut out, &HELLO_ZLIB, &mut consumed, &mut produced).expect("ok");
+        assert_eq!(n, HELLO_PLAIN.len());
+        assert_eq!(consumed, HELLO_ZLIB.len(), "the entire stream is consumed");
+        assert_eq!(
+            produced,
+            HELLO_PLAIN.len(),
+            "the produced-count out-parameter matches the return value"
+        );
+    }
+
+    #[test]
+    fn uncompress2_consumes_only_the_stream_with_trailing_bytes() {
+        // A valid stream followed by trailing junk: only the stream bytes are
+        // consumed, and `*source_len` reports exactly that count.
+        let mut buf = [0u8; 40];
+        buf[..HELLO_ZLIB.len()].copy_from_slice(&HELLO_ZLIB);
+        let mut out = [0u8; 32];
+        let mut consumed = buf.len();
+        let mut produced = out.len();
+        let n = uncompress2(&mut out, &buf, &mut consumed, &mut produced).expect("ok");
+        assert_eq!(n, HELLO_PLAIN.len());
+        assert_eq!(
+            consumed,
+            HELLO_ZLIB.len(),
+            "trailing bytes are not consumed"
+        );
+        assert_eq!(produced, HELLO_PLAIN.len(), "produced count is reported");
+        assert_eq!(&out[..n], HELLO_PLAIN);
+    }
+
+    #[test]
+    fn truncated_input_is_data_error() {
+        // Feed only a prefix that cuts into the deflate data. The engine
+        // consumes all of it yet never reaches stream end (leftover_in == 0),
+        // which `uncompr.c` L80-81 maps to Z_DATA_ERROR.
+        let mut out = [0u8; BIG_PLAIN_LEN];
+        let err = uncompress(&mut out, &BIG_ZLIB[..7]).unwrap_err();
+        assert_eq!(err, ReturnCode::DataError);
+    }
+
+    #[test]
+    fn dest_too_small_is_buf_error() {
+        // Full, valid, incompressible input but a far-too-small output buffer:
+        // output fills while input still remains (leftover_in > 0), which falls
+        // through to Z_BUF_ERROR.
+        let mut out = [0u8; 64];
+        let err = uncompress(&mut out, &INCOMP_ZLIB).unwrap_err();
+        assert_eq!(err, ReturnCode::BufError);
+    }
+
+    #[test]
+    fn corrupt_input_is_data_error() {
+        let mut corrupt = HELLO_ZLIB; // `[u8; 20]` is `Copy`.
+        corrupt[8] ^= 0xff; // Damage a deflate-data byte.
+        let mut out = [0u8; 32];
+        let err = uncompress(&mut out, &corrupt).unwrap_err();
+        assert_eq!(err, ReturnCode::DataError);
+    }
+
+    #[test]
+    fn zero_declared_source_len_is_data_error() {
+        // Declaring zero available input means nothing can be decoded; with all
+        // (zero) input "consumed" this is the truncated-stream branch.
+        let mut out = [0u8; 32];
+        let mut consumed = 0usize;
+        let mut produced = out.len();
+        let err = uncompress2(&mut out, &HELLO_ZLIB, &mut consumed, &mut produced).unwrap_err();
+        assert_eq!(err, ReturnCode::DataError);
+        assert_eq!(consumed, 0);
+        assert_eq!(produced, 0, "no output is produced on this error path");
+    }
+
+    #[test]
+    fn source_len_cap_is_honored() {
+        // Capping the declared input below the stream length prevents the
+        // engine from ever finishing, and the cap is never exceeded.
+        let mut out = [0u8; 32];
+        let mut consumed = 6usize; // Fewer than the 20-byte stream.
+        let mut produced = out.len();
+        let result = uncompress2(&mut out, &HELLO_ZLIB, &mut consumed, &mut produced);
+        assert!(result.is_err(), "a capped, incomplete stream cannot finish");
+        assert!(consumed <= 6, "never read past the declared cap");
+        assert!(
+            produced <= out.len(),
+            "produced count stays within the buffer"
+        );
     }
 }

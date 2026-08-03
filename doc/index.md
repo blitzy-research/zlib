@@ -15,7 +15,7 @@ of the published crate through the `exclude` list in `Cargo.toml`.
 | --- | --- |
 | **Baseline** | zlib `1.3.2.1-motley`, `ZLIB_VERNUM 0x1321`. `zlibVersion()` reports that full four-component string; the Cargo package version is `1.3.2`, because SemVer admits no fourth component. |
 | **Memory safety** | `unsafe` is confined to the `ffi` boundary. All eight core module groups — `deflate`, `inflate`, `checksum`, `gz`, `util`, `error`, `constants`, `gz_header` — measure **zero** executable `unsafe`. |
-| **Structure** | **40** modules in a **seven-layer** tree mirroring the C `#include` layering: `error` / `constants` → `util` → `checksum` → `stream` / `gz_header` → `{deflate, inflate}` → `gz` → `ffi`. `deflate` and `inflate` are strict peers. The layering is the architecture rather than a claim of acyclicity: **four** `use` sites point upward — `stream` names the two engine states it owns, and the two one-call wrappers call the engines as `compress.c` / `uncompr.c` do — so `deflate`↔`stream`, `inflate`↔`stream`, and `deflate`↔`util` reference each other. A Rust crate is one compilation unit, so those are module references, not a build cycle ([details](technical-specifications.md#031-refactored-structure-planning)). It replaces **26** C translation units and headers, **23,107** lines of C exposing **119** `ZEXTERN` entry points. |
+| **Structure** | **40** modules in a **seven-layer** tree mirroring the C `#include` layering: `error` / `constants` → `util` → `checksum` → `stream` / `gz_header` → `{deflate, inflate}` → `gz` → `ffi`. `stream` / `gz_header` and `deflate` / `inflate` are strict peers. The graph is **acyclic**: every `use crate::…` in the shipped library points at a strictly lower layer — no upward edges, no same-layer edges — and the `the_module_graph_has_no_upward_edges` test re-derives the whole edge set from the source text and fails on any reference that does not, so the layering is enforced rather than asserted ([details](technical-specifications.md#031-refactored-structure-planning)). It replaces **26** C translation units and headers, **23,107** lines of C exposing **119** `ZEXTERN` entry points. |
 | **Byte-identity** | Proven at **50/50** and **3,750/3,750** configurations against a reference C zlib built from this repository's own C sources. |
 | **C ABI** | **95** exported symbols; **54/54** of `zlib.map`'s `global:` symbols present and **0/10** of its `local:` symbols leaked. |
 | **Formats** | All **10** compression levels, **5** strategies, and **7** flush modes. |
@@ -81,7 +81,7 @@ here: they move with every test added, while that invariant does not.
 
 ## Documented divergences
 
-Five are **visible to a C caller**, each deliberate and none a defect:
+Six are **visible to a C caller**, each deliberate and none a defect:
 
 1. `gzprintf` / `gzvprintf` ship as ABI-compatible stubs returning `Z_STREAM_ERROR`, because rendering a C
    `va_list` needs the nightly-only `c_variadic` feature. This is advertised programmatically through
@@ -93,12 +93,15 @@ Five are **visible to a C caller**, each deliberate and none a defect:
    applying the version script is opt-in.
 5. A gzip handle's `Drop` is intentionally empty of finishing logic, so `gzclose` / `gzclose_w` remain mandatory
    — a destructor cannot surface a deferred compression or I/O error.
+6. A gzip destination that accepts **nothing** (`write(2)` returning `0` for a non-empty request) is reported as a
+   *retryable* `Z_ERRNO` instead of being retried forever, as C's `while (strm->next_out > state->x.next)` loop
+   does. The cursor, the buffered input, and the caller's true partial progress are all retained, so a retry
+   resumes exactly where C would have; POSIX permits that return only for a zero-length write, which this loop
+   never issues, so the case is as unreachable in practice as C's spin.
 
 A second class exists and is deliberately kept separate: internal departures from C that are **invisible at the
 C ABI**, because each is strictly stricter or strictly safer than C while leaving the return-code set, the struct
-layout, and the emitted bytes untouched. `deflateSetHeader` deep-copies the header instead of retaining the
-caller's pointer — a stricter lifetime contract, held to C's exact `{Z_OK, Z_STREAM_ERROR}` return set so an
-added allocation step cannot widen an inherited contract. Opaque state carries a kind tag, so handing a deflate
+layout, and the emitted bytes untouched. Opaque state carries a kind tag, so handing a deflate
 stream to `inflateEnd` is a defined `Z_STREAM_ERROR` rather than C's undefined reinterpretation. Indexing is
 bounds-checked, so a path that would corrupt memory in C aborts instead. Allocation is fallible with no global
 fallback, which is C's `ZALLOC` contract stated precisely. Full reasoning lives in the repository's

@@ -131,8 +131,9 @@
 //! directory as the writable one and the rest as read-only inputs:
 //!
 //! ```text
-//! cargo +nightly fuzz run fuzz_inflate fuzz/corpus/fuzz_inflate fuzz/seeds/fuzz_inflate
-//! cargo +nightly fuzz coverage fuzz_inflate fuzz/seeds/fuzz_inflate
+//! cargo +nightly-2026-08-01 fuzz run fuzz_inflate \
+//!     fuzz/corpus/fuzz_inflate fuzz/seeds/fuzz_inflate
+//! cargo +nightly-2026-08-01 fuzz coverage fuzz_inflate fuzz/seeds/fuzz_inflate
 //! ```
 //!
 //! A bounded campaign reaches the gate by mutation regardless, and that was

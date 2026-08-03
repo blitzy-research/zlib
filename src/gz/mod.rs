@@ -212,21 +212,396 @@ pub use write::{gzflush, gzfwrite, gzprintf, gzputc, gzputs, gzvprintf, gzwrite}
 /// writer must be closed explicitly to produce a valid stream.
 pub use close::{gzclose, gzclose_r, gzclose_w};
 
-// The descriptor-releasing close finalizers and the mode pre-validator, surfaced
-// at crate visibility for `src/ffi/gz.rs` only.
+// The descriptor-releasing close finalizers, surfaced at crate visibility for
+// `src/ffi/gz.rs` only.
 //
-// Both exist because reference zlib's C contract depends on operations this
+// They exist because reference zlib's C contract depends on an operation this
 // layer cannot perform: reporting a failing `close(2)` as `Z_ERRNO`
 // (`gzread.c` L665-L667, `gzwrite.c` L695-L696), which needs an `unsafe` libc
-// call, and rejecting an invalid `gzdopen` mode *before* the caller's descriptor
-// is adopted (`gzlib.c` L150-L197 precede L263), which needs to happen before
-// the `unsafe` `File::from_raw_fd`. Both `unsafe` operations belong to the FFI
-// boundary (AAP §0.6.2, §0.8.1 D-6), so this layer supplies the safe halves —
-// "finalize everything and hand me the still-open descriptor" and "is this mode
-// acceptable?" — and the shim supplies the `unsafe` remainder.
+// call. That `unsafe` belongs to the FFI boundary (AAP §0.6.2, §0.8.1 D-6), so
+// this layer supplies the safe half — "finalize everything and hand me the
+// still-open descriptor" — and the shim supplies the `unsafe` remainder.
 pub(crate) use close::{gzclose_r_release, gzclose_release, gzclose_w_release};
-pub(crate) use open::validate_mode;
+
+/// The descriptor-flag contract between this layer and `src/ffi/gz.rs`: unix
+/// only, because both flags it carries are POSIX descriptor bits.
+#[cfg(unix)]
+pub(crate) use open::{DescriptorRequest, descriptor_request};
+
+// The path-opening entry points, surfaced at crate visibility for
+// `src/ffi/gz.rs`. Both are portable — `gzopen`, `gzopen64` and `gzopen_w` reach
+// them wherever `gz-io` is enabled — so neither carries a platform gate.
+pub(crate) use open::{gzopen_bytes, gzopen64_bytes};
+
+// The descriptor-adopting opener, the mode pre-validator and the file slot,
+// surfaced at crate visibility for the descriptor-adopting half of
+// `src/ffi/gz.rs` — hence the `cfg`, which is a correctness statement rather
+// than warning suppression.
+//
+// `validate_mode` exists so an invalid `gzdopen` mode is rejected *before* the
+// caller's descriptor is adopted (`gzlib.c` L150-L197 precede L263), which must
+// happen before the `unsafe` `File::from_raw_fd` / `File::from_raw_handle`;
+// `gzdopen_bytes` is the safe remainder of that adoption, and `GzFile` is what
+// the shim installs the adopted descriptor into once allocation succeeds. All
+// three consumers live inside the `#[cfg(any(unix, windows))]` `gzdopen` /
+// `dopen_state` pair, and the shim's own import of `GzFile` is already
+// `#[cfg(all(any(unix, windows), feature = "gz-io"))]` — adopting a raw C `int`
+// descriptor is `from_raw_fd` on Unix and `_get_osfhandle` plus
+// `from_raw_handle` on Windows, with no portable `std` equivalent anywhere
+// else, so the fallback `gzdopen` returns null unconditionally and reaches none
+// of the three names.
+//
+// Without these gates all three re-exports are genuinely unused on such a
+// target and the compiler says so, which is a real signal, not noise: an
+// unconditional `pub(crate) use` claims a crate-wide consumer that does not
+// exist there. Gating states the platform contract instead of muting the
+// diagnostic, so no `#[allow(unused_imports)]` is needed anywhere and the
+// warnings-denied CI gates stay meaningful.
+#[cfg(any(unix, windows))]
+pub(crate) use open::{gzdopen_bytes, validate_mode};
+#[cfg(any(unix, windows))]
 pub(crate) use state::GzFile;
+
+#[cfg(test)]
+pub(crate) mod test_temp {
+    //! Hardened temporary-file support shared by every `gz`-family test module.
+    //!
+    //! # Why this module exists
+    //!
+    //! The gzip layer is the only part of this crate that touches the filesystem,
+    //! so it is the only part whose tests need real files on disk. The obvious way
+    //! to get one — name it `…_<pid>.gz` in [`std::env::temp_dir`] and open it with
+    //! [`std::fs::File::create`] — is unsafe on a shared `/tmp` in three separate
+    //! ways, and every one of them was present across six test surfaces in this
+    //! crate before this module replaced them:
+    //!
+    //! * **CWE-377, insecure temporary file.** The name is derived entirely from
+    //!   public information, so any other user on the host can compute it before
+    //!   the test runs.
+    //! * **CWE-59, link following.** `File::create` opens `O_CREAT | O_TRUNC`
+    //!   *without* `O_EXCL` and follows a final-component symlink, so a link
+    //!   planted at the predicted name redirects the write to a target of the
+    //!   planter's choosing — and truncates it on the way.
+    //! * **CWE-367, time-of-check/time-of-use.** Any `exists()`-then-create or
+    //!   `remove_file`-then-create sequence has a window between the two calls.
+    //!   [`std::fs::create_dir_all`] is the same defect in directory form: it
+    //!   succeeds when the path is *already* a directory — or a symlink to one —
+    //!   silently adopting a tree the test did not create and will later remove
+    //!   recursively.
+    //!
+    //! # How the hazards are removed
+    //!
+    //! Uniqueness and exclusivity are carried by a **directory**, not by a
+    //! filename. [`create_private_dir`] issues a single non-recursive `mkdir(2)`,
+    //! which is atomic, never follows a symlink for the final component, and fails
+    //! with [`io::ErrorKind::AlreadyExists`] rather than adopting whatever is
+    //! already there. On Unix the `0o700` mode is applied by that same syscall, so
+    //! there is no interval in which the directory is group- or world-accessible
+    //! and no `set_permissions` call to race. An occupied candidate name is
+    //! **skipped, never deleted**, so a planted symlink is neither followed nor
+    //! destroyed. Files are then created inside that fresh directory with
+    //! [`create_new_file`] (`O_CREAT | O_EXCL`), which cannot truncate and cannot
+    //! follow a link. Cleanup is [`Drop`]-owned so it also runs when an assertion
+    //! unwinds, and it removes only a directory this guard brought into existence.
+    //!
+    //! These are *creation-time* guarantees. The guards hold paths rather than open
+    //! handles, so they make no claim that a path still resolves to the same object
+    //! later; on non-Unix targets the directory mode is the platform default, which
+    //! is acceptable because Windows already gives each user a private `%TEMP%`.
+    //!
+    //! # Provenance
+    //!
+    //! Consolidated from the two independently hardened implementations that were
+    //! already in this crate — `src/gz/write.rs` (private-directory `TempFile` with
+    //! [`Deref`](core::ops::Deref) to [`Path`]) and `src/gz/state.rs`
+    //! ([`safe_component`] plus the retrying `TempGz`) — so that the remaining
+    //! `gz` test surfaces share one audited implementation instead of each
+    //! re-deriving it. It lives here, at the `gz` module root, because that is the
+    //! nearest common ancestor of every consumer; `pub(crate)` and `#[cfg(test)]`
+    //! keep it out of every shipped artifact. `src/ffi/alloc.rs`'s
+    //! `pub(crate) mod test_hook` is the established precedent for this shape.
+
+    use std::fs::{File, OpenOptions};
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Bounded retry budget for finding an unused directory name.
+    ///
+    /// Each attempt only advances the candidate name, so exhausting the budget
+    /// means 64 distinct names were all simultaneously occupied — a broken
+    /// environment rather than a collision, and worth failing loudly for.
+    const MAX_ATTEMPTS: u32 = 64;
+
+    /// Process-wide counter making concurrently-created directories distinct
+    /// within a single test binary, where the pid is shared by every thread.
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// Reduces an arbitrary string to a single safe path component.
+    ///
+    /// Tags reach this module from module-local literals, but `CLONE_INDEX` is
+    /// ambient input read from the environment and therefore outside this crate's
+    /// control. Interpolating such a value into a path unfiltered is a
+    /// directory-traversal defect (CWE-22): a value like
+    /// `slot/../../security_target` escapes the temporary directory lexically and
+    /// resolves somewhere else entirely.
+    ///
+    /// Only ASCII alphanumerics, `_`, and `-` survive, which drops every character
+    /// that could terminate the component or refer to a parent — `/`, `\`, `.` (so
+    /// `..` collapses away completely), `:`, NUL, and every non-ASCII byte. The
+    /// result is truncated so an absurdly long value cannot push the path past a
+    /// filesystem limit, and an input filtering down to nothing becomes `x`, so the
+    /// function is total and every caller receives a usable component.
+    pub(crate) fn safe_component(raw: &str) -> String {
+        let filtered: String = raw
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .take(32)
+            .collect();
+        if filtered.is_empty() {
+            "x".to_owned()
+        } else {
+            filtered
+        }
+    }
+
+    /// Creates `path` as a new directory, private to the current user, failing if
+    /// anything already occupies the name.
+    ///
+    /// Non-recursive on purpose. Unlike [`std::fs::create_dir_all`] this reports
+    /// [`io::ErrorKind::AlreadyExists`] when the name is taken — including when it
+    /// is taken by a symlink — which is what lets the callers move to the next
+    /// candidate instead of following the link or deleting it. On Unix the `0o700`
+    /// mode is handed to `mkdir(2)` itself, so the directory is never even briefly
+    /// group- or world-accessible.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `mkdir(2)` reports, unchanged, so callers can distinguish a name
+    /// collision from a genuine failure.
+    pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new().mode(0o700).create(path)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::DirBuilder::new().create(path)
+        }
+    }
+
+    /// Creates `path` exclusively for writing: it must not already exist, no
+    /// symlink at that name is followed, and nothing is truncated.
+    ///
+    /// # Panics
+    ///
+    /// If the file cannot be created exclusively. Inside a
+    /// [`TempDir`]-owned directory that is a genuine environment failure, since the
+    /// directory did not exist a moment earlier.
+    pub(crate) fn create_new_file(path: &Path) -> File {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .unwrap_or_else(|e| panic!("exclusively create {}: {e}", path.display()))
+    }
+
+    /// Builds the candidate directory name for attempt `attempt`.
+    ///
+    /// The `blitzy_adhoc_test_` prefix marks it as a validation artifact that must
+    /// never be committed. The remaining components — a sanitized caller tag, the
+    /// sanitized `CLONE_INDEX`, the process id, a monotonic counter, and the retry
+    /// ordinal — keep the name distinct across parallel test threads, across
+    /// concurrent `cargo test` invocations, and across sibling clones of this
+    /// repository sharing one `/tmp`.
+    fn candidate(tag: &str, serial: u32, attempt: u32) -> PathBuf {
+        let clone = safe_component(&std::env::var("CLONE_INDEX").unwrap_or_default());
+        let tag = safe_component(tag);
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!(
+            "blitzy_adhoc_test_{tag}_{clone}_{pid}_{serial}_{attempt}"
+        ))
+    }
+
+    /// An exclusively created, caller-private directory, removed with its contents
+    /// when the guard drops.
+    ///
+    /// This is the unit of ownership: the directory is what was created
+    /// exclusively, so names *inside* it may be plain and readable. Use
+    /// [`Self::child`] to name a path within it and [`Self::create_child`] to
+    /// materialize one.
+    pub(crate) struct TempDir {
+        dir: PathBuf,
+    }
+
+    impl TempDir {
+        /// Creates a fresh private directory tagged with `tag`.
+        ///
+        /// # Panics
+        ///
+        /// If no unused name can be created within [`MAX_ATTEMPTS`], or if
+        /// `mkdir(2)` fails for a reason other than the name being taken. A
+        /// collision is retried rather than reported, and nothing pre-existing is
+        /// ever removed.
+        pub(crate) fn new(tag: &str) -> Self {
+            let serial = COUNTER.fetch_add(1, Ordering::Relaxed);
+            for attempt in 0..MAX_ATTEMPTS {
+                let dir = candidate(tag, serial, attempt);
+                match create_private_dir(&dir) {
+                    Ok(()) => return Self { dir },
+                    // The name is taken — possibly by a planted symlink. Skip it;
+                    // never follow it and never delete it.
+                    Err(ref e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("create private temp dir {}: {e}", dir.display()),
+                }
+            }
+            panic!("no private temp directory available after {MAX_ATTEMPTS} attempts");
+        }
+
+        /// The directory itself.
+        pub(crate) fn path(&self) -> &Path {
+            &self.dir
+        }
+
+        /// Names — without creating — a path inside this directory.
+        pub(crate) fn child(&self, name: &str) -> PathBuf {
+            self.dir.join(name)
+        }
+
+        /// Creates a file inside this directory with create-new semantics and
+        /// returns its path, discarding the handle.
+        ///
+        /// # Panics
+        ///
+        /// If the file already exists or cannot be created.
+        pub(crate) fn create_child(&self, name: &str) -> PathBuf {
+            let path = self.child(name);
+            drop(create_new_file(&path));
+            path
+        }
+
+        /// Creates a file inside this directory with create-new semantics and
+        /// writes `contents` into it, returning its path.
+        ///
+        /// # Panics
+        ///
+        /// If the file already exists, cannot be created, or cannot be written.
+        pub(crate) fn write_child(&self, name: &str, contents: &[u8]) -> PathBuf {
+            use std::io::Write as _;
+            let path = self.child(name);
+            let mut file = create_new_file(&path);
+            file.write_all(contents)
+                .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+            file.flush()
+                .unwrap_or_else(|e| panic!("flush {}: {e}", path.display()));
+            path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            // The recursion rests on `dir` not having existed before `new` created
+            // it with create-new semantics, so the removal set starts from a path
+            // this guard brought into existence rather than one it adopted, and on
+            // Unix from one no other user could enter. Best effort on every route
+            // out, including an unwinding one: failing to clean up must never mask
+            // the failure that triggered the unwind.
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A single named path inside its own private [`TempDir`].
+    ///
+    /// Dereferences to [`Path`], so it can be passed anywhere a `&Path` is
+    /// expected. The file is *named* but not created, because the gzip entry points
+    /// under test are themselves what must create it; [`Self::create`] materializes
+    /// it exclusively for the tests that need it to pre-exist.
+    pub(crate) struct TempFile {
+        dir: TempDir,
+        path: PathBuf,
+    }
+
+    impl TempFile {
+        /// Names `payload.gz` inside a fresh private directory tagged with `tag`.
+        ///
+        /// # Panics
+        ///
+        /// See [`TempDir::new`].
+        pub(crate) fn new(tag: &str) -> Self {
+            Self::named(tag, "payload.gz")
+        }
+
+        /// Names `name` inside a fresh private directory tagged with `tag`.
+        ///
+        /// # Panics
+        ///
+        /// See [`TempDir::new`].
+        pub(crate) fn named(tag: &str, name: &str) -> Self {
+            let dir = TempDir::new(tag);
+            let path = dir.child(name);
+            Self { dir, path }
+        }
+
+        /// The named path.
+        pub(crate) fn path(&self) -> &Path {
+            &self.path
+        }
+
+        /// Another path inside the *same* private directory, for tests needing two
+        /// destinations.
+        pub(crate) fn sibling(&self, name: &str) -> PathBuf {
+            self.dir.child(name)
+        }
+
+        /// Materializes the file exclusively and returns its handle, for tests that
+        /// need it to already exist.
+        ///
+        /// # Panics
+        ///
+        /// If it already exists or cannot be created.
+        pub(crate) fn create(&self) -> File {
+            create_new_file(&self.path)
+        }
+
+        /// Whether the file currently exists.
+        pub(crate) fn exists(&self) -> bool {
+            self.path.exists()
+        }
+
+        /// The bytes currently on disk, or empty when the file does not exist.
+        pub(crate) fn bytes(&self) -> Vec<u8> {
+            std::fs::read(&self.path).unwrap_or_default()
+        }
+    }
+
+    impl core::ops::Deref for TempFile {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    /// Lets a guard stand in for a path at the generic [`std::fs`] entry points.
+    ///
+    /// [`Deref`](core::ops::Deref) alone is not enough there: deref coercion fires
+    /// when the parameter type is concretely `&Path`, but `std::fs::read`,
+    /// `std::fs::write`, and `File::open` are generic over `AsRef<Path>`, and a
+    /// generic bound is never satisfied by coercion. Implementing the trait keeps
+    /// call sites reading as they did before hardening.
+    impl AsRef<Path> for TempFile {
+        fn as_ref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<Path> for TempDir {
+        fn as_ref(&self) -> &Path {
+            &self.dir
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -299,5 +674,204 @@ mod tests {
         assert_eq!(How::Look as u8, 0);
         assert_eq!(How::Copy as u8, 1);
         assert_eq!(How::Gzip as u8, 2);
+    }
+
+    /// [`safe_component`](super::test_temp::safe_component) must collapse every
+    /// traversal and separator form to one harmless component.
+    ///
+    /// The first case is the shape that matters: interpolated raw,
+    /// `slot/../../security_target` names a path two levels *above* the temporary
+    /// directory. Sanitized, it can only ever name a child of it.
+    #[test]
+    fn safe_component_neutralizes_traversal_and_separators() {
+        use super::test_temp::safe_component;
+        use std::path::Path;
+
+        // Exact outcomes for the shapes that matter, so a change in filtering
+        // policy is visible and not merely "still safe".
+        assert_eq!(
+            safe_component("slot/../../security_target"),
+            "slotsecurity_target"
+        );
+        assert_eq!(safe_component(".."), "x");
+        assert_eq!(safe_component("../.."), "x");
+        assert_eq!(safe_component("/etc/passwd"), "etcpasswd");
+        assert_eq!(safe_component(r"..\..\windows"), "windows");
+        assert_eq!(safe_component("a:b"), "ab");
+        assert_eq!(safe_component("a\0b"), "ab");
+        assert_eq!(safe_component("na\u{ef}ve"), "nave");
+        // Ordinary values pass through untouched, `_` and `-` included.
+        assert_eq!(safe_component("004"), "004");
+        assert_eq!(safe_component("clone_index-7"), "clone_index-7");
+
+        // The decisive property, asserted over every shape: joining the result to a
+        // base descends exactly one level, so no input can escape the directory.
+        for raw in [
+            "slot/../../security_target",
+            "../../../etc/passwd",
+            "..",
+            ".",
+            "/absolute",
+            "back\\slash",
+            "c:\\windows\\system32",
+            "with space",
+            "semi;colon",
+            "new\nline",
+            "nul\0byte",
+            "tilde~",
+            "dollar$sign",
+            "\u{00e9}\u{4f60}\u{597d}",
+        ] {
+            let got = safe_component(raw);
+            assert!(
+                !got.contains(".."),
+                "{raw:?} yielded {got:?}, still traversing"
+            );
+            assert_eq!(
+                Path::new("/tmp").join(&got).parent(),
+                Some(Path::new("/tmp")),
+                "{raw:?} yielded {got:?}, which does not stay one level below the base"
+            );
+        }
+    }
+
+    /// `safe_component` must be total and bounded: never empty, never longer than
+    /// 32 characters, and always a single component whatever it is given.
+    #[test]
+    fn safe_component_is_total_and_bounded() {
+        use super::test_temp::safe_component;
+        use std::path::Path;
+
+        for raw in [
+            "",
+            "...",
+            "////",
+            "\0\0",
+            "🙂🙂🙂",
+            &"z".repeat(500),
+            "../../../../../../etc/shadow",
+        ] {
+            let out = safe_component(raw);
+            assert!(!out.is_empty(), "must never be empty for {raw:?}");
+            assert!(out.chars().count() <= 32, "must be bounded for {raw:?}");
+            assert_eq!(
+                Path::new(&out).components().count(),
+                1,
+                "must be exactly one component for {raw:?}"
+            );
+            assert!(
+                out.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "must contain only safe characters for {raw:?}"
+            );
+        }
+    }
+
+    /// The private-directory guard must create exclusively, refuse to adopt an
+    /// occupied name, and remove exactly what it created.
+    ///
+    /// The `AlreadyExists` assertion is the load-bearing one: it is the difference
+    /// between skipping a planted symlink and following it. `create_dir_all` — the
+    /// call this helper replaced across the gzip test surfaces — returns `Ok` here
+    /// instead, silently adopting the tree.
+    #[test]
+    fn private_dir_creation_is_exclusive_and_cleanup_is_scoped() {
+        use super::test_temp::{TempDir, create_private_dir};
+        use std::io::ErrorKind;
+
+        let recorded;
+        {
+            let dir = TempDir::new("modroot_exclusive");
+            recorded = dir.path().to_path_buf();
+            assert!(
+                recorded.is_dir(),
+                "the directory exists while the guard lives"
+            );
+
+            // Re-creating the very same name must be refused, not adopted.
+            let again = create_private_dir(dir.path());
+            let err = again.expect_err("an occupied name must not be adopted");
+            assert_eq!(
+                err.kind(),
+                ErrorKind::AlreadyExists,
+                "exclusive creation must report AlreadyExists"
+            );
+
+            // `create_dir_all`, by contrast, happily adopts it — which is exactly
+            // the defect this helper exists to remove.
+            assert!(
+                std::fs::create_dir_all(dir.path()).is_ok(),
+                "create_dir_all adopts an existing directory, so it cannot be used here"
+            );
+
+            // Children are created exclusively and a second attempt fails.
+            let child = dir.create_child("first.gz");
+            assert!(child.is_file());
+            assert!(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&child)
+                    .is_err(),
+                "create_new must refuse an existing child"
+            );
+
+            // Contents round-trip through the writing helper.
+            let written = dir.write_child("payload.bin", b"hardened");
+            assert_eq!(std::fs::read(&written).expect("read back"), b"hardened");
+
+            // On Unix the mode is owner-only from `mkdir(2)` onwards.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(dir.path())
+                    .expect("stat the private dir")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o700, "the directory must be owner-only");
+            }
+        }
+        // Drop removed the directory and everything the test put inside it.
+        assert!(
+            !recorded.exists(),
+            "the guard must remove the directory it created"
+        );
+    }
+
+    /// Two guards must never collide, and the file guard must name a path inside
+    /// its own directory without creating it until asked.
+    #[test]
+    fn temp_file_guards_are_distinct_and_create_on_demand() {
+        use super::test_temp::TempFile;
+
+        let a = TempFile::new("modroot_distinct");
+        let b = TempFile::new("modroot_distinct");
+        assert_ne!(a.path(), b.path(), "two guards must not share a path");
+        assert_ne!(
+            a.path().parent(),
+            b.path().parent(),
+            "each guard owns its own directory"
+        );
+
+        // Named but not yet created: the entry point under test is what creates it.
+        assert!(!a.exists(), "the payload is named, not created");
+        assert!(a.bytes().is_empty(), "a missing file reads as empty");
+
+        drop(a.create());
+        assert!(a.exists(), "create() materializes it exclusively");
+
+        // A sibling lands in the same private directory.
+        let sib = a.sibling("other.gz");
+        assert_eq!(sib.parent(), a.path().parent());
+
+        // `Deref<Target = Path>` lets a guard stand in for a `&Path`.
+        let as_path: &std::path::Path = &a;
+        assert_eq!(as_path, a.path());
+
+        let recorded = (a.path().to_path_buf(), b.path().to_path_buf());
+        drop(a);
+        drop(b);
+        assert!(!recorded.0.exists() && !recorded.1.exists());
     }
 }

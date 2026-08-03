@@ -6,8 +6,8 @@
 //! persist between `inflate()` calls. The driver ([`crate::inflate`] `mod.rs`),
 //! the fast decode loop (`fast.rs`), and the raw-callback back-inflate
 //! (`back.rs`) all operate on an [`InflateState`], and the public streaming
-//! type [`crate::stream::ZStream`] owns one as its
-//! `StreamState::Inflate(Box<InflateState>)` variant.
+//! type [`crate::stream::ZStream`] owns one as the boxed
+//! [`EngineState`](crate::stream) in its engine slot.
 //!
 //! # Relationship to the C model
 //!
@@ -17,9 +17,9 @@
 //!
 //! * **No back-pointer.** The C struct stores `z_streamp strm` — a pointer back
 //!   to the owning stream. Ownership is inverted here: the stream owns the state
-//!   as the `StreamState::Inflate(Box<InflateState>)` variant (per AAP §0.6.3),
-//!   which is where the C `internal_state *state` pointer went, so the
-//!   back-pointer is omitted entirely rather than modelled as a raw pointer.
+//!   as the boxed engine in its engine slot (per AAP §0.6.3), which is where the
+//!   C `internal_state *state` pointer went, so the back-pointer is omitted
+//!   entirely rather than modelled as a raw pointer.
 //! * **Owned window.** The C `unsigned char FAR *window` (manually
 //!   `ZALLOC`/`ZFREE`-managed) becomes an owned
 //!   [`AllocBuffer<u8>`](crate::stream::AllocBuffer), which routes the
@@ -63,12 +63,15 @@
 //! and the crate's own safe modules.
 
 use alloc::boxed::Box;
+use core::any::Any;
 
 use crate::gz_header::GzHeader;
 use crate::inflate::tables::{Code, ENOUGH};
 use core::ffi::{c_int, c_uchar, c_uint, c_ulong, c_ushort, c_void};
 
-use crate::stream::{AllocBuffer, AllocHook, try_box};
+use crate::stream::{
+    AllocBuffer, AllocHook, Allocator, BoxedEngine, EngineBox, EngineKind, EngineState, try_box,
+};
 
 /// The possible inflate modes maintained between `inflate()` calls.
 ///
@@ -174,6 +177,66 @@ pub enum InflateMode {
     Sync,
 }
 
+impl InflateMode {
+    /// Whether this mode is one C's `inflateStateCheck` accepts.
+    ///
+    /// C stores the mode in a plain `inflate_mode` field reached through an
+    /// opaque `internal_state *`, so a transplanted or uninitialized struct can
+    /// present garbage. It therefore range-checks the field (`inflate.c`
+    /// L88-L97):
+    ///
+    /// ```text
+    /// state->mode < HEAD || state->mode > SYNC
+    /// ```
+    ///
+    /// `HEAD` and `SYNC` are the first and last of the 32 modes, so C's test
+    /// admits exactly the declared set. Here the field is this typed enum with
+    /// those same 32 variants, so an out-of-range value is unrepresentable and
+    /// the predicate holds for every variant. It is written as an exhaustive
+    /// `match` rather than a bare `true` so that C's clause appears where a
+    /// reader of the FFI state check expects it, and so that adding a
+    /// Rust-specific mode outside C's `HEAD..=SYNC` span cannot silently widen
+    /// the set of streams the C ABI admits — the exhaustiveness check would
+    /// force it to be classified here.
+    #[must_use]
+    pub(crate) const fn is_c_valid(self) -> bool {
+        match self {
+            InflateMode::Head
+            | InflateMode::Flags
+            | InflateMode::Time
+            | InflateMode::Os
+            | InflateMode::ExLen
+            | InflateMode::Extra
+            | InflateMode::Name
+            | InflateMode::Comment
+            | InflateMode::Hcrc
+            | InflateMode::DictId
+            | InflateMode::Dict
+            | InflateMode::Type
+            | InflateMode::TypeDo
+            | InflateMode::Stored
+            | InflateMode::CopyUnderscore
+            | InflateMode::Copy
+            | InflateMode::Table
+            | InflateMode::LenLens
+            | InflateMode::CodeLens
+            | InflateMode::LenUnderscore
+            | InflateMode::Len
+            | InflateMode::LenExt
+            | InflateMode::Dist
+            | InflateMode::DistExt
+            | InflateMode::Match
+            | InflateMode::Lit
+            | InflateMode::Check
+            | InflateMode::Length
+            | InflateMode::Done
+            | InflateMode::Bad
+            | InflateMode::Mem
+            | InflateMode::Sync => true,
+        }
+    }
+}
+
 impl Default for InflateMode {
     /// The mode a freshly initialized or reset inflate state starts in.
     ///
@@ -229,8 +292,9 @@ pub enum TableSource {
 /// to 32 KB.
 ///
 /// Because the struct is large, it is normally kept behind a [`Box`] (see
-/// [`InflateState::new`]); the owning [`crate::stream::ZStream`] holds it as its
-/// `StreamState::Inflate(Box<InflateState>)` variant.
+/// [`InflateState::new`]); the owning [`crate::stream::ZStream`] holds it as the
+/// boxed `EngineState` in its engine slot, and the typed accessors that
+/// recover it are the `InflateStream` extension methods defined below.
 ///
 /// # Ownership and cleanup
 ///
@@ -289,7 +353,28 @@ pub struct InflateState {
     pub total: u64,
     /// Optional gzip header being filled in when the caller requested one via
     /// `inflateGetHeader` (C `gz_headerp head`; [`None`] mirrors `Z_NULL`).
+    ///
+    /// On the C ABI path this carries only the header's *scalars*; the
+    /// `extra`/`name`/`comment` payloads are written straight into the caller's
+    /// own buffers through a per-call
+    /// [`ForeignGzHeaderSink`](crate::gz_header::ForeignGzHeaderSink) instead of
+    /// being accumulated here. See the `head_foreign` field, which is present
+    /// only when the `gzip` feature is enabled.
     pub head: Option<GzHeader>,
+    /// Whether the registered header's payload buffers live in *caller* memory,
+    /// as they do for every `inflateGetHeader` call made through the C ABI.
+    ///
+    /// C has no counterpart because it only ever has this case: `state->head`
+    /// *is* the caller's struct. The flag distinguishes it from the idiomatic
+    /// Rust API, which lends the decoder an owned [`GzHeader`] to fill. When set,
+    /// the `EXTRA`/`NAME`/`COMMENT` states store through the lent sink — which
+    /// re-reads the caller's live pointers and capacities on every call and
+    /// allocates nothing — rather than growing owned vectors.
+    ///
+    /// Cleared by [`reset_keep`](Self::reset_keep) alongside `head`, mirroring
+    /// C's `state->head = Z_NULL` (`inflate.c` L115).
+    #[cfg(feature = "gzip")]
+    pub head_foreign: bool,
 
     // --- sliding window ----------------------------------------------------
     /// Base-2 logarithm of the requested window size (C `unsigned wbits`).
@@ -325,6 +410,28 @@ pub struct InflateState {
     /// Number of valid bits currently held in [`hold`](InflateState::hold) (C
     /// `unsigned bits`).
     pub bits: u32,
+
+    /// Whole input bytes the fast path handed back that lie *behind* the input
+    /// slice it was given — the part of C's `in -= (bits >> 3)` (`inffast.c`
+    /// L291) that an index into a slice cannot express.
+    ///
+    /// C rewinds a raw pointer, so when it enters `inflate_fast` with whole bytes
+    /// already buffered (which `inflatePrime` alone guarantees) it may move
+    /// `strm->next_in` to before where the call started, un-consuming bytes an
+    /// earlier call took. It never dereferences them, so this is sound in C and
+    /// observable only through `next_in`, `avail_in`, `total_in` and `data_type`.
+    ///
+    /// Whether those bytes exist is a property of the *caller's* memory, not of
+    /// the decoder: a C caller owns one contiguous buffer and can honour the
+    /// rewind, while a caller handing over an independent `&[u8]` per call cannot.
+    /// The fast path therefore records the debt here instead of acting on it, and
+    /// the corresponding bits stay in [`Self::hold`] until something settles it.
+    /// The crate-internal `inflate_take_input_history_rewind` is that settlement,
+    /// used by the C ABI boundary.
+    ///
+    /// Purely per-call: zeroed on entry to every decode call, so it is never read
+    /// stale.
+    pub rewound: u32,
 
     // --- string / stored-block copy ---------------------------------------
     /// Literal byte value, or the length of data still to copy (C
@@ -412,40 +519,6 @@ pub struct InflateState {
     /// allocator, or the caller's `zalloc`/`zfree`/`opaque` when one was
     /// installed through the FFI `z_stream` (AAP §0.6.3 has-hook clause).
     pub alloc_hook: AllocHook,
-
-    /// Hook-backed reservation mirroring reference zlib's allocation of the
-    /// inflate state struct itself — C `inflateInit2_` does
-    /// `ZALLOC(strm, 1, sizeof(struct inflate_state))` before any window is
-    /// needed (`inflate.c` L198, `infback.c` L51).
-    ///
-    /// The idiomatic [`InflateState`] lives in a Rust [`Box`] on the global
-    /// allocator (safe, and matching how the deflate engine keeps its
-    /// `DeflateState` boxed while routing its *working buffers* through the
-    /// hook). To honour a caller-installed `zalloc`/`zfree` for the **state**
-    /// allocation as well — so that a limited or failing hook yields
-    /// `Z_MEM_ERROR` at `inflateInit2_`, *before* the window is ever needed,
-    /// exactly as C does — the regular inflate init path
-    /// ([`inflate_init2`](crate::inflate::inflate_init2)) reserves the
-    /// equivalent footprint through the caller's hook and parks it here. It is:
-    ///
-    /// * an active-hook [`Foreign`](AllocBuffer::Foreign) buffer of
-    ///   [`C_LAYOUT_SIZE`](InflateState::C_LAYOUT_SIZE) bytes — C's own
-    ///   `sizeof(struct inflate_state)`, not this Rust type's size — whenever the
-    ///   init path's allocator reserves the state footprint (one `zalloc`,
-    ///   matching C's state `ZALLOC`); this covers both
-    ///   [`inflate_init2`](crate::inflate::inflate_init2) and the `inflateBack`
-    ///   init path, whose *only* allocation in C is exactly this one
-    ///   (`infback.c` L51); and
-    /// * an empty [`AllocBuffer::default`] under the global allocator, so no
-    ///   extra allocation is made and the crate's ~7 KB inflate memory-bounds
-    ///   parity is preserved (AAP §0.6.5).
-    ///
-    /// Being an owned [`AllocBuffer`], it is released automatically on drop —
-    /// through the caller's `zfree` for a hook-backed reservation — subsuming
-    /// C's `ZFREE(strm, state)` at `inflateEnd` (AAP §0.6.3/§0.6.5). The
-    /// invariant this field exists to hold is that the inflate state allocation
-    /// never bypasses the caller's allocator hook.
-    pub state_alloc: AllocBuffer<u8>,
 }
 
 // ===========================================================================
@@ -458,13 +531,16 @@ pub struct InflateState {
 /// reference zlib passes to a caller's `zalloc` in
 /// `ZALLOC(strm, 1, sizeof(struct inflate_state))` (`inflate.c` L198).
 ///
-/// `size_of::<InflateState>()` is *not* that number — it is 7296 against C's
+/// `size_of::<InflateState>()` is *not* that number — it is 7272 against C's
 /// 7160 on LP64 — because the idiomatic state holds an owning
 /// [`AllocBuffer`] where C holds a bare `unsigned char *`, a
 /// [`TableSource`] discriminant plus offsets where C holds three interior
-/// `code *` pointers, and Rust enums where C holds `int`s. Sizing the *request*
-/// from the C layout while keeping the *storage* in a Rust [`Box`] is what makes
-/// a bounded caller allocator observe C's footprint (AAP §0.6.5).
+/// `code *` pointers, and Rust enums where C holds `int`s. The two numbers
+/// therefore cannot be one value, and this mirror exists to keep C's available:
+/// it is what documents, and what the layout tests assert, the request reference
+/// zlib would make. The port's own init paths ask for `size_of::<InflateState>()`
+/// instead, because the region they receive is where the state actually lives
+/// (AAP §0.6.3 has-hook clause, §0.6.5).
 ///
 /// Every field is a `core::ffi` scalar alias or a raw pointer and the struct is
 /// `#[repr(C)]`, so rustc applies the platform C ABI's layout rules — the same
@@ -531,6 +607,135 @@ struct CodeC {
 /// `inflateResetKeep`.
 const DMAX_DEFAULT: u32 = 32768;
 
+// ===========================================================================
+// Stream integration — the typed view of a `ZStream`'s decompression engine
+// ===========================================================================
+
+/// Lets a [`ZStream`](crate::stream::ZStream) own an `InflateState` without
+/// naming it.
+///
+/// `crate::stream` is layer 5 and this module is layer 6, so the naming has to
+/// run in this direction: the stream stores `Box<dyn EngineState>` and this impl
+/// is what makes an `InflateState` installable (AAP §0.3.1, §0.4.2 B2). The
+/// [`Any`] accessors are the MSRV-1.85 spelling of
+/// `&dyn EngineState -> &dyn Any` upcasting, which only became available in
+/// Rust 1.86.
+impl EngineState for InflateState {
+    #[inline]
+    fn engine_kind(&self) -> EngineKind {
+        EngineKind::Inflate
+    }
+
+    #[inline]
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    #[inline]
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    #[inline]
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+/// The typed, layer-6 view of a stream's installed decompression engine.
+///
+/// These are the spellings the inflate driver and the FFI shims use
+/// (`strm.inflate_state_mut()`, `strm.set_inflate_state(state)`); they forward to
+/// the engine-agnostic generic accessors on
+/// [`ZStream`](crate::stream::ZStream). Keeping them here rather than on
+/// `ZStream` itself is what removes the `stream -> inflate` upward edge while
+/// leaving every call site unchanged: the concrete engine type is named only in
+/// the layer that defines it.
+///
+/// Bring the trait into scope with
+/// `use crate::inflate::state::InflateStream;` to use the methods.
+pub(crate) trait InflateStream {
+    /// The allocator this stream was built with.
+    type Alloc: Allocator;
+
+    /// Borrows the installed decompression engine, or [`None`] if the stream
+    /// holds no state or a compression engine.
+    fn inflate_state(&self) -> Option<&InflateState>;
+
+    /// Mutably borrows the installed decompression engine, or [`None`]. The hot
+    /// path for `inflate()`.
+    fn inflate_state_mut(&mut self) -> Option<&mut InflateState>;
+
+    /// Installs a decompression engine, replacing (and thereby freeing) any
+    /// engine previously held — the RAII replacement for the C `inflateEnd` that
+    /// would otherwise be required first.
+    ///
+    /// The engine arrives already placed — on the Rust heap, or in the region a
+    /// caller's `zalloc` handed back — so installing it allocates nothing.
+    fn set_inflate_state(&mut self, state: BoxedEngine<InflateState>);
+
+    /// Mutably borrows the installed decompression engine **together with** a
+    /// shared borrow of the stream's allocator, or [`None`].
+    ///
+    /// Exists so paths that mutate the decoder *and* need to allocate — the lazy
+    /// window allocation in `updatewindow`, reached from `inflate` and
+    /// `inflateSetDictionary` — can route their allocation through the
+    /// [`Allocator`] trait rather than bypassing it (AAP §0.6.3).
+    fn inflate_state_and_allocator(&mut self) -> Option<(&mut InflateState, &Self::Alloc)>;
+
+    /// Removes and returns the installed decompression engine.
+    ///
+    /// Returns [`None`] — **leaving any installed engine in place** — when the
+    /// stream holds no engine or holds a *compression* engine. That is exactly
+    /// C `inflateStateCheck` rejecting a stream it must not touch (`inflate.c`
+    /// L88-L97): the caller's `z_stream` is left as it was found.
+    ///
+    /// `inflate()` uses this to decouple the borrow of the engine from the borrow
+    /// of the surrounding stream fields (`msg`, `total_in`, `adler`), then puts
+    /// the engine back on every exit path.
+    fn take_inflate_state(&mut self) -> Option<BoxedEngine<InflateState>>;
+}
+
+impl<A: Allocator> InflateStream for crate::stream::ZStream<A> {
+    type Alloc = A;
+
+    #[inline]
+    fn inflate_state(&self) -> Option<&InflateState> {
+        self.engine_state::<InflateState>()
+    }
+
+    #[inline]
+    fn inflate_state_mut(&mut self) -> Option<&mut InflateState> {
+        self.engine_state_mut::<InflateState>()
+    }
+
+    #[inline]
+    fn set_inflate_state(&mut self, state: BoxedEngine<InflateState>) {
+        self.set_engine_state(state);
+    }
+
+    #[inline]
+    fn inflate_state_and_allocator(&mut self) -> Option<(&mut InflateState, &A)> {
+        self.engine_state_and_allocator::<InflateState>()
+    }
+
+    #[inline]
+    fn take_inflate_state(&mut self) -> Option<BoxedEngine<InflateState>> {
+        // Look before leaping: a compression engine must be left exactly where it
+        // is, so only remove the engine once it is known to be a decompressor.
+        if self.engine_kind() != Some(EngineKind::Inflate) {
+            return None;
+        }
+        let engine = self.take_engine_state()?;
+        // The kind check above already established the concrete type, so the
+        // downcast cannot fail; `ok()` keeps the path total rather than panicking.
+        // The owning view stays the placement wrapper — a state that lives in a
+        // caller's region cannot be moved out of it without allocating elsewhere —
+        // so this hands back the wrapper itself and allocates nothing.
+        engine.into_any().downcast::<EngineBox<InflateState>>().ok()
+    }
+}
+
 impl InflateState {
     /// The byte count reference zlib passes to a caller's `zalloc` when it
     /// allocates the inflate state — C's `sizeof(struct inflate_state)` —
@@ -538,15 +743,25 @@ impl InflateState {
     /// this Rust type's own size.
     ///
     /// This is the value C uses in
-    /// `ZALLOC(strm, 1, sizeof(struct inflate_state))` (`inflate.c` L198), and it
-    /// is what [`inflate_init2`](crate::inflate::inflate_init2) and
-    /// [`inflate_copy`](crate::inflate::inflate_copy) reserve so a
-    /// caller-supplied allocator observes the same request C would make
-    /// (AAP §0.6.3, §0.6.5). It is **7160 on LP64**, whereas
-    /// `size_of::<InflateState>()` is legitimately larger.
+    /// `ZALLOC(strm, 1, sizeof(struct inflate_state))` (`inflate.c` L198). It is
+    /// **7160 on LP64**, whereas `size_of::<InflateState>()` is legitimately
+    /// larger — this port's state carries the same information in Rust-native
+    /// shapes (owned buffers, `Option`s, offsets) and does not have to be
+    /// byte-compatible, only behaviourally so.
     ///
-    /// Exposed publicly because it is the only way an allocator implementation or
-    /// a memory-accounting test can predict the request it will be handed.
+    /// That difference is why it is **not** the size the init paths request. A
+    /// caller's `zalloc` is asked for `size_of::<InflateState>()`, because the
+    /// region it returns is the state's real home (AAP §0.6.3 has-hook clause,
+    /// §0.6.5): a block of C's smaller `sizeof` could not hold it, so preserving
+    /// the argument *pair* and holding the state in the caller's memory are
+    /// mutually exclusive. AAP §0.6.5 requires the allocation **count** and the
+    /// **failure timing** to match, and both do; the byte count of a single
+    /// request is not something any zlib contract lets a caller assert, and C's
+    /// own value moves with `LIT_MEM` and pointer width.
+    ///
+    /// Exposed publicly because it is the ABI mirror's own size, and the only way
+    /// an allocator implementation or a memory-accounting test can state what
+    /// reference zlib would have asked for.
     pub const C_LAYOUT_SIZE: usize = core::mem::size_of::<InflateStateC>();
 
     /// Creates a new, boxed inflate state for the given wrapper mode and window
@@ -580,9 +795,9 @@ impl InflateState {
     ///   lazy `ZALLOC`.
     ///
     /// The state is returned already boxed because it is large (~7 KB): keeping
-    /// it behind a [`Box`] matches the `StreamState::Inflate(Box<InflateState>)`
-    /// variant the owning [`crate::stream::ZStream`] holds, and avoids moving the
-    /// arrays around by value.
+    /// it behind a [`Box`] matches the placed engine the owning
+    /// [`crate::stream::ZStream`] holds, and avoids moving the arrays around by
+    /// value.
     ///
     /// # Allocator
     ///
@@ -609,9 +824,10 @@ impl InflateState {
     ///
     /// The window is *not* allocated here — it is sized on demand by the
     /// driver's `updatewindow`, which consults the stored
-    /// [`alloc_hook`](InflateState::alloc_hook) at that time. Neither is the
-    /// caller-visible state reservation: see
-    /// [`try_new_in`](Self::try_new_in) for who installs it and when.
+    /// [`alloc_hook`](InflateState::alloc_hook) at that time. Nor is the state
+    /// itself charged to `hook`: this spelling places it on the Rust heap. See
+    /// [`try_new_in`](Self::try_new_in) for the paths that place it in the
+    /// caller's own memory instead, and when.
     ///
     /// # Panics
     ///
@@ -633,27 +849,49 @@ impl InflateState {
     /// (`inflate.c` L198-L200), so every init path must be able to surface it.
     /// The field-initialization contract is identical to [`new`](Self::new).
     ///
-    /// # Callers, and the allocation each one performs
+    /// # Placement
     ///
-    /// This constructor itself makes exactly **one** allocation — the global
-    /// `Box` holding the state — and no caller-hook request. The reservation that
-    /// stands in for C's state `ZALLOC`, and the window, are the responsibility of
-    /// the two init paths above it:
+    /// This spelling always boxes on the Rust global heap, so it makes exactly
+    /// **one** allocation and no caller-hook request. It is the Rust-native
+    /// constructor.
+    ///
+    /// The paths that must reproduce C's caller-visible allocation schedule do
+    /// **not** use it: they take a `crate::stream::EngineReservation` at C's
+    /// position in the sequence, build the state with
+    /// `build_in`, and move it into the reserved region, so a
+    /// caller's `zalloc` really does hold the `inflate_state` and gets it back
+    /// through `zfree` (AAP §0.6.3 has-hook clause, §0.6.5):
     ///
     /// | Caller | Caller-hook requests, in order |
     /// |--------|--------------------------------|
-    /// | [`crate::inflate::inflate_init2`] (reached from FFI `inflateInit2_`) | `(1, `[`C_LAYOUT_SIZE`](Self::C_LAYOUT_SIZE)`)` for the state reservation; the window comes later, lazily, from `updatewindow` — C's schedule exactly (`inflate.c` L198, L261) |
-    /// | `crate::inflate::back::inflate_back_init_borrowed_window` (reached from FFI `inflateBackInit_`) | `(1, `[`C_LAYOUT_SIZE`](Self::C_LAYOUT_SIZE)`)` and nothing else — the window is the ABI caller's own buffer, lent rather than allocated (`infback.c` L51, L60) |
-    /// | [`crate::inflate::back::inflate_back_init_with`] (Rust-native convenience) | the same state reservation, then `(1 << window_bits, 1)` for a window it owns — the one documented divergence from C, since a Rust caller supplies no buffer |
+    /// | [`crate::inflate::inflate_init2`] (reached from FFI `inflateInit2_`) | one for the state itself; the window comes later, lazily, from `updatewindow` — C's schedule exactly (`inflate.c` L198, L261) |
+    /// | `crate::inflate::back::inflate_back_init_borrowed_window` (reached from FFI `inflateBackInit_`) | one for the state and nothing else — the window is the ABI caller's own buffer, lent rather than allocated (`infback.c` L51, L60) |
+    /// | [`crate::inflate::inflate_copy`] | one for the destination state (`inflate.c` L1340), then one for its window when the source had one (L1346) |
     ///
-    /// Each of those paths makes the reservation only when its
-    /// [`Allocator::reserves_state_footprint`](crate::stream::Allocator::reserves_state_footprint)
-    /// says to, so the global-allocator path keeps its historical footprint: the
-    /// `Box` below already *is* that allocation, and charging a second equally
-    /// sized region would double every stream's fixed overhead (AAP §0.6.5).
+    /// Each of those paths charges the hook only when its
+    /// [`Allocator::reserves_state_footprint`] says to, so the global-allocator
+    /// path keeps its historical footprint: there the `Box` already *is* that
+    /// allocation, and charging a second equally sized region would double every
+    /// stream's fixed overhead (AAP §0.6.5).
     #[must_use]
     pub fn try_new_in(hook: AllocHook, wrap: i32, wbits: u32) -> Option<Box<InflateState>> {
         try_box(Self::build(hook, wrap, wbits))
+    }
+
+    /// Builds the initial state **unboxed**, for a caller that has already
+    /// reserved its final home.
+    ///
+    /// This is the entry point the C-parity init paths use: they take a
+    /// `crate::stream::EngineReservation` where C issues
+    /// `ZALLOC(strm, 1, sizeof(struct inflate_state))`, call this to produce the
+    /// value, and then move the value into the reserved region. Splitting
+    /// reservation from construction is unavoidable, because the reservation has
+    /// to be charged *before* the state exists in order to fail where C fails.
+    ///
+    /// The field-initialization contract is identical to [`new`](Self::new).
+    #[must_use]
+    pub(crate) fn build_in(hook: AllocHook, wrap: i32, wbits: u32) -> InflateState {
+        Self::build(hook, wrap, wbits)
     }
 
     /// Builds the unboxed initial state shared by [`new_in`](Self::new_in) and
@@ -669,8 +907,11 @@ impl InflateState {
             dmax: DMAX_DEFAULT,
             total: 0,
             head: None,
+            #[cfg(feature = "gzip")]
+            head_foreign: false,
             hold: 0,
             bits: 0,
+            rewound: 0,
             lencode: 0,
             distcode: 0,
             lentable: TableSource::Dynamic,
@@ -701,13 +942,6 @@ impl InflateState {
             codes: [Code::default(); ENOUGH],
             was: 0,
             alloc_hook: hook,
-            // Left empty here. The reservation standing in for C's state `ZALLOC`
-            // is installed by whichever init path built this state — see the table
-            // on `try_new_in` — and only when that path's allocator reserves the
-            // state footprint. Leaving it to the caller keeps this constructor's
-            // own allocation count at one (the `Box`) regardless of which path
-            // reaches it.
-            state_alloc: AllocBuffer::default(),
         }
     }
 
@@ -730,8 +964,19 @@ impl InflateState {
         self.flags = -1;
         self.dmax = DMAX_DEFAULT;
         self.head = None;
+        // C's `state->head = Z_NULL` (`inflate.c` L115) drops the registration
+        // itself, so the ownership marker must go with it: a stale `true` here
+        // would let a later call consult a sink the caller is entitled to have
+        // freed the moment the reset returned.
+        #[cfg(feature = "gzip")]
+        {
+            self.head_foreign = false;
+        }
         self.hold = 0;
         self.bits = 0;
+        // The fast path's un-honoured input debt is per-call, so a reset must
+        // not carry one into the next decode.
+        self.rewound = 0;
         // `lencode = distcode = next = codes` (offset 0, dynamic arena) in C.
         self.lencode = 0;
         self.distcode = 0;
@@ -861,34 +1106,36 @@ impl InflateState {
     }
 }
 
-/// Releases the window and the state reservation in **C `inflateEnd`'s order**.
+/// Releases the window in **C `inflateEnd`'s order**, ahead of the state itself.
 ///
-/// Ownership alone already frees both — that is what makes the explicit
-/// `ZFREE`s of C unnecessary — but it frees them in *field declaration* order,
-/// which is an incidental property of how this struct happens to be written.
-/// Reference zlib's order is fixed by its source:
+/// Ownership alone already frees the window — that is what makes C's explicit
+/// `ZFREE` unnecessary — but the state's own storage is released by the
+/// crate-internal `EngineBox` wrapper that holds it, which runs *after* this
+/// impl. Reference zlib's order is fixed by its source:
 ///
 /// ```text
 /// if (state->window != Z_NULL) ZFREE(strm, state->window);  /* inflate.c L1160 */
 /// ZFREE(strm, strm->state);                                 /* inflate.c L1161 */
 /// ```
 ///
-/// A caller-supplied `zfree` observes that sequence, and AAP §0.6.5 makes the
-/// allocator-visible schedule a first-class parity requirement, so it is pinned
-/// here rather than left to depend on field ordering — matching how
+/// so the window must reach `zfree` before the state does. Dropping the window
+/// explicitly here — rather than letting the implicit field drops do it — is what
+/// pins that, because field-declaration order is an incidental property of how
+/// this struct happens to be written, and AAP §0.6.5 makes the allocator-visible
+/// schedule a first-class parity requirement. This matches how
 /// [`crate::deflate::DeflateState`] pins C `deflateEnd`'s five-step order.
 ///
-/// Each buffer is swapped out with [`core::mem::take`] and dropped immediately;
+/// The window is swapped out with [`core::mem::take`] and dropped immediately;
 /// the replacement is an empty [`AllocBuffer`] whose own drop is a no-op, so the
 /// implicit field drops that follow release nothing further.
 ///
 /// For an `inflateBack` state the window is the ABI caller's own lent region,
-/// whose `Drop` is deliberately empty, so only the reservation reaches `zfree` —
-/// exactly the single free `inflateBackEnd` performs (`infback.c` L572-L577).
+/// whose `Drop` is deliberately empty, so nothing at all reaches `zfree` here —
+/// the one free `inflateBackEnd` performs is of the state itself
+/// (`infback.c` L572-L577).
 impl Drop for InflateState {
     fn drop(&mut self) {
         drop(core::mem::take(&mut self.window));
-        drop(core::mem::take(&mut self.state_alloc));
     }
 }
 
@@ -1268,16 +1515,33 @@ mod tests {
     #[test]
     fn state_is_boxable_matching_stream_model() {
         // `new` already yields a `Box<InflateState>`; inspect it before moving it
-        // into the `StreamState::Inflate(Box<InflateState>)` variant that
-        // `src/stream.rs` actually holds — the place C keeps its
-        // `internal_state *state` pointer.
+        // into the engine slot `src/stream.rs` actually holds — the place C keeps
+        // its `internal_state *state` pointer.
         let state: Box<InflateState> = InflateState::new(2, 15);
         assert_eq!(state.mode, InflateMode::Head);
         assert_eq!(state.wrap, 2);
-        let owned = crate::stream::StreamState::Inflate(state);
-        assert!(owned.is_inflate());
-        assert!(!owned.is_deflate());
-        assert!(!owned.is_none());
+
+        let mut strm: crate::stream::ZStream = crate::stream::ZStream::new();
+        // The slot holds a *placed* engine, because the FFI init path puts the state
+        // in the caller's own `zalloc` region; `try_owned` is the global-heap arm of
+        // that same wrapper, which is what a Rust-native `Box` becomes.
+        strm.set_inflate_state(
+            EngineBox::try_owned(*state).expect("the test heap holds an engine"),
+        );
+        assert!(strm.is_inflate());
+        assert!(!strm.is_deflate());
+        assert!(strm.has_state());
+        // The typed view resolves, and the slot reports this direction. (The
+        // wrong-direction downcast is asserted in `src/stream.rs`, which owns the
+        // slot; `inflate` must not name `deflate` — they are strict peers.)
+        assert_eq!(strm.inflate_state().map(|s| s.wrap), Some(2));
+        assert!(!strm.is_deflate());
+
+        // Taking it back hands over the same concrete box and empties the slot.
+        let taken = strm.take_inflate_state().expect("an inflate engine");
+        assert_eq!(taken.mode, InflateMode::Head);
+        assert!(!strm.has_state());
+        assert!(strm.take_inflate_state().is_none());
     }
 
     // =======================================================================
@@ -1313,7 +1577,7 @@ mod tests {
         );
         assert_eq!(size_of::<CodeC>(), 4, "sizeof(code)");
         // `ENOUGH` bounds the `codes` arena; a wrong value here would move every
-        // trailing offset and silently mis-size the reservation.
+        // trailing offset and silently mis-report C's `sizeof`.
         assert_eq!(ENOUGH, 1444, "ENOUGH_LENS + ENOUGH_DISTS");
     }
 

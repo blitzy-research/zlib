@@ -75,8 +75,8 @@ lines of C across 26 root translation units and headers**, exposing **119** `ZEX
 - **Tech stack migration (primary).** The entire library moves from C to Rust. This is not a partial port
   or a wrapper — every C translation unit has a named Rust owner ([§0.2.1](#021-exhaustively-in-scope)).
 - **Modularity restructuring (secondary).** Fifteen flat C translation units become a seven-layer,
-  forty-file Rust module tree with an explicit dependency ordering — one-way apart from the four
-  upward references enumerated in [§0.3.1](#031-refactored-structure-planning).
+  forty-file Rust module tree with a strictly one-way, acyclic dependency ordering that an in-crate test
+  enforces against the source text ([§0.3.1](#031-refactored-structure-planning)).
 - **Design pattern application (tertiary).** Raw function-pointer dispatch, interior pointers,
   macro-based bit manipulation, and manual allocate/free pairs are each replaced by a specific idiomatic
   Rust construct, enumerated in [§0.3.2](#032-design-pattern-applications).
@@ -185,7 +185,7 @@ instance of one of five rules, applied consistently across all forty modules.
 
 | Dimension | Current (C) | Target (Rust) |
 |-----------|-------------|---------------|
-| Structure | 15 flat translation units, coupled through `#include "zutil.h"` and `deflate.h` / `inflate.h` | 7 layers, 40 files; the module graph mirrors the C `#include` layering with no extra top-level modules (`src/lib.rs`, module-graph documentation), one-way apart from four upward references ([§0.3.1](#031-refactored-structure-planning)) |
+| Structure | 15 flat translation units, coupled through `#include "zutil.h"` and `deflate.h` / `inflate.h` | 7 layers, 40 files; the module graph mirrors the C `#include` layering with no extra top-level modules (`src/lib.rs`, module-graph documentation) and is strictly one-way and acyclic, enforced by an in-crate scan of the source text ([§0.3.1](#031-refactored-structure-planning)) |
 | Memory | 22 explicit `ZALLOC` / `ZFREE` call sites (`deflate.c` 11, `inflate.c` 9, `infback.c` 2) | Owned buffers behind one allocator abstraction; no free path exists to forget ([§0.6.3](#063-memory-ownership-model)) |
 | Dispatch | `compress_func` raw function-pointer table [`deflate.c` L70] | A tag enum resolved by exhaustive `match` (`deflate::strategy::CompressFunc`), preserving selection behavior without `unsafe` |
 | State | `int`-valued mode/status fields plus interior pointers into an arena | `#[repr]`-tagged enums with C-exact discriminants, plus offsets and a source discriminant instead of interior pointers |
@@ -226,20 +226,30 @@ current state was measured before planning any change:
 | Gate | Command | Observed |
 |------|---------|----------|
 | Release build | `cargo build --locked --release` | exit 0 |
-| Default test suite | `cargo test --locked` | **860 passed / 0 failed / 0 ignored** (705 unit, 128 integration, 27 doctests) |
-| no-`std` test suite | `cargo test --locked --no-default-features` | **634 passed / 0 failed / 0 ignored** (512 unit, 97 integration, 25 doctests) |
-| All-features test suite | `cargo test --locked --all-features` | **873 passed / 0 failed / 0 ignored** (adds the 13 live C-oracle tests) |
+| Default test suite | `cargo test --locked` | **956 passed / 0 failed / 0 ignored** (797 unit, 130 integration, 29 doctests) |
+| no-`std` test suite | `cargo test --locked --no-default-features` | **695 passed / 0 failed / 0 ignored** (571 unit, 97 integration, 27 doctests) |
+| All-features test suite | `cargo test --locked --all-features` | **969 passed / 0 failed / 0 ignored** (adds the 13 live C-oracle tests) |
 | Formatting | `cargo fmt --all -- --check` | exit 0 |
 | Lints | `cargo clippy --locked --all-targets --all-features -- -D warnings` | exit 0 |
 | Docs | `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features` | exit 0, 0 warnings |
-| Published docs | `mkdocs build --strict --site-dir "$(mktemp -d)/site"` | exit 0, 0 warnings |
-| Packaged crate | `cargo package --locked --list` | **75** files; the unpacked archive re-runs its own suite at 860 |
+| Published docs | `mkdocs build --strict --site-dir "$(mktemp -d)/site"` | exit 0, 0 strict diagnostics (see the note below) |
+| Packaged crate | `cargo package --locked --list` | **76** files; the unpacked archive re-runs its own suite at 956 |
+
+On the published-docs row, "0 strict diagnostics" means no `WARNING` and no `ERROR` from MkDocs, its
+plugins, or this project's content. The Material theme separately prints one advisory banner from its own
+maintainers about the forthcoming MkDocs 2.0; that is a vendor notice rather than a build diagnostic,
+`--strict` does not fail on it, and nothing in this repository can suppress it.
 
 Release artifacts, measured from a clean `cargo build --locked --release` under default features with
-`rustc 1.97.1 (8bab26f4f 2026-07-14)` on `x86_64-unknown-linux-gnu`: `libzlib_rs.rlib` 2,478,440 B,
-`libzlib_rs.so` 635,968 B, `libzlib_rs.a` 22,397,744 B. These byte counts are **provenance-bound** — they
+`rustc 1.97.1 (8bab26f4f 2026-07-14)` on `x86_64-unknown-linux-gnu`: `libzlib_rs.rlib` 2,791,948 B,
+`libzlib_rs.so` 660,944 B, `libzlib_rs.a` 22,441,620 B. These byte counts are **provenance-bound** — they
 shift with the toolchain, the feature row, and any change to the crate's own source or documentation
-metadata, so a figure quoted without its toolchain and feature set says very little. Linking a C program
+metadata, so a figure quoted without its toolchain and feature set says very little: read them as a
+dated snapshot of one build, observed **2026-08-03**, rather than a reproducible invariant or a size
+budget — no gate asserts them. The `.rlib` is the least durable of the three, because an rlib embeds
+absolute build paths and so changes size when the checkout directory or `CARGO_TARGET_DIR` changes
+without any source change; reproduce them for your own build with
+`stat -c '%s' target/release/libzlib_rs.{rlib,so,a}`. Linking a C program
 against the static archive yields
 `ver=1.3.2.1-motley crc=cbf43926 adler=091e01de compress=0 uncompress=0 bound=22`, and against the shared
 object yields a byte-exact 50,000-byte round trip with correct `1f 8b` gzip framing at `windowBits = 31`.
@@ -306,50 +316,55 @@ REFERENCE-mode and semantically authoritative for the exported/hidden partition
 
 #### 0.2.1.2 Source transformations — Rust modules (UPDATE mode)
 
-All **40** modules under `src/` are in scope, totaling **58,836** lines
+All **40** modules under `src/` are in scope, totaling **71,795** lines
 (`find src -name '*.rs' -exec cat {} + | wc -l`, as of the measurement basis at the head of this
 document). Every one is UPDATE mode: verify against the C oracle, harden, and close any parity or
 documentation gap.
 
-| Layer | Modules (measured lines) |
-|-------|---------------------------|
-| Crate root and public types | `lib.rs` 2,437 · `error.rs` 448 · `constants.rs` 759 · `stream.rs` 2,362 · `gz_header.rs` 807 |
-| `src/checksum/**.rs` | `mod.rs` 14 · `adler32.rs` 658 · `crc32.rs` 1,687 |
-| `src/util/**.rs` | `mod.rs` 411 · `compress.rs` 500 · `uncompress.rs` 479 · `version.rs` 597 |
-| `src/deflate/**.rs` | `mod.rs` 2,517 · `state.rs` 3,680 · `trees.rs` 1,745 · `rle.rs` 578 · `strategy.rs` 475 · `slow.rs` 315 · `stored.rs` 313 · `fast.rs` 265 · `huff.rs` 196 |
-| `src/inflate/**.rs` | `mod.rs` 3,621 · `back.rs` 1,494 · `state.rs` 1,364 · `tables.rs` 1,229 · `fast.rs` 1,064 · `fixed.rs` 334 |
-| `src/gz/**.rs` | `write.rs` 2,940 · `open.rs` 2,035 · `state.rs` 1,479 · `read.rs` 1,371 · `close.rs` 671 · `mod.rs` 303 |
-| `src/ffi/**.rs` | `inflate.rs` 4,661 · `types.rs` 3,599 · `deflate.rs` 2,980 · `gz.rs` 2,949 · `alloc.rs` 2,282 · `mod.rs` 1,778 · `util.rs` 1,439 |
+| Layer | Measured lines | Modules (snapshot) |
+|-------|----------------|--------------------|
+| Crate root and public types | 8,852 | `lib.rs` 3,680 · `stream.rs` 2,853 · `gz_header.rs` 1,112 · `constants.rs` 759 · `error.rs` 448 |
+| `src/checksum/**.rs` | 2,542 | `crc32.rs` 1,870 · `adler32.rs` 658 · `mod.rs` 14 |
+| `src/util/**.rs` | 1,693 | `version.rs` 597 · `compress.rs` 572 · `mod.rs` 312 · `uncompress.rs` 212 |
+| `src/deflate/**.rs` | 11,321 | `state.rs` 4,053 · `mod.rs` 3,381 · `trees.rs` 1,745 · `rle.rs` 578 · `strategy.rs` 475 · `slow.rs` 315 · `stored.rs` 313 · `fast.rs` 265 · `huff.rs` 196 |
+| `src/inflate/**.rs` | 10,854 | `mod.rs` 4,524 · `back.rs` 2,041 · `state.rs` 1,628 · `tables.rs` 1,229 · `fast.rs` 1,098 · `fixed.rs` 334 |
+| `src/gz/**.rs` | 10,262 | `write.rs` 3,270 · `open.rs` 2,279 · `state.rs` 1,583 · `read.rs` 1,580 · `mod.rs` 877 · `close.rs` 673 |
+| `src/ffi/**.rs` | 26,271 | `inflate.rs` 7,148 · `types.rs` 4,587 · `deflate.rs` 4,291 · `gz.rs` 3,888 · `alloc.rs` 2,580 · `mod.rs` 1,919 · `util.rs` 1,858 |
+| **Total** | **71,795** | the seven rows above sum exactly, across all 40 modules |
 
-An earlier recorded baseline of this plan reported 32,354 lines across the same 40 modules; that figure is
-a **historical datum** from before the hardening work described in
-[§0.10.1](#0101-authoritative-d1d12-register) and is not the current state.
+Earlier recorded baselines of this plan reported 32,354 lines across the same 40 modules, then 58,677, then
+58,836; all three are **historical data** from before the hardening work described in
+[§0.10.1](#0101-authoritative-d1d12-register) and none is the current state. A single table now carries the
+per-layer breakdown, replacing the two divergent snapshots an earlier revision printed back to back.
 
 No module contains a placeholder: a scan for `todo!()`, `unimplemented!()`, `TODO`, `FIXME`, and `XXX`
 across all `*.rs` files returns zero matches.
 
 #### 0.2.1.3 Test, benchmark, and fuzz updates (UPDATE mode)
 
-- `tests/**.rs` — seven drivers, **17,595** lines: `interop.rs` 6,287 · `c_oracle.rs` 3,548 ·
-  `inflate_coverage.rs` 3,425 · `gzip_compat.rs` 1,732 · `round_trip.rs` 1,116 · `checksum.rs` 754 ·
-  `regression.rs` 733
+- `tests/**.rs` — seven drivers, **18,154** lines: `interop.rs` 6,287 · `c_oracle.rs` 3,548 ·
+  `inflate_coverage.rs` 3,474 · `gzip_compat.rs` 2,089 · `round_trip.rs` 1,116 · `checksum.rs` 754 ·
+  `regression.rs` 886
 - `benches/**.rs` — three Criterion targets, **806** lines: `deflate_bench.rs` 391 ·
   `inflate_bench.rs` 229 · `checksum_bench.rs` 186. The target *names* are `deflate_bench`,
   `inflate_bench`, and `checksum_bench`, all declared `harness = false`
-- `fuzz/fuzz_targets/**.rs` — five libFuzzer targets, **8,512** lines: `fuzz_ffi_roundtrip.rs` 3,537 ·
-  `fuzz_inflate.rs` 1,837 · `fuzz_gzip.rs` 1,551 · `fuzz_deflate_roundtrip.rs` 1,044 ·
+- `fuzz/fuzz_targets/**.rs` — five libFuzzer targets, **8,537** lines: `fuzz_ffi_roundtrip.rs` 3,561 ·
+  `fuzz_inflate.rs` 1,838 · `fuzz_gzip.rs` 1,551 · `fuzz_deflate_roundtrip.rs` 1,044 ·
   `fuzz_checksum.rs` 543
-- `fuzz/Cargo.toml` (185 lines) and `fuzz/Cargo.lock` — the detached fuzz workspace manifest and its
+- `fuzz/Cargo.toml` (186 lines) and `fuzz/Cargo.lock` — the detached fuzz workspace manifest and its
   13-package lock
-- **No `fuzz/deny.toml`.** The detached workspace is governed by the *root* policy,
-  invoked a second time against its manifest — `cargo deny --locked --manifest-path
-  fuzz/Cargo.toml --config deny.toml check`. Naming `--config` there is load-bearing:
-  `cargo-deny` resolves configuration from the target manifest's workspace root, and
-  `fuzz/Cargo.toml` declares its own `[workspace]` table, so without it the tool would
-  find no policy and silently fall back to built-in defaults. One reviewed policy, two
-  invocations, is what makes the 102-package claim below true for all 102 rather than
-  for 89 of them; `policy-integrity` in `.github/workflows/audit.yml` fails if a sibling
-  policy reappears
+- `fuzz/deny.toml` (478 lines) — the detached workspace's **own** reviewed `cargo-deny`
+  policy, aimed at its manifest with `cargo deny --locked --manifest-path
+  fuzz/Cargo.toml --config fuzz/deny.toml check`. Naming `--config` there is
+  load-bearing: `cargo-deny` resolves configuration from the target manifest's
+  workspace root, so a discovery miss silently falls back to built-in defaults, and a
+  silent fallback looks exactly like a pass. One reviewed policy **per graph** is what
+  makes the 102-package claim below true for all 102 rather than for 89 of them, and it
+  is what lets each file run at full severity over its own graph — the root policy
+  needs two narrow suppressions for entries it holds as latent defence in depth, the
+  fuzz policy needs none. `policy-integrity` in `.github/workflows/audit.yml` fails if
+  either file goes missing, drops a governed table, or drifts from the other on any
+  shared key
 
 #### 0.2.1.4 Configuration, build, and packaging updates
 
@@ -358,7 +373,9 @@ across all `*.rs` files returns zero matches.
   distributables
 - `build.rs` — CRC table generation plus the opt-in `cdylib` version-script wiring; pure `std`, no
   build-dependencies
-- `rust-toolchain.toml` · `deny.toml` · `clippy.toml` · `rustfmt.toml` · `.cargo/config.toml`
+- `rust-toolchain.toml` · `deny.toml` · `clippy.toml` · `rustfmt.toml` · `.cargo/config.toml`. The
+  second `cargo-deny` policy, `fuzz/deny.toml`, governs the detached fuzz workspace and is listed
+  with it in [§0.2.1.3](#0213-test-benchmark-and-fuzz-updates-update-mode) rather than repeated here
 - `.gitignore` — already Rust-aware, ignoring `/target` and `/fuzz/{target,corpus,artifacts,coverage}`
 - `catalog-info.yaml` — Backstage component descriptor, already retargeted to Rust
 - `.github/workflows/ci.yml` (12 jobs) · `.github/workflows/audit.yml` (4 jobs) ·
@@ -500,16 +517,11 @@ graph TD
     G --> F["8. ffi/**<br/>C ABI boundary —<br/>the ONLY unsafe module"]
     D --> F
     I --> F
-    D -. "stream.rs owns<br/>Box&lt;DeflateState&gt;" .-> S
-    I -. "stream.rs owns<br/>Box&lt;InflateState&gt;" .-> S
-    D -. "util/compress.rs<br/>calls deflate()" .-> U
-    I -. "util/uncompress.rs<br/>calls inflate()" .-> U
 ```
 
 Every arrow reads *is used by*: `A --> B` means `B` names `A`, so the arrowhead sits on the dependent and
-the tail on its dependency. The eleven solid edges therefore run down the tier order. The four dashed edges
-are the crate's upward references, drawn in the same convention — `D -.-> S` means `stream` names `deflate`
-— and each is annotated with the file that makes the reference.
+the tail on its dependency. Every edge therefore runs down the tier order, and there is no edge of any
+other kind: the graph has no upward reference and no same-tier reference, so it is acyclic.
 
 The seven tiers are: `error` with `constants`; `util`; `checksum`; `stream` with `gz_header`; the
 `deflate` and `inflate` engines (peers, neither depending on the other); `gz`; and `ffi`. The crate root
@@ -519,61 +531,81 @@ complementary rather than contradictory: they differ only in whether the public-
 `constants`, `stream`, `gz_header`) are counted as one tier or distributed across the tiers that introduce
 them.
 
-**Where the layering bends: four upward references, and why.** The tier ordering above is the
-architecture; it is deliberately *not* stated as a claim that the module graph is acyclic, because it is
-not. The dashed edges in the diagram are the crate's four upward references. Measured from the source text
-with comments and string literals blanked, `#[cfg(test)]` items removed, and brace-grouped `use` lists
-expanded, the cross-module reference sets are:
+**The graph is acyclic, and a test enforces it.** Measured from the source text with comments and string
+literals blanked, `#[cfg(test)]` items removed, and brace-grouped `use` lists expanded, the shipped
+cross-module reference sets are:
 
 | Module | References |
 |--------|------------|
 | `error`, `constants`, `checksum`, `gz_header` | *(nothing else in the crate)* |
-| `stream` | `constants`, `error`, **`deflate`**, **`inflate`** |
-| `util` | `constants`, `error`, `stream`, **`deflate`**, **`inflate`** |
-| `deflate` | `checksum`, `constants`, `error`, `gz_header`, `stream`, **`util`** |
-| `inflate` | `checksum`, `constants`, `error`, `gz_header`, `stream` |
+| `util` | `constants`, `error` |
+| `stream` | `constants`, `error` |
+| `deflate` | `checksum`, `constants`, `error`, `gz_header`, `stream`, `util` |
+| `inflate` | `checksum`, `constants`, `error`, `gz_header`, `stream`, `util` |
 | `gz` | `constants`, `deflate`, `error`, `inflate`, `stream` |
 | `ffi` | `checksum`, `constants`, `deflate`, `error`, `gz`, `gz_header`, `inflate`, `stream`, `util` |
 
-Three module pairs are therefore mutually referential — `deflate`↔`stream`, `inflate`↔`stream`, and
-`deflate`↔`util` — and every upward half of those pairs is a single `use`:
+Every entry points at a strictly lower tier. `stream` and `gz_header` do not name each other, `deflate` and
+`inflate` do not name each other, and no module names anything above it — so the graph contains no cycle of
+any length, not merely no two-cycle.
 
-```sh
-# The four upward `use` declarations, and the only ones in the crate:
-grep -nE '^\s*(pub )?use crate::(deflate|inflate)' \
-     src/stream.rs src/util/compress.rs src/util/uncompress.rs
-#   src/stream.rs:179:          use crate::deflate::state::DeflateState;
-#   src/stream.rs:181:          use crate::inflate::state::InflateState;
-#   src/util/compress.rs:45:    use crate::deflate::{deflate, deflate_end, deflate_init};
-#   src/util/uncompress.rs:45:  use crate::inflate::{inflate, inflate_end, inflate_init};
-```
+Nothing in the compiler enforces this. A Rust crate is one compilation unit, so an upward `use` compiles
+perfectly and the layering would erode silently, which is precisely how the ordering degrades in practice.
+The invariant is therefore mechanical: the `the_module_graph_has_no_upward_edges` test in `src/lib.rs`
+re-derives the entire edge set from the source text of every file under `src/` and fails on any reference
+that does not point downward, naming the file, the line, the tier and both layer numbers. Four guards keep
+it from passing vacuously — every file must classify into one of the ten declared modules, the shipped
+graph must show more than forty inter-module edges, the two tiers must be distinct texts, and every
+test-only exemption must actually be exercised.
 
-The `^` anchor is load-bearing: without it the same search returns ten additional matches, all inside `//!`,
-`///`, or `//` comments — intra-doc links and prose, not dependencies. This is the same distinction the graph
-scan draws by blanking comments and string literals before it looks for a `use`. The downward halves of the
-three pairs are equally short: `deflate`→`util` is `use crate::util::OS_CODE;` plus the
-`crate::util::PRESET_DICT` constant alias [`src/deflate/mod.rs` L103, L109], and `deflate`/`inflate`→`stream`
-import the allocator and buffer types.
+The check is two-tiered, because the shipped library and the `#[cfg(test)]` configuration are different
+compilation units with different obligations:
 
-Both directions are entailed by decisions this plan mandates elsewhere, not by a layering mistake:
+- **Shipped code** — every file with its `#[cfg(test)]` items removed — must be *strictly* one-way: no
+  upward edge and no same-tier edge. This is the library that is built, linked and published, and this
+  tier is what lets each layer be read, reviewed and reasoned about without the layers above it.
+- **`#[cfg(test)]` code** may hold exceptions, but only the three enumerated in
+  `TEST_ONLY_CROSS_LAYER_EXCEPTIONS`, each carrying its rationale: `stream` drives the counting
+  `alloc_func`/`free_func` hook that lives in `crate::ffi::alloc::test_hook`, because building a real C
+  hook pair needs raw-pointer `unsafe` and that is permitted only under `src/ffi/**`
+  ([§0.6.2](#062-unsafe-code-boundary)); and the two engines decode each other's output, because an
+  in-crate round trip is the only way to assert emitted bytes without `std` or a third-party codec, so the
+  engine unit tests run in every feature configuration. Because it is an allow-list rather than a blanket
+  exemption, a *new* test-only inversion fails the test until it is justified there, and a stale entry
+  fails it too.
 
-- `StreamState` (`src/stream.rs`) **owns** the engine state as `Box<DeflateState>` / `Box<InflateState>`,
-  which is pattern **C5** in [§0.3.2](#032-design-pattern-applications): `ZStream` replaces "C's
-  caller-managed `z_streamp` plus its opaque `state` pointer with a single value whose lifetime the
-  compiler tracks". C breaks the same relationship with an opaque forward declaration
-  (`struct internal_state FAR *state`, `zlib.h`); an owning enum must name what it owns. That ownership is
-  what makes the free path unforgettable ([§0.6.3](#063-memory-ownership-model)).
-- `compress.c` and `uncompr.c` call `deflate()` and `inflate()`, and
-  [§0.4.1.6](#0416-one-call-wrappers-and-shared-internals) maps them to `src/util/compress.rs` and
-  `src/util/uncompress.rs` — the same directory as the `zutil.h` counterpart, whose `OS_CODE` and
-  `PRESET_DICT` `src/deflate/mod.rs` consumes. Grouping a *caller* of the engine and a *dependency* of the
-  engine into one module is what closes the `deflate`↔`util` pair.
+Two design decisions make the shipped graph one-way, and both mirror the C baseline rather than working
+around it:
 
-Two consequences are worth stating plainly, because both are easy to get wrong. First, these are module
-*references*, not a build or initialisation cycle: a Rust crate is a single compilation unit, so intra-crate
+- **The engine state is opaque to `stream`.** `ZStream` owns it as `Box<dyn EngineState>` and names neither
+  `DeflateState` nor `InflateState`; the typed views live one tier *up*, as
+  `crate::deflate::state::DeflateStream` and `crate::inflate::state::InflateStream`, which downcast on the
+  concrete engine type. This is pattern **C5** in [§0.3.2](#032-design-pattern-applications): `ZStream`
+  replaces "C's caller-managed `z_streamp` plus its opaque `state` pointer with a single value whose
+  lifetime the compiler tracks", and it keeps the layer-5 handle exactly as incurious about the engines as
+  C's opaque forward declaration `struct internal_state FAR *state` [`zlib.h`]. Ownership still makes the
+  free path unforgettable ([§0.6.3](#063-memory-ownership-model)), and `take_inflate_state` refuses a
+  stream holding a compression engine and leaves it untouched, exactly as C's `inflateStateCheck` does
+  [`inflate.c` L88-L97]. The `EngineState` trait spells out `as_any` / `as_any_mut` / `into_any` by hand
+  rather than relying on trait upcasting, because upcasting stabilised in Rust 1.86 and the crate's MSRV is
+  1.85.0 ([§0.5.1](#051-key-packages)).
+- **The one-call façades are split the way the C `#include` graph splits them.** `compress.c` and
+  `uncompr.c` *include* `zlib.h` and *drive* the engines, so in the include order they sit above the engine
+  rather than beside `zutil.h`. Accordingly the bit-exact `compressBound` formula and the complete C driver
+  loops — the chunked `u32::MAX` windowing, the `Z_NO_FLUSH`/`Z_FINISH` schedule, the unconditional length
+  write-back before teardown, and the `uncompr.c` L78-L81 return-code folding — stay in `src/util/` behind
+  the `OneCallDeflate` / `OneCallInflate` port traits, while the engine-owning adapters and the public
+  `compress`, `compress2`, `uncompress` and `uncompress2` entry points live in `src/deflate/mod.rs` and
+  `src/inflate/mod.rs`, from where the crate root re-exports them under their exact `zlib.h` names.
+  `zutil.h`'s `OS_CODE` and `PRESET_DICT` remain in `src/util/mod.rs` [`src/deflate/mod.rs` L104, L110],
+  and `src/deflate/mod.rs` reading them is an ordinary downward edge.
+
+One consequence is worth stating plainly, because it is easy to over-read: acyclicity here is an
+architectural property, not a build requirement. A Rust crate is a single compilation unit, so intra-crate
 module paths are resolved together and impose no ordering constraint — unlike C, where the `#include` graph
-must be acyclic to compile at all. Second, `unsafe` containment does not depend on the graph shape. It is
-enforced by `#![deny(unsafe_code)]` with exactly two scoped carve-outs plus a dedicated CI job
+must be acyclic to compile at all. The value of the invariant is reviewability and extractability, not
+compilability. Nor does `unsafe` containment depend on the graph shape: it is enforced by
+`#![deny(unsafe_code)]` with exactly two scoped carve-outs plus a dedicated CI job
 ([§0.6.2](#062-unsafe-code-boundary)), which hold regardless of which module names which.
 
 **Module declaration contract.** Eight modules are declared unconditionally — `checksum`, `constants`,
@@ -596,7 +628,9 @@ pub use constants::{
 };
 pub use stream::{Allocator, DefaultAllocator, ZStream};
 pub use gz_header::GzHeader;
-pub use util::{compress, compress_bound, compress2, compressBound, uncompress, uncompress2};
+pub use deflate::{compress, compress2};
+pub use inflate::{uncompress, uncompress2};
+pub use util::{compress_bound, compressBound};
 pub use util::{z_error, zError, zlib_compile_flags, zlib_version, zlibCompileFlags, zlibVersion};
 pub use checksum::{adler32, adler32_combine, crc32, crc32_combine};
 ```
@@ -612,11 +646,15 @@ glob-importing it cannot pull raw-pointer entry points into scope; it re-exports
 deliberate split: the **Cargo package version is `1.3.2`**, because SemVer forbids the four-component
 motley string, while the C API shim still reports the full upstream identity from `src/util/version.rs`.
 
-**Measured artifact geometry.** `cargo build --locked --release` emits `libzlib_rs.rlib` at 2,478,440 B,
-`libzlib_rs.so` at 635,968 B, and `libzlib_rs.a` at 22,397,744 B — measured from a clean release build under
-default features with `rustc 1.97.1 (8bab26f4f 2026-07-14)` on `x86_64-unknown-linux-gnu`. Because all three
-share the single `target/release/` output path, the last feature row built is the one on disk (§0.6.2), so
-these numbers are only meaningful together with the toolchain and feature set that produced them.
+**Measured artifact geometry.** `cargo build --locked --release` emits `libzlib_rs.rlib` at 2,791,948 B,
+`libzlib_rs.so` at 660,944 B, and `libzlib_rs.a` at 22,441,620 B — measured from a clean release build under
+default features with `rustc 1.97.1 (8bab26f4f 2026-07-14)` on `x86_64-unknown-linux-gnu`, observed
+**2026-08-03**. Read them as a dated, environment-specific snapshot rather than an invariant: no gate asserts
+them, they move with the compiler, the feature row and the profile, and the `.rlib` in particular embeds
+absolute build paths, so its size changes when the checkout directory or `CARGO_TARGET_DIR` changes without
+any source change. Because all three share the single `target/release/` output path, the last feature row
+built is the one on disk (§0.6.2). Reproduce exact bytes locally with
+`stat -c '%s' target/release/libzlib_rs.{rlib,so,a}` rather than relying on a transcribed count.
 
 **Build-time table generation contract.** `build.rs` (2,425 lines) reimplements `crc32.c`'s
 `make_crc_table`, `multmodp`, `x2nmodp`, `byte_swap`, and `braid` in "Pure `std` only — no external
@@ -648,6 +686,14 @@ wiring described in [§0.6.2](#062-unsafe-code-boundary).
 **Complete target file and folder layout**, annotated with C provenance and measured line counts. Every
 Rust entry exists and is UPDATE mode; the retained C baseline is REFERENCE only.
 
+Every numeric column below is a **dated snapshot**, not a contract — with three columns that mean different
+things, which is exactly the trap a bulk regeneration falls into. `Cargo.lock` and `fuzz/Cargo.lock` are
+counted in **pinned packages**; `${OUT_DIR}/crc32_tables.rs` names the **C lines eliminated**; every other
+number is `wc -l` of the file. Regenerate the line-count column with
+`git ls-files | grep -E '\.(rs|toml|yml|md)$' | xargs wc -l`, the two package counts with
+`grep -c '^name = ' Cargo.lock fuzz/Cargo.lock`, and the file counts with the drift check printed after the
+tree.
+
 ```text
 zlib-rs (same repository, additive to the retained C baseline)
 
@@ -656,15 +702,14 @@ zlib-rs (same repository, additive to the retained C baseline)
 ├── Cargo.lock                      89 pinned packages (tracked: ships cdylib + staticlib)
 ├── build.rs                       2425  <- crc32.c make_crc_table/multmodp/x2nmodp/byte_swap/braid
 │                                        + opt-in cdylib version-script wiring
-├── rust-toolchain.toml             285  pins channel 1.85.0 + rustfmt + clippy, profile minimal
-├── deny.toml                       930  cargo-deny licenses / advisories / bans / sources
-│                                        (the ONLY policy file; aimed at both graphs — §0.10.1 D1)
+├── rust-toolchain.toml             291  pins channel 1.85.0 + rustfmt + clippy, profile minimal
+├── deny.toml                       925  cargo-deny policy for the 89-package ROOT graph
 ├── clippy.toml                     172  pinned lint configuration
 ├── rustfmt.toml                    192  pinned format configuration
-├── CHANGELOG.md                    593  Rust crate release history
-├── SECURITY.md                     709  vulnerability disclosure policy
-├── CONTRIBUTING.md                1589  contribution workflow, the seven blocking gates, MSRV policy
-├── README.md                      1143
+├── CHANGELOG.md                    631  Rust crate release history
+├── SECURITY.md                     744  vulnerability disclosure policy
+├── CONTRIBUTING.md                1662  contribution workflow, the seven blocking gates, MSRV policy
+├── README.md                      1225  measured evidence, drop-in transcript, quick-start guide
 ├── LICENSE                          22  upstream zlib licence, retained verbatim
 ├── mkdocs.yml                      176  docs_dir: doc — three-entry nav + canonical-root rationale
 │                                        + the mermaid rendering reconciliation (§0.6.7)
@@ -673,28 +718,29 @@ zlib-rs (same repository, additive to the retained C baseline)
 ├── .cargo/
 │   └── config.toml                 305  target rustflags / link args
 ├── .github/workflows/
-│   ├── ci.yml                     2273  12 jobs (see §0.10.1)
-│   ├── audit.yml                  1466  4 jobs — policy-integrity, cargo-audit, cargo-deny, deny-fuzz
-│   └── fuzz.yml                    823  1 job — cargo-fuzz (pull_request + weekly cron + dispatch)
+│   ├── ci.yml                     3102  12 jobs (see §0.10.1)
+│   ├── audit.yml                  1678  4 jobs — policy-integrity, cargo-audit, cargo-deny, deny-fuzz
+│   ├── fuzz.yml                    861  1 job — cargo-fuzz (pull_request + weekly cron + dispatch)
+│   └── docs-requirements.txt       213  hash-pinned MkDocs requirement set (46 packages, 47 hashes)
 ├── src/
-│   ├── lib.rs                     2437  <- zlib.h  (crate root, API curator, #![deny(unsafe_code)],
+│   ├── lib.rs                     3680  <- zlib.h  (crate root, API curator, #![deny(unsafe_code)],
 │   │                                       private no_std libc allocator + abort panic handler)
 │   ├── error.rs                    448  <- zlib.h Z_* codes + zutil.c z_errmsg
 │   ├── constants.rs                759  <- zlib.h + zconf.h #define surface
-│   ├── stream.rs                  2362  <- z_stream [zlib.h L90-L110]
-│   ├── gz_header.rs                807  <- gz_header (13 fields)
+│   ├── stream.rs                  2853  <- z_stream [zlib.h L90-L110]
+│   ├── gz_header.rs               1112  <- gz_header (13 fields)
 │   ├── checksum/
 │   │   ├── mod.rs                   14  re-export surface
 │   │   ├── adler32.rs              658  <- adler32.c (164)
-│   │   └── crc32.rs               1687  <- crc32.c (983) + generated tables
+│   │   └── crc32.rs               1870  <- crc32.c (983) + generated tables
 │   ├── util/
-│   │   ├── mod.rs                  411  <- zutil.h (331)
-│   │   ├── compress.rs             500  <- compress.c (99)
-│   │   ├── uncompress.rs           479  <- uncompr.c (101)
+│   │   ├── mod.rs                  312  <- zutil.h (331)
+│   │   ├── compress.rs             572  <- compress.c (99)
+│   │   ├── uncompress.rs           212  <- uncompr.c (101)
 │   │   └── version.rs              597  <- zutil.c (312)
 │   ├── deflate/
-│   │   ├── mod.rs                 2517  <- deflate.c driver (2185)
-│   │   ├── state.rs               3680  <- deflate.h deflate_state (383)
+│   │   ├── mod.rs                 3381  <- deflate.c driver (2185)
+│   │   ├── state.rs               4053  <- deflate.h deflate_state (383)
 │   │   ├── strategy.rs             475  <- deflate.c L63-L68, L70, L88-L124
 │   │   ├── fast.rs                 265  <- deflate.c deflate_fast
 │   │   ├── slow.rs                 315  <- deflate.c deflate_slow (L1956)
@@ -703,33 +749,33 @@ zlib-rs (same repository, additive to the retained C baseline)
 │   │   ├── huff.rs                 196  <- deflate.c deflate_huff
 │   │   └── trees.rs               1745  <- trees.c (1119) + trees.h (128)
 │   ├── inflate/
-│   │   ├── mod.rs                 3621  <- inflate.c (1413)
-│   │   ├── state.rs               1364  <- inflate.h (126)
-│   │   ├── fast.rs                1064  <- inffast.c (321) + inffast.h
+│   │   ├── mod.rs                 4524  <- inflate.c (1413)
+│   │   ├── state.rs               1628  <- inflate.h (126)
+│   │   ├── fast.rs                1098  <- inffast.c (321) + inffast.h
 │   │   ├── tables.rs              1229  <- inftrees.c (424) + inftrees.h (64)
 │   │   ├── fixed.rs                334  <- inffixed.h (94)
-│   │   └── back.rs                1494  <- infback.c (579)
+│   │   └── back.rs                2041  <- infback.c (579)
 │   ├── gz/                              [feature = "gz-io" => std + gzip]
-│   │   ├── mod.rs                  303  <- gzguts.h facade
-│   │   ├── state.rs               1479  <- gzguts.h gz_state (216)
-│   │   ├── open.rs                2035  <- gzlib.c (609)
-│   │   ├── read.rs                1371  <- gzread.c (668)
-│   │   ├── write.rs               2940  <- gzwrite.c (700)
-│   │   └── close.rs                671  <- gzclose.c (23)
+│   │   ├── mod.rs                  877  <- gzguts.h facade
+│   │   ├── state.rs               1583  <- gzguts.h gz_state (216)
+│   │   ├── open.rs                2279  <- gzlib.c (609)
+│   │   ├── read.rs                1580  <- gzread.c (668)
+│   │   ├── write.rs               3270  <- gzwrite.c (700)
+│   │   └── close.rs                673  <- gzclose.c (23)
 │   └── ffi/                             [the SOLE unsafe module]
-│       ├── mod.rs                 1778  wiring + cfg(test) ABI-drift guard (96 coercions:
+│       ├── mod.rs                 1919  wiring + cfg(test) ABI-drift guard (96 coercions:
 │                                        94 unsafe extern "C" fn + 2 safe — see §0.6.2)
-│       ├── types.rs               3599  <- zlib.h + zconf.h ABI mirrors
-│       ├── deflate.rs             2980  <- deflate.c public API (17 entry points)
-│       ├── inflate.rs             4661  <- inflate.c + infback.c public API (22)
-│       ├── gz.rs                  2949  <- gz*.c public API (34)
-│       ├── util.rs                1439  <- compress.c / uncompr.c / zutil.c / adler32.c / crc32.c (25)
-│       └── alloc.rs               2282  <- zutil.c zcalloc / zcfree bridge
+│       ├── types.rs               4587  <- zlib.h + zconf.h ABI mirrors
+│       ├── deflate.rs             4291  <- deflate.c public API (17 entry points)
+│       ├── inflate.rs             7148  <- inflate.c + infback.c public API (22)
+│       ├── gz.rs                  3888  <- gz*.c public API (34)
+│       ├── util.rs                1858  <- compress.c / uncompr.c / zutil.c / adler32.c / crc32.c (25)
+│       └── alloc.rs               2580  <- zutil.c zcalloc / zcfree bridge
 ├── tests/
-│   ├── regression.rs               733  <- test/example.c (fixed vectors)
+│   ├── regression.rs               886  <- test/example.c (fixed vectors)
 │   ├── round_trip.rs              1116  <- test/example.c (quickcheck randomized half)
-│   ├── inflate_coverage.rs        3425  <- test/infcover.c
-│   ├── gzip_compat.rs             1732  <- test/minigzip.c
+│   ├── inflate_coverage.rs        3474  <- test/infcover.c
+│   ├── gzip_compat.rs             2089  <- test/minigzip.c
 │   ├── checksum.rs                 754  <- adler32.c + crc32.c known-answer vectors
 │   ├── interop.rs                 6287  two-tier byte-identity + wire-format gate
 │   └── c_oracle.rs                3548  live C-oracle sweep [required-features = ["c-oracle"]]
@@ -738,17 +784,19 @@ zlib-rs (same repository, additive to the retained C baseline)
 │   ├── inflate_bench.rs            229  uncompress throughput
 │   └── checksum_bench.rs           186  Adler-32 / CRC-32 throughput
 ├── fuzz/                                [DETACHED workspace, never in the root build graph]
-│   ├── Cargo.toml                  185
+│   ├── Cargo.toml                  186
 │   ├── Cargo.lock                   13 pinned packages
+│   ├── deny.toml                   478  cargo-deny policy for this 13-package graph
+│   ├── seeds/fuzz_inflate/          11 committed seed corpora
 │   └── fuzz_targets/
 │       ├── fuzz_checksum.rs        543
 │       ├── fuzz_deflate_roundtrip.rs  1044
-│       ├── fuzz_ffi_roundtrip.rs  3537
+│       ├── fuzz_ffi_roundtrip.rs  3561
 │       ├── fuzz_gzip.rs           1551
-│       └── fuzz_inflate.rs        1837
+│       └── fuzz_inflate.rs        1838
 ├── doc/                                 [the published docs_dir]
-│   ├── index.md                    136  published landing page
-│   ├── project-guide.md            852  frozen internal §1-§9 numbering
+│   ├── index.md                    139  published landing page
+│   ├── project-guide.md            913  frozen internal §1-§9 numbering
 │   ├── technical-specifications.md      this document
 │   └── rfc1950.txt, rfc1951.txt, rfc1952.txt, algorithm.txt, txtvsbin.txt, crc-doc.1.0.pdf
 │                                        REFERENCE ONLY — never edited (D-7)
@@ -1038,7 +1086,7 @@ every artifact the plan called for is present in the tree
 | Target file | Mode | Source file | Key changes |
 |-------------|------|-------------|-------------|
 | `src/ffi/mod.rs` | UPDATE | `zlib.h` ABI | Maintain the `cfg(test)` ABI-drift guard — **96** fn-pointer coercions, one per exported symbol — and the three inventory tests that assert that coverage is exhaustive in both directions against the 96 exports and the 54 `zlib.map` globals |
-| `src/ffi/types.rs` | UPDATE | `zlib.h` + `zconf.h` | Confirm the 14-field `z_stream` (112 B on LP64), the 13-field `gz_header` (80 B), the `gzFile_s` `{ have, next, pos }` prefix (24 B) required by C's `gzgetc` **macro**, `HandleKind` / `HandleHeader` tagging, and the four `guard_*` panic guards — `guard_int`, `guard_ulong`, `guard_ptr<T>`, `guard_off` — **defined here**, each as a `std` / `no_std` pair at L1509+L1519, L1529+L1539, L1549+L1559, L1569+L1579 |
+| `src/ffi/types.rs` | UPDATE | `zlib.h` + `zconf.h` | Confirm the 14-field `z_stream` (112 B on LP64), the 13-field `gz_header` (80 B), the `gzFile_s` `{ have, next, pos }` prefix (24 B) required by C's `gzgetc` **macro**, `HandleKind` / `HandleHeader` tagging, and the four `guard_*` panic guards — `guard_int`, `guard_ulong`, `guard_ptr<T>`, `guard_off`, `guard_long`, `guard_size`, `guard_const_ptr<T>`, `guard_void` — **defined here**, all eight as a `std` / `no_std` pair, at L2021+L2031, L2041+L2051, L2061+L2071, L2081+L2091, L2104+L2114, L2127+L2137, L2150+L2160, L2178+L2185 |
 | `src/ffi/deflate.rs` | UPDATE | `deflate.c` public API | Confirm `deflateInit_` / `deflateInit2_` version-and-size validation and the 17 exported entry points |
 | `src/ffi/inflate.rs` | UPDATE | `inflate.c` + `infback.c` public API | Confirm `inflateInit_` / `inflateInit2_` / `inflateBackInit_` validation and the 22 exported entry points |
 | `src/ffi/gz.rs` | UPDATE | `gz*.c` public API | Confirm the 34 exported entry points, the `#[cfg(windows)]` gating of `gzopen_w`, and the zero-C-dependency rule |
@@ -1046,26 +1094,31 @@ every artifact the plan called for is present in the tree
 | `src/ffi/alloc.rs` | UPDATE | `zutil.c` `zcalloc` / `zcfree` | Confirm the has-hook allocator clause, and that `CForeignBuffer` / `try_alloc_foreign` remain the sole implementor of the safe `crate::stream::ForeignBuffer` interface, so that **all** allocator-hook `unsafe` stays in this one file |
 
 **Where the `guard_*` panic guards live, and who calls them.** An earlier revision of this table attributed
-the four guards to `src/ffi/alloc.rs`. That was wrong in both directions: `alloc.rs` neither defines nor
+the guards to `src/ffi/alloc.rs`, and counted four of them where there are eight. The attribution was wrong
+in both directions: `alloc.rs` neither defines nor
 calls them. They are **defined in `src/ffi/types.rs`** and **called from the four entry-point shim
 modules**, which is exactly what a panic guard is for — it wraps the body of an `extern "C"` function so a
 Rust panic can never unwind into a C caller. Both halves are reproducible:
 
 ```sh
-# Definitions — eight lines, one std/no_std pair per guard, all in ffi/types.rs.
-grep -rnE '^\s*pub\(crate\) fn guard_(int|ulong|ptr|off)\b' src/
-#   src/ffi/types.rs:1509 / :1519   guard_int
-#   src/ffi/types.rs:1529 / :1539   guard_ulong
-#   src/ffi/types.rs:1549 / :1559   guard_ptr<T>
-#   src/ffi/types.rs:1569 / :1579   guard_off
+# Definitions — sixteen lines: eight guards, one std/no_std pair each, all in ffi/types.rs.
+grep -rnE '^\s*pub\(crate\) fn guard_(int|ulong|ptr|off|long|size|const_ptr|void)\b' src/
+#   src/ffi/types.rs:2021 / :2031   guard_int
+#   src/ffi/types.rs:2041 / :2051   guard_ulong
+#   src/ffi/types.rs:2061 / :2071   guard_ptr<T>
+#   src/ffi/types.rs:2081 / :2091   guard_off
+#   src/ffi/types.rs:2104 / :2114   guard_long
+#   src/ffi/types.rs:2127 / :2137   guard_size
+#   src/ffi/types.rs:2150 / :2160   guard_const_ptr<T>
+#   src/ffi/types.rs:2178 / :2185   guard_void
 
-# Call sites — 70 across the four shim modules, and zero in alloc.rs.
+# Call sites — 82 across the four shim modules, and zero in alloc.rs.
 for f in src/ffi/deflate.rs src/ffi/inflate.rs src/ffi/gz.rs src/ffi/util.rs src/ffi/alloc.rs; do
-  printf '%4d  %s\n' "$(sed 's://.*::' "$f" | grep -cE 'guard_(int|ulong|ptr|off)\s*\(')" "$f"
+  printf '%4d  %s\n' "$(sed 's://.*::' "$f" | grep -cE 'guard_(int|ulong|ptr|off|long|size|const_ptr|void)\s*\(')" "$f"
 done
 #     15  src/ffi/deflate.rs
-#     20  src/ffi/inflate.rs
-#     27  src/ffi/gz.rs
+#     21  src/ffi/inflate.rs
+#     38  src/ffi/gz.rs
 #      8  src/ffi/util.rs
 #      0  src/ffi/alloc.rs
 ```
@@ -1100,7 +1153,7 @@ documentation. `SECURITY.md` cites `src/ffi/types.rs` for these guards and is co
 | `build.rs` | UPDATE | `crc32.c` `make_crc_table` | Keep the pure-`std` table generation and the opt-in `cargo:rustc-cdylib-link-arg` version-script wiring |
 | `rust-toolchain.toml` | UPDATE | `Cargo.toml` `rust-version` | Keep the toolchain pinned so local builds match CI |
 | `deny.toml` | UPDATE | `Cargo.lock` | `cargo-deny` licenses / advisories / bans / sources policy over the 89-package root graph — the first half of the 102-package closure |
-| `fuzz/deny.toml` | **NOT CREATED** (deliberately absent) | — | This row records a path that does **not** exist and is not to be created. It is deliberately *not* marked `DELETE`: [§0.4.1](#041-file-by-file-transformation-plan) defines exactly three modes — `UPDATE`, `CREATE`, `REFERENCE` — and no deletion of this path was performed against the migration baseline, because **the baseline never contained it**. A second policy file governing a blocking gate would be a second place for the standard to drift and a place a reviewer can miss, so the authorized design is one policy file ([§0.10.1](#0101-authoritative-d1d12-register), artifact `D1`). The root `deny.toml` covers the fuzz half of the closure directly, invoked a second time with `--manifest-path fuzz/Cargo.toml --config deny.toml`; what the fuzz graph legitimately needs is absorbed into the root policy as *scoped* entries rather than as a parallel standard (the `cc` `wrappers = ["libfuzzer-sys"]` scope, the crate-scoped `NCSA` exception, `allow-wildcard-paths`, and `[graph] targets = []`). `policy-integrity` in `.github/workflows/audit.yml` asserts the sibling's non-existence and fails if it reappears |
+| `fuzz/deny.toml` | UPDATE | `fuzz/Cargo.lock` | `cargo-deny` licenses / advisories / bans / sources policy over the 13-package detached fuzz graph — the second half of the 102-package closure. Kept as its own file because that graph is genuinely a different graph: it must admit `libfuzzer-sys` under NCSA and the `cc` / `jobserver` / `shlex` / `find-msvc-tools` driver chain, which the root policy keeps out of the library closure entirely. Both files state the same boundary for those crates (the `cc` `wrappers = ["libfuzzer-sys"]` scope, the crate-scoped `NCSA` exception, `allow-wildcard-paths`, `[graph] targets = []`); this one allows exactly the three licences its graph uses and carries `skip = []`, since the acknowledged duplicate majors are root-graph-only. Aimed at the graph with `--manifest-path fuzz/Cargo.toml --config fuzz/deny.toml`. `policy-integrity` in `.github/workflows/audit.yml` fails if either policy goes missing, drops a governed table, or diverges from the other on a shared key |
 | `clippy.toml`, `rustfmt.toml` | UPDATE | — | Keep lint and format configuration pinned |
 | `.cargo/config.toml` | UPDATE | — | Provide the home for target-specific rustflags and link arguments. Delivered as an **inert placeholder**: five empty `[target.<triple>]` tables and no settings at all — see the D7 row in [§0.10.1](#0101-authoritative-d1d12-register). No rustflags or link arguments are actually in force today; adding any is a deliberate future change, and per-target link wiring for the `cdylib` version script lives in `build.rs` instead |
 
@@ -1119,7 +1172,7 @@ documentation. `SECURITY.md` cites `src/ffi/types.rs` for these guards and is co
 | `README.md` | UPDATE | `README.md` | Keep measured evidence current: symbol reconciliation, byte-identity sweeps, MSRV validated on both 1.85.0 and current stable |
 | `CHANGELOG.md` | UPDATE | `ChangeLog` (C file, as format precedent) | Rust crate release history |
 | `SECURITY.md` | UPDATE | — | Vulnerability disclosure policy |
-| `CONTRIBUTING.md` | UPDATE | — | Contribution workflow, the blocking quality gates, the MSRV policy, and the byte-identity risk surface — present, 1,589 lines |
+| `CONTRIBUTING.md` | UPDATE | — | Contribution workflow, the blocking quality gates, the MSRV policy, and the byte-identity risk surface. Its line count is published once, in §0.2.1.5 and the D6 row of §0.10.1 — not restated here, because a count duplicated into a plan table is a drift surface with no reader benefit |
 | `mkdocs.yml` | UPDATE | `mkdocs.yml` | `docs_dir: doc` with a three-entry `nav`; the `nav` is frozen and this document is its third entry |
 | [`index.md`](index.md) | UPDATE | — | The single canonical landing page |
 | [`project-guide.md`](project-guide.md) | UPDATE | — | Keep its own internal §1–§9 numbering (a frozen citation target) while reconciling any AAP-section reference to this document's scheme |
@@ -1156,22 +1209,24 @@ The mapping is one *module*, not one literal import line. `src/util/mod.rs` quot
 `use crate::{error::ZlibError, util::*};` as shorthand for the correspondence, but that glob form appears
 nowhere in the crate as code: measured over `src/`, the only three `use crate::…::*;` globs are inside
 `src/ffi/**`, and every core module imports targeted items instead — `use crate::util::OS_CODE;`
-[`src/deflate/mod.rs` L109] and `crate::util::PRESET_DICT` [L103] on the `util` side, and
+[`src/deflate/mod.rs` L110] and `crate::util::PRESET_DICT` [L104] on the `util` side, and
 `use crate::error::{ReturnCode, ZlibError};` or `use crate::error::ReturnCode;` at 16 non-`ffi` sites on
 the `error` side. Targeted imports are what let the crate assert *which* module owns a shared constant: an
 in-crate test scans `src/deflate/mod.rs` with comments and strings blanked and requires it to contain
 `use crate::util::OS_CODE;` verbatim, so that "the gzip header emission path must import the one canonical
 OS_CODE from crate::util instead of declaring its own" [`src/lib.rs`].
 
-**B2 — Layer imports run downward, with the four upward references of
-[§0.3.1](#031-refactored-structure-planning) as the documented exceptions.** The ordering is
+**B2 — Layer imports run strictly downward, with no exceptions in the shipped library.** The ordering is
 `error` / `constants` → `util` → `checksum` → `stream` / `gz_header` → `{deflate, inflate}` → `gz` → `ffi`,
-and every module except `stream` and `util` references only modules at or below its own tier. The four
-exceptions — `stream` naming the two engine states it owns, and `util`'s two one-call wrappers calling the
-engines — make `deflate`↔`stream`, `inflate`↔`stream`, and `deflate`↔`util` mutually referential; §0.3.1
-enumerates the exact `use` sites and the AAP decisions that entail them. Because a Rust crate is a single
-compilation unit, a mutual module reference imposes no ordering constraint, so no module needs to "compile
-first" in the C sense. Ordering discipline is still applied where it buys clarity: `src/deflate/strategy.rs`
+and every module references only modules *below* its own tier — never above it and never beside it, so
+`stream`/`gz_header` and `deflate`/`inflate` stay strict peers and the graph is acyclic. §0.3.1 gives the
+measured reference sets, the two design decisions that keep the graph one-way (an opaque
+`Box<dyn EngineState>` in `stream`, and one-call façades split into layer-3 driver logic plus layer-6
+engine-owning entry points), and the `the_module_graph_has_no_upward_edges` test that enforces it against
+the source text together with its three enumerated `#[cfg(test)]`-only exemptions. Because a Rust crate is
+a single compilation unit, the invariant buys reviewability and extractability rather than compilability —
+no module needs to "compile first" in the C sense. Ordering discipline is applied for the same reason
+wherever it buys clarity: `src/deflate/strategy.rs`
 is kept data-only with a single dependency on `crate::constants::Strategy`, even though the block producers
 it feeds all return `BlockState`, a type `strategy.rs` itself defines.
 
@@ -1288,7 +1343,7 @@ minimal closure is a deliberate design goal, expressed in-tree as the **zero-C-d
 | crates.io | `rand` | `"0.9.4"` | 0.9.4 | Randomized test-data generation. Pinned at or above 0.9.4 to stay above the patched range for RustSec advisory RUSTSEC-2026-0097, a dev-dependency-only advisory |
 
 **Fuzz workspace dependencies.** `fuzz/` is a **detached workspace** with its own `[workspace]` table, so
-root-level `cargo build`, `test`, `clippy`, and `fmt` never touch it. Its manifest (185 lines) declares
+root-level `cargo build`, `test`, `clippy`, and `fmt` never touch it. Its manifest (186 lines) declares
 exactly two dependencies — `libfuzzer-sys = "0.4"` and `[dependencies.zlib-rs] path = ".."`, the only path
 dependency anywhere in the project — sets `[profile.release] debug = 1, overflow-checks = true`, and
 declares five `[[bin]]` targets with `test = false, doc = false`.
@@ -1304,10 +1359,10 @@ declares five `[[bin]]` targets with `test = false, doc = false`.
 `getrandom` 0.4.3, `jobserver` 0.1.35, `libc` 0.2.186, `libfuzzer-sys` 0.4.13, `r-efi` 6.0.0, `shlex`
 2.0.1, `zlib-rs` 1.3.2, `zlib-rs-fuzz` 0.0.0). The total governed surface is therefore **102 packages**,
 all sourced from `registry+https://github.com/rust-lang/crates.io-index` except the single `path = ".."`
-self-reference. "Governed" is literal, and it takes two *invocations* of one policy to be literal: the root
-`deny.toml` covers the 89, and the same file covers the 13 when it is pointed at `fuzz/Cargo.toml` with
-`--config deny.toml`, because `fuzz/Cargo.toml` declares its own `[workspace]` table and a root-invoked
-`cargo deny` therefore never resolves that half of the closure.
+self-reference. "Governed" is literal, and it takes two invocations against two reviewed policies to be
+literal: `deny.toml` covers the 89, and `fuzz/deny.toml` covers the 13 when `cargo-deny` is pointed at
+`fuzz/Cargo.toml` with `--config fuzz/deny.toml`, because `fuzz/Cargo.toml` declares its own `[workspace]`
+table and a root-invoked `cargo deny` therefore never resolves that half of the closure.
 
 Notable transitive pins in the root lock: `miniz_oxide` 0.8.9, `adler2` 2.0.1, and `simd-adler32` 0.3.9
 (the `flate2` pure-Rust backend chain), `libc` 0.2.186, and `rand_chacha` 0.9.0.
@@ -1327,8 +1382,8 @@ and are exempted by name; see "Two scopes" below.
 `cargo tree -i rand` fails with `specification 'rand' is ambiguous`, listing both — direct proof that both
 are in the graph. The consequence is that the RUSTSEC-2026-0097 mitigation is expressed **only** against
 the direct 0.9.4 requirement; the transitive 0.10.2 is not governed by any declared floor. This is exactly
-the class of drift a `cargo-deny` / `cargo-audit` gate exists to catch, and it is why the single policy file
-must be authored against the measured graph — standard S6,
+the class of drift a `cargo-deny` / `cargo-audit` gate exists to catch, and it is why each policy file
+must be authored against the graph it actually governs — standard S6,
 [§0.7.2](#072-plan-adopted-engineering-standards).
 
 **One scope, and it is why `deny.toml` carries four `skip` entries rather than three.** All four pairs above
@@ -1338,7 +1393,8 @@ pruned. `r-efi` is therefore in view and is correctly reported as a fourth dupli
 waived by name like the other three. `[bans]` accordingly sets `multiple-versions = "deny"` with
 `multiple-versions-include-dev = true` (the second key is load-bearing: without it every duplication here is
 invisible, because all of them are dev-only) and exempts exactly `rand@0.10.2`, `rand_core@0.10.1`,
-`getrandom@0.4.3`, and `r-efi@6.0.0` by exact version, with `skip-tree = []`.
+`getrandom@0.4.3`, and `r-efi@6.0.0` by exact version, with `skip-tree = []`,
+because a subtree waiver would widen silently as the tree changes.
 
 The empty list replaced a nine-triple one, and that was a coverage fix rather than a refinement. Measured
 with `cargo deny list` over the root graph: `targets = []` governs 89 of 89 packages, the five supported
@@ -1352,10 +1408,14 @@ is the cheaper side of the trade: a package nobody evaluates is not a package no
 Measured with the exact invocation CI runs,
 `cargo deny --locked --config deny.toml -L info check bans -A unused-wrapper -A license-exception-not-encountered`
 -> `bans ok: 0 errors, 0 warnings, 5 notes` (four acknowledged skips plus the `cc` ban's unmatched
-`libfuzzer-sys` wrapper scope). The same one policy aimed at the detached fuzz graph reports
-`bans ok: 0 errors, 0 warnings, 7 notes`; there, `rand` / `rand_core` are absent and `getrandom` / `r-efi`
-appear in one version only, which is the sole reason that invocation adds
-`-A license-not-encountered -A unmatched-skip -A unnecessary-skip`.
+`libfuzzer-sys` wrapper scope). The detached fuzz graph is judged by its own policy, so that invocation
+needs no allowances at all:
+`cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml -L info check bans`
+-> `bans ok: 0 errors, 0 warnings, 1 notes`, the single note being the skipped private workspace crate
+`zlib-rs-fuzz`. Each root entry names the *transitive* copy, so a future bump surfaces as
+`warning[unmatched-skip]` rather than as a silently broadened exemption, and `policy-integrity` in
+`.github/workflows/audit.yml` asserts the skip list as an exact set — four entries for `deny.toml` and none
+for `fuzz/deny.toml` — so a fifth waiver cannot land unreviewed.
 
 **Reproducibility, measured.** `cargo build --offline` and `cargo metadata --offline --locked` both succeed
 once the registry index is warm, and `git status --porcelain Cargo.lock` remains empty afterwards,
@@ -1375,19 +1435,16 @@ exactly `cfg-if` plus optional `crc32fast`. That minimality is the point: a memo
 
 **Tooling.** These are CI-installed tools and policy files, not manifest dependencies:
 
-- `cargo-deny` driven by the single root `deny.toml`, evaluated once over the 89-package root graph and once
-  over the 13 packages of the detached fuzz workspace — and `cargo-audit`, all wired into
+- `cargo-deny` driven by one reviewed policy per graph — `deny.toml` over the 89-package root graph and
+  `fuzz/deny.toml` over the 13 packages of the detached fuzz workspace — and `cargo-audit`, all wired into
   `.github/workflows/audit.yml` — four jobs (`policy-integrity`, `cargo-audit`, `cargo-deny`,
   `cargo-deny-fuzz`) on push, pull request, manual dispatch, and a daily schedule. Two invocations are
-  required, not one, and each carries the allowances its graph shape needs, so both are copy-pasteable as
-  written:
-  `cargo deny --locked --config deny.toml check -A unused-wrapper -A license-exception-not-encountered`
-  reaches the root graph, and
-  `cargo deny --locked --manifest-path fuzz/Cargo.toml --config deny.toml check -A license-not-encountered -A unmatched-skip -A unnecessary-skip`
-  reaches the other 13, so only the pair together governs the 102-package closure. Because one policy spans
-  two graph shapes, each invocation allows exactly the "unused configuration" diagnostics that the other graph
-  enforces — dropping any one of those `-A` flags turns a policy clause the *other* graph needs into a failure
-  here — and both then report `0 errors, 0 warnings`. They also specifically bound the transitive `rand 0.10.2`.
+  required, not one: `cargo deny --locked --config deny.toml check` reaches the root graph and
+  `cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check` reaches the other 13,
+  so only the pair together governs the 102-package closure. Each policy is shaped for the graph it governs,
+  so the fuzz invocation needs no "unused configuration" suppressions at all and the root invocation needs
+  exactly two — for the `cc` wrapper scope and the `NCSA` exception it retains as latent defence in depth —
+  and both report `0 errors, 0 warnings`. They also specifically bound the transitive `rand 0.10.2`.
 - `cargo-fuzz` remains nightly-only and CI-installed. It is not, and must not become, a manifest
   dependency. CI installs it with `--version 0.13.2 --locked` on the date-pinned
   `nightly-2026-08-01` toolchain and asserts the resolved version, so the weekly campaign
@@ -1451,10 +1508,10 @@ consumer who knows how their C zlib was configured can reproduce it exactly. The
 
 The declared default set is `default = ["std", "gzip", "gz-io", "simd"]`.
 
-**Measured feature-matrix outcomes.** Default → 860 tests pass; `--no-default-features` → 634;
-`--all-features` → 873 (the delta is the 13 `c_oracle` tests, which complete in about 21 s). Every
+**Measured feature-matrix outcomes.** Default → 956 tests pass; `--no-default-features` → 695;
+`--all-features` → 969 (the delta is the 13 `c_oracle` tests, which complete in about 21 s). Every
 configuration reports **zero failed and zero ignored**. The CI `build-test` matrix exercises seven rows
-(default, `--all-features`, `std`+`gzip`+`gz-io`, that set plus `simd`, `--no-default-features`
+(default, `--all-features`, `std`+`gzip`+`gz-io`, `std`+`simd`, `--no-default-features`
 library-build-only, plus a native Windows x86_64 row and a native macOS aarch64 row), alongside a dedicated
 blocking `no-std-tests` job that runs `--no-default-features` and `--no-default-features --features no-std`
 in both debug and release.
@@ -1561,15 +1618,15 @@ only lines where the `unsafe` token appears in code:
 
 | Location | Unsafe-construct lines | Nature |
 |----------|------------------------|--------|
-| `src/ffi/inflate.rs` | 309 | `extern "C"` entry points and pointer validation |
-| `src/ffi/deflate.rs` | 236 | `extern "C"` entry points and pointer validation |
-| `src/ffi/util.rs` | 159 | one-call wrappers, checksums, version, compile flags |
-| `src/ffi/gz.rs` | 150 | gzip file API, C strings, descriptors |
-| `src/ffi/types.rs` | 113 | ABI mirrors, hook aliases, handle tagging |
-| `src/ffi/mod.rs` | 101 | wiring plus the ABI-drift guard |
-| `src/ffi/alloc.rs` | 55 | `zcalloc` / `zcfree` bridge |
-| **`src/ffi/**` total** | **1,123** | the designated boundary |
-| `src/lib.rs` | 46 | private libc-backed global allocator over `malloc` / `calloc` / `realloc` / `free` / `posix_memalign`, plus an abort panic handler and the `rust_eh_personality` shim, active only in true non-test no-`std` panic-abort builds |
+| `src/ffi/inflate.rs` | 478 | `extern "C"` entry points and pointer validation |
+| `src/ffi/deflate.rs` | 333 | `extern "C"` entry points and pointer validation |
+| `src/ffi/gz.rs` | 186 | gzip file API, C strings, descriptors |
+| `src/ffi/util.rs` | 184 | one-call wrappers, checksums, version, compile flags |
+| `src/ffi/types.rs` | 148 | ABI mirrors, hook aliases, handle tagging |
+| `src/ffi/mod.rs` | 106 | wiring plus the ABI-drift guard |
+| `src/ffi/alloc.rs` | 62 | `zcalloc` / `zcfree` bridge |
+| **`src/ffi/**` total** | **1,497** | the designated boundary |
+| `src/lib.rs` | 47 | private libc-backed global allocator over `malloc` / `calloc` / `realloc` / `free` / `posix_memalign`, plus an abort panic handler and the `rust_eh_personality` shim, active only in true non-test no-`std` panic-abort builds |
 | `src/stream.rs` | 2 | **type aliases only** — `grep -c "unsafe {" src/stream.rs` returns **0**; there is no executable unsafe block |
 | Core module groups (`src/deflate`, `src/inflate`, `src/checksum`, `src/gz`, `src/util`, `src/error.rs`, `src/constants.rs`, `src/gz_header.rs`) | **0** | the word appears there only in documentation prose |
 
@@ -1586,7 +1643,7 @@ other core module. The correct response to a perceived need for `unsafe` in a co
 **restructure**, exactly as `src/deflate/strategy.rs` did when it replaced C's `compress_func` pointer table
 with a tag enum.
 
-**Documentation discipline.** There are **388** `// SAFETY:` comments in `src/`
+**Documentation discipline.** There are **513** `// SAFETY:` comments in `src/`
 (`grep -rn '// SAFETY:' src | wc -l`), required by `#![warn(clippy::undocumented_unsafe_blocks)]` at the
 crate root together with `#![warn(missing_docs)]`. Both lints are declared at `warn`, and CI's
 `-D warnings` gate promotes them to hard errors; `undocumented_unsafe_blocks` is relaxed to `allow` under
@@ -1606,10 +1663,11 @@ with **exactly two** `#[allow(unsafe_code)]` carve-outs: one on the private `mod
 libc-backed global allocator, the abort panic handler, and the `eh_personality` shim), and one on
 `pub mod ffi` (the C ABI drop-in surface). `deny` is used rather than `forbid` deliberately: `forbid` cannot
 be relaxed by an inner `allow`, which would make the two legitimate carve-outs impossible to express.
-Several core modules additionally re-assert `#![deny(unsafe_code)]` at module scope —
+Seven modules additionally re-assert `#![deny(unsafe_code)]` at module scope — `src/stream.rs`,
 `src/deflate/slow.rs`, `src/deflate/stored.rs`, `src/deflate/trees.rs`, `src/gz/open.rs`,
 `src/gz/write.rs`, and `src/gz/close.rs` — so the containment survives even a mistaken edit to the crate
-root. A dedicated CI job, `unsafe-boundary`, runs the boundary-scanner tests
+root. Enumerate them with `grep -rlE '^\s*#!\[deny\(unsafe_code\)\]' src`, which returns those seven plus
+`src/lib.rs` itself. A dedicated CI job, `unsafe-boundary`, runs the boundary-scanner tests
 (`executable_unsafe_is_confined_to_the_designated_boundary`,
 `unsafe_code_denial_has_exactly_two_scoped_carve_outs`, `boundary_scanner_classifies_tokens_correctly`) and
 separately greps the source to assert that `#![deny(unsafe_code)]` is present and `#![forbid(unsafe_code)]`
@@ -1795,7 +1853,7 @@ variant occupies L1537-L1588 and is deliberately *not* the one ported. The prese
 `chain_length = s->max_chain_length` [L1390]; `nice_match = s->nice_match` [L1395]; chain-length
 **quartering** when `s->prev_length >= s->good_match` — the guard is `deflate.c` L1423 and the reduction
 itself is `chain_length >>= 2;` at L1424, a two-bit shift that divides the remaining chain budget by **four**
-and not by two, reproduced operator-for-operator at [`src/deflate/state.rs` L2010]; the lookahead clamp
+and not by two, reproduced operator-for-operator at [`src/deflate/state.rs` L2349]; the lookahead clamp
 `if ((uInt)nice_match > s->lookahead) nice_match = (int)s->lookahead;` [L1429]; the early break
 `if (len >= nice_match) break;` [L1517]; and the candidate prefilter. For the prefilter the port
 reproduces the **portable** `#else /* UNALIGNED_OK */` branch at `deflate.c` L1482-L1485 —
@@ -1985,7 +2043,7 @@ Verified live through the C ABI: `compressBound(9) = 22`.
 helper, empty-slice seed normalization matching reference zlib, and `adler32_combine` taking `i64` lengths
 and returning `0xffff_ffff` for negative input. CRC-32 uses the reflected polynomial `0xEDB88320`, with
 `build.rs`-generated `CRC_BRAID_N = 5` and `CRC_BRAID_W = 8` tables and **compile-time** endian selection via
-`cfg!(target_endian = "little")` at `src/checksum/crc32.rs:640`. Verified live:
+`cfg!(target_endian = "little")` at `src/checksum/crc32.rs:745`. Verified live:
 `crc32("123456789") = 0xcbf43926`, `adler32("123456789") = 0x091e01de`.
 
 **Endian selection is a compile-time decision, and it is a documented divergence from C.** This is worth
@@ -2004,7 +2062,7 @@ stating precisely because the two possible misreadings point in opposite directi
 The divergence cannot change a checksum, and that is asserted rather than assumed. Each variant is a
 self-consistent algorithm over the same bytes — one loading words little-endian against the reflected
 tables, the other big-endian against the byte-swapped companions — so both return the same CRC for the same
-input. The unit test `both_endian_braids_match_byte_wise` (`src/checksum/crc32.rs:737`) drives `braid_le`
+input. The unit test `both_endian_braids_match_byte_wise` (`src/checksum/crc32.rs:842`) drives `braid_le`
 **and** `braid_be` against the byte-wise reference on whatever target runs the suite, which is also what
 exercises `CRC_BIG_TABLE` and `CRC_BRAID_BIG_TABLE` on a little-endian host where the selected path never
 reaches them. Should a target ever need a genuine run-time probe, the change is local to that one `cfg!`:
@@ -2021,11 +2079,11 @@ grep -n 'target_endian' build.rs
 
 # Exactly one executable selection site in the consumer (the other two hits are doc comments).
 grep -nE '^\s+c = if cfg!\(target_endian' src/checksum/crc32.rs
-#   640:            c = if cfg!(target_endian = "little") {
+#   745:            c = if cfg!(target_endian = "little") {
 
 # The test that exercises the arm this host does not take.
 grep -n 'fn both_endian_braids_match_byte_wise' src/checksum/crc32.rs
-#   737:        fn both_endian_braids_match_byte_wise() {
+#   842:        fn both_endian_braids_match_byte_wise() {
 ```
 
 **Shared internals.** `STORED_BLOCK 0`, `STATIC_TREES 1`, `DYN_TREES 2`, `MIN_MATCH 3`, `MAX_MATCH 258`,
@@ -2076,10 +2134,10 @@ provenance.
 
 | C driver | Size | Rust port | Lines | What carries over |
 |----------|------|-----------|-------|-------------------|
-| `test/example.c` | 15,709 B | `tests/regression.rs` | 733 | The fixed-vector official driver — "a faithful Rust port of `test/example.c`, the reference zlib exerciser shipped with the C library", which "operationalizes the 'official zlib test vectors'" |
+| `test/example.c` | 15,709 B | `tests/regression.rs` | 886 | The fixed-vector official driver — "a faithful Rust port of `test/example.c`, the reference zlib exerciser shipped with the C library", which "operationalizes the 'official zlib test vectors'" |
 | `test/example.c` | — | `tests/round_trip.rs` | 1,116 | The *randomized* half of the same conformance story via `quickcheck` |
-| `test/infcover.c` | 24,738 B | `tests/inflate_coverage.rs` | 3,425 | The exhaustive malformed-stream decoder coverage table |
-| `test/minigzip.c` | 15,486 B | `tests/gzip_compat.rs` | 1,732 | The library-exercising behavior of the C reference gzip client |
+| `test/infcover.c` | 24,738 B | `tests/inflate_coverage.rs` | 3,474 | The exhaustive malformed-stream decoder coverage table |
+| `test/minigzip.c` | 15,486 B | `tests/gzip_compat.rs` | 2,089 | The library-exercising behavior of the C reference gzip client |
 | `adler32.c` + `crc32.c` | — | `tests/checksum.rs` | 754 | Known-answer vectors plus `*_combine` parity |
 | Reference C encoder | — | `tests/interop.rs` | 6,287 | The two-tier gate below |
 | Reference C encoder, live | — | `tests/c_oracle.rs` | 3,548 | The opt-in live sweep |
@@ -2135,13 +2193,19 @@ be lost.
 
 | Configuration | Total | Unit | Integration | Doctests | Failed | Ignored |
 |---------------|-------|------|-------------|----------|--------|---------|
-| default | **860** | 705 | 128 (checksum 23, gzip_compat 15, inflate_coverage 29, interop 30, regression 12, round_trip 19) | 27 | 0 | 0 |
-| `--no-default-features` | **634** | 512 | 97 (checksum 23, gzip_compat 0, inflate_coverage 28, interop 19, regression 10, round_trip 17) | 25 | 0 | 0 |
-| `--all-features` | **873** | 705 | 141 (the above plus c_oracle 13) | 27 | 0 | 0 |
+| default | **956** | 797 | 130 (checksum 23, gzip_compat 17, inflate_coverage 29, interop 30, regression 12, round_trip 19) | 29 | 0 | 0 |
+| `--no-default-features` | **695** | 571 | 97 (checksum 23, gzip_compat 0, inflate_coverage 28, interop 19, regression 10, round_trip 17) | 27 | 0 | 0 |
+| `--all-features` | **969** | 797 | 143 (the above plus c_oracle 13) | 29 | 0 | 0 |
 
-Five `cargo-fuzz` targets are declared, and the engagement's recorded baseline reports roughly 1.13 M
-accumulated executions with 0 crashes — a *cumulative* total that no single command reproduces and that was
-**not re-derived here**. What is durable rather than snapshot is the mechanism:
+Five `cargo-fuzz` targets are declared. A campaign replicating `fuzz.yml`'s exact invocation — writable
+corpus first, read-only `fuzz/seeds/**` second, on the workflow's pinned `nightly-2026-08-01` with
+`cargo-fuzz` 0.13.2 at the pull-request budget of 120 s per target — was **executed against this revision**
+and completed **1,674,289 executions with 0 crashes and 0 crash artifacts** (`fuzz_inflate` 912,404 ·
+`fuzz_gzip` 318,608 · `fuzz_deflate_roundtrip` 226,262 · `fuzz_ffi_roundtrip` 134,558 · `fuzz_checksum`
+82,457). That figure is a *single-campaign* total at a stated budget, not a cumulative lifetime count, and
+it moves with the budget and the corpus; an earlier recorded baseline's "roughly 1.13 M accumulated
+executions" is a **historical datum** that no single command reproduces. What is durable rather than
+snapshot is the mechanism:
 `.github/workflows/fuzz.yml` keeps a per-target cached corpus so coverage accumulates across runs instead of
 restarting each week.
 
@@ -2234,77 +2298,79 @@ cites() { grep -ohE '§0(\.[0-9]+)+' "$@"; }
 # `cites` is a shell function, so it must be given the file list as arguments;
 # `... | xargs cites` would try to exec a binary named `cites` and find none.
 echo "population scanned      : $(aap_population | wc -l)"                                   # 65
-echo "files containing a cite : $(aap_population | xargs grep -lE '§0(\.[0-9]+)+' | wc -l)"   # 40
-echo "total citations         : $(cites $(aap_population) | wc -l)"                           # 452
-echo "distinct as written     : $(cites $(aap_population) | sort -u | wc -l)"                 # 22
-echo "distinct normalised     : $(cites $(aap_population) | cut -d. -f1-3 | sort -u | wc -l)" # 20
+echo "files containing a cite : $(aap_population | xargs grep -lE '§0(\.[0-9]+)+' | wc -l)"   # 42
+echo "total citations         : $(cites $(aap_population) | wc -l)"                           # 548
+echo "distinct as written     : $(cites $(aap_population) | sort -u | wc -l)"                 # 23
+echo "distinct normalised     : $(cites $(aap_population) | cut -d. -f1-3 | sort -u | wc -l)" # 21
 ```
 
 Note that `grep -c` would answer a *different* question — matching lines, not matches — and undercounts
-`src/stream.rs` as 56 rather than 68. Per-file totals therefore use `cites "$f" | wc -l`.
+`src/stream.rs` as 67 rather than 85. Per-file totals therefore use `cites "$f" | wc -l`.
 
-**Measured population.** 65 tracked files scanned; **40** contain at least one citation; **452** citations
-total; **22** distinct citation strings as written, which normalise to **20** distinct top-level anchors once
+**Measured population.** 65 tracked files scanned; **42** contain at least one citation; **548** citations
+total; **23** distinct citation strings as written, which normalise to **21** distinct top-level anchors once
 `§0.4.1.8` and `§0.4.1.12` are folded into their `§0.4.1` parent. Both figures are correct answers to
 different questions, and the earlier flat claim of "19 anchors" was the normalised count as it then
 stood, stated without saying so.
 
 | Scope | Files with a citation | Citations |
 |-------|----------------------:|----------:|
-| `CODE` | 35 | 439 |
+| `CODE` | 36 | 531 |
 | `MANIFEST` | 1 | 2 |
-| `DOCS` | 4 | 11 |
-| **Total** | **40** | **452** |
+| `DOCS` | 5 | 15 |
+| **Total** | **42** | **548** |
 
-**Every cited anchor resolves.** All 22 strings, in document order, with citation counts and the heading
+**Every cited anchor resolves.** All 23 strings, in document order, with citation counts and the heading
 each reaches — so the acceptance set can be verified rather than trusted:
 
 | Anchor | Cites | Resolves to |
 |--------|------:|-------------|
 | `§0.2.2` | 1 | ### 0.2.2 Explicitly Out of Scope |
-| `§0.3.1` | 13 | ### 0.3.1 Refactored Structure Planning |
-| `§0.3.2` | 15 | ### 0.3.2 Design Pattern Applications |
+| `§0.3.1` | 38 | ### 0.3.1 Refactored Structure Planning |
+| `§0.3.2` | 16 | ### 0.3.2 Design Pattern Applications |
 | `§0.4.1` | 2 | ### 0.4.1 File-by-File Transformation Plan |
 | `§0.4.1.8` | 1 | #### 0.4.1.8 Verification layer |
 | `§0.4.1.12` | 2 | #### 0.4.1.12 Retained C baseline (REFERENCE only, never modified) |
+| `§0.4.2` | 24 | ### 0.4.2 Cross-File Dependencies |
 | `§0.5.1` | 2 | ### 0.5.1 Key Packages |
 | `§0.5.2` | 9 | ### 0.5.2 Dependency Updates |
 | `§0.5.3` | 3 | ### 0.5.3 Feature Flags |
 | `§0.6.1` | 4 | ### 0.6.1 State Machine Translation |
-| `§0.6.2` | 42 | ### 0.6.2 Unsafe Code Boundary |
-| `§0.6.3` | 82 | ### 0.6.3 Memory Ownership Model |
-| `§0.6.4` | 42 | ### 0.6.4 Bit-Exact Wire Format |
-| `§0.6.5` | 116 | ### 0.6.5 Allocation Sites and Failure Timing |
+| `§0.6.2` | 49 | ### 0.6.2 Unsafe Code Boundary |
+| `§0.6.3` | 91 | ### 0.6.3 Memory Ownership Model |
+| `§0.6.4` | 43 | ### 0.6.4 Bit-Exact Wire Format |
+| `§0.6.5` | 134 | ### 0.6.5 Allocation Sites and Failure Timing |
 | `§0.6.6` | 10 | ### 0.6.6 Numeric-Constant Correctness |
-| `§0.6.7` | 5 | ### 0.6.7 Official Test-Vector Conformance |
+| `§0.6.7` | 7 | ### 0.6.7 Official Test-Vector Conformance |
 | `§0.7.2` | 31 | ### 0.7.2 Plan-Adopted Engineering Standards |
-| `§0.8.1` | 40 | ### 0.8.1 Preservation and Byte-Identity Directives |
-| `§0.8.2` | 21 | ### 0.8.2 Documented Divergences to Preserve |
+| `§0.8.1` | 48 | ### 0.8.1 Preservation and Byte-Identity Directives |
+| `§0.8.2` | 22 | ### 0.8.2 Documented Divergences to Preserve |
 | `§0.8.3` | 5 | ### 0.8.3 Performance Expectations |
 | `§0.10.1` | 5 | ### 0.10.1 Authoritative D1–D12 Register |
 | `§0.10.3` | 1 | ### 0.10.3 Document Conventions |
 
-The heaviest-citing files are `src/stream.rs` (68), `src/deflate/state.rs` (40), `tests/c_oracle.rs` (38),
-`src/inflate/mod.rs` (30), and `src/ffi/types.rs` (27).
+The heaviest-citing files are `src/stream.rs` (85), `src/deflate/state.rs` (44), `tests/c_oracle.rs` (38),
+`src/inflate/mod.rs` (37), and `src/lib.rs` (31).
 
-**Citations from outside `src/` and `tests/`: 8 files, 35 citations, 12 distinct anchors.** An earlier
+**Citations from outside `src/` and `tests/`: 9 files, 39 citations, 13 distinct anchors.** An earlier
 revision of this section said "three anchors", which was wrong by a factor of four; the itemised table
 replaces the summary so the claim is checkable:
 
 | File | Cites | Anchors cited |
 |------|------:|---------------|
 | `build.rs` | 17 | `§0.3.1` `§0.4.1.12` `§0.5.2` `§0.6.2` `§0.8.2` `§0.10.1` |
-| `doc/project-guide.md` | 6 | `§0.8.1` `§0.8.2` `§0.8.3` `§0.10.3` |
+| `doc/project-guide.md` | 7 | `§0.6.2` `§0.8.1` `§0.8.2` `§0.8.3` `§0.10.3` |
 | `README.md` | 3 | `§0.5.2` `§0.7.2` `§0.8.2` |
+| `CONTRIBUTING.md` | 3 | `§0.6.2` `§0.6.7` `§0.8.1` |
 | `fuzz/fuzz_targets/fuzz_ffi_roundtrip.rs` | 3 | `§0.6.5` `§0.8.1` |
 | `Cargo.toml` | 2 | `§0.3.1` `§0.4.1` |
 | `fuzz/fuzz_targets/fuzz_gzip.rs` | 2 | `§0.7.2` `§0.8.1` |
 | `CHANGELOG.md` | 1 | `§0.8.2` |
-| `CONTRIBUTING.md` | 1 | `§0.6.2` |
-| **Total** | **35** | **12 distinct** |
+| `SECURITY.md` | 1 | `§0.6.7` |
+| **Total** | **39** | **13 distinct** |
 
-`SECURITY.md`, `doc/index.md`, `docs/index.md`, all three `benches/*.rs`, `fuzz/Cargo.toml`, and the other
-three fuzz targets cite no anchor at all, which is why 8 rather than 18 files appear above. Reproduce with
+`doc/index.md`, `docs/index.md`, all three `benches/*.rs`, `fuzz/Cargo.toml`, and the other three fuzz
+targets cite no anchor at all, which is why 9 rather than 18 files appear above. Reproduce with
 the `aap_population` and `cites` helpers defined in the census script above, still in scope in the same
 shell:
 
@@ -2320,19 +2386,19 @@ for it, for the reason given above.
 **Reconciliation against the AAP-frozen acceptance set.** The plan froze **17** anchors on the grounds that
 the numbering had to keep every in-tree citation valid: `§0.2.2`, `§0.3.1`, `§0.3.2`, `§0.4.1`, `§0.5.1`,
 `§0.5.2`, `§0.6.1`, `§0.6.2`, `§0.6.3`, `§0.6.4`, `§0.6.5`, `§0.6.6`, `§0.6.7`, `§0.7.1`, `§0.7.2`, `§0.8.1`,
-`§0.8.3`. Set arithmetic against the 22 measured strings closes exactly:
+`§0.8.3`. Set arithmetic against the 23 measured strings closes exactly:
 
 | Class | Count | Anchors |
 |-------|------:|---------|
 | **Kept** — frozen and still cited, resolving to a real heading | 16 | `§0.2.2` `§0.3.1` `§0.3.2` `§0.4.1` `§0.5.1` `§0.5.2` `§0.6.1` `§0.6.2` `§0.6.3` `§0.6.4` `§0.6.5` `§0.6.6` `§0.6.7` `§0.7.2` `§0.8.1` `§0.8.3` |
 | **Redirected** — frozen, no longer cited anywhere; the heading still exists, but its former semantics moved | 1 | `§0.7.1` (see the redirect table below) |
-| **Added** — cited today, absent from the frozen 17; all resolve | 6 | `§0.4.1.8` `§0.4.1.12` `§0.5.3` `§0.8.2` `§0.10.1` `§0.10.3` |
+| **Added** — cited today, absent from the frozen 17; all resolve | 7 | `§0.4.1.8` `§0.4.1.12` `§0.4.2` `§0.5.3` `§0.8.2` `§0.10.1` `§0.10.3` |
 
-16 + 1 = 17 frozen, and 16 + 6 = 22 measured. Both identities hold, which is the check that the acceptance
+16 + 1 = 17 frozen, and 16 + 7 = 23 measured. Both identities hold, which is the check that the acceptance
 set is fully accounted for rather than approximately matched.
 
 An earlier recorded baseline of this document worked from a smaller census of 111 citations across 23 files.
-The growth to 452 across 40 is not drift: it is the fuzz targets, `tests/c_oracle.rs`, and the expanded
+The growth to 548 across 42 is not drift: it is the fuzz targets, `tests/c_oracle.rs`, and the expanded
 module documentation entering the tree, each carrying its own provenance citations.
 
 **§0.7.1 itself is no longer cited.** At one point ten source sites pointed at this section, and those ten
@@ -2390,13 +2456,13 @@ the measured value is published and the earlier one is labelled a historical dat
 quietly dropped.
 
 **S2 — Unsafe containment by construction, not by convention.** `unsafe` is confined to `src/ffi/**`
-(1,123 construct lines) and the private no-`std` runtime block of `src/lib.rs` (46 lines file-wide under the
+(1,497 construct lines) and the private no-`std` runtime block of `src/lib.rs` (47 lines file-wide under the
 canonical scan, of which the runtime block itself holds 22 and the boundary tests that police it hold the
 rest). The eight core module
 groups measure **zero**. Enforcement is a hard compile error: `#![deny(unsafe_code)]` at the crate root with
-exactly two `#[allow(unsafe_code)]` carve-outs, several core modules re-asserting the denial at module
+exactly two `#[allow(unsafe_code)]` carve-outs, seven modules re-asserting the denial at module
 scope, a dedicated `unsafe-boundary` CI job, and `-D warnings` promoting
-`#![warn(clippy::undocumented_unsafe_blocks)]` and `#![warn(missing_docs)]` to errors. All 388
+`#![warn(clippy::undocumented_unsafe_blocks)]` and `#![warn(missing_docs)]` to errors. All 513
 `// SAFETY:` comments remain mandatory. Details in [§0.6.2](#062-unsafe-code-boundary).
 
 **S3 — Bit-exactness is a release gate, not an aspiration.** The tier-1 baked-oracle vectors in
@@ -2531,8 +2597,8 @@ versioned init entry points (`deflateInit_`, `deflateInit2_`, `inflateInit_`, `i
 to report `"1.3.2.1-motley"` with `ZLIB_VERNUM 0x1321`. The reconciliation that proves it is in
 [§0.6.2](#062-unsafe-code-boundary).
 
-**D-5 — Test coverage is preserved and only ever increased.** The measured totals are 860 by default, 634
-under `--no-default-features`, and 873 under `--all-features`, with **zero failed and zero ignored** in
+**D-5 — Test coverage is preserved and only ever increased.** The measured totals are 956 by default, 695
+under `--no-default-features`, and 969 under `--all-features`, with **zero failed and zero ignored** in
 every configuration. No test may be removed, weakened, or `#[ignore]`d to accommodate a change. The four
 official-driver ports (`tests/regression.rs`, `tests/round_trip.rs`, `tests/inflate_coverage.rs`,
 `tests/gzip_compat.rs`) are the operationalization of Constraint 4 and are load-bearing.
@@ -2565,7 +2631,7 @@ empty `diff` across the full output. The same 3,750-combination grid is reproduc
 
 ### 0.8.2 Documented Divergences to Preserve
 
-Five divergences from a literal C port exist. Each is deliberate, each is documented, and each must be
+Six divergences from a literal C port exist. Each is deliberate, each is documented, and each must be
 **kept** rather than "fixed" — a well-meaning attempt to close any of them would either require a nightly
 compiler, break byte-identity, or bloat the published crate.
 
@@ -2611,7 +2677,21 @@ carries linker-portability risk best exercised through the platform matrix — g
 and silently swallowing a write failure during unwinding would be worse than matching C's explicit-close
 contract. This must not be "improved" into an auto-finishing destructor.
 
-**The boundary of this list.** Divergences 1–5 are exactly those a **C caller can observe**. The port also departs from C internally in ways that are **invisible at the C ABI**, and those are deliberately kept out of this register because each is strictly stricter or strictly safer than C while leaving the return-code set, the `#[repr(C)]` layouts, and the emitted bytes untouched: `deflateSetHeader` deep-copies the caller's `gz_header` instead of retaining its pointer — a stricter lifetime contract whose added allocation step is still reported through C's exact `{Z_OK, Z_STREAM_ERROR}` return set, never as `Z_MEM_ERROR`, because a shim may not invent a return code its C original cannot produce; `HandleKind` / `HandleHeader` turn C's undefined cross-engine `End` call into a defined `Z_STREAM_ERROR`; indexing is bounds-checked, so a path that would corrupt memory in C aborts instead; and allocation is fallible with no global fallback, which states C's `ZALLOC` contract precisely. Moving any item from that class into this one is a breaking change to the drop-in contract and must be recorded as one.
+**Divergence 6 — a gzip destination that accepts nothing is reported as a *retryable* `Z_ERRNO` rather than
+retried forever.** C's inner drain loop
+`while (strm->next_out > state->x.next) { writ = write(...); ... state->x.next += writ; }`
+(`gzwrite.c` L119-L124) treats `writ == 0` as progress of zero and iterates again, with no exit condition —
+an unbounded spin inside the library (CWE-835). Both Rust output loops (`drain_pending` and `write_direct` in
+`src/gz/write.rs`) report the condition instead. Everything else about C's behaviour is preserved by marking
+it retryable: `GzState::again` is set, so the output cursor and the buffered input are both retained, the
+stream is not declared dead, `write_ready` still admits a retry, and `gzwrite` returns its true partial count
+rather than `0`. A caller that retries therefore drives exactly the outcome C's endless retry would have
+reached. POSIX permits `write(2)` to return `0` only for a zero-length request and neither loop ever issues
+one, so the arm is as unreachable in practice as C's spin — which is why it is recorded here as a divergence
+rather than treated as a behaviour change. This entry is the formal amendment the alternative to "preserve C
+behaviour" requires.
+
+**The boundary of this list.** Divergences 1–6 are exactly those a **C caller can observe**. The port also departs from C internally in ways that are **invisible at the C ABI**, and those are deliberately kept out of this register because each is strictly stricter or strictly safer than C while leaving the return-code set, the `#[repr(C)]` layouts, and the emitted bytes untouched: `HandleKind` / `HandleHeader` turn C's undefined cross-engine `End` call into a defined `Z_STREAM_ERROR`; indexing is bounds-checked, so a path that would corrupt memory in C aborts instead; and allocation is fallible with no global fallback, which states C's `ZALLOC` contract precisely. Moving any item from that class into this one is a breaking change to the drop-in contract and must be recorded as one.
 
 ### 0.8.3 Performance Expectations
 
@@ -2645,9 +2725,9 @@ match finder does the most fruitless work". A per-profile comparison against a r
 
 | Deflate input profile (level 6) | Absolute Rust throughput — **measured here** | Recorded ratio vs. C |
 |-----------------------|--------------------------|----------------------|
-| `incompressible` (high-entropy) | **≈ 35 MiB/s** (1.777 ms/case) — **slowest by ≈ 5.6×** | ≈ **82–86%** — the *closest* to C |
-| `text` | ≈ 197 MiB/s (317 µs/case) | ≈ **58–64%** — the *furthest* from C |
-| `repetitive` | ≈ 201 MiB/s (311 µs/case) | ≈ **58–64%** — the *furthest* from C |
+| `incompressible` (high-entropy) | **≈ 35 MiB/s** (1.774 ms/case) — **slowest by ≈ 4.7×–5.5×** | ≈ **82–86%** — the *closest* to C |
+| `text` | ≈ 166 MiB/s (377 µs/case) | ≈ **58–64%** — the *furthest* from C |
+| `repetitive` | ≈ 194 MiB/s (322 µs/case) | ≈ **58–64%** — the *furthest* from C |
 
 The absolute column is reproducible in-repository and was re-derived for this revision — it needs no C
 comparator, because it is a Rust-only measurement:
@@ -2721,7 +2801,7 @@ single phase defined in [§0.4.4](#044-one-phase-execution).
 | Security and supply-chain audit (**D1** `deny.toml`, **D2** `audit.yml`) | High | 8 | **Artifacts in place**; the residual is keeping the policy authored against the measured graph, including the coexisting `rand` 0.9.4 / 0.10.2 majors |
 | Cross-platform CI coverage (**D3**) | Medium | 6 | **Largely satisfied** — native Windows and macOS rows plus `aarch64` / `i686` / big-endian `s390x` cross type-checks. Residual: *runtime* execution on a big-endian machine |
 | Broader byte-identity conformance matrix | Medium | 4 | **Empirically satisfied** by the 3,750-combination sweep; **D9** makes it reproducible in-repository as `tests/c_oracle.rs` |
-| Real-hardware `no_std` validation (**D10**) | Medium | 5 | **Partially satisfied** — a `thumbv7em-none-eabihf` build gate exists and asserts the freestanding runtime block is compiled in. Residual: execution on real hardware. 634 passing hosted tests do not prove an embedded target |
+| Real-hardware `no_std` validation (**D10**) | Medium | 5 | **Partially satisfied** — a `thumbv7em-none-eabihf` build gate exists and asserts the freestanding runtime block is compiled in. Residual: execution on real hardware. 695 passing hosted tests do not prove an embedded target |
 | Scheduled / CI-integrated fuzzing | Medium | 3 | **Satisfied** — weekly cron, a pull-request/scheduled budget split, and per-target corpus caching. Residual: duration tuning |
 | `crates.io` release governance (**D5**, **D12**) | Medium | 3 | **Partially satisfied** — `CHANGELOG.md` exists and the `package-verify` job enforces the `exclude` contract and packages the crate. Residual: an actual publish flow |
 | Incompressible-input deflate performance tuning | Low | 6 | **Outstanding** — gated behind the byte-identity rule above. The item keeps its AAP name, which identifies the slowest *absolute* profile; the C-relative headroom, however, sits on the **compressible** profiles (≈ 58% – 64%), while incompressible input is both the closest to C (≈ 82% – 86%) and the slowest in absolute terms — so `deflate_incompressible_guard` is the regression guard rather than the objective |
@@ -2784,8 +2864,8 @@ bullets, and the four Constraints. Reproduced verbatim where quoted — see
 | `gzlib.c`, `gzread.c`, `gzwrite.c`, `gzclose.c`, `gzguts.h` | The gzip file API |
 | `test/example.c`, `test/infcover.c`, `test/minigzip.c` | The official test vectors, ported to the drivers named in [§0.6.7](#067-official-test-vector-conformance) |
 
-**Rust migration artifacts**, inventoried and cited: the 40 files under `src/` totalling 58,836 lines; the
-7 integration drivers (17,595 lines); the 3 benches (806 lines); the 5 fuzz targets (8,512 lines);
+**Rust migration artifacts**, inventoried and cited: the 40 files under `src/` totalling 71,795 lines; the
+7 integration drivers (18,154 lines); the 3 benches (806 lines); the 5 fuzz targets (8,537 lines);
 `Cargo.toml`, `Cargo.lock`, `fuzz/Cargo.toml`, `fuzz/Cargo.lock`, and `build.rs`. The per-file breakdown
 behind the `src/` figure is in [§0.3.1](#031-refactored-structure-planning), which is the single
 authoritative place for it; this list quotes the totals only.
@@ -2833,14 +2913,18 @@ mis-transcription. Ten of the twelve are closed outright, one (D10) is partial, 
 in the narrow sense that the file now exists — it is an inert placeholder that configures nothing, which the
 row below states explicitly rather than letting "CLOSED" imply working wiring.
 
+Line counts in the **Measured status today** column were taken with `wc -l` on 2026-08-03. They are
+inventory detail, not contracts — what the row asserts is that the artifact *exists and does its job*, so
+re-measure a count rather than treating a transcribed one as authoritative.
+
 | ID | Artifact | As first recorded | Measured status today | Severity |
 |----|----------|-------------------|-----------------------|----------|
-| D1 | `deny.toml` — `cargo-deny` policy (licenses / advisories / bans / sources) over the 102-package closure | absent | **CLOSED** — present, 930 lines | High |
-| D2 | A supply-chain workflow running `cargo-audit` / `cargo-deny` | absent; no CI job ran either | **CLOSED** — `.github/workflows/audit.yml`, 1,466 lines, 4 jobs (`policy-integrity`, `cargo-audit`, `cargo-deny`, `cargo-deny-fuzz`), daily schedule plus push / pull-request / manual dispatch | High |
+| D1 | `deny.toml` — `cargo-deny` policy (licenses / advisories / bans / sources) over the 102-package closure | absent | **CLOSED** — present as two reviewed policies, one per graph: `deny.toml` (925 lines) over the 89 root packages and `fuzz/deny.toml` (478 lines) over the 13 fuzz-only packages | High |
+| D2 | A supply-chain workflow running `cargo-audit` / `cargo-deny` | absent; no CI job ran either | **CLOSED** — `.github/workflows/audit.yml`, 1,678 lines, 4 jobs (`policy-integrity`, `cargo-audit`, `cargo-deny`, `cargo-deny-fuzz`), daily schedule plus push / pull-request / manual dispatch | High |
 | D3 | Cross-platform CI matrix rows — the matrix varied **features only**, with `runs-on: ubuntu-latest` everywhere | absent | **CLOSED, with a residual** — `build-test` carries native `windows-latest` x86_64 and `macos-latest` aarch64 rows; `cross-targets` type-checks `aarch64` / `i686` / big-endian `s390x`; `build-script-tests` type-checks the big-endian braid selection. Residual: those cross rows are compile-verified, not runtime-verified | Medium |
-| D4 | `rust-toolchain.toml` — pin the toolchain so contributor builds do not float | absent | **CLOSED** — present, 285 lines, `channel = "1.85.0"` with `rustfmt` and `clippy`, `profile = "minimal"` | Medium |
-| D5 | `CHANGELOG.md` — the Rust crate had no release history of its own | absent | **CLOSED** — present, 593 lines | Medium |
-| D6 | `SECURITY.md` and `CONTRIBUTING.md` | both absent | **CLOSED** — `SECURITY.md` present (709 lines); `CONTRIBUTING.md` present (1,589 lines), covering the contribution workflow, the blocking quality gates, the MSRV policy, and the seven byte-identity-risk files | Medium |
+| D4 | `rust-toolchain.toml` — pin the toolchain so contributor builds do not float | absent | **CLOSED** — present, 291 lines, `channel = "1.85.0"` with `rustfmt` and `clippy`, `profile = "minimal"` | Medium |
+| D5 | `CHANGELOG.md` — the Rust crate had no release history of its own | absent | **CLOSED** — present, 631 lines | Medium |
+| D6 | `SECURITY.md` and `CONTRIBUTING.md` | both absent | **CLOSED** — `SECURITY.md` present (744 lines); `CONTRIBUTING.md` present (1,662 lines), covering the contribution workflow, the blocking quality gates, the MSRV policy, and the seven byte-identity-risk files | Medium |
 | D7 | `.cargo/config.toml` — no home for target rustflags or link arguments | absent | **CLOSED** — present, 305 lines | Low |
 | D8 | cdylib symbol-version wiring — `zlib.map` authoritative but consumed by no Rust build step | absent | **CLOSED as an opt-in** — `build.rs` emits `cargo:rustc-cdylib-link-arg` under `ZLIB_RS_VERSION_SCRIPT`; measured 54 tagged symbols and 16 version definitions when enabled, 0 tags when not, 95 `T` symbols either way | Low |
 | D9 | Automated C-oracle conformance harness — the 3,750-combination sweep was not reproducible in-repository | absent; no `[[test]]`, no `c-oracle` feature | **CLOSED** — `tests/c_oracle.rs` (3,548 lines) plus the `c-oracle` feature and `[[test]] name = "c_oracle"` with `required-features`; 13 tests, exact 3,750-combination grid, no mandatory build-dependency | Medium |
@@ -2862,7 +2946,7 @@ row below states explicitly rather than letting "CLOSED" imply working wiring.
 **The twelve CI jobs**, for reference, since several gap statuses above depend on them:
 `build-test` (7 matrix rows across three operating systems, each asserting its own `rustc -vV` host triple,
 `runner.arch`, and a per-row test-count floor with zero failed and zero ignored), `no-std-tests` (four
-invocations, each at a 634-test floor),
+invocations, each reading the single job-scoped `STD_OFF_FLOOR`),
 `lint` (`cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`,
 and an anchored scan rejecting any real `#[ignore]` attribute),
 `docs` (`RUSTDOCFLAGS: -D warnings` over `cargo doc --locked --no-deps --all-features`, plus
@@ -2873,8 +2957,8 @@ and an anchored scan rejecting any real `#[ignore]` attribute),
 `bare-metal-no-std`, and `package-verify` (17 must-ship patterns, then the unpacked archive runs its own
 suite). Every dependency-resolving command in the workflow passes `--locked`, every job carries a
 `timeout-minutes`, the workflow declares `permissions: contents: read` and a `concurrency` group with
-`cancel-in-progress`, and all 41 external action references are pinned to full commit SHAs with
-`persist-credentials: false` on every checkout.
+`cancel-in-progress`, and all 26 external action references in this workflow — 41 across all three
+workflows — are pinned to full commit SHAs with `persist-credentials: false` on every checkout.
 
 ### 0.10.2 Corrections to Later Cross-References
 

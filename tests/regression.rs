@@ -584,28 +584,145 @@ fn safe_component(raw: &str) -> String {
     }
 }
 
-/// Builds a unique temporary `.gz` path. Uniqueness combines the process id, an
-/// optional `CLONE_INDEX` (set for parallel clones), and a high-resolution
-/// timestamp so that concurrent test runs on the shared host never collide.
+/// Creates `path` as a new, owner-private directory, failing if anything already
+/// occupies the name.
 ///
-/// Both the caller's `tag` and the ambient `CLONE_INDEX` pass through
-/// [`safe_component`], so the returned path is always exactly one level below the
-/// system temporary directory and can never traverse out of it.
+/// Non-recursive by construction: unlike [`std::fs::create_dir_all`] this reports
+/// [`AlreadyExists`] when the name is taken — including when it is taken by a
+/// symlink someone else planted — which is what lets [`TempGz::new`] skip to the
+/// next candidate rather than following the link or deleting it. On Unix the
+/// `0o700` mode is handed to `mkdir(2)` itself, so the directory is never even
+/// briefly group- or world-accessible and there is no `set_permissions` window to
+/// race. On other platforms the mode is the platform default and this function
+/// asserts no privacy property.
+///
+/// [`AlreadyExists`]: std::io::ErrorKind::AlreadyExists
 #[cfg(feature = "gz-io")]
-fn unique_temp_path(tag: &str) -> std::path::PathBuf {
-    use std::time::{SystemTime, UNIX_EPOCH};
+fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    // Explicit even though it is the default: this single flag is what makes the
+    // call one `mkdir(2)` — an atomic create-or-fail — and it must never be
+    // relaxed to `recursive(true)`.
+    builder.recursive(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
 
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let clone = safe_component(&std::env::var("CLONE_INDEX").unwrap_or_default());
-    let tag = safe_component(tag);
-    let name = format!("zlibrs_{tag}_{}_{clone}_{nanos}.gz", std::process::id());
-    std::env::temp_dir().join(name)
+/// A temporary `.gz` fixture inside its own exclusively created private
+/// directory, both removed when the guard drops.
+///
+/// # Why the path alone was not enough
+///
+/// The previous helper returned a bare
+/// `temp_dir()/zlibrs_<tag>_<pid>_<clone>_<nanos>.gz`. Every component of that name
+/// is public information, and [`test_gzio`] then handed it to `gzopen(&path, "wb")`
+/// — which resolves it with `O_CREAT | O_TRUNC` and *without* `O_EXCL*, following a
+/// final-component symlink. A link planted at the predicted name therefore
+/// redirected the whole gzip member to a target of the planter's choosing and
+/// truncated it first (CWE-377 insecure temporary file, CWE-59 link following). A
+/// timestamp makes a collision unlikely, but *unlikely* is not a security property
+/// when the name is guessable and the system temporary directory is world-writable.
+/// The trailing best-effort `remove_file` did not close the hole either: a failing
+/// assertion unwinds straight past it, leaving the name for the next run.
+///
+/// # What replaces it
+///
+/// Uniqueness and exclusivity move onto a **directory** created by
+/// [`create_private_dir`]: one atomic `mkdir(2)`, owner-only on Unix from the
+/// instant it exists, which reports [`AlreadyExists`] instead of adopting an
+/// occupied name. An occupied candidate is *skipped, never deleted*, so a planted
+/// symlink is neither followed nor destroyed. The fixture name inside that
+/// directory may then be plain, because the directory did not exist a moment
+/// earlier. [`Drop`] removes the directory and its contents, on the unwinding path
+/// as well as the happy one.
+///
+/// These are properties of the moment of creation. The guard holds a path rather
+/// than an open handle, so it makes no claim that the path still resolves to the
+/// same object later.
+///
+/// [`AlreadyExists`]: std::io::ErrorKind::AlreadyExists
+#[cfg(feature = "gz-io")]
+struct TempGz {
+    /// The private directory. The only constructor is [`TempGz::new`], which
+    /// returns solely after [`create_private_dir`] created this exact path, so a
+    /// `TempGz` never names a directory it did not itself bring into existence —
+    /// which is the premise the recursive delete in [`Drop`] rests on.
+    dir: std::path::PathBuf,
+    /// The fixture inside [`Self::dir`].
+    path: std::path::PathBuf,
+}
+
+#[cfg(feature = "gz-io")]
+impl TempGz {
+    /// Creates a fresh private directory tagged with `tag` and names a `.gz`
+    /// fixture inside it.
+    ///
+    /// Both the caller's `tag` and the ambient `CLONE_INDEX` pass through
+    /// [`safe_component`], so the directory is always exactly one level below the
+    /// system temporary directory and can never traverse out of it. The process id,
+    /// a nanosecond timestamp and the attempt ordinal keep it distinct across
+    /// parallel test threads, concurrent `cargo test` invocations, and sibling
+    /// clones of this repository sharing one `/tmp`.
+    ///
+    /// # Panics
+    ///
+    /// If no unused name can be created in 64 attempts, or if `mkdir(2)` fails for
+    /// any reason other than the name being taken. A collision is retried, never
+    /// reported, and nothing pre-existing is ever removed.
+    fn new(tag: &str) -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let clone = safe_component(&std::env::var("CLONE_INDEX").unwrap_or_default());
+        let tag = safe_component(tag);
+        let pid = std::process::id();
+        let base = std::env::temp_dir();
+
+        for attempt in 0..64u32 {
+            let dir = base.join(format!(
+                "blitzy_adhoc_test_zlibrs_{tag}_{pid}_{clone}_{nanos}_{attempt}"
+            ));
+            match create_private_dir(&dir) {
+                Ok(()) => {
+                    let path = dir.join("fixture.gz");
+                    return Self { dir, path };
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("create private temp dir {}: {e}", dir.display()),
+            }
+        }
+        panic!("no private temp directory available after 64 attempts");
+    }
+
+    /// The private directory itself.
+    fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
+    /// The fixture path inside the private directory.
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+#[cfg(feature = "gz-io")]
+impl Drop for TempGz {
+    fn drop(&mut self) {
+        // Best effort on every route out, including an unwinding one: failing to
+        // clean up must never mask the failure that triggered the unwind.
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 /// The sanitizer must collapse every traversal and separator form so that
-/// [`unique_temp_path`] stays exactly one level below the temporary directory.
+/// [`TempGz`]'s private directory stays exactly one level below the temporary
+/// directory.
 #[cfg(feature = "gz-io")]
 #[test]
 fn temp_paths_cannot_traverse_out_of_the_temp_directory() {
@@ -634,18 +751,54 @@ fn temp_paths_cannot_traverse_out_of_the_temp_directory() {
         );
     }
 
-    // The composed path is what actually matters.
-    let path = unique_temp_path("../../escape");
+    // The composed path is what actually matters. A hostile tag must still land
+    // exactly one level below the temporary directory.
+    let temp = TempGz::new("../../escape");
     assert_eq!(
-        path.parent(),
+        temp.dir().parent(),
         Some(std::env::temp_dir().as_path()),
         "{} must sit directly under the temp directory",
-        path.display()
+        temp.dir().display()
+    );
+    assert_eq!(
+        temp.path().parent(),
+        Some(temp.dir()),
+        "the fixture must live inside the private directory"
     );
     assert!(
-        !path.to_string_lossy().contains(".."),
+        !temp.path().to_string_lossy().contains(".."),
         "{} must contain no parent-directory reference",
-        path.display()
+        temp.path().display()
+    );
+
+    // Exclusive creation, not adoption: re-creating the same name must be refused,
+    // which is what lets `TempGz::new` skip a planted symlink instead of following
+    // it. `create_dir_all` would have returned `Ok` here.
+    assert_eq!(
+        create_private_dir(temp.dir())
+            .expect_err("an occupied name must not be adopted")
+            .kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+
+    // On Unix the directory is owner-only from `mkdir(2)` onwards.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(temp.dir())
+            .expect("stat the private directory")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "the private directory must be owner-only");
+    }
+
+    // The guard removes exactly what it created.
+    let recorded = temp.dir().to_path_buf();
+    drop(temp);
+    assert!(
+        !recorded.exists(),
+        "the guard must remove the directory it created"
     );
 }
 
@@ -668,11 +821,14 @@ fn test_gzio() {
     const SEEK_CUR: i32 = 1;
 
     let len = HELLO.len() as i32; // 14
-    let path = unique_temp_path("gzio");
+    // Guard-owned: the fixture lives in an exclusively created private directory
+    // and is removed with it, including if one of the assertions below unwinds.
+    let temp = TempGz::new("gzio");
+    let path = temp.path();
 
     // ---- write ----
     {
-        let mut file = gzopen(&path, "wb").expect("gzopen wb");
+        let mut file = gzopen(path, "wb").expect("gzopen wb");
         assert_eq!(
             gzputc(&mut file, i32::from(b'h')),
             i32::from(b'h'),
@@ -691,7 +847,7 @@ fn test_gzio() {
     }
 
     // ---- read ----
-    let mut file = gzopen(&path, "rb").expect("gzopen rb");
+    let mut file = gzopen(path, "rb").expect("gzopen rb");
     let mut uncompr = vec![0u8; UNCOMPR_LEN];
     uncompr[..GARBAGE.len()].copy_from_slice(GARBAGE);
 
@@ -727,7 +883,4 @@ fn test_gzio() {
     assert_eq!(&line[..cstr_len], &HELLO[6..13], "bad gzgets after gzseek");
 
     assert_eq!(gzclose(file), 0, "gzclose (read)");
-
-    // Best-effort cleanup of the temporary file.
-    let _ = std::fs::remove_file(&path);
 }

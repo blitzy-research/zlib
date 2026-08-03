@@ -69,6 +69,10 @@
 //!    substituting `crc32fast`'s software table for this module's braid.
 //!
 //! Which backend a given build actually runs is reported by [`crc32_backend`].
+//! That reachability test is a run-time CPU probe on x86, x86-64 and AArch64, and
+//! the bulk dispatcher consults it on every call, so its answer — which is
+//! immutable for the lifetime of the process — is resolved once and cached
+//! thereafter rather than re-probed per call.
 //! Relative throughput is a property of the target and the CPU, so compare the
 //! two feature rows with `benches/checksum_bench.rs` on the machine that matters
 //! rather than assuming an ordering.
@@ -302,6 +306,13 @@ pub enum Crc32Backend {
 /// This is diagnostic information, never a correctness switch — both backends
 /// return identical values for identical input.
 ///
+/// # Cost
+///
+/// The answer is resolved at most once per process and cached thereafter, so
+/// this is cheap enough to sit on the [`crc32`] hot path — which it does, since
+/// the bulk dispatcher consults it on every bulk call. Only the first call can
+/// run a CPU-feature probe; every later one reads a cached byte.
+///
 /// # Examples
 ///
 /// ```
@@ -313,6 +324,16 @@ pub enum Crc32Backend {
 /// ```
 #[must_use]
 pub fn crc32_backend() -> Crc32Backend {
+    memoized_crc32_backend()
+}
+
+/// Resolves the backend from first principles: the compiled feature set, plus a
+/// CPU-capability test on the targets that have one.
+///
+/// This is the whole decision, and it is deliberately kept separate from the
+/// caching in [`memoized_crc32_backend`] so that a test can compare the cached
+/// answer against a freshly computed one.
+fn resolve_crc32_backend() -> Crc32Backend {
     // `cfg!` rather than `#[cfg]` so both arms type-check in every feature row.
     // With `simd` off the predicate is never reached at run time (`&&` short
     // circuits on a compile-time `false`), but it is still compiled, so it
@@ -321,6 +342,90 @@ pub fn crc32_backend() -> Crc32Backend {
         Crc32Backend::Crc32Fast
     } else {
         Crc32Backend::Braid
+    }
+}
+
+// The cached form of `resolve_crc32_backend`.
+//
+// Caching is only worth anything where the resolver actually costs something,
+// which is exactly the configurations whose `accelerated_backend_is_reachable`
+// performs a RUN-TIME probe: `std` on x86, x86-64 or AArch64. Everywhere else the
+// resolver is a chain of `cfg!` predicates that the optimizer folds to a
+// constant, and routing it through an atomic would make it *slower*, so those
+// configurations call the resolver directly.
+cfg_if::cfg_if! {
+    if #[cfg(all(
+        feature = "std",
+        any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")
+    ))] {
+        /// Returns the process-wide backend decision, probing the CPU at most
+        /// once.
+        ///
+        /// Without this cache every bulk CRC-32 call re-ran the three
+        /// `is_x86_feature_detected!` probes inside
+        /// [`accelerated_backend_is_reachable`] — and then handed the work to
+        /// `crc32fast`, which immediately repeated its own three probes in
+        /// `Hasher::new_with_initial`. Those probes are individually cheap and
+        /// internally cached by `std`, but they are not free, and this crate's
+        /// half of the pair is pure overhead once the answer is known.
+        ///
+        /// # Why a plain relaxed load and store is sufficient
+        ///
+        /// The value being cached is *immutable for the lifetime of the
+        /// process*: it is a function of the compiled feature set, the target
+        /// architecture, and CPU capability bits that do not change while the
+        /// program runs. Two threads racing here therefore compute the **same**
+        /// answer, so the worst a race can do is perform the resolution more
+        /// than once and store the identical byte more than once. No lost
+        /// update is possible, nothing is published *through* this cell, and no
+        /// other memory is ordered against it — so `Relaxed` is the correct
+        /// ordering rather than merely a cheap one, and a compare-exchange loop
+        /// would buy nothing. Restricting the cell to load/store also keeps it
+        /// available on every target that has 8-bit atomics.
+        ///
+        /// Correctness does not depend on the cache at all: both backends are
+        /// bit-exact equivalents, so even a hypothetically stale answer would
+        /// return the same checksum — only the throughput would differ.
+        fn memoized_crc32_backend() -> Crc32Backend {
+            use core::sync::atomic::{AtomicU8, Ordering};
+
+            /// Sentinel meaning "not resolved yet". Distinct from both encoded
+            /// backends so the first caller can tell the cell is empty.
+            const UNRESOLVED: u8 = 0;
+            /// Encoded [`Crc32Backend::Braid`].
+            const BRAID: u8 = 1;
+            /// Encoded [`Crc32Backend::Crc32Fast`].
+            const CRC32FAST: u8 = 2;
+
+            static MEMO: AtomicU8 = AtomicU8::new(UNRESOLVED);
+
+            match MEMO.load(Ordering::Relaxed) {
+                BRAID => Crc32Backend::Braid,
+                CRC32FAST => Crc32Backend::Crc32Fast,
+                // `UNRESOLVED`, and — unreachable in practice, since nothing
+                // else is ever stored — any other byte: resolve and publish.
+                _ => {
+                    let backend = resolve_crc32_backend();
+                    MEMO.store(
+                        match backend {
+                            Crc32Backend::Braid => BRAID,
+                            Crc32Backend::Crc32Fast => CRC32FAST,
+                        },
+                        Ordering::Relaxed,
+                    );
+                    backend
+                }
+            }
+        }
+    } else {
+        /// Returns the process-wide backend decision.
+        ///
+        /// On this configuration [`accelerated_backend_is_reachable`] is a
+        /// compile-time `cfg!` test, so the resolver is already constant-folded
+        /// and there is nothing a cache could save.
+        fn memoized_crc32_backend() -> Crc32Backend {
+            resolve_crc32_backend()
+        }
     }
 }
 
@@ -906,6 +1011,7 @@ mod tests {
         LITTLE_CRC_ENTRY_1, SELECTED_BRAID_ENTRY_1, SELECTED_CRC_ENTRY_1, X2N_TABLE,
         accelerated_backend_is_reachable, braid, crc32, crc32_backend, crc32_combine,
         crc32_combine_gen, crc32_combine_op, crc32_z, get_crc_table, multmodp,
+        resolve_crc32_backend,
     };
 
     // Every expected value below was produced by reference zlib (Python's
@@ -1011,6 +1117,83 @@ mod tests {
         // Stable for the lifetime of the process: the probe reads immutable CPU
         // capability bits, so repeated calls cannot disagree.
         assert_eq!(backend, crc32_backend());
+    }
+
+    /// The cached answer must be the same answer, every time.
+    ///
+    /// [`crc32_backend`] is consulted on every bulk CRC-32 call, so its result is
+    /// memoized rather than re-probed. That cache is only ever correct if it
+    /// returns exactly what a fresh resolution returns, so this compares the two
+    /// directly — including on the first call, before anything can have been
+    /// cached — and then hammers the cached path to show it does not drift.
+    #[test]
+    fn the_reported_backend_is_memoized_without_changing_the_answer() {
+        let fresh = resolve_crc32_backend();
+        assert_eq!(
+            crc32_backend(),
+            fresh,
+            "the cached backend must equal a freshly resolved one"
+        );
+
+        for _ in 0..1_000 {
+            assert_eq!(
+                crc32_backend(),
+                fresh,
+                "the cache must not drift across repeated reads"
+            );
+            assert_eq!(
+                resolve_crc32_backend(),
+                fresh,
+                "resolution itself must be deterministic"
+            );
+        }
+
+        // And the checksum is untouched by any of it: the canonical vector still
+        // holds after a thousand dispatch decisions.
+        assert_eq!(crc32(0, b"123456789"), 0xcbf4_3926);
+    }
+
+    /// Concurrent first use must be safe and unanimous.
+    ///
+    /// The cache is a relaxed load/store with no compare-exchange, which is sound
+    /// only because every racing thread computes the *same* immutable value — so
+    /// the worst outcome is redundant work, never a wrong answer. This asserts
+    /// that property directly: many threads race to populate the cache while also
+    /// computing checksums, and all of them must agree with each other and with
+    /// the reference value.
+    #[test]
+    fn concurrent_first_use_of_the_backend_cache_is_unanimous() {
+        const THREADS: usize = 16;
+        const ROUNDS: usize = 200;
+
+        let handles: alloc::vec::Vec<_> = (0..THREADS)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let mut seen = Crc32Backend::Braid;
+                    let mut agreed = true;
+                    for round in 0..ROUNDS {
+                        let backend = crc32_backend();
+                        if round == 0 {
+                            seen = backend;
+                        } else if backend != seen {
+                            agreed = false;
+                        }
+                        assert_eq!(crc32(0, b"123456789"), 0xcbf4_3926);
+                    }
+                    (seen, agreed)
+                })
+            })
+            .collect();
+
+        let expected = resolve_crc32_backend();
+        for handle in handles {
+            let (seen, agreed) = handle.join().expect("worker must not panic");
+            assert!(agreed, "a thread observed the cache changing under it");
+            assert_eq!(
+                seen, expected,
+                "every thread must observe the same immutable backend decision"
+            );
+        }
     }
 
     /// Whichever backend is selected, it must agree with the braided reference

@@ -61,6 +61,8 @@ use alloc::boxed::Box;
 use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
 
+#[cfg(feature = "gzip")]
+use crate::gz_header::{ForeignGzHeader, ForeignGzHeaderSink};
 use crate::gz_header::{GzHeader, HeaderPublication};
 use crate::stream::{AllocBuffer, AllocHook, Allocator, ZStream, ZeroValid};
 
@@ -896,11 +898,150 @@ impl HandleKind {
 }
 
 /// The common `#[repr(C)]` prefix shared by every tagged handle: a
-/// [`HandleKind`] at offset 0, readable regardless of the concrete handle type
-/// behind the opaque `state` pointer.
+/// [`HandleKind`] at offset 0 followed by the owning stream's address, both
+/// readable regardless of the concrete handle type behind the opaque `state`
+/// pointer.
+///
+/// `owner` is the Rust counterpart of C's `s->strm` back-pointer, which
+/// `deflateInit2_` sets (`deflate.c` L444), `deflateCopy` re-points at the
+/// destination (`deflate.c` L1340), `inflateInit2_` sets (`inflate.c` L203), and
+/// `deflateStateCheck` / `inflateStateCheck` then compare against the incoming
+/// `strm`. Without it a *same-kind* handle can be reached through a **different**
+/// `z_stream` — the exact situation a caller creates by copying the 14-field
+/// struct — and both copies then claim ownership of one allocation, so whichever
+/// `*End` runs second frees it again or reads it after free. The tag alone
+/// cannot detect that, because both structs carry the same tag.
+///
+/// Every concrete handle declares these two fields first, in this order, with
+/// these types, and `#[repr(C)]` fixes their offsets — which is what makes it
+/// sound to read the prefix through this type before the concrete handle type is
+/// known. [`TaggedHandle`] is the contract that keeps them in step.
 #[repr(C)]
 struct HandleHeader {
     kind: HandleKind,
+    owner: *const z_stream,
+}
+
+/// The contract every boxed FFI engine handle satisfies so that installation and
+/// validation can be written once instead of once per engine.
+///
+/// An implementor must declare, as its first two fields and in this order, a
+/// `kind: HandleKind` and an `owner: *const z_stream`, and must be `#[repr(C)]`
+/// so those fields sit at the offsets [`HandleHeader`] reads. In exchange it
+/// gets [`install_handle`] (which cannot forget to bind the owner) and
+/// [`handle_prefix_valid`] (the shared clauses of C's state check).
+pub(crate) trait TaggedHandle: Sized {
+    /// The discriminant this handle type always carries at offset 0.
+    const KIND: HandleKind;
+
+    /// Records the address of the `z_stream` this handle is installed into.
+    fn set_owner(&mut self, owner: *const z_stream);
+
+    /// Whether the engine state behind this handle carries a status/mode value
+    /// reference zlib's state check accepts.
+    ///
+    /// This is the engine-specific clause of C's predicate:
+    /// `deflate.c` L538-L556 enumerates the eight legal `status` values, and
+    /// `inflate.c` L88-L97 range-checks `mode` against `HEAD..=SYNC`.
+    fn engine_status_is_c_valid(&self) -> bool;
+}
+
+/// Installs a freshly built tagged handle into [`z_stream::state`], binding it to
+/// `strm` as its owner.
+///
+/// This is the single place a handle becomes reachable through a `z_stream`, and
+/// it performs C's `s->strm = strm` (`deflate.c` L444, `inflate.c` L203) in the
+/// same statement pair that publishes the pointer — so the owner can never be
+/// left unset by an initializer that forgets it.
+///
+/// # Safety
+///
+/// `strm.state` must not already hold a live handle: the previous handle would be
+/// leaked. Every caller is an `*Init*` shim that has just verified the field is
+/// null or has already reclaimed what was there.
+#[inline]
+pub(crate) unsafe fn install_handle<T: TaggedHandle>(strm: &mut z_stream, mut handle: Box<T>) {
+    handle.set_owner(strm as *const z_stream);
+    // SAFETY: ownership of the box is transferred to the raw `state` field, from
+    // which exactly one `*End`/reclaim path reconstitutes it.
+    strm.state = unsafe { state_ptr_from_box(handle) };
+}
+
+/// The *identity* clauses shared by every engine's C state check: an installed
+/// handle, the expected engine kind, and a matching owner.
+///
+/// This is the composable core the three engine-specific predicates are built
+/// from, because reference zlib does **not** apply the same clauses to all three
+/// engines — `inflateBack` deliberately checks less than `inflate` (see
+/// [`inflate_back_state_check`]). Splitting the clauses here lets each engine
+/// reproduce its own C predicate exactly instead of being flattened onto the
+/// strictest one.
+///
+/// Returns `Some(&T)` only when the handle behind [`z_stream::state`] may be
+/// reinterpreted as `T` and belongs to this very stream. **Nothing outside `strm`
+/// and its own state handle is touched** — no auxiliary caller pointer is read,
+/// dereferenced, or turned into a slice — which is the property that lets a shim
+/// run this *before* bridging a `dictionary`, `head`, or buffer pointer that may
+/// be stale. C rejects such a call without touching those pointers, so Rust must
+/// not form a reference to them either: constructing a slice over invalid memory
+/// is undefined behavior even when the slice is never read.
+///
+/// # Safety
+///
+/// A non-null [`z_stream::state`] must point at a live handle installed by
+/// [`install_handle`], so its `#[repr(C)]` prefix is readable.
+#[inline]
+#[must_use]
+pub(crate) unsafe fn handle_owner_valid<T: TaggedHandle>(strm: &z_stream) -> Option<&T> {
+    // Clause 1 (`strm == Z_NULL`) is discharged by the caller: holding a
+    // `&z_stream` at all means the pointer was non-null.
+    //
+    // Clause `s == Z_NULL`, plus the Rust-only kind tag, which is strictly
+    // stronger than anything C can check and prevents reinterpreting a different
+    // engine's allocation.
+    let (kind, owner) =
+        // SAFETY: delegated prefix read; see `peek_handle_prefix`.
+        unsafe { peek_handle_prefix(strm) }?;
+    if kind != T::KIND {
+        return None;
+    }
+
+    // Clause `s->strm != strm` — the owner check (`deflate.c` L546,
+    // `inflate.c` L95).
+    if !core::ptr::eq(owner, strm) {
+        return None;
+    }
+
+    // SAFETY: the tag confirms the allocation really is a live `T`, and the
+    // returned shared borrow is tied to `strm`, which owns it.
+    Some(unsafe { &*(strm.state as *const T) })
+}
+
+/// The full symmetric predicate shared by `deflateStateCheck` (`deflate.c`
+/// L538-L556) and `inflateStateCheck` (`inflate.c` L88-L97): a live allocator
+/// pair, the identity clauses of [`handle_owner_valid`], and an engine
+/// status/mode value C would accept.
+///
+/// Inherits [`handle_owner_valid`]'s guarantee that nothing outside `strm` and
+/// its own handle is touched.
+///
+/// # Safety
+///
+/// A non-null [`z_stream::state`] must point at a live handle installed by
+/// [`install_handle`], so its `#[repr(C)]` prefix is readable.
+#[inline]
+#[must_use]
+pub(crate) unsafe fn handle_prefix_valid<T: TaggedHandle>(strm: &z_stream) -> bool {
+    // Clause `strm->zalloc == 0 || strm->zfree == 0`. Both halves are published
+    // by `init_allocator_prologue`, so a successfully initialized stream always
+    // has them; a caller who zeroes one afterwards is telling the library its
+    // allocator is gone, and C refuses rather than calling through a null hook.
+    if strm.zalloc.is_none() || strm.zfree.is_none() {
+        return false;
+    }
+
+    // SAFETY: delegated; the identity clauses read only the handle prefix.
+    unsafe { handle_owner_valid::<T>(strm) }.is_some_and(TaggedHandle::engine_status_is_c_valid)
 }
 
 /// The boxed deflate engine handle installed in [`z_stream::state`] by the
@@ -916,20 +1057,80 @@ struct HandleHeader {
 pub struct DeflateHandle {
     /// Discriminant tag; always [`HandleKind::DEFLATE`]. MUST be the first field.
     kind: HandleKind,
+    /// Address of the `z_stream` this handle is installed into — C's `s->strm`
+    /// (`deflate.c` L444). MUST be the second field. Written by
+    /// [`install_handle`]; null until then.
+    owner: *const z_stream,
     /// The idiomatic deflate stream this handle owns.
     pub zs: ZStream<CAllocator>,
+    /// The caller's live `gz_header`, as handed to `deflateSetHeader` — C's
+    /// `s->gzhead` (`deflate.c` L717). Null when no header is registered.
+    ///
+    /// Only the *pointer* is kept, never a copy: every field is re-read from the
+    /// caller's struct each time the engine needs it, so mutations made after
+    /// registration but before emission are honored exactly as in C
+    /// (`deflate.c` L893-L907, L1092-L1188). Holding a raw pointer requires no
+    /// `unsafe`; the dereference is confined to `borrow_gz_header`.
+    #[cfg(feature = "gzip")]
+    pub(crate) head: *mut gz_header,
 }
 
 impl DeflateHandle {
     /// Wraps a freshly built deflate stream, tagging it as a deflate handle.
+    ///
+    /// The owner is left null: it is bound by `install_handle` at the moment
+    /// the handle becomes reachable through a `z_stream`, so a handle that has
+    /// not been installed can never pass `deflate_state_check`.
     #[inline]
     #[must_use]
     pub fn new(zs: ZStream<CAllocator>) -> Self {
         Self {
             kind: HandleKind::DEFLATE,
+            owner: ptr::null(),
             zs,
+            #[cfg(feature = "gzip")]
+            head: ptr::null_mut(),
         }
     }
+}
+
+impl TaggedHandle for DeflateHandle {
+    const KIND: HandleKind = HandleKind::DEFLATE;
+
+    #[inline]
+    fn set_owner(&mut self, owner: *const z_stream) {
+        self.owner = owner;
+    }
+
+    #[inline]
+    fn engine_status_is_c_valid(&self) -> bool {
+        use crate::deflate::state::DeflateStream;
+        self.zs
+            .deflate_state()
+            .is_some_and(|st| st.status.is_c_valid())
+    }
+}
+
+/// C's `deflateStateCheck` (`deflate.c` L538-L556), reproduced clause for clause.
+///
+/// Returns `true` when reference zlib would have accepted `strm` — i.e. when C's
+/// `deflateStateCheck` would have returned 0. Every `deflate*` shim that reaches
+/// the engine runs this first, and, critically, **runs it before bridging any
+/// auxiliary caller pointer**: C rejects an invalid stream without reading the
+/// `dictionary`, `head`, `pending`, or buffer pointers passed alongside it, so a
+/// stale non-null pointer must not be turned into a Rust slice or reference
+/// either. Forming a reference to invalid memory is undefined behavior even if
+/// the reference is never read.
+///
+/// # Safety
+///
+/// `strm` must be a valid `z_stream`, and a non-null [`z_stream::state`] must
+/// point at a live handle installed by [`install_handle`].
+#[inline]
+#[must_use]
+pub(crate) unsafe fn deflate_state_check(strm: &z_stream) -> bool {
+    // SAFETY: delegated; every clause is discharged there.
+    unsafe { handle_prefix_valid::<DeflateHandle>(strm) }
 }
 
 /// Reads the [`HandleKind`] tag at offset 0 of the installed state handle, or
@@ -945,13 +1146,32 @@ impl DeflateHandle {
 #[inline]
 #[must_use]
 pub unsafe fn peek_handle_kind(strm: &z_stream) -> Option<HandleKind> {
+    // SAFETY: delegated prefix read; see `peek_handle_prefix`.
+    unsafe { peek_handle_prefix(strm) }.map(|(kind, _)| kind)
+}
+
+/// Reads the `#[repr(C)]` prefix of the installed state handle as
+/// `(kind, owner)`, or [`None`] if no handle is installed.
+///
+/// # Safety
+///
+/// If [`z_stream::state`] is non-null it must point at a live handle whose first
+/// two fields are a [`HandleKind`] and a `*const z_stream`. Every FFI init shim
+/// installs such a handle through [`install_handle`], so the prefix is always
+/// present and both fields are simply read and compared — no enum-validity or
+/// pointer-validity requirement applies to either.
+#[inline]
+#[must_use]
+pub(crate) unsafe fn peek_handle_prefix(strm: &z_stream) -> Option<(HandleKind, *const z_stream)> {
     if strm.state.is_null() {
         None
     } else {
-        // SAFETY: `state` is non-null and points at a live handle allocation of
-        // at least 8 bytes; reading the leading `HandleKind` (a `u64`) is valid
-        // for any such allocation and carries no enum-validity requirement.
-        Some(unsafe { (*(strm.state as *const HandleHeader)).kind })
+        // SAFETY: `state` is non-null and points at a live handle allocation
+        // whose `#[repr(C)]` prefix is a `HandleHeader`; reading a `u64` and a
+        // raw pointer out of it is valid and carries no validity requirement on
+        // the values themselves.
+        let header = unsafe { &*(strm.state as *const HandleHeader) };
+        Some((header.kind, header.owner))
     }
 }
 
@@ -966,16 +1186,39 @@ pub unsafe fn peek_handle_kind(strm: &z_stream) -> Option<HandleKind> {
 /// FFI init shim (so its leading tag is readable).
 #[inline]
 pub unsafe fn deflate_state(strm: &mut z_stream) -> Option<&mut ZStream<CAllocator>> {
-    // SAFETY: delegated tag read; see `peek_handle_kind`.
-    match unsafe { peek_handle_kind(strm) } {
-        Some(kind) if kind == HandleKind::DEFLATE => {
-            // SAFETY: the tag confirms a live `DeflateHandle`; the borrow is tied
-            // to `strm`, so it cannot alias for its lifetime.
-            let handle = unsafe { &mut *(strm.state as *mut DeflateHandle) };
-            Some(&mut handle.zs)
-        }
-        _ => None,
+    // SAFETY: delegated; runs every clause of C's `deflateStateCheck` and reads
+    // nothing outside `strm` and its own handle.
+    if !unsafe { deflate_state_check(strm) } {
+        return None;
     }
+    // SAFETY: the check confirmed the tag and the owner, so the allocation really
+    // is a live `DeflateHandle`; the borrow is tied to `strm`, so it cannot alias
+    // for its lifetime.
+    let handle = unsafe { &mut *(strm.state as *mut DeflateHandle) };
+    Some(&mut handle.zs)
+}
+
+/// Borrows the whole installed [`DeflateHandle`], not just its stream, after
+/// running every clause of C's `deflateStateCheck`.
+///
+/// [`deflate_state`] is the right accessor for shims that need only the engine;
+/// this one additionally exposes [`DeflateHandle::head`], the caller's live
+/// `gz_header` pointer, which the `deflate` and `deflateBound` shims must re-read
+/// on every call to reproduce C's lazy header reads.
+///
+/// # Safety
+///
+/// Same contract as [`deflate_state`]: a non-null [`z_stream::state`] must point
+/// at a live handle installed by an FFI init shim.
+#[inline]
+pub(crate) unsafe fn deflate_handle(strm: &mut z_stream) -> Option<&mut DeflateHandle> {
+    // SAFETY: delegated; reads nothing outside `strm` and its own handle.
+    if !unsafe { deflate_state_check(strm) } {
+        return None;
+    }
+    // SAFETY: the check confirmed the tag and the owner, so the allocation really
+    // is a live `DeflateHandle`; the borrow is tied to `strm` and cannot alias.
+    Some(unsafe { &mut *(strm.state as *mut DeflateHandle) })
 }
 
 /// Reclaims the boxed [`DeflateHandle`] from the state field, validating the
@@ -989,17 +1232,52 @@ pub unsafe fn deflate_state(strm: &mut z_stream) -> Option<&mut ZStream<CAllocat
 /// FFI init shim, not already reclaimed.
 #[inline]
 pub unsafe fn deflate_take(strm: &mut z_stream) -> Option<Box<DeflateHandle>> {
-    // SAFETY: delegated tag read; see `peek_handle_kind`.
-    match unsafe { peek_handle_kind(strm) } {
-        Some(kind) if kind == HandleKind::DEFLATE => {
-            // SAFETY: the tag confirms a live `Box<DeflateHandle>`; reconstitute
-            // exactly once and null the field to prevent a double free.
-            let boxed = unsafe { Box::from_raw(strm.state as *mut DeflateHandle) };
-            strm.state = ptr::null_mut();
-            Some(boxed)
-        }
-        _ => None,
+    // SAFETY: delegated; runs every clause of C's `deflateStateCheck`, including
+    // the owner comparison. That clause is what makes reclaim safe: a caller who
+    // copied the 14-field `z_stream` holds a second struct pointing at the SAME
+    // handle, and freeing through the copy would leave the original with a
+    // dangling `state`. C returns `Z_STREAM_ERROR` for the copy (`deflate.c`
+    // L538-L556 via `s->strm != strm`) and this reproduces that refusal, so the
+    // allocation is released exactly once, through its owner.
+    if !unsafe { deflate_state_check(strm) } {
+        return None;
     }
+    // SAFETY: the check confirmed a live, owner-matched `Box<DeflateHandle>`;
+    // reconstitute it exactly once and null the field to prevent a double free.
+    let boxed = unsafe { Box::from_raw(strm.state as *mut DeflateHandle) };
+    strm.state = ptr::null_mut();
+    Some(boxed)
+}
+
+// --- Cross-width scalar bridging -------------------------------------------
+
+/// Narrow a [`uLong`] (C `unsigned long`) to the `u32` in which zlib actually
+/// carries a checksum value or a gzip header timestamp.
+///
+/// C `unsigned long` is 64-bit on LP64 targets (e.g. 64-bit Linux) and 32-bit on
+/// LLP64 targets (e.g. 64-bit Windows), yet every value crossing this boundary —
+/// an Adler-32, a CRC-32, a `crc32_combine` operator, a `gz_header::time` — is
+/// defined by the format as exactly 32 bits. So the `as` cast is a genuine
+/// truncation on LP64 and the identity on LLP64, and it is correct on both:
+/// reference zlib relies on the same property, its own `uLong` checksums never
+/// carrying more than 32 significant bits.
+///
+/// Being the identity on LLP64 is precisely what makes
+/// [`clippy::unnecessary_cast`] fire there while staying silent on LP64 — a lint
+/// that is right about the expression and wrong about the program, and one that
+/// a Linux-only CI lane never surfaces. Confining the conversion, and with it the
+/// single localized exemption, to one function keeps every checksum and header
+/// shim portable and lint-clean on both target families without scattering
+/// `#[allow]` across eighteen call sites. This mirrors `off_to_i64` in
+/// `src/ffi/util.rs`, which solves the same problem in the widening direction for
+/// `z_off_t`.
+///
+/// [`clippy::unnecessary_cast`]: https://rust-lang.github.io/rust-clippy/master/index.html#unnecessary_cast
+#[inline]
+#[must_use]
+#[allow(clippy::unnecessary_cast)]
+pub(crate) fn ulong_to_u32(value: uLong) -> u32 {
+    value as u32
 }
 
 // --- Input/output slice bridging -------------------------------------------
@@ -1104,6 +1382,78 @@ pub unsafe fn advance_input(strm: &mut z_stream, consumed: usize) {
     strm.total_in = strm.total_in.wrapping_add(consumed as c_ulong);
 }
 
+/// Un-consumes `rewound` input bytes: moves [`z_stream::next_in`] *backwards* and
+/// grows [`z_stream::avail_in`].
+///
+/// This is the exact inverse of [`advance_input`] and exists for one reason: C's
+/// `inflate_fast` epilogue does `in -= bits >> 3` (`inffast.c` L291) without any
+/// lower bound, so a call that entered with whole bytes already buffered hands
+/// bytes back that an *earlier* call consumed. `strm->next_in` then points before
+/// where this call started, `avail_in` exceeds the value the caller passed in, and
+/// `total_in` decreases. Reference zlib relies on the caller presenting one
+/// contiguous buffer and never dereferences the rewound bytes.
+///
+/// This deliberately leaves [`z_stream::total_in`] alone. C does not adjust the
+/// total per operation: it derives one per-call delta as `in -= strm->avail_in`
+/// in **`uInt`** arithmetic and then adds that to the `uLong` total
+/// (`inflate.c` L1139-L1141). When a rewind exceeds the bytes the call consumed
+/// the delta wraps at 2³² *before* the widening, so reference C reports
+/// `total_in == 4294967295` — not `-1` widened to 64 bits — for a one-byte rewind
+/// at `total_in == 0`. That value is part of the observable contract
+/// (AAP §0.8.1 D-4), so the caller reproduces the 32-bit delta itself rather than
+/// composing two independent 64-bit adjustments.
+///
+/// # Safety
+///
+/// `rewound` must not exceed the number of bytes preceding `next_in` *within the
+/// same allocation*, and those bytes must still be valid for reads — that is, the
+/// caller must not have moved or freed the buffer region it already fed. This is
+/// the same obligation reference zlib imposes. The resulting pointer is formed
+/// with [`pointer::wrapping_sub`](primitive@pointer) and is never dereferenced
+/// here.
+#[inline]
+pub(crate) unsafe fn rewind_input(strm: &mut z_stream, rewound: usize) {
+    if rewound == 0 {
+        return;
+    }
+    // `wrapping_sub` rather than `sub`: the offset is only guaranteed in-bounds by
+    // the caller's contiguous-buffer contract, and this crate never dereferences
+    // the result — it is published to the caller, which owns the memory.
+    strm.next_in = strm.next_in.wrapping_sub(rewound);
+    strm.avail_in += rewound as c_uint;
+}
+
+/// Republishes [`z_stream::total_in`] using C's per-call input delta.
+///
+/// Reference zlib never adjusts the running total incrementally. It snapshots
+/// `in = strm->avail_in` on entry and, on the way out, collapses the whole call
+/// into one delta before widening it (`inflate.c` L1139-L1141):
+///
+/// ```text
+/// in -= strm->avail_in;      /* uInt  — wraps at 2^32 */
+/// strm->total_in += in;      /* uLong — the 32-bit delta is zero-extended */
+/// ```
+///
+/// The wrap matters. When `inflate_fast`'s unbounded give-back (`inffast.c` L291)
+/// hands back more bytes than the call pulled, `avail_in` ends up *larger* than it
+/// started, the `uInt` delta wraps to just under 2³², and that value — not a
+/// 64-bit `-1` — is what a C caller observes. Composing an `advance_input` add with
+/// a `rewind_input` subtract in 64-bit arithmetic would instead publish
+/// `u64::MAX`, so the shim reconstructs C's delta explicitly whenever a rewind is
+/// in play.
+///
+/// `base` is `total_in` as it stood before the call consumed anything.
+#[inline]
+pub(crate) fn republish_total_in(
+    strm: &mut z_stream,
+    base: c_ulong,
+    consumed: usize,
+    rewound: usize,
+) {
+    let delta = (consumed as u32).wrapping_sub(rewound as u32);
+    strm.total_in = base.wrapping_add(c_ulong::from(delta));
+}
+
 /// Advances the output cursor after `produced` bytes were written: bumps
 /// [`z_stream::next_out`], decrements [`z_stream::avail_out`], and accumulates
 /// [`z_stream::total_out`].
@@ -1196,6 +1546,159 @@ unsafe fn cstr_bytes(ptr: *const c_uchar) -> Result<Vec<u8>, TryReserveError> {
     try_copy_bytes(unsafe { slice::from_raw_parts(ptr, len) })
 }
 
+/// Returns the bytes of a NUL-terminated C string as a **borrowed** slice,
+/// excluding the terminator.
+///
+/// The allocation-free counterpart of [`cstr_bytes`]. It exists because C's
+/// `deflateSetHeader` copies nothing: `deflate` re-reads `s->gzhead->name[...]`
+/// straight out of caller memory at emission time (`deflate.c` L1158), so the
+/// shim must be able to hand the engine a borrow rather than a copy. Being
+/// infallible is the point — C's registration cannot fail for want of memory, so
+/// neither may this path (AAP §0.6.5).
+///
+/// # Safety
+///
+/// `ptr` must be non-null and point at a NUL-terminated sequence of bytes that
+/// stays valid, and unmutated, for the lifetime `'a`.
+#[cfg(feature = "gzip")]
+unsafe fn cstr_slice<'a>(ptr: *const c_uchar) -> &'a [u8] {
+    let mut len = 0usize;
+    // SAFETY: per the contract, `ptr` points at a NUL-terminated string, so
+    // every `ptr.add(len)` up to and including the terminator is readable.
+    while unsafe { *ptr.add(len) } != 0 {
+        len += 1;
+    }
+    // SAFETY: bytes `ptr[0..len]` precede the NUL and are therefore readable,
+    // and the contract keeps them valid for `'a`.
+    unsafe { slice::from_raw_parts(ptr, len) }
+}
+
+/// Borrows a live caller-owned [`gz_header`] as a [`ForeignGzHeader`], or
+/// [`None`] when `head` is null.
+///
+/// This is the read side of the C ABI's gzip-header contract and the reason
+/// `deflateSetHeader` needs no allocation at all. C stores the caller's pointer
+/// and re-reads every field lazily when the header is emitted (`deflate.c` L717,
+/// L893-L907, L1092-L1188); this function reproduces that by materializing
+/// borrowed slices over the caller's own buffers, once per engine call.
+///
+/// Nothing is copied and nothing is allocated, so unlike
+/// [`gz_header_to_idiomatic`] this cannot fail — which is required, because
+/// reference zlib's `deflateSetHeader` returns only `Z_OK` or `Z_STREAM_ERROR`
+/// and can never report `Z_MEM_ERROR`.
+///
+/// # Safety
+///
+/// `head` must be null, or point at a valid `gz_header` that stays valid for
+/// `'a`, whose `extra` (when non-null) is readable for `extra_len` bytes and
+/// whose `name`/`comment` (when non-null) are NUL-terminated — exactly the
+/// contract `zlib.h` L843-L847 places on the caller.
+#[cfg(feature = "gzip")]
+pub(crate) unsafe fn borrow_gz_header<'a>(head: *const gz_header) -> Option<ForeignGzHeader<'a>> {
+    if head.is_null() {
+        return None;
+    }
+    // SAFETY: `head` is non-null and, per the contract, a valid `gz_header`.
+    let h = unsafe { &*head };
+    Some(ForeignGzHeader {
+        text: h.text != 0,
+        // C writes the low four bytes of `head->time` (`deflate.c` L1098-L1101),
+        // so a 64-bit `uLong` is truncated exactly as C truncates it.
+        time: h.time as u32,
+        os: h.os,
+        hcrc: h.hcrc != 0,
+        extra: if h.extra.is_null() {
+            None
+        } else {
+            // C bounds the field by `head->extra_len & 0xffff` (`deflate.c`
+            // L1120), and `zlib.h` L845-L846 makes `extra_len` bytes readable
+            // the caller's responsibility.
+            // SAFETY: a non-null `extra` is readable for `extra_len` bytes and
+            // stays valid for `'a` per this function's contract.
+            Some(unsafe { slice::from_raw_parts(h.extra, h.extra_len as usize) })
+        },
+        name: if h.name.is_null() {
+            None
+        } else {
+            // SAFETY: a non-null `name` is a NUL-terminated C string valid for `'a`.
+            Some(unsafe { cstr_slice(h.name) })
+        },
+        comment: if h.comment.is_null() {
+            None
+        } else {
+            // SAFETY: a non-null `comment` is a NUL-terminated C string valid for `'a`.
+            Some(unsafe { cstr_slice(h.comment) })
+        },
+    })
+}
+
+/// Borrows a live caller-owned [`gz_header`]'s **output buffers** as a
+/// [`ForeignGzHeaderSink`], or [`None`] when `head` is null.
+///
+/// This is the read direction's counterpart of [`borrow_gz_header`], and it must
+/// be called immediately before each engine call rather than once at
+/// registration: C re-reads `head->extra`/`name`/`comment` and their
+/// `extra_max`/`name_max`/`comm_max` capacities on **every stored byte**
+/// (`inflate.c` L614-L621, L632-L637, L654-L659), so a caller may install,
+/// replace, resize or withdraw a sink at any point before the bytes arrive and
+/// see it honored. Re-materializing per call reproduces that: a caller cannot
+/// mutate its header *during* a synchronous call, so per-call and per-byte
+/// freshness observe the same bytes.
+///
+/// Nothing is copied and nothing is allocated — the slices alias the caller's own
+/// storage, which is exactly why the header path can no longer report a
+/// `Z_MEM_ERROR` C never reports.
+///
+/// # Safety
+///
+/// `head` must be null, or point at a valid `gz_header` that stays valid and
+/// unaliased for `'a`. When `extra`/`name`/`comment` are non-null, each must
+/// address at least `extra_max`/`name_max`/`comm_max` **writable** bytes — the
+/// contract `zlib.h` L1076-L1085 places on an `inflateGetHeader` caller.
+#[cfg(feature = "gzip")]
+pub(crate) unsafe fn borrow_gz_header_sink<'a>(
+    head: *mut gz_header,
+) -> Option<ForeignGzHeaderSink<'a>> {
+    if head.is_null() {
+        return None;
+    }
+    // SAFETY: `head` is non-null and, per the contract, a valid `gz_header`
+    // exclusively available to this call.
+    let h = unsafe { &mut *head };
+    // Each capacity is read *now*, so a mid-decode change takes effect on the
+    // next call — C's per-byte re-read, at call granularity.
+    let extra_max = h.extra_max as usize;
+    let name_max = h.name_max as usize;
+    let comm_max = h.comm_max as usize;
+    Some(ForeignGzHeaderSink {
+        // C derives the extra field's write offset from the caller's own
+        // `extra_len` (`inflate.c` L616-L617), so it belongs to the live view.
+        extra_len: h.extra_len,
+        extra: if h.extra.is_null() || extra_max == 0 {
+            None
+        } else {
+            // SAFETY: a non-null `extra` addresses `extra_max` writable bytes and
+            // stays valid for `'a` per this function's contract; the slice is the
+            // only live reference to that range for the duration of the call.
+            Some(unsafe { slice::from_raw_parts_mut(h.extra, extra_max) })
+        },
+        name: if h.name.is_null() || name_max == 0 {
+            None
+        } else {
+            // SAFETY: a non-null `name` addresses `name_max` writable bytes valid
+            // for `'a`; see above.
+            Some(unsafe { slice::from_raw_parts_mut(h.name, name_max) })
+        },
+        comment: if h.comment.is_null() || comm_max == 0 {
+            None
+        } else {
+            // SAFETY: a non-null `comment` addresses `comm_max` writable bytes
+            // valid for `'a`; see above.
+            Some(unsafe { slice::from_raw_parts_mut(h.comment, comm_max) })
+        },
+    })
+}
+
 /// Converts a raw [`gz_header`] (as passed to `deflateSetHeader`) into the
 /// idiomatic [`GzHeader`], or `Ok(None)` when `head` is null.
 ///
@@ -1262,7 +1765,7 @@ pub unsafe fn gz_header_to_idiomatic(
 
     Ok(Some(GzHeader {
         text: h.text != 0,
-        time: h.time as u32,
+        time: ulong_to_u32(h.time),
         // `xflags`/`os` are C `int` (== `i32`), assigned directly.
         xflags: h.xflags,
         os: h.os,
@@ -1502,6 +2005,15 @@ unsafe fn copy_tail_bounded(dst: *mut c_uchar, src: &[u8], stored: usize, cap: u
 // is unavailable and builds typically use `panic = "abort"`) the closure runs
 // directly. The helpers are `pub(crate)` and consumed by the sibling shim
 // files, hence `#[allow(dead_code)]` for standalone compilation of this module.
+//
+// THIS IS THE SINGLE HOME FOR EVERY BOUNDARY GUARD. One guard exists per return
+// width the exported C surface actually uses — `c_int`, `c_ulong`, `c_long`,
+// `z_size_t`, `z_off64_t`, `*mut T`, `*const T`, and `void` — so the set of
+// widths the boundary covers is auditable by reading this one section. A shim
+// file must never define its own guard or open a bare `catch_unwind`: a
+// duplicate drifts from the `#[cfg(feature = "std")]` pair below the moment one
+// copy is edited, and a bare `catch_unwind` at a call site is invisible to that
+// audit. If a new entry point returns a width not listed above, add it HERE.
 
 /// Runs `f`, returning its `c_int` result, or `default` if it panics.
 #[cfg(feature = "std")]
@@ -1583,12 +2095,103 @@ pub(crate) fn guard_off(
     f()
 }
 
+/// Runs `f`, returning its `c_long` result, or `default` if it panics.
+///
+/// The `c_long` width is needed by `inflateMark`, whose C signature returns
+/// `long` (`zlib.h`) and whose documented failure value is `-1 << 16`.
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+pub(crate) fn guard_long(
+    default: c_long,
+    f: impl FnOnce() -> c_long + core::panic::UnwindSafe,
+) -> c_long {
+    std::panic::catch_unwind(f).unwrap_or(default)
+}
+
+/// `no_std` fallback: runs `f` directly (no unwinding to catch).
+#[cfg(not(feature = "std"))]
+#[allow(dead_code)]
+pub(crate) fn guard_long(
+    _default: c_long,
+    f: impl FnOnce() -> c_long + core::panic::UnwindSafe,
+) -> c_long {
+    f()
+}
+
+/// Runs `f`, returning its [`z_size_t`] result, or `default` if it panics.
+///
+/// The `size_t` width is needed by `gzfread` / `gzfwrite`, whose C signatures
+/// return `z_size_t` and whose documented failure value is `0`.
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+pub(crate) fn guard_size(
+    default: z_size_t,
+    f: impl FnOnce() -> z_size_t + core::panic::UnwindSafe,
+) -> z_size_t {
+    std::panic::catch_unwind(f).unwrap_or(default)
+}
+
+/// `no_std` fallback: runs `f` directly (no unwinding to catch).
+#[cfg(not(feature = "std"))]
+#[allow(dead_code)]
+pub(crate) fn guard_size(
+    _default: z_size_t,
+    f: impl FnOnce() -> z_size_t + core::panic::UnwindSafe,
+) -> z_size_t {
+    f()
+}
+
+/// Runs `f`, returning its `*const T` result, or `default` if it panics.
+///
+/// Distinct from [`guard_ptr`], which covers `*mut T`: `gzerror` returns
+/// `const char *` and must not be forced through a mutable pointer type.
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+pub(crate) fn guard_const_ptr<T>(
+    default: *const T,
+    f: impl FnOnce() -> *const T + core::panic::UnwindSafe,
+) -> *const T {
+    std::panic::catch_unwind(f).unwrap_or(default)
+}
+
+/// `no_std` fallback: runs `f` directly (no unwinding to catch).
+#[cfg(not(feature = "std"))]
+#[allow(dead_code)]
+pub(crate) fn guard_const_ptr<T>(
+    default: *const T,
+    f: impl FnOnce() -> *const T + core::panic::UnwindSafe,
+) -> *const T {
+    let _ = default;
+    f()
+}
+
+/// Runs `f` and swallows a panic — the guard for the `void`-returning shims.
+///
+/// `gzclearerr` is the only C entry point in this library that returns nothing,
+/// so there is no value to substitute; the obligation is purely that the panic
+/// must not cross the ABI. Having it here rather than as an inline
+/// `catch_unwind` at the call site keeps every boundary guard in one place, so
+/// the set of return widths the boundary covers is auditable by reading one
+/// section of one file.
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+pub(crate) fn guard_void(f: impl FnOnce() + core::panic::UnwindSafe) {
+    let _ = std::panic::catch_unwind(f);
+}
+
+/// `no_std` fallback: runs `f` directly (no unwinding to catch).
+#[cfg(not(feature = "std"))]
+#[allow(dead_code)]
+pub(crate) fn guard_void(f: impl FnOnce() + core::panic::UnwindSafe) {
+    f();
+}
+
 // --- Shared test utility for the panic guards ------------------------------
 //
 // Declared at module scope (not inside `mod tests`) and `pub(crate)` so the
-// sibling shim files' test modules — `src/ffi/gz.rs` has two guards of its own
-// for the `z_size_t` / `*const T` widths this module does not cover — reach the
-// same serialization primitive. Without a single shared lock, two test modules
+// sibling shim files' test modules reach the same serialization primitive: every
+// guard now lives in this module, but each shim file still tests the guards IT
+// uses from its own test module. Without a single shared lock, two test modules
 // swapping the process-global panic hook concurrently can interleave.
 
 /// Serializes every test that installs a scoped panic hook.
@@ -1875,13 +2478,16 @@ mod tests {
     }
 
     /// The three published [`HandleKind`] magics must be pairwise distinct, and
-    /// the tag must stay a `u64` sitting at offset 0 of every tagged handle.
+    /// the shared `(kind, owner)` prefix must sit at identical offsets in
+    /// [`HandleHeader`] and in every tagged handle.
     ///
-    /// [`peek_handle_kind`] reads the discriminant through the C-layout
-    /// [`HandleHeader`] prefix *before* any handle is reinterpreted, so a magic
-    /// collision — or a width/offset drift — would silently defeat the
-    /// cross-engine `End` guard and re-open the layout-mismatched deallocation
-    /// that tagging exists to prevent.
+    /// [`peek_handle_prefix`] reads both fields through the C-layout
+    /// [`HandleHeader`] *before* any handle is reinterpreted as its concrete
+    /// type, so a magic collision — or a width/offset drift in either field —
+    /// would silently defeat the cross-engine `End` guard and the owner check,
+    /// re-opening both the layout-mismatched deallocation and the
+    /// double-reclaim-through-a-copied-`z_stream` hazard that the prefix exists to
+    /// prevent.
     #[test]
     fn handle_kind_magics_are_distinct_and_u64_shaped() {
         // Pairwise distinctness across all three engines.
@@ -1893,13 +2499,30 @@ mod tests {
         // reading the tag through the `HandleHeader` prefix is exact.
         assert_eq!(size_of::<HandleKind>(), size_of::<u64>());
         assert_eq!(align_of::<HandleKind>(), align_of::<u64>());
-        assert_eq!(size_of::<HandleHeader>(), size_of::<u64>());
 
-        // The tag must lead the shared header AND every tagged handle — that is
-        // precisely what lets `peek_handle_kind` read it without knowing the
-        // concrete handle type behind the opaque `state` pointer.
+        // The prefix is two fields wide, not one: `kind` then `owner`. Asserting
+        // the *offsets* rather than the total size keeps this correct on targets
+        // where a `*const` is narrower than the `u64` tag and tail padding is
+        // therefore inserted.
         assert_eq!(offset_of!(HandleHeader, kind), 0);
+        assert_eq!(
+            offset_of!(HandleHeader, owner),
+            size_of::<HandleKind>(),
+            "`owner` must follow `kind` immediately; a gap here would make \
+             `peek_handle_prefix` read the wrong bytes"
+        );
+
+        // The prefix must lead every tagged handle at exactly those offsets — that
+        // is precisely what lets `peek_handle_prefix` read `(kind, owner)` without
+        // knowing the concrete handle type behind the opaque `state` pointer.
+        // `InflateHandle`/`InflateBackHandle` are private to `ffi::inflate` and are
+        // asserted the same way in that module's own tests.
         assert_eq!(offset_of!(DeflateHandle, kind), 0);
+        assert_eq!(
+            offset_of!(DeflateHandle, owner),
+            offset_of!(HandleHeader, owner)
+        );
+        assert!(size_of::<DeflateHandle>() >= size_of::<HandleHeader>());
     }
 
     /// The three published [`HandleKind`] magics must be *these exact* `u64`
@@ -1954,11 +2577,16 @@ mod tests {
         }
     }
 
-    /// The tag gates `deflate_state`/`deflate_take`: a foreign engine's handle is
-    /// rejected WITHOUT reconstituting a wrong-type box, and `state` is left
-    /// intact so nothing is ever dropped through a mismatched `Layout`.
+    /// `deflate_state`/`deflate_take` gate on the *whole* of C's
+    /// `deflateStateCheck` (`deflate.c` L538-L556), clause by clause: the
+    /// allocator pair, the installed handle, the engine kind, the owning
+    /// `z_stream`, and the status ladder.
+    ///
+    /// Each clause is toggled in isolation and then restored, so a clause that
+    /// silently stopped being enforced fails here rather than surfacing as a
+    /// double free or a cross-engine `Layout` mismatch in a consumer.
     #[test]
-    fn handle_tag_gates_deflate_state_and_take() {
+    fn deflate_state_check_enforces_every_c_clause() {
         // No handle installed: every accessor reports absence without touching
         // the null pointer.
         let mut strm = zeroed_stream();
@@ -1969,34 +2597,74 @@ mod tests {
         // SAFETY: as above.
         assert!(unsafe { deflate_take(&mut strm) }.is_none());
 
-        // Install a genuine, correctly tagged deflate handle.
-        let handle = Box::new(DeflateHandle::new(ZStream::with_allocator(CAllocator {
-            zalloc: None,
-            zfree: None,
-            opaque: ptr::null_mut(),
-        })));
-        // SAFETY: transfers ownership of a freshly boxed handle into `state`;
-        // it is reclaimed exactly once by the `deflate_take` at the end.
-        strm.state = unsafe { state_ptr_from_box(handle) };
+        // Build a genuine engine behind a genuine caller hook, so clause 5 (the
+        // status ladder) has a real `DeflateStatus` to inspect and the stream's
+        // advertised allocator pair matches the one the buffers came from.
+        // `stats` is declared first so it outlives every allocation made through
+        // its hook.
+        let stats = crate::ffi::alloc::test_hook::HookStats::new();
+        let hook = stats.hook();
+        let calloc = CAllocator {
+            zalloc: hook.zalloc(),
+            zfree: hook.zfree(),
+            opaque: hook.opaque(),
+        };
+        let mut zs = ZStream::with_allocator(calloc);
+        crate::deflate::deflate_init2(&mut zs, 6, 8, 15, 8, crate::constants::Strategy::Default)
+            .expect("a default deflate init must succeed");
+        strm.zalloc = calloc.zalloc;
+        strm.zfree = calloc.zfree;
+        strm.opaque = calloc.opaque;
+
+        // Installing binds the owner, which is what every clause-4b check below
+        // compares against. `strm` must not be moved from here on.
+        // SAFETY: `state` is null, so nothing is leaked, and the box is reclaimed
+        // exactly once by the `deflate_take` at the end.
+        unsafe { install_handle(&mut strm, Box::new(DeflateHandle::new(zs))) };
         // SAFETY: `state` holds the live `Box<DeflateHandle>` installed above,
-        // whose first field is the `HandleKind` tag.
+        // whose `#[repr(C)]` prefix is readable.
         assert_eq!(
             unsafe { peek_handle_kind(&strm) },
             Some(HandleKind::DEFLATE)
         );
-        // SAFETY: as above; the tag confirms a `DeflateHandle`.
-        assert!(unsafe { deflate_state(&mut strm) }.is_some());
+        // SAFETY: as above; every clause holds, so the borrow is handed out.
+        assert!(
+            unsafe { deflate_state(&mut strm) }.is_some(),
+            "a correctly installed, owner-bound, initialized handle must pass"
+        );
 
+        // --- Clause 2: `strm->zalloc == 0 || strm->zfree == 0` ---------------
+        for (label, clear_zalloc) in [("zalloc", true), ("zfree", false)] {
+            let saved_alloc = strm.zalloc;
+            let saved_free = strm.zfree;
+            if clear_zalloc {
+                strm.zalloc = None;
+            } else {
+                strm.zfree = None;
+            }
+            // SAFETY: `state` still holds the live handle; only `strm`'s own
+            // `Copy` hook fields were changed.
+            assert!(
+                !unsafe { deflate_state_check(&strm) },
+                "C rejects a stream whose {label} hook has been cleared"
+            );
+            // SAFETY: as above; a rejected take must not reconstitute the box.
+            assert!(unsafe { deflate_take(&mut strm) }.is_none());
+            assert!(!strm.state.is_null());
+            strm.zalloc = saved_alloc;
+            strm.zfree = saved_free;
+        }
+
+        // --- Clause 4a: the Rust-only engine-kind tag -----------------------
         // Overwrite the tag with a foreign engine's magic, emulating a caller
         // that passes an inflate-initialized stream to `deflateEnd`.
-        // SAFETY: `state` points at a live, C-layout `DeflateHandle` whose first
-        // field is a `HandleKind`, and `HandleHeader` is a C-layout struct with
-        // the same leading field, so this writes exactly that field and no other.
+        // SAFETY: `state` points at a live, C-layout `DeflateHandle` whose prefix
+        // is a `HandleHeader`, so this writes exactly that field and no other.
         unsafe {
             (*(strm.state as *mut HandleHeader)).kind = HandleKind::INFLATE;
         }
-        // SAFETY: `state` still points at the live handle allocation, so the tag
-        // remains readable.
+        // SAFETY: `state` still points at the live handle allocation, so the
+        // prefix remains readable.
         assert!(unsafe { deflate_state(&mut strm) }.is_none());
         // SAFETY: as above.
         assert!(unsafe { deflate_take(&mut strm) }.is_none());
@@ -2005,20 +2673,56 @@ mod tests {
             "a rejected take must leave `state` installed, never dropping a \
              wrong-type box"
         );
-
-        // Restore the correct tag and reclaim the box, so the handle is freed
-        // through its real type and the test leaks nothing.
-        // SAFETY: as for the corrupting write above — same allocation, same
-        // leading field.
+        // SAFETY: as for the corrupting write above — same allocation, same field.
         unsafe {
             (*(strm.state as *mut HandleHeader)).kind = HandleKind::DEFLATE;
         }
-        // SAFETY: the tag again confirms the live `Box<DeflateHandle>`, which is
+
+        // --- Clause 4b: `s->strm != strm`, the owner check ------------------
+        // This is the transplantation guard. A caller who `memcpy`s the 14-field
+        // `z_stream` gets a second struct naming the SAME handle; C refuses every
+        // call through the copy, and so must this. Emulating it by rewriting the
+        // recorded owner is equivalent to — and far safer than — building a real
+        // copy, because a real copy would leave a second struct able to double
+        // free if the guard regressed.
+        let foreign = 0xDEAD_BEEF_usize as *const z_stream;
+        // SAFETY: same allocation, same `#[repr(C)]` prefix; `owner` is a raw
+        // pointer field that is only ever compared, never dereferenced.
+        unsafe {
+            (*(strm.state as *mut HandleHeader)).owner = foreign;
+        }
+        // SAFETY: `state` still points at the live handle allocation.
+        assert!(
+            !unsafe { deflate_state_check(&strm) },
+            "a handle owned by a different z_stream must be refused"
+        );
+        // SAFETY: as above.
+        assert!(unsafe { deflate_state(&mut strm) }.is_none());
+        // SAFETY: as above — and this is the assertion that pins the fix: a
+        // wrong-owner reclaim must NOT reconstitute the box.
+        assert!(unsafe { deflate_take(&mut strm) }.is_none());
+        assert!(
+            !strm.state.is_null(),
+            "a wrong-owner take must leave `state` installed so the real owner \
+             can still reclaim it exactly once"
+        );
+        // SAFETY: as above; restore the true owner.
+        unsafe {
+            (*(strm.state as *mut HandleHeader)).owner = &raw const strm;
+        }
+
+        // --- All clauses restored: the true owner reclaims exactly once ------
+        // SAFETY: every clause holds again, so the live `Box<DeflateHandle>` is
         // reconstituted exactly once here.
         assert!(unsafe { deflate_take(&mut strm) }.is_some());
         assert!(
             strm.state.is_null(),
             "a successful take must null `state` to prevent a double free"
+        );
+        assert_eq!(
+            stats.live_bytes(),
+            0,
+            "reclaiming through the owner must release every hook-backed region"
         );
     }
 
@@ -2327,9 +3031,9 @@ mod tests {
         assert!(longs.iter().all(|&l| l == 0));
     }
 
-    /// Geometry regression: `DeflateState::new_in` must present the caller's
-    /// `zalloc` with the same `(items, size)` argument pairs — in the same order,
-    /// and the same number of times — that C `deflateInit2_` passes.
+    /// Geometry regression: the FFI init path must present the caller's `zalloc`
+    /// with the same argument *shape* — in the same order, and the same number of
+    /// times — that C `deflateInit2_` passes.
     ///
     /// A bounded or inspecting allocator (`infcover.c`'s is the canonical
     /// example) legitimately reads both arguments and counts the calls, so
@@ -2348,10 +3052,17 @@ mod tests {
     /// There is no sixth request: C carves the symbol buffer out of the pending
     /// allocation with `s->sym_buf = s->pending_buf + s->lit_bufsize` (L520), and
     /// this port reproduces that as index arithmetic inside one owned buffer
-    /// (AAP §0.3.2 rule T3). The state's byte count comes from
-    /// [`DeflateState::C_LAYOUT_SIZE`] — the field-exact `#[repr(C)]` layout
-    /// mirror of C's `deflate_state` — not from this Rust type's own `size_of`,
-    /// which differs (AAP §0.6.3).
+    /// (AAP §0.3.2 rule T3).
+    ///
+    /// The four working buffers reproduce C's `(items, size)` pairs exactly. The
+    /// state's request is `(1, size_of::<DeflateState>())` rather than
+    /// `(1, `[`DeflateState::C_LAYOUT_SIZE`]`)`, because the region it secures *is*
+    /// where the state lives (AAP §0.6.3 has-hook clause) and this port's state is
+    /// legitimately larger than C's — a block of C's `sizeof` could not hold it. Of
+    /// the two, holding the state in the caller's memory is the property AAP §0.6.5
+    /// asks for: it fixes the allocation **count** and the **failure timing**, and a
+    /// single request's byte count is not something any zlib contract lets a caller
+    /// assert (C's own value moves with `LIT_MEM` and pointer width).
     #[test]
     fn deflate_new_in_presents_c_zalloc_geometry() {
         use core::sync::atomic::{AtomicUsize, Ordering};
@@ -2391,15 +3102,25 @@ mod tests {
 
         // Reference parameters: level 6, 15-bit window, mem level 8 — the zlib
         // defaults, and the configuration `deflateInit_` produces.
-        let state = DeflateState::new_in(hook, 6, Z_DEFLATED, 15, 8, Strategy::Default, 1)
-            .expect("healthy hook initializes the state");
+        // The C-parity init path — the one the FFI `deflateInit2_` shim drives —
+        // charges the state to the hook as well as the four working buffers.
+        let state = DeflateState::new_in_with_detail(
+            &HookAllocator::new(hook),
+            6,
+            Z_DEFLATED,
+            15,
+            8,
+            Strategy::Default,
+            1,
+        )
+        .expect("healthy hook initializes the state");
 
         let w_size = 1usize << 15;
         let hash_size = 1usize << (8 + 7);
         let lit_bufsize = 1usize << (8 + 6);
         let expected: [(usize, usize); 5] = [
             // C: ZALLOC(strm, 1, sizeof(deflate_state))   -- deflate.c L440
-            (1, DeflateState::C_LAYOUT_SIZE),
+            (1, size_of::<DeflateState>()),
             // C: ZALLOC(strm, s->w_size, 2 * sizeof(Byte)) -- deflate.c L458
             (w_size, 2),
             // C: ZALLOC(strm, s->w_size, sizeof(Pos))      -- deflate.c L459
@@ -2482,8 +3203,16 @@ mod tests {
         // A small geometry keeps the test cheap while keeping every request pair
         // distinct enough to be meaningful: windowBits 9 => w_size 512,
         // memLevel 4 => hash_size 2048, lit_bufsize 1024.
-        let state = DeflateState::new_in(hook, 6, Z_DEFLATED, 9, 4, Strategy::Default, 1)
-            .expect("healthy hook initializes the state");
+        let state = DeflateState::new_in_with_detail(
+            &HookAllocator::new(hook),
+            6,
+            Z_DEFLATED,
+            9,
+            4,
+            Strategy::Default,
+            1,
+        )
+        .expect("healthy hook initializes the state");
 
         RECORDING.store(true, Ordering::SeqCst);
         let copy = state
@@ -2496,7 +3225,8 @@ mod tests {
         let lit_bufsize = 1usize << (4 + 6);
         let expected: [(usize, usize); 5] = [
             // C: ZALLOC(dest, 1, sizeof(deflate_state))     -- deflate.c L1335
-            (1, DeflateState::C_LAYOUT_SIZE),
+            // (this port's own `size_of`; see the init-geometry test for why)
+            (1, size_of::<DeflateState>()),
             // C: ZALLOC(dest, ds->w_size, 2 * sizeof(Byte)) -- deflate.c L1341
             (w_size, 2),
             // C: ZALLOC(dest, ds->w_size, sizeof(Pos))      -- deflate.c L1342
@@ -2528,7 +3258,7 @@ mod tests {
         assert_eq!(copy.lit_bufsize, state.lit_bufsize);
         assert_eq!(copy.pending_buf.len(), state.pending_buf.len());
         assert_eq!(&copy.window[..], &state.window[..]);
-        assert!(copy.pending_buf.is_foreign() && copy.state_alloc.is_foreign());
+        assert!(copy.pending_buf.is_foreign() && copy.is_foreign());
     }
 
     /// Regression guard: the engines must release their buffers in the **reverse of
@@ -2599,8 +3329,16 @@ mod tests {
 
         // --- deflate: five allocations, freed 4, 3, 2, 1, 0 ------------------
         {
-            let state = DeflateState::new_in(hook, 6, Z_DEFLATED, 15, 8, Strategy::Default, 1)
-                .expect("healthy hook initializes the state");
+            let state = DeflateState::new_in_with_detail(
+                &HookAllocator::new(hook),
+                6,
+                Z_DEFLATED,
+                15,
+                8,
+                Strategy::Default,
+                1,
+            )
+            .expect("healthy hook initializes the state");
             assert_eq!(
                 NALLOC.load(Ordering::SeqCst),
                 5,
@@ -2621,18 +3359,23 @@ mod tests {
              (`deflate.c` L1300-L1306)"
         );
 
-        // --- inflate: state reservation then the lazily grown window ---------
+        // --- inflate: the state itself, then the lazily grown window ---------
         NALLOC.store(0, Ordering::SeqCst);
         NFREE.store(0, Ordering::SeqCst);
         for cell in &FREED {
             cell.store(usize::MAX, Ordering::SeqCst);
         }
         {
-            let mut state = InflateState::try_new_in(hook, 0, 15).expect("state boxes");
-            // Install the two hook-backed regions in C's order: the state
-            // reservation (`inflate.c` L198) and then the window (L261).
-            state.state_alloc = AllocBuffer::try_zeroed_items(1, InflateState::C_LAYOUT_SIZE, hook)
-                .expect("healthy hook reserves the state footprint");
+            // Take the two hook-backed regions in C's order: the state itself
+            // (`inflate.c` L198) and then the window (L261). The reservation is what
+            // the real `inflate_init2` takes, and filling it puts the state *in* the
+            // caller's region rather than beside it.
+            let reservation =
+                crate::stream::EngineReservation::<InflateState>::take(&HookAllocator::new(hook))
+                    .expect("healthy hook serves the state");
+            let mut state = reservation
+                .fill(InflateState::build_in(hook, 0, 15))
+                .expect("filling a secured region cannot fail");
             state.window =
                 AllocBuffer::try_zeroed(1 << 15, hook).expect("healthy hook serves the window");
             assert_eq!(NALLOC.load(Ordering::SeqCst), 2);
@@ -2642,7 +3385,7 @@ mod tests {
         let order: [usize; 2] = core::array::from_fn(|i| FREED[i].load(Ordering::SeqCst));
         assert_eq!(
             order,
-            // 0 = state reservation, 1 = window.
+            // 0 = the state, 1 = window.
             [1, 0],
             "inflateEnd frees the window then the state \
              (`inflate.c` L1160-L1161)"
@@ -2686,9 +3429,17 @@ mod tests {
         let hook = AllocHook::new(Some(flaky_zalloc), Some(flaky_zfree), ptr::null_mut());
 
         // Small geometry (9-bit window, mem level 1) keeps the test cheap.
-        let state = DeflateState::new_in(hook, 6, Z_DEFLATED, 9, 1, Strategy::Default, 1)
-            .expect("healthy hook initializes the state");
-        assert!(state.window.is_foreign());
+        let state = DeflateState::new_in_with_detail(
+            &HookAllocator::new(hook),
+            6,
+            Z_DEFLATED,
+            9,
+            1,
+            Strategy::Default,
+            1,
+        )
+        .expect("healthy hook initializes the state");
+        assert!(state.window.is_foreign() && state.is_foreign());
 
         {
             let copy = state
@@ -2699,8 +3450,8 @@ mod tests {
                     && copy.prev.is_foreign()
                     && copy.head.is_foreign()
                     && copy.pending_buf.is_foreign()
-                    && copy.state_alloc.is_foreign(),
-                "every buffer of the copy must stay in the caller's arena"
+                    && copy.is_foreign(),
+                "the copy's state and every buffer must stay in the caller's arena"
             );
             assert_eq!(copy.window.len(), state.window.len());
             assert_eq!(&copy.window[..], &state.window[..]);
@@ -3230,18 +3981,26 @@ mod tests {
 
     // -- panic-guard tests --------------------------------------------------
     //
-    // Every fallible shim body in `src/ffi/**` runs inside one of the four
+    // Every fallible shim body in `src/ffi/**` runs inside one of the eight
     // guards above, because a Rust panic unwinding across the C ABI is
-    // undefined behavior. The guards are four *separate* implementations, one
+    // undefined behavior. The guards are eight *separate* implementations, one
     // per C return width, and each is the last line of defense for the shims
     // that use it, so each is exercised directly rather than by analogy:
     //
-    // | Guard         | C return type          | Representative shims                       |
-    // |---------------|------------------------|--------------------------------------------|
-    // | `guard_int`   | `int`                  | `deflate`, `inflate`, `gzread`, `gzclose`   |
-    // | `guard_ulong` | `uLong`                | `adler32`, `crc32`, `compressBound`         |
-    // | `guard_ptr`   | `T *`                  | `gzgets`, `gzopen`                          |
-    // | `guard_off`   | `z_off_t`/`z_off64_t`  | `gzseek`, `gztell`, `gzoffset`              |
+    // | Guard             | C return type          | Representative shims                        |
+    // |-------------------|------------------------|---------------------------------------------|
+    // | `guard_int`       | `int`                  | `deflate`, `inflate`, `gzread`, `gzclose`    |
+    // | `guard_ulong`     | `uLong`                | `adler32`, `crc32`, `compressBound`          |
+    // | `guard_long`      | `long`                 | `inflateMark`                               |
+    // | `guard_size`      | `z_size_t`             | `gzfread`, `gzfwrite`, `compressBound_z`     |
+    // | `guard_ptr`       | `T *`                  | `gzgets`, `gzopen`                          |
+    // | `guard_const_ptr` | `const T *`            | `zError`, `zlibVersion`, `gzerror`           |
+    // | `guard_off`       | `z_off_t`/`z_off64_t`  | `gzseek`, `gztell`, `gzoffset`              |
+    // | `guard_void`      | `void`                 | `gzclearerr`                                |
+    //
+    // `ffi::types` is the single home for all eight; no shim file may define its
+    // own guard or open a bare `catch_unwind`, which
+    // `every_boundary_guard_lives_in_this_module` asserts structurally.
     //
     // Two properties matter for every one of them: the success value must pass
     // through *bit-exactly* (a guard that clamped or re-derived it would corrupt
@@ -3362,7 +4121,215 @@ mod tests {
         assert_eq!(extreme, z_off64_t::MIN);
     }
 
-    /// Pass-through holds for **both** implementations of every guard.
+    /// [`guard_long`] passes a [`c_long`] through unchanged — including the `-1`
+    /// sentinel `inflateMark` returns for an absent state — and substitutes its
+    /// exact default when the body panics.
+    ///
+    /// The signedness matters for the same reason it does in [`guard_off`]:
+    /// `inflateMark`'s documented failure value is `-1 << 16`, so a guard that
+    /// routed the value through an unsigned type would hand the caller a huge
+    /// positive mark.
+    #[cfg(feature = "std")]
+    #[test]
+    fn guard_long_catches_panic_and_passes_value() {
+        assert_eq!(guard_long(-1, || 0), 0);
+        assert_eq!(guard_long(0, || -1), -1);
+        assert_eq!(guard_long(0, || -(1 << 16)), -(1 << 16));
+        assert_eq!(guard_long(0, || c_long::MIN), c_long::MIN);
+        assert_eq!(guard_long(0, || c_long::MAX), c_long::MAX);
+
+        let caught = with_silenced_panic_hook(|| guard_long(-1, || panic!("boundary panic")));
+        assert_eq!(caught, -1);
+
+        let marked =
+            with_silenced_panic_hook(|| guard_long(-(1 << 16), || panic!("boundary panic")));
+        assert_eq!(marked, -(1 << 16));
+    }
+
+    /// [`guard_size`] passes a [`z_size_t`] through unchanged and substitutes its
+    /// exact default when the body panics.
+    ///
+    /// The `_z` family (`gzfread`, `gzfwrite`, `compressBound_z`) reports failure
+    /// as `0`, which is also a perfectly ordinary success value, so both must
+    /// survive the guard distinctly.
+    #[cfg(feature = "std")]
+    #[test]
+    fn guard_size_catches_panic_and_passes_value() {
+        assert_eq!(guard_size(1, || 0), 0);
+        assert_eq!(guard_size(0, || 1), 1);
+        assert_eq!(guard_size(0, || z_size_t::MAX), z_size_t::MAX);
+
+        let caught = with_silenced_panic_hook(|| guard_size(0, || panic!("boundary panic")));
+        assert_eq!(caught, 0);
+
+        let nonzero = with_silenced_panic_hook(|| guard_size(0xFEED, || panic!("boundary panic")));
+        assert_eq!(nonzero, 0xFEED);
+    }
+
+    /// [`guard_const_ptr`] passes a `*const T` through by **identity** and
+    /// substitutes its default when the body panics.
+    ///
+    /// This is the guard behind the shims that hand a C caller a pointer into
+    /// static storage — `zError`, `zlibVersion`, `gzerror` — where returning a
+    /// re-derived pointer instead of the exact one produced would be a silent
+    /// corruption. Exercised at two pointee types so the generic parameter is
+    /// proven live rather than accidentally monomorphic.
+    #[cfg(feature = "std")]
+    #[test]
+    fn guard_const_ptr_catches_panic_and_passes_value() {
+        let value: c_int = 42;
+        let live: *const c_int = &raw const value;
+
+        assert_eq!(guard_const_ptr(ptr::null(), || live), live);
+
+        let nulled = with_silenced_panic_hook(|| {
+            guard_const_ptr(ptr::null::<c_int>(), || panic!("boundary"))
+        });
+        assert!(nulled.is_null());
+
+        let fallback = with_silenced_panic_hook(|| guard_const_ptr(live, || panic!("boundary")));
+        assert_eq!(fallback, live);
+        assert_eq!(value, 42, "the guard moves pointers, never the pointee");
+
+        // `c_char` is the pointee that actually matters: it is what `zError`,
+        // `zlibVersion` and `gzerror` return.
+        let text = c"boundary";
+        let text_ptr: *const c_char = text.as_ptr();
+        assert_eq!(guard_const_ptr(ptr::null(), || text_ptr), text_ptr);
+        let text_nulled = with_silenced_panic_hook(|| {
+            guard_const_ptr(ptr::null::<c_char>(), || panic!("boundary"))
+        });
+        assert!(text_nulled.is_null());
+    }
+
+    /// [`guard_void`] runs its body and swallows a panic without a value to
+    /// substitute.
+    ///
+    /// `gzclearerr` returns `void`, so there is no sentinel a C caller could
+    /// observe — which makes the guard's only obligations to (a) actually invoke
+    /// the body and (b) never let an unwind reach the C frame. Both are asserted:
+    /// the side effect proves the body ran, and the surviving assertion after the
+    /// panicking call proves the unwind was contained.
+    #[cfg(feature = "std")]
+    #[test]
+    fn guard_void_runs_its_body_and_contains_a_panic() {
+        let mut ran = false;
+        guard_void(core::panic::AssertUnwindSafe(|| ran = true));
+        assert!(ran, "guard_void must invoke its body");
+
+        let mut reached = false;
+        with_silenced_panic_hook(|| {
+            guard_void(core::panic::AssertUnwindSafe(|| {
+                reached = true;
+                panic!("boundary panic");
+            }));
+        });
+        assert!(
+            reached,
+            "the body must have started before the panic was contained"
+        );
+    }
+
+    /// `ffi::types` is the **only** module that may define a boundary guard or
+    /// open a bare `catch_unwind`.
+    ///
+    /// Before this was centralized, `ffi::inflate` carried its own `guard_long`,
+    /// `ffi::gz` carried its own `guard_size` and `guard_const_ptr`, and
+    /// `gzclearerr` opened a bare `std::panic::catch_unwind` with no guard at all.
+    /// Four independent implementations of one safety-critical primitive is four
+    /// places for the `no_std` arm, the `AssertUnwindSafe` boundary, or the
+    /// default-substitution semantics to drift apart, and the drift would be
+    /// invisible: each copy passes its own tests.
+    ///
+    /// The invariant is therefore asserted structurally, over the source itself.
+    /// Comments are stripped first, so the prose above cannot satisfy it.
+    #[test]
+    fn every_boundary_guard_lives_in_this_module() {
+        /// Every `src/ffi/**` module that must contain no guard definition.
+        const SHIM_FILES: [&str; 6] = [
+            "src/ffi/mod.rs",
+            "src/ffi/deflate.rs",
+            "src/ffi/inflate.rs",
+            "src/ffi/gz.rs",
+            "src/ffi/util.rs",
+            "src/ffi/alloc.rs",
+        ];
+
+        /// The canonical guard names. Each must be defined here, twice — once for
+        /// `std` and once for `no_std`.
+        const CANONICAL: [&str; 8] = [
+            "guard_int",
+            "guard_ulong",
+            "guard_long",
+            "guard_size",
+            "guard_ptr",
+            "guard_const_ptr",
+            "guard_off",
+            "guard_void",
+        ];
+
+        let strip = |text: &str| -> std::string::String {
+            text.lines()
+                .map(|line| match line.find("//") {
+                    Some(at) => &line[..at],
+                    None => line,
+                })
+                .collect::<std::vec::Vec<_>>()
+                .join("\n")
+        };
+        let read = |relative: &str| -> std::string::String {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+            strip(
+                &std::fs::read_to_string(&path)
+                    .unwrap_or_else(|err| panic!("{} must be readable: {err}", path.display())),
+            )
+        };
+
+        // Every canonical guard is defined here, in both feature arms.
+        let home = read("src/ffi/types.rs");
+        for name in CANONICAL {
+            let needle = std::format!("fn {name}");
+            let count = home.matches(needle.as_str()).count();
+            assert!(
+                count >= 2,
+                "`{name}` must be defined in src/ffi/types.rs for both the `std` \
+                 and `no_std` arms; found {count} definition(s)"
+            );
+        }
+
+        // No shim file defines one, and none opens a bare `catch_unwind`.
+        let mut strays: std::vec::Vec<std::string::String> = std::vec::Vec::new();
+        for relative in SHIM_FILES {
+            let text = read(relative);
+            for name in CANONICAL {
+                if text.contains(&std::format!("fn {name}(")) {
+                    strays.push(std::format!(
+                        "{relative} defines `{name}`; the single home is \
+                         src/ffi/types.rs"
+                    ));
+                }
+                if text.contains(&std::format!("fn {name}<")) {
+                    strays.push(std::format!(
+                        "{relative} defines generic `{name}`; the single home is \
+                         src/ffi/types.rs"
+                    ));
+                }
+            }
+            if text.contains("catch_unwind") {
+                strays.push(std::format!(
+                    "{relative} opens a bare `catch_unwind`; route the body \
+                     through the guard for its C return width instead"
+                ));
+            }
+        }
+        assert!(
+            strays.is_empty(),
+            "boundary guards must live only in src/ffi/types.rs:\n{}",
+            strays.join("\n")
+        );
+    }
+
+    /// Pass-through holds for **both** implementations of all **eight** guards.
     ///
     /// Each guard exists twice: a `catch_unwind` form under `std` and a
     /// direct-call form under `no_std`, where there is no unwinding to catch.
@@ -3386,10 +4353,31 @@ mod tests {
         assert_eq!(guard_off(-1, || 2_147_483_648), 2_147_483_648);
         assert_eq!(guard_off(0, || z_off64_t::MIN), z_off64_t::MIN);
 
+        assert_eq!(guard_long(-1, || 0), 0);
+        assert_eq!(guard_long(0, || c_long::MIN), c_long::MIN);
+        assert_eq!(guard_long(0, || c_long::MAX), c_long::MAX);
+
+        assert_eq!(guard_size(1, || 0), 0);
+        assert_eq!(guard_size(0, || z_size_t::MAX), z_size_t::MAX);
+
+        assert_eq!(guard_off(-1, || 2_147_483_648), 2_147_483_648);
+        assert_eq!(guard_off(0, || z_off64_t::MIN), z_off64_t::MIN);
+
         let mut value: c_int = 42;
         let live: *mut c_int = &raw mut value;
         assert_eq!(guard_ptr(ptr::null_mut(), || live), live);
         assert_eq!(value, 42, "the guard moves pointers, never the pointee");
+
+        let frozen: *const c_int = &raw const value;
+        assert_eq!(guard_const_ptr(ptr::null(), || frozen), frozen);
+        assert_eq!(value, 42);
+
+        // `guard_void` has no value to pass through, so the property it must hold
+        // is that the body actually runs: a guard that swallowed its closure
+        // would silently turn `gzclearerr` into a no-op.
+        let mut ran = false;
+        guard_void(core::panic::AssertUnwindSafe(|| ran = true));
+        assert!(ran, "guard_void must invoke its body in every feature row");
     }
 
     /// `init_allocator_prologue` must reproduce C's allocator prologue for all

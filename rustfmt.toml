@@ -55,7 +55,7 @@
 #
 #       cargo fmt --all -- --check           # the pinned MSRV floor
 #       cargo +stable fmt --all -- --check   # what the CI `lint` job runs
-#       cargo +nightly fmt --all -- --check  # what `cargo-fuzz` contributors get
+#       cargo +nightly-2026-08-01 fmt --all -- --check  # what `cargo-fuzz` contributors get
 #
 # * TO CHECK A VALUE AGAINST THE TOOL'S OWN DEFAULTS, ask rustfmt, not the docs:
 #

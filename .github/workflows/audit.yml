@@ -8,17 +8,30 @@
 # closure. Two independent tools run here, because they answer two different
 # questions:
 #
-#   * `cargo-audit` reads a LOCKFILE and matches its packages against the
-#     RustSec advisory database. It is the only mechanism anywhere in this
-#     repository that checks `fuzz/Cargo.lock` for advisories.
-#   * `cargo-deny` evaluates the root `deny.toml` POLICY - permitted licences,
-#     advisory severity, banned crates and permitted sources - over the resolved
-#     root crate graph.
+#   * `cargo-audit` reads a LOCKFILE directly and matches its packages against
+#     the RustSec advisory database, consulting no policy file. This is the only
+#     place it runs, and the only place `fuzz/Cargo.lock` is read AS A FILE. It
+#     is NOT the only advisory coverage of that closure: `cargo-deny-fuzz` below
+#     resolves the same fuzz graph and runs `check advisories` over it as well.
+#     Two tools reaching one closure by different routes is the intent.
+#   * `cargo-deny` evaluates a POLICY - permitted licences, advisory severity,
+#     banned crates and permitted sources - over a RESOLVED crate graph. One
+#     reviewed policy governs each graph: `deny.toml` the root graph and
+#     `fuzz/deny.toml` the detached fuzz graph.
 #
 # Neither tool is, or may become, a manifest dependency. Both are installed by
-# the jobs below, exactly as `fuzz.yml` installs `cargo-fuzz`. This file is the
-# ONLY place either tool runs: `fuzz.yml` builds and fuzzes the harnesses and
-# nothing else, so the supply-chain gate has exactly one home.
+# the jobs below, exactly as `fuzz.yml` installs `cargo-fuzz`. This file owns the
+# supply-chain gate over both PROJECT graphs, and is the sole home of that gate.
+#
+# `cargo-deny` is not unique to this file, and saying otherwise would misdescribe
+# `fuzz.yml`. That workflow also installs cargo-deny, asserts the SAME 0.20.2
+# pin, and runs `check advisories` against the dependency graph of the
+# `cargo-fuzz` TOOL before installing it from source. That is a third, disjoint
+# graph - a build tool's own closure, not this project's - so it belongs beside
+# that install rather than here. The two version pins must never diverge.
+# `fuzz.yml` additionally runs its own `fmt`, two Clippy gates and a
+# no-default-features build over the detached harnesses, because workspace-scoped
+# root gates cannot reach them.
 #
 # Every job and step here is BLOCKING and none may be marked advisory: a gate that
 # reports without failing is indistinguishable from no gate. Nothing here suppresses
@@ -28,14 +41,14 @@
 # `unused-ignored-advisory = "deny"` makes a stale entry an error in its own right.
 #
 # Jobs:
-#   policy-integrity   structural self-assertion over `deny.toml`, the single
-#                      policy file; needs no Rust toolchain
+#   policy-integrity   structural self-assertion over BOTH policy files,
+#                      `deny.toml` and `fuzz/deny.toml`; needs no Rust toolchain
 #   cargo-audit        RustSec advisory scan of BOTH lockfiles (89 + 13 = 102
 #                      packages); the only cargo-audit run in the repository
 #   cargo-deny         root `deny.toml` policy over the root graph: licenses,
 #                      advisories, bans and sources, one named step each
-#   cargo-deny-fuzz    the SAME root `deny.toml`, aimed at the detached fuzz graph
-#                      with `--manifest-path`; the sole enforcement point for that
+#   cargo-deny-fuzz    `fuzz/deny.toml`, aimed at the detached fuzz graph with
+#                      `--manifest-path`; the sole enforcement point for that
 #                      half of the closure
 #
 # All four jobs are independent - none declares `needs:` - so they run in
@@ -107,45 +120,52 @@
 # root `deny.toml` bans `cc` outright because the crate proper takes no
 # C-toolchain build dependency, while the fuzz graph legitimately contains `cc`,
 # `jobserver`, `shlex` and `find-msvc-tools` for the libFuzzer runtime shim plus an
-# NCSA-licensed `libfuzzer-sys`. That is an argument against `--config deny.toml`,
-# not against scanning the graph. It is also exactly why `--config deny.toml` is
-# MANDATORY on the fuzz invocation: `cargo-deny` resolves its configuration from the
-# TARGET manifest's workspace root, so `--manifest-path fuzz/Cargo.toml` without
-# `--config` would look for a `fuzz/deny.toml`, find none, and silently fall back to
-# built-in defaults - a result indistinguishable from a pass. `-L info` prints which
-# config was actually used, which is the positive evidence that the reviewed root
-# policy was in force.
+# NCSA-licensed `libfuzzer-sys`. That is an argument for giving the fuzz graph its
+# OWN reviewed policy, not for leaving the graph unscanned.
 #
-# BOTH graphs are governed by the single root `deny.toml`, and the fuzz job says
-# so explicitly with `--config deny.toml`. That is a deliberate change from an
-# earlier arrangement in which a sibling `fuzz/deny.toml` was DISCOVERED (not
-# named) because cargo-deny resolves configuration from the target manifest's
-# workspace root. The sibling file was deleted: a blocking supply-chain verdict
-# must be produced by a policy that is reviewed as part of this repository's
-# normal review surface, and a second policy file governing a blocking gate is a
-# second place for the standard to drift and a place a reviewer can miss.
+# TWO GRAPHS, TWO POLICY FILES, ONE WORKFLOW. The 89-package root graph is
+# governed by `deny.toml`; the 13-package detached fuzz graph is governed by
+# `fuzz/deny.toml`; and BOTH are evaluated here, by the `cargo-deny` and
+# `cargo-deny-fuzz` jobs respectively. Each invocation names its policy with an
+# explicit `--config`, which is MANDATORY on both: `cargo-deny` resolves its
+# configuration from the TARGET manifest's workspace root and falls back to
+# BUILT-IN DEFAULTS, silently, when it finds nothing there - a result
+# indistinguishable from a pass. Naming the path turns "which policy governed this
+# verdict" from a property of cargo-deny's search order into an assertion. `-L
+# info` then prints the configuration path that was actually used, which is the
+# positive evidence that the named policy - not a default - was in force.
 #
-# The fuzz graph legitimately contains `cc`, `jobserver`, `shlex` and
-# `find-msvc-tools` for the libFuzzer runtime shim, plus an NCSA-licensed
-# `libfuzzer-sys` - all of which the crate proper must never acquire. The root
-# policy accommodates exactly those, narrowly and reviewably: the `cc` ban is
-# scoped with `wrappers = ["libfuzzer-sys"]` rather than relaxed, and NCSA is
-# granted through a crate-scoped `[[licenses.exceptions]]` entry rather than
-# added to the global allow list. See "THE FOUR PLACES THIS FILE ACCOMMODATES THE
-# FUZZ GRAPH" in `deny.toml`.
+# WHY ONE POLICY PER GRAPH rather than one file aimed at two graphs. A policy is
+# a statement about a specific closure, and the two closures differ in exactly the
+# places that matter: the fuzz graph must admit `cc` and NCSA-licensed
+# `libfuzzer-sys`, which the crate proper must never acquire, while the root graph
+# alone carries the `Unicode-3.0` allowance and the four exact-version `[bans]
+# skip` pins for its dev-only duplicate majors. Evaluating either file against the
+# other's graph produces pure SHAPE noise - unused allowances, unmatched skips -
+# and every code waved off to quiet that noise is a code that can no longer speak
+# on that graph. Measured on this tree: with one policy per graph, `deny.toml`
+# needs exactly two narrow `-A` flags for two entries it holds as defence in depth,
+# and the fuzz invocation needs NONE, so all four categories run at FULL severity
+# over all 102 packages.
 #
-# `-L info` still prints the resolved configuration path in both jobs, which is
-# the positive evidence that the ROOT policy is in force rather than a
-# rediscovered sibling or a silent built-in default.
+# The root policy still NAMES the fuzz-graph crates, narrowly and reviewably, so
+# that the two files state the same boundary and so a `cc` that ever reached the
+# root graph would be rejected by an entry a reviewer had already read: the `cc`
+# ban is scoped with `wrappers = ["libfuzzer-sys"]` rather than relaxed, and NCSA
+# is granted through a crate-scoped `[[licenses.exceptions]]` entry rather than
+# added to the global allow list. See "THE FOUR PLACES THIS FILE STILL NAMES
+# FUZZ-GRAPH CRATES" in `deny.toml`. `fuzz/deny.toml` carries both entries
+# unsuppressed, because on ITS graph they are load-bearing rather than latent.
 #
-# Why that job has to live HERE, and ONLY here: THIS FILE IS THE SUPPLY-CHAIN
-# GATE. The gate is one deliverable with one home - `deny.toml` is the single
-# policy and this workflow is what evaluates it, once per graph. An
-# earlier revision of `fuzz.yml` carried its own `cargo-deny` job over the fuzz
-# graph; it has been removed, because a second copy of the gate is not defence in
-# depth but a second place for the tool pin, the `--locked` discipline and the
-# lockfile assertion to drift out of step. `fuzz.yml` now builds and fuzzes and
-# nothing else, and it must not reacquire a policy job.
+# Why BOTH jobs have to live HERE, and only here: THIS FILE IS THE SUPPLY-CHAIN
+# GATE. Two policy files, one evaluator. An earlier revision of `fuzz.yml` carried
+# its own `cargo-deny` job over the fuzz graph; it has been removed, because a
+# second copy of the GATE is not defence in depth but a second place for the tool
+# pin, the `--locked` discipline and the lockfile assertion to drift out of step.
+# (Two POLICY FILES are not a second copy of the gate: they are one gate reading
+# the right rulebook for each graph, and `policy-integrity` below asserts they
+# agree on every shared key.) `fuzz.yml` builds and fuzzes and nothing else, and
+# it must not reacquire a policy job.
 #
 # `cargo-deny-fuzz` therefore has SOLE ownership of the fuzz graph's licence, ban
 # and source evaluation, and its trigger surface strictly contains the one the
@@ -175,20 +195,37 @@
 # is never repaired from inside this workflow:
 #
 #   * A licence or advisory outcome that warrants a policy change belongs in
-#     `deny.toml`, which this workflow only ever READS.
+#     `deny.toml` or `fuzz/deny.toml`, both of which this workflow only ever READS.
 #   * A version change belongs in `Cargo.toml` and `Cargo.lock`. No step here
 #     re-resolves dependencies, or does anything else whose side effect is
 #     regenerating a lockfile, and each of the three tool jobs ends by asserting
 #     that neither lockfile moved. (`policy-integrity` runs no cargo command, so
 #     it has nothing to assert.)
-#   * `cargo deny check bans` reports the three ACKNOWLEDGED duplicate majors as
-#     `note[skipped]` lines, because root `deny.toml` lists each under `skip` with
+#   * `cargo deny check bans` reports the four ACKNOWLEDGED duplicate majors as
+#     `note[skipped]` lines - `rand@0.10.2`, `rand_core@0.10.1`, `getrandom@0.4.3`
+#     and `r-efi@6.0.0` - because root `deny.toml` lists each under `skip` with
 #     an exact `crate@version` pin; those notes are the designed behaviour. Any
 #     OTHER duplicate is a hard `error[duplicate]` and fails the step, because the
-#     policy sets `multiple-versions = "deny"`. Nothing in this file escalates or
-#     downgrades anything - no `-D`, `-W` or `-A` on any command line, and no
-#     duplicate detection of its own. The severity lives in `deny.toml`, where a
-#     reviewer reads it.
+#     policy sets `multiple-versions = "deny"`. Severity lives in the two policy
+#     files, where a reviewer reads it; this workflow adds no duplicate detection
+#     of its own and no blanket overrides. Every severity flag on a command line
+#     here is enumerated and bounded:
+#
+#       - `-D unsound -D unmaintained -D yanked` on the two steps that audit a
+#         SCANNER'S OWN graph. Those promote advisory scopes on cargo-audit's and
+#         cargo-deny's dependency trees - not on this project's.
+#       - exactly two `-A` codes on the four root policy steps:
+#         `unused-wrapper` and `license-exception-not-encountered`, for the two
+#         entries `deny.toml` holds as defence in depth against crates that are
+#         absent from the ROOT graph (`cc`, `libfuzzer-sys`). Both codes stay at
+#         FULL severity on the fuzz invocation, which is the graph those crates
+#         actually live in.
+#       - NOTHING on the fuzz policy step, because `fuzz/deny.toml` is shaped for
+#         the graph it governs and so has no unused entries to explain away.
+#
+#     Nothing capable of hiding a real finding is downgraded anywhere: `rejected`,
+#     `denied`, `duplicate`, `vulnerability`, `unmaintained`, `unsound`, `yanked`,
+#     `unknown-registry` and `unknown-git` are at full severity on both graphs.
 #
 # The specific drift this gate is shaped to catch: two `rand` majors coexist in
 # the root graph. `rand 0.9.4` is the DIRECT dev-dependency and carries the
@@ -216,8 +253,8 @@
 #   different interpretation of the same policy text. Every install below names
 #   an exact version and the following step ASSERTS what resolved:
 #
-#       cargo-deny   0.20.2   <- the version `deny.toml`, the one policy in
-#                                was authored and probed against
+#       cargo-deny   0.20.2   <- the version both policy files were authored
+#                                and probed against
 #       cargo-audit  0.22.2   <- current at the time this gate was validated
 #
 #   WHAT BYTES. The tarball is fetched from static.crates.io by hand, so Cargo's
@@ -281,7 +318,8 @@
 #   * THE ONE QUALIFIED EXCEPTION, stated here so the list above is honest: the
 #     four root `cargo deny check` invocations DO carry `-A unused-wrapper -A
 #     license-exception-not-encountered`, and only those two codes. Both are
-#     shape artifacts of running ONE policy over TWO graphs - the `cc` ban's
+#     shape artifacts of two entries the ROOT policy retains as defence in
+#     depth - the `cc` ban's
 #     `wrappers = ["libfuzzer-sys"]` scope and the `libfuzzer-sys` NCSA exception
 #     are legitimately unused against the ROOT graph, where neither crate exists -
 #     and both stay at full severity on `cargo-deny-fuzz`, the graph where they
@@ -405,7 +443,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Structural self-assertion over the single cargo-deny policy.
+  # Structural self-assertion over both cargo-deny policies.
   #
   # WHY THIS JOB EXISTS. `cargo deny` evaluates what it finds and does not require
   # the policy file to contain anything: with `deny.toml` present but its `[bans]`
@@ -425,14 +463,18 @@ jobs:
   # the same commit. That coupling is the point - a policy relaxation becomes a
   # two-file diff a reviewer cannot miss, instead of a one-word edit.
   #
-  # This job ALSO asserts that `fuzz/deny.toml` does not exist. There used to be
-  # one, and it silently governed a blocking verdict from outside the reviewed
-  # surface; `deny.toml` is now the only policy and both graphs are checked
-  # against it with an explicit `--config deny.toml`. If a sibling file ever
-  # reappears, the fuzz job's explicit `--config` keeps ignoring it while a
-  # reader would reasonably assume otherwise - so its mere presence is a defect.
+  # This job asserts BOTH policies - the root `deny.toml` over the 89-package root
+  # graph and the sibling `fuzz/deny.toml` over the 13-package detached fuzz graph.
+  # Each is named explicitly by its consumer (`--config deny.toml` and
+  # `--config fuzz/deny.toml`), so neither can degrade to cargo-deny's built-in
+  # defaults through failed discovery; and each is asserted here, so neither can
+  # be DELETED or eroded silently. A missing policy file is the loudest erosion
+  # there is and is a hard failure below. The two files are additionally compared
+  # against each other on every key where divergence would weaken one graph
+  # relative to the other, which is what keeps "two policies" from becoming "two
+  # standards".
   policy-integrity:
-    name: policy integrity (deny.toml self-assertion)
+    name: policy integrity (deny.toml + fuzz/deny.toml self-assertion)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -499,7 +541,32 @@ jobs:
               ("licenses", "include-dev", True),
               ("licenses", "include-build", True),
               ("licenses", "unused-allowed-license", "deny"),
-              ("licenses", "allow", ["Apache-2.0", "MIT", "Unicode-3.0", "Zlib"]),
+              # cargo-deny's licence DETECTION threshold, and load-bearing for the
+              # same reason as the keys around it: lowering it makes a fuzzy,
+              # low-confidence match count as a positive identification, so a crate
+              # whose licence text cannot actually be recognised would pass the
+              # allow-list check instead of being surfaced. It was the other
+              # unasserted key in this table.
+              ("licenses", "confidence-threshold", 0.93),
+              # The two DIAGNOSTIC-ONLY keys, pinned for completeness rather than
+              # because changing them would weaken coverage - neither can make a
+              # check pass vacuously or admit a disallowed crate or licence. They
+              # are asserted so that "every load-bearing key" above is a claim about
+              # the whole file rather than a judgement a reader has to re-derive:
+              # after these two, EVERY key of EVERY governed table in BOTH policies
+              # is pinned here - measured, not assumed: the two files carry identical
+              # key sets, and `licenses.allow` is the single key whose VALUE differs
+              # (asserted per policy by `EXPECTED_ALLOW` below).
+              #
+              # Caveat worth knowing: `[output]` is deliberately absent from
+              # REQUIRED_TABLES, because its absence cannot cause a vacuous pass the
+              # way a missing `[licenses]` or `[bans]` would. The loop below skips a
+              # table that is not present, so DELETING `[output]` entirely is not
+              # caught in EITHER policy - only changing `feature-depth` in place is.
+              # That is the correct trade: the key affects how much feature-graph
+              # detail cargo-deny prints, nothing more.
+              ("output", "feature-depth", 1),
+              ("bans", "highlight", "all"),
               ("bans", "multiple-versions", "deny"),
               ("bans", "multiple-versions-include-dev", True),
               ("bans", "wildcards", "deny"),
@@ -542,10 +609,33 @@ jobs:
           # SET, not just the shape, is what stops a fifth duplicate being waved
           # through by adding one line to `deny.toml`.
           EXPECTED_SKIPS = {
-              "rand@0.10.2", "rand_core@0.10.1", "getrandom@0.4.3", "r-efi@6.0.0",
+              "deny.toml": {
+                  "rand@0.10.2", "rand_core@0.10.1", "getrandom@0.4.3",
+                  "r-efi@6.0.0",
+              },
+              # The fuzz graph has no duplicate majors, so it acknowledges none.
+              # An entry appearing here is a NEW duplicate and a policy decision.
+              "fuzz/deny.toml": set(),
           }
 
-          POLICY = "deny.toml"
+          # `licenses.allow` differs between the two policies by exactly one term
+          # and that difference is load-bearing, so it is asserted per policy
+          # rather than shared. `Unicode-3.0` is required by `unicode-ident`, a
+          # ROOT-graph crate declaring the conjunction
+          # `(MIT OR Apache-2.0) AND Unicode-3.0`; the fuzz graph never reaches it,
+          # and with `unused-allowed-license = "deny"` in force there, listing it
+          # would make the fuzz invocation fail. Every other allowed term must be
+          # identical - see CROSS-POLICY CONSISTENCY below.
+          EXPECTED_ALLOW = {
+              "deny.toml": ["Apache-2.0", "MIT", "Unicode-3.0", "Zlib"],
+              "fuzz/deny.toml": ["Apache-2.0", "MIT", "Zlib"],
+          }
+
+          # Both policies are asserted. Neither may be missing: `deny.toml` governs
+          # the 89 root packages and `fuzz/deny.toml` the 13 of the detached fuzz
+          # workspace, and between them they are the whole of AAP gap D1's
+          # "102-package closure". Deleting either one silently ungoverns its graph.
+          POLICIES = ("deny.toml", "fuzz/deny.toml")
           failures = []
 
           def check(path, table, key, expected, actual_holder):
@@ -562,29 +652,25 @@ jobs:
                   failures.append(f"{path}: [{table}] {key} = {actual!r}, "
                                   f"expected {expected!r}")
 
-          # A sibling fuzz policy must never come back. `cargo-deny` resolves its
-          # configuration from the TARGET manifest's workspace root, so a
-          # `fuzz/deny.toml` would be DISCOVERED by any invocation that forgot
-          # `--config deny.toml` - governing a blocking verdict from outside the
-          # reviewed surface. Both invocations now name this file explicitly, which
-          # makes a reappeared sibling inert AND misleading.
-          if os.path.exists("fuzz/deny.toml"):
-              failures.append("fuzz/deny.toml exists again. `deny.toml` is the only "
-                              "cargo-deny policy in this repository and governs BOTH "
-                              "graphs via an explicit `--config deny.toml`; delete "
-                              "the sibling file, or if it is genuinely wanted, wire "
-                              "it up and re-review this job.")
+          # Load both policies. A file that is absent, or is not valid TOML, is a
+          # hard failure: `cargo deny` would fall back to built-in defaults for a
+          # graph nobody had reviewed, and report `ok`.
+          loaded = {}
+          for POLICY in POLICIES:
+              if not os.path.exists(POLICY):
+                  failures.append(f"{POLICY}: the policy file is missing entirely. "
+                                  f"Both policies are required - `deny.toml` for the "
+                                  f"89 root packages and `fuzz/deny.toml` for the 13 "
+                                  f"of the detached fuzz workspace. Restore it; do "
+                                  f"not delete a policy to silence a finding.")
+                  continue
+              try:
+                  with open(POLICY, "rb") as handle:
+                      loaded[POLICY] = tomllib.load(handle)
+              except tomllib.TOMLDecodeError as exc:
+                  failures.append(f"{POLICY}: is not valid TOML: {exc}")
 
-          policy = None
-          try:
-              with open(POLICY, "rb") as handle:
-                  policy = tomllib.load(handle)
-          except FileNotFoundError:
-              failures.append(f"{POLICY}: the policy file is missing entirely")
-          except tomllib.TOMLDecodeError as exc:
-              failures.append(f"{POLICY}: is not valid TOML: {exc}")
-
-          if policy is not None:
+          for POLICY, policy in loaded.items():
               for table in REQUIRED_TABLES:
                   if table not in policy:
                       failures.append(f"{POLICY}: the [{table}] table is absent, so "
@@ -594,6 +680,12 @@ jobs:
               for table, key, expected in EXPECTED:
                   if table in policy:
                       check(POLICY, table, key, expected, policy[table])
+
+              # `licenses.allow`, per policy - see EXPECTED_ALLOW above for why the
+              # two lists differ by exactly `Unicode-3.0`.
+              if "licenses" in policy:
+                  check(POLICY, "licenses", "allow", EXPECTED_ALLOW[POLICY],
+                        policy["licenses"])
 
               # The licence carve-out set, compared exactly. A second exception is a
               # policy change and must be a visible two-file diff.
@@ -617,7 +709,21 @@ jobs:
 
               # `[licenses.private] ignore` may exempt unpublished workspace
               # members, so it must stay scoped to that and nothing else.
+              #
+              # BOTH keys of this nested table are pinned. `registries` bounds WHERE
+              # the exemption may apply and `ignore` decides WHETHER it applies at
+              # all, so pinning only the first left the load-bearing half of the pair
+              # unasserted - the header above claims every load-bearing key still
+              # holds its reviewed value, and that claim was not true of this one.
+              # `ignore` is routed through `check`, which compares value AND type, so
+              # `ignore = 1` is rejected as well as `ignore = false`: the requirement
+              # is that it is `True` exactly, not merely truthy.
+              #
+              # The table is nested, so it cannot be expressed in `EXPECTED` (whose
+              # holder is `policy[table]`); the name passed to `check` is spelled
+              # "licenses.private" so a failure message names the real TOML path.
               private = policy.get("licenses", {}).get("private", {})
+              check(POLICY, "licenses.private", "ignore", True, private)
               if private.get("registries", None) != []:
                   failures.append(f"{POLICY}: [licenses.private] registries must be "
                                   f"an empty list; got "
@@ -669,24 +775,78 @@ jobs:
                   if isinstance(entry, dict) and not entry.get("reason"):
                       failures.append(f"{POLICY}: [bans] skip entry `{spec}` carries "
                                       f"no reason")
-              if seen_skips != EXPECTED_SKIPS:
-                  added = sorted(seen_skips - EXPECTED_SKIPS)
-                  dropped = sorted(EXPECTED_SKIPS - seen_skips)
+              if seen_skips != EXPECTED_SKIPS[POLICY]:
+                  added = sorted(seen_skips - EXPECTED_SKIPS[POLICY])
+                  dropped = sorted(EXPECTED_SKIPS[POLICY] - seen_skips)
                   failures.append(f"{POLICY}: [bans] skip set changed; unexpected "
                                   f"{added!r}, missing {dropped!r}. A new duplicate "
                                   f"major is a policy decision, not a formality.")
+
+          # CROSS-POLICY CONSISTENCY. Two policy files are two places for a standard
+          # to drift, so the keys where drift would WEAKEN one graph relative to the
+          # other are compared directly. `licenses.allow` is deliberately excluded
+          # (it differs by the root-only `Unicode-3.0`, asserted per policy above)
+          # and so is `bans.skip` (root-only duplicate acknowledgements). Everything
+          # here must be byte-equal in both files.
+          SHARED_KEYS = [
+              ("graph", "targets"), ("graph", "all-features"),
+              ("advisories", "db-urls"), ("advisories", "unmaintained"),
+              ("advisories", "unsound"), ("advisories", "yanked"),
+              ("advisories", "disable-yank-checking"),
+              ("advisories", "maximum-db-staleness"), ("advisories", "ignore"),
+              ("advisories", "unused-ignored-advisory"),
+              ("licenses", "include-dev"), ("licenses", "include-build"),
+              ("licenses", "unused-allowed-license"),
+              ("licenses", "confidence-threshold"),
+              ("output", "feature-depth"),
+              ("bans", "multiple-versions"),
+              ("bans", "multiple-versions-include-dev"), ("bans", "wildcards"),
+              ("bans", "allow-wildcard-paths"), ("bans", "skip-tree"),
+              ("bans", "highlight"),
+              ("sources", "unknown-registry"), ("sources", "unknown-git"),
+              ("sources", "allow-registry"), ("sources", "allow-git"),
+              ("sources", "required-git-spec"),
+              ("sources", "unused-allowed-source"),
+              ("sources", "unused-allowed-org"),
+          ]
+          if len(loaded) == len(POLICIES):
+              root, fuzz = loaded["deny.toml"], loaded["fuzz/deny.toml"]
+              for table, key in SHARED_KEYS:
+                  a = root.get(table, {}).get(key, "<absent>")
+                  b = fuzz.get(table, {}).get(key, "<absent>")
+                  if a != b:
+                      failures.append(
+                          f"cross-policy drift: [{table}] {key} is {a!r} in "
+                          f"deny.toml but {b!r} in fuzz/deny.toml. Both graphs must "
+                          f"be held to the same standard on this key; if the "
+                          f"divergence is genuinely wanted, move the key out of "
+                          f"SHARED_KEYS with a reason in the same diff.")
+              # The architectural bans must be identical by NAME in both files, so a
+              # banned crate cannot enter the closure through whichever graph forgot
+              # to ban it.
+              def denied_names(pol):
+                  return {e["crate"] for e in pol.get("bans", {}).get("deny", [])
+                          if isinstance(e, dict) and "crate" in e}
+              only_root = sorted(denied_names(root) - denied_names(fuzz))
+              only_fuzz = sorted(denied_names(fuzz) - denied_names(root))
+              if only_root or only_fuzz:
+                  failures.append(
+                      f"cross-policy drift: [bans] deny differs; denied only in "
+                      f"deny.toml {only_root!r}, only in fuzz/deny.toml "
+                      f"{only_fuzz!r}. The architectural boundaries are the same "
+                      f"boundaries for both graphs.")
 
           if failures:
               for failure in failures:
                   print(f"::error::{failure}")
               print(f"{len(failures)} policy-integrity assertion(s) failed. Either "
-                    "the policy was weakened, or this job's expectations are out of "
+                    "a policy was weakened, or this job's expectations are out of "
                     "date -- update whichever is actually wrong, in the same commit.")
               raise SystemExit(1)
 
-          print("deny.toml declares every governed table, holds every load-bearing "
-                "key at its reviewed value, and is the only cargo-deny policy in "
-                "the tree")
+          print("deny.toml and fuzz/deny.toml both declare every governed table, "
+                "both hold every load-bearing key at its reviewed value, and they "
+                "agree on every shared key")
           PY
 
       # 3. Re-derive the workflow census that this file's ACTION PINNING section
@@ -799,6 +959,10 @@ jobs:
 
           failures = []
           census = {prefix: 0 for prefix in EXPECTED_USES}
+          # action -> the set of SHAs it is actually pinned to, across all three
+          # files. A well-formed tree yields exactly one SHA per action; more than
+          # one means a half-finished upgrade.
+          actual_shas = {}
 
           for path in WORKFLOWS:
               raw = open(path, "rb").read()
@@ -831,6 +995,37 @@ jobs:
                       failures.append(f"{path}: `{used}` is not pinned to a 40-hex "
                                       "commit SHA, contrary to the documented "
                                       "convention")
+                      continue
+                  action, _, sha = used.partition("@")
+                  actual_shas.setdefault(action, set()).add(sha)
+
+          # The ACTION PINNING table in this file's header quotes a SHA and a use
+          # count per action. Those figures had already drifted from the tree once:
+          # the prose TOTALS were asserted here and stayed right, while the TABLE
+          # was asserted nowhere and ended up claiming 18x/17x against an actual
+          # 17/16. Derive both columns from the same census so it cannot drift
+          # again, and require one SHA per action so a half-finished upgrade fails.
+          PIN_ROW = re.compile(
+              r"^#\s+(\S+/\S+)\s+([0-9a-f]{40})\s+\S+\s+(\d+)x\s*$", re.MULTILINE)
+          table = {a: (s, int(n)) for a, s, n in
+                   PIN_ROW.findall(open(WORKFLOWS[1], encoding="utf-8").read())}
+          governed = {p.rstrip("@") for p in EXPECTED_USES}
+          if set(table) != governed:
+              failures.append("the ACTION PINNING table lists "
+                              f"{sorted(table)}, but the census governs "
+                              f"{sorted(governed)}")
+          for prefix, total in census.items():
+              action = prefix.rstrip("@")
+              if action not in table:
+                  continue
+              sha, count = table[action]
+              if count != total:
+                  failures.append(f"the ACTION PINNING table says {action} is used "
+                                  f"{count}x; the census counted {total}")
+              if actual_shas.get(action) != {sha}:
+                  failures.append(f"the ACTION PINNING table pins {action} to "
+                                  f"{sha}, but the workflows use "
+                                  f"{sorted(actual_shas.get(action, []))}")
 
           if failures:
               for failure in failures:
@@ -846,10 +1041,12 @@ jobs:
                 "all three workflows are byte-ASCII")
           PY
 
-  # RustSec advisory scan of both lockfiles. This is the only `cargo-audit` run
-  # in the repository, and the only place `fuzz/Cargo.lock` is checked for
-  # advisories. It carries no `needs:` on any other job, so all four run in
-  # parallel and a red build points at one tool without waiting on the others.
+  # RustSec advisory scan of both lockfiles. This is the only `cargo-audit` run in
+  # the repository, and the only place `fuzz/Cargo.lock` is read AS A FILE - though
+  # not the only advisory coverage of that closure, since `cargo-deny-fuzz` resolves
+  # the same graph and runs `check advisories` over it as well. It carries no
+  # `needs:` on any other job, so all four run in parallel and a red build points
+  # at one tool without waiting on the others.
   cargo-audit:
     name: cargo-audit (RustSec advisories)
     runs-on: ubuntu-latest
@@ -1040,9 +1237,10 @@ jobs:
   # four checks run as four separately-named steps rather than one `cargo deny
   # check`, so the log attributes a failure to a policy section without anyone
   # reading the output to find out which. The detached fuzz graph is governed by
-  # this SAME policy, evaluated a second time by the `cargo-deny-fuzz` job below;
-  # see "SCOPE" in the header for why one file must be aimed at both graphs
-  # explicitly rather than rediscovered per workspace.
+  # its OWN reviewed policy, `fuzz/deny.toml`, evaluated by the `cargo-deny-fuzz`
+  # job below; see "TWO GRAPHS, TWO POLICY FILES, ONE WORKFLOW" in the header for
+  # why each invocation names its policy explicitly instead of relying on
+  # per-workspace discovery.
   cargo-deny:
     name: cargo-deny (licenses / advisories / bans / sources)
     runs-on: ubuntu-latest
@@ -1097,7 +1295,7 @@ jobs:
                " The RUSTUP_TOOLCHAIN override was lost and rust-toolchain.toml won."; exit 1 ;;
           esac
 
-      # 4. Install cargo-deny, PINNED to the version the one policy file was probed
+      # 4. Install cargo-deny, PINNED to the version both policy files were probed
       #    against. This is the pin that matters most here: cargo-deny 0.20 removed
       #    and re-scoped whole families of `[advisories]` and `[licenses]` keys, and a
       #    future major could do the same - the dangerous outcome being not a parse
@@ -1153,9 +1351,11 @@ jobs:
       #     trusted. `-D unsound -D unmaintained -D yanked` promotes the three
       #     advisory classes that default to warnings, so this is stricter than a
       #     bare `check advisories`. These flags are scoped to the TOOL's own graph
-      #     only - the project checks below deliberately carry no CLI override, so
-      #     that the reviewed `deny.toml` remains the single policy for this
-      #     repository's dependencies.
+      #     only - the project checks below carry no severity override at all, so
+      #     that the reviewed `deny.toml` remains the sole source of severity for
+      #     this graph's dependencies. (The two `-A` codes those steps do pass are
+      #     narrow shape suppressions for entries absent from this graph, spelled
+      #     out below, not severity policy.)
       - name: Audit cargo-deny's own dependency graph
         run: |
           set -euo pipefail
@@ -1170,27 +1370,31 @@ jobs:
       #                  thing that moves the lock.
       #      `--config deny.toml`
       #                  names the policy EXPLICITLY rather than relying on
-      #                  cargo-deny's discovery. There is exactly one policy file
-      #                  in this repository and both graphs are governed by it,
-      #                  so both invocations state it the same way; discovery
-      #                  falls back to built-in defaults when it finds nothing,
-      #                  and a silent fallback looks exactly like a pass.
+      #                  cargo-deny's discovery. There are TWO policy files in
+      #                  this repository, one per graph, so both invocations state
+      #                  theirs the same way and neither can be re-rooted onto the
+      #                  other's rulebook; discovery falls back to built-in
+      #                  defaults when it finds nothing, and a silent fallback
+      #                  looks exactly like a pass.
       #      `-L info`   makes cargo-deny print the configuration path it
       #                  resolved ("using config from .../deny.toml"). With
       #                  `--config` that is a confirmation rather than the only
       #                  evidence, and it is cheap to keep.
       #      `-A unused-wrapper`
       #      `-A license-exception-not-encountered`
-      #                  TWO shape artifacts, and nothing else. `deny.toml` is
-      #                  one policy over two graphs, so its two fuzz-graph
-      #                  accommodations -- the `cc` ban's
+      #                  TWO shape artifacts, and nothing else. `deny.toml`
+      #                  deliberately RETAINS two entries for crates that are
+      #                  absent from the root graph -- the `cc` ban's
       #                  `wrappers = ["libfuzzer-sys"]` scope and the
-      #                  `libfuzzer-sys` NCSA licence exception -- are
-      #                  legitimately UNUSED here, because neither crate is in
-      #                  the root graph. Both codes stay at full severity on the
-      #                  `cargo-deny-fuzz` invocation below, which is the graph
-      #                  where they mean something: if `libfuzzer-sys` ever stops
-      #                  needing `cc`, or leaves the graph, that job reports it.
+      #                  `libfuzzer-sys` NCSA licence exception -- as defence in
+      #                  depth, so that a build dependency which ever pulled
+      #                  either crate into THIS graph would meet a boundary that
+      #                  had already been reviewed. While they are absent those
+      #                  entries are legitimately UNUSED here. Both codes stay at
+      #                  full severity on the `cargo-deny-fuzz` invocation below,
+      #                  which reads `fuzz/deny.toml` over the graph where those
+      #                  crates actually live: if `libfuzzer-sys` ever stops
+      #                  needing `cc`, or leaves that graph, that job reports it.
       #                  Nothing capable of hiding a real finding is suppressed --
       #                  `rejected`, `denied`, `duplicate`, `vulnerability`,
       #                  `unmaintained`, `unsound`, `yanked`, `unknown-registry`
@@ -1267,9 +1471,9 @@ jobs:
           fi
           echo "Cargo.lock and fuzz/Cargo.lock are unchanged"
 
-  # Policy evaluation over the DETACHED fuzz crate graph, against the SAME root
-  # `deny.toml` the job above uses. THIS IS NOW THE ONLY JOB IN THE REPOSITORY
-  # THAT EVALUATES THE FUZZ GRAPH AGAINST THE POLICY, and it exists because of a
+  # Policy evaluation over the DETACHED fuzz crate graph, against that graph's own
+  # reviewed policy `fuzz/deny.toml`. THIS IS THE ONLY JOB IN THE REPOSITORY THAT
+  # EVALUATES THE FUZZ GRAPH AGAINST A POLICY, and it exists because of a
   # trigger-coverage gap it has since closed.
   #
   # `fuzz.yml` USED TO CARRY a `supply-chain` job running the same command, but it
@@ -1290,7 +1494,7 @@ jobs:
   # removed job's triggers - and is blocking on all of them. See "SCOPE" in the
   # header. Do NOT re-add a policy job to `fuzz.yml` to "restore the sequencing".
   cargo-deny-fuzz:
-    name: cargo-deny (fuzz graph, root policy)
+    name: cargo-deny (fuzz graph, fuzz/deny.toml)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # Current stable, for the same reason as every other job here.
@@ -1341,10 +1545,13 @@ jobs:
           esac
 
       # 4. Install cargo-deny at the same pin as the root policy job. The two
-      #    pins must never diverge: BOTH jobs evaluate the SAME root `deny.toml`,
-      #    one file aimed at two graphs, and evaluating it with different
-      #    cargo-deny versions would make "the 102-package closure is governed"
-      #    a statement about two different rulebooks.
+      #    pins must never diverge: the two jobs evaluate the two halves of ONE
+      #    reviewed policy pair -- `deny.toml` over the 89-package library graph
+      #    and `fuzz/deny.toml` over the 13-package fuzz graph -- whose shared
+      #    keys the `policy-integrity` job asserts are identical. Evaluating
+      #    those halves with different cargo-deny versions would make "the
+      #    102-package closure is governed" a statement about two different
+      #    rulebooks.
       #
       #    Same integrity-verified install as the root policy job: sparse-index
       #    sha256 on a hand-fetched tarball (Cargo's own checksum check does not
@@ -1398,24 +1605,35 @@ jobs:
       #    `advisories ok, bans ok, licenses FAILED, sources ok`, exit 4. For a
       #    13-package graph that single summary line is clearer than four steps.
       #
-      #    Five flags, each load-bearing:
+      #    Four flags, each load-bearing:
       #
       #      `--manifest-path fuzz/Cargo.toml`
       #                  points cargo-deny at the detached workspace, whose own
       #                  empty `[workspace]` table keeps it out of the root graph.
-      #      `--config deny.toml`
+      #      `--config fuzz/deny.toml`
       #                  MANDATORY, and the reason this job is trustworthy.
       #                  cargo-deny resolves configuration from the TARGET
-      #                  manifest's workspace root, so WITHOUT this flag it would
-      #                  look for `fuzz/deny.toml` and fall back to built-in
-      #                  DEFAULTS if it found none. A sibling policy file used to
-      #                  live there and used to be picked up that way; it was
-      #                  deleted because a blocking supply-chain verdict must come
-      #                  from a policy reviewed on this repository's normal review
-      #                  surface, not from a second file governing a blocking gate.
-      #                  This flag is what makes the reviewed root policy govern
-      #                  all 102 packages. The `policy-integrity` job fails if a
-      #                  `fuzz/deny.toml` ever reappears.
+      #                  manifest's workspace root, so WITHOUT this flag the
+      #                  file it discovers happens to be the right one today and
+      #                  would silently become a built-in DEFAULT the moment that
+      #                  workspace root moved or the file were renamed. Naming
+      #                  the path makes the governing policy an assertion rather
+      #                  than a lucky side effect of cargo-deny's search order,
+      #                  which is the same discipline the root invocation above
+      #                  follows.
+      #
+      #                  `fuzz/deny.toml` is the fuzz graph's OWN reviewed
+      #                  policy, and it exists because that graph is genuinely a
+      #                  different graph: it admits `libfuzzer-sys` under NCSA
+      #                  and the `cc` / `jobserver` / `shlex` /
+      #                  `find-msvc-tools` C-compiler driver chain, both of which
+      #                  the root policy must keep OUT of the 89-package library
+      #                  closure entirely. One policy per graph is what lets each
+      #                  file state the truth about its own graph at FULL
+      #                  severity with no suppression flags at all. The
+      #                  `policy-integrity` job fails if either policy goes
+      #                  missing, drops a governed table, or drifts from the
+      #                  other on any shared key.
       #      `--locked`  MANDATORY. Without it cargo-deny re-resolves and will
       #                  REWRITE `fuzz/Cargo.lock` when manifest and lock have
       #                  drifted, then report `ok` on the graph it just invented
@@ -1424,31 +1642,25 @@ jobs:
       #                  un-`--locked` command rewrite the lockfile and still
       #                  print all four `ok` lines; with `--locked` the same
       #                  fixture fails and the lockfile is untouched.
-      #      `-L info`   prints `using config from <root>/deny.toml`, which is the
-      #                  positive evidence that the ROOT policy is in force rather
-      #                  than a rediscovered sibling or a built-in default.
-      #      `-A license-not-encountered`
-      #      `-A unmatched-skip -A unnecessary-skip`
-      #                  THREE shape artifacts of evaluating one policy against a
-      #                  13-package SUBSET, and nothing else. `Unicode-3.0` is
-      #                  required by `unicode-ident`, a root-graph crate, so the
-      #                  allowance is unused here; and the four `[bans] skip`
-      #                  entries name root-graph duplicates, so `rand` /
-      #                  `rand_core` are unmatched and `getrandom` / `r-efi`
-      #                  unnecessary here. All three codes stay at FULL severity on
-      #                  the root invocation above, which is where they mean
-      #                  something -- `unused-allowed-license = "deny"` and the
-      #                  "a stale skip is a prompt to re-review" property are both
-      #                  still enforced there. Nothing capable of hiding a real
-      #                  finding is suppressed: `rejected`, `denied`, `duplicate`,
-      #                  `vulnerability`, `unmaintained`, `unsound`, `yanked`,
-      #                  `unknown-registry` and `unknown-git` are untouched.
-      #                  Measured on this tree: `advisories ok, bans ok, licenses
-      #                  ok, sources ok` over `gathered 13 crates`, zero warnings.
-      - name: Check the detached fuzz graph against the root deny.toml
+      #      `-L info`   prints `using config from <root>/fuzz/deny.toml`, which
+      #                  is the positive evidence that the fuzz graph's own
+      #                  reviewed policy is in force rather than a built-in
+      #                  default or the root file aimed at the wrong graph.
+      #
+      #    NO `-A` suppressions, and that absence is the measurable payoff of one
+      #    policy per graph. Evaluating the ROOT file against this 13-package
+      #    SUBSET produced three pure shape artifacts that had to be waved off --
+      #    `license-not-encountered` for the root-only `Unicode-3.0` allowance,
+      #    and `unmatched-skip` / `unnecessary-skip` for the four root-graph
+      #    duplicate pins -- and each code so waved off is a code that can no
+      #    longer speak on this graph at all. `fuzz/deny.toml` allows exactly the
+      #    three licences this graph uses and carries `skip = []`, so all four
+      #    categories run at FULL severity with nothing suppressed. Measured on
+      #    this tree: `advisories ok, bans ok, licenses ok, sources ok` over
+      #    `gathered 13 crates`, zero warnings, zero flags.
+      - name: Check the detached fuzz graph against fuzz/deny.toml
         run: cargo +stable deny --locked --manifest-path fuzz/Cargo.toml
-               --config deny.toml -L info check
-               -A license-not-encountered -A unmatched-skip -A unnecessary-skip
+               --config fuzz/deny.toml -L info check
 
       # 7. Lockfile immutability, from the outside, exactly as the two jobs above
       #    do it. `fuzz/Cargo.lock` is the one this job could plausibly disturb,

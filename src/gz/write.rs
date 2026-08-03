@@ -435,14 +435,18 @@ mod fault {
 /// pointer bump copies nothing. Advancing an offset is `O(1)` per write and
 /// `O(N)` overall, matching C exactly.
 ///
-/// The window is re-anchored at the front (`out_start = 0`) once, when it empties
-/// — the counterpart of C reclaiming the buffer with
-/// `strm->next_out = state->out; state->x.next = state->out;` (C L125-L128). That
-/// restores the invariant `out_pending == 0 ⇒ out_start == 0` that the compress
-/// loop relies on: `deflate` is only ever handed the scratch area while the window
-/// is empty, so it always receives the whole `out_buf[..size]` starting at index
-/// `0`, and the compressed byte sequence is therefore identical no matter how the
-/// destination chunked its acceptance.
+/// # What this deliberately does *not* do
+///
+/// It does **not** re-anchor the window at `out_buf[0]` when it empties. C splits
+/// those two steps: its inner `while (strm->next_out > state->x.next)` loop only
+/// advances `state->x.next`, and the buffer reclaim
+/// `strm->avail_out = state->size; strm->next_out = state->out;
+/// state->x.next = state->out;` is guarded by `if (strm->avail_out == 0)`
+/// (`gzwrite.c` L125-L128). A drain provoked by a *flush* therefore leaves
+/// `next_out` exactly where it was, and the following `deflate` appends after it
+/// rather than restarting at the front. Reproducing that split is what keeps the
+/// number of `deflate` calls, and the output slice each one receives, identical to
+/// C; the reclaim itself is performed by [`gz_deflate_loop`] under C's guard.
 ///
 /// [`std::io::Write::write_all`] is deliberately not used: it reports only
 /// *whether* it failed, not how far it got, so a partial write followed by a
@@ -453,12 +457,21 @@ mod fault {
 /// * [`ZlibError::ErrNo`] on a non-blocking stall
 ///   ([`io::ErrorKind::WouldBlock`]), which additionally sets
 ///   [`GzState::again`](crate::gz::state::GzState) so the caller may retry;
-/// * [`ZlibError::ErrNo`] on any other write failure, and on a writer that
-///   accepts nothing (`Ok(0)`) while bytes remain — per the
-///   [`std::io::Write::write`] contract that means the destination can take no
-///   more, so it is reported rather than silently dropping the remainder. (C has
-///   no such arm: its `write(2)` returning `0` spins the loop forever, which is
-///   strictly worse than a reported error.)
+/// * [`ZlibError::ErrNo`] on any other write failure;
+/// * [`ZlibError::ErrNo`] on a writer that accepts nothing (`Ok(0)`) while bytes
+///   remain, which — like a stall — also sets
+///   [`GzState::again`](crate::gz::state::GzState). C has no such arm at all:
+///   `writ == 0` leaves `state->x.next` unchanged and its
+///   `while (strm->next_out > state->x.next)` loop simply tries again, forever
+///   (`gzwrite.c` L119-L124). Spinning inside the library is not an option
+///   (CWE-835), so the condition is reported instead — but reported as
+///   *retryable*, which is what keeps the rest of C's behaviour intact: the
+///   cursor and the buffered input are both retained, `gzwrite` reports its true
+///   partial progress rather than `0`, and the stream is not declared dead.
+///   POSIX permits `write(2)` to return `0` only for a zero-length request, and
+///   this loop never issues one, so the arm is as unreachable in practice as C's
+///   spin. It is documented as divergence 6 in `doc/technical-specifications.md`
+///   §0.8.2.
 ///
 /// On every error path the pending window is left intact, so a retry resumes at
 /// the exact byte the OS stopped at.
@@ -470,6 +483,10 @@ fn drain_pending(state: &mut GzState) -> Result<(), ZlibError> {
         match write_some(&mut state.file, &state.out_buf[start..end]) {
             Ok(0) => {
                 // The destination accepts nothing while output is still pending.
+                // C would retry this forever; report it instead, but keep it
+                // retryable so the cursor, the buffered input, and the caller's
+                // ability to resume all survive (see "# Errors").
+                state.again = true;
                 state.error(ReturnCode::ErrNo, Some("write error"));
                 return Err(ZlibError::ErrNo);
             }
@@ -493,11 +510,10 @@ fn drain_pending(state: &mut GzState) -> Result<(), ZlibError> {
         }
     }
 
-    // The window is empty: re-anchor it at the front so the next `deflate` call
-    // receives the whole scratch area from index `0` (C L125-L128's buffer
-    // reclaim). Reached only by the loop draining completely — every error path
-    // above returns early with the cursor left exactly where the OS stopped.
-    state.out_start = 0;
+    // The window is empty and `out_start` has caught up to the produced-bytes
+    // frontier — C's post-loop state `state->x.next == strm->next_out`. The
+    // buffer reclaim that returns both to `out_buf[0]` is C's separate,
+    // `avail_out == 0`-guarded step and belongs to the caller (see above).
     Ok(())
 }
 
@@ -509,8 +525,11 @@ fn drain_pending(state: &mut GzState) -> Result<(), ZlibError> {
 /// duplicating retry (see [`CompOutcome`]). On a non-blocking stall
 /// ([`io::ErrorKind::WouldBlock`]) it sets
 /// [`GzState::again`](crate::gz::state::GzState) and reports
-/// [`ReturnCode::ErrNo`]; any other write failure, and a writer that accepts
-/// nothing while bytes remain, likewise reports [`ReturnCode::ErrNo`].
+/// [`ReturnCode::ErrNo`]; any other write failure likewise reports
+/// [`ReturnCode::ErrNo`]. A writer that accepts nothing (`Ok(0)`) while bytes
+/// remain is reported the same way as a stall, `again` included, for the reason
+/// given under [`drain_pending`]'s `# Errors`: C retries that case forever, and a
+/// retryable report is the closest terminating equivalent.
 ///
 /// No pending-output window is needed here: the bytes still live in the caller's
 /// `input` slice, so the accurate `consumed` count is all a retry requires.
@@ -523,7 +542,10 @@ fn write_direct(state: &mut GzState, input: &[u8]) -> CompOutcome {
             Ok(0) => {
                 // The destination accepts nothing while input remains. Reporting
                 // this (rather than breaking out silently) is what stops the
-                // unwritten tail from vanishing without a trace.
+                // unwritten tail from vanishing without a trace; reporting it as
+                // retryable is what lets the caller resume, as C's endless retry
+                // would have.
+                state.again = true;
                 state.error(ReturnCode::ErrNo, Some("write error"));
                 return CompOutcome::err(off, ZlibError::ErrNo);
             }
@@ -553,19 +575,33 @@ fn write_direct(state: &mut GzState, input: &[u8]) -> CompOutcome {
 /// [`GzState::out_buf`](crate::gz::state::GzState), and
 /// [`GzState::file`](crate::gz::state::GzState) as disjoint fields.
 ///
-/// Unlike C — which accumulates output in `state->out` and writes only when the
-/// buffer fills or a flush occurs — this drains `out_buf` after every `deflate`
-/// call. The DEFLATE byte stream is identical either way; only the number of
-/// `write` syscalls differs.
+/// # When output reaches the operating system
+///
+/// Compressed bytes accumulate in `out_buf` and are handed to the file at exactly
+/// C's two checkpoints, evaluated at the top of every iteration
+/// (`gzwrite.c` L112-L128):
+///
+/// * the scratch area is **full** (`avail_out == 0`), or
+/// * the caller asked for a **flush** — but while finishing, not until `deflate`
+///   has reported `Z_STREAM_END`, so a `Z_FINISH` writes the final block and the
+///   gzip trailer together rather than in pieces.
+///
+/// Draining after *every* `deflate` call instead would be observably different,
+/// not merely chattier: a `Z_NO_FLUSH` write to a destination that cannot accept
+/// bytes right now — a full non-blocking pipe or socket — would surface
+/// `Z_ERRNO` from `gzwrite`, where C buffers the output, returns the full count,
+/// and leaves `gzerror` reporting `Z_OK`. The DEFLATE byte stream is unaffected
+/// either way; the *error* the application sees is not.
 ///
 /// # Ordering invariant
 ///
-/// Any output left over from an earlier stalled call is drained **before**
-/// `deflate` is invoked, and each call's output is drained before the next, so
-/// the engine always receives the whole `out_buf[..size]` scratch area and
-/// compressed bytes are never overwritten while still unwritten. This is the
-/// safe-index equivalent of C never letting `strm->next_out` run past
-/// `state->x.next`.
+/// `deflate` is only ever handed the still-unproduced tail of the scratch area,
+/// `out_buf[out_start + out_pending .. size]`, so it can never overwrite a byte
+/// the file has not received. The buffer is reclaimed back to `out_buf[0]` only
+/// once it is both full and fully written — C's `if (strm->avail_out == 0)` arm —
+/// which makes the sequence of output slices handed to the engine independent of
+/// how the destination chunked its acceptance, and the compressed bytes therefore
+/// byte-identical to reference zlib.
 ///
 /// # Errors
 ///
@@ -581,24 +617,46 @@ fn gz_deflate_loop(state: &mut GzState, input: &[u8], flush: FlushMode) -> CompO
     let size = state.size;
     let flush_i32 = flush.as_c_int();
     let mut consumed = 0usize;
-
-    // Deliver anything a previous stalled call left behind before generating
-    // more. Skipping this would let the `deflate` below overwrite compressed
-    // bytes the file has not received, splicing the DEFLATE stream.
-    if let Err(e) = drain_pending(state) {
-        return CompOutcome::err(consumed, e);
-    }
+    // C seeds `ret = Z_OK` before the loop (`gzwrite.c` L109) purely so the
+    // `flush == Z_FINISH` arm of the write checkpoint below can ask whether the
+    // *previous* `deflate` already reported `Z_STREAM_END`.
+    let mut code = ReturnCode::Ok;
 
     loop {
-        // Compress the still-unconsumed tail of `input` into the full output
-        // scratch buffer. `input` is external, and `strm`/`out_buf` are
-        // distinct `state` fields, so these borrows are disjoint. The pending
-        // window is empty here (drained above / at the end of the previous
-        // iteration), so the whole scratch area is available.
+        // ---- C L112-L128: the write checkpoint. -------------------------------
+        // Free space left in the scratch area — C's `strm->avail_out`. The
+        // produced-bytes frontier (C's `next_out`) sits at
+        // `out_start + out_pending`.
+        let avail_out = size - (state.out_start + state.out_pending);
+        if avail_out == 0
+            || (flush != FlushMode::NoFlush
+                && (flush != FlushMode::Finish || code == ReturnCode::StreamEnd))
+        {
+            // Deliver everything produced but not yet accepted. On a stall this
+            // returns with the window intact so the retry resumes exactly where
+            // the operating system stopped.
+            if let Err(e) = drain_pending(state) {
+                return CompOutcome::err(consumed, e);
+            }
+            // C L125-L128: reclaim the buffer, but only once it is full *and*
+            // fully written. A drain triggered by a flush leaves the frontier
+            // where it was, exactly as C leaves `next_out`.
+            if avail_out == 0 {
+                debug_assert_eq!(state.out_pending, 0, "drain_pending emptied the window");
+                debug_assert_eq!(state.out_start, size, "the frontier reached the buffer end");
+                state.out_start = 0;
+            }
+        }
+
+        // ---- C L130-L134: compress into the free tail of the scratch area. ----
+        // `input` is external and `strm`/`out_buf` are distinct `state` fields,
+        // so these borrows are disjoint. The slice starts at the frontier, never
+        // at `0`, so bytes the file has not yet accepted are never overwritten.
+        let frontier = state.out_start + state.out_pending;
         let outcome = deflate::deflate(
             &mut state.strm,
             &input[consumed..],
-            &mut state.out_buf[..size],
+            &mut state.out_buf[frontier..size],
             flush_i32,
         );
 
@@ -612,42 +670,24 @@ fn gz_deflate_loop(state: &mut GzState, input: &[u8], flush: FlushMode) -> CompO
         }
 
         consumed += outcome.consumed;
+        code = outcome.code;
+        // Advance the frontier by what this call produced — C's implicit
+        // `next_out += have`. Nothing is written here; the checkpoint above
+        // decides when the operating system sees these bytes.
+        state.out_pending += outcome.produced;
 
-        // Hand the freshly produced bytes to the file (C L114-L128). They occupy
-        // `out_buf[0..produced]`, so publishing the count is all that is required;
-        // whatever the OS declines to take stays pending for the next call.
-        //
-        // The window is front-anchored here by construction: `drain_pending`
-        // resets `out_start` to `0` when it empties the window, and it is only
-        // reached below when it returned `Ok`. Asserting rather than assigning is
-        // deliberate — a future change that broke the invariant must fail loudly in
-        // tests instead of silently discarding compressed bytes the OS never took.
-        debug_assert_eq!(
-            state.out_start, 0,
-            "the pending window must be empty and front-anchored before deflate"
-        );
-        state.out_pending = outcome.produced;
-        if let Err(e) = drain_pending(state) {
-            return CompOutcome::err(consumed, e);
-        }
-
-        let input_left = input.len() - consumed;
-        let output_was_full = outcome.produced == size;
-        // While finishing, keep going until the engine emits `Z_STREAM_END`
-        // (the final block plus the gzip trailer have all been produced).
-        let finishing = flush == FlushMode::Finish && outcome.code != ReturnCode::StreamEnd;
-
-        // The engine is done for this flush once all input is consumed, the
-        // output was not completely filled (so nothing is pending), and we are
-        // not mid-finish. This mirrors the C `while (have)` guard, where
-        // `have` is the bytes produced by the last `deflate`.
-        if input_left == 0 && !output_was_full && !finishing {
-            break;
-        }
-
-        // Safety valve: if a call made no progress at all and we are not
-        // finishing, stop rather than spin forever.
-        if outcome.consumed == 0 && outcome.produced == 0 && !finishing {
+        // ---- C L142: `} while (have);` ----------------------------------------
+        // `have` is precisely the number of bytes the last `deflate` produced.
+        // Producing nothing means the engine has no more work for this flush:
+        // with a non-empty output slice (guaranteed above, since the checkpoint
+        // reclaims whenever the area is full) `deflate` stops only when it has
+        // taken all the input it can, so this cannot exit with work outstanding.
+        if outcome.produced == 0 {
+            debug_assert!(
+                outcome.consumed == input.len() - (consumed - outcome.consumed)
+                    || outcome.consumed == 0,
+                "deflate produced nothing yet left input unconsumed"
+            );
             break;
         }
     }
@@ -1168,6 +1208,63 @@ fn gz_vacate(state: &mut GzState) -> bool {
     state.have > state.size
 }
 
+/// A [`core::fmt::Write`] sink that renders **directly into a caller-supplied
+/// byte region** and refuses to grow.
+///
+/// This is the port's stand-in for C's `vsnprintf(next, state->size, …)`
+/// (`gzwrite.c` L467): the destination is the already-allocated free half of the
+/// gzip input buffer, the capacity is fixed before formatting starts, and a
+/// fragment that does not fit stops [`core::fmt::write`] immediately by
+/// returning [`core::fmt::Error`] rather than reallocating. Formatting a
+/// caller-controlled `format_args!` therefore performs **no allocation at all**
+/// and cannot be driven past the configured buffer size, which is what keeps a
+/// hostile or merely large format string from turning into an unbounded
+/// allocation (and, with the global allocator's infallible `handle_alloc_error`,
+/// a process abort) on an ordinary write path.
+///
+/// The written prefix is always valid: `write_str` copies a whole `&str`
+/// fragment or none of it, so [`Self::len`] bytes of `buf` hold exactly the
+/// concatenation of the accepted fragments.
+struct BoundedWriter<'a> {
+    /// The destination region. Its length **is** the capacity — writing stops at
+    /// `buf.len()`, never beyond it.
+    buf: &'a mut [u8],
+    /// Bytes accepted so far; always `<= buf.len()`.
+    len: usize,
+    /// Set once a fragment was refused for lack of room. Once set it stays set,
+    /// because [`core::fmt::write`] aborts on the first `Err`.
+    overflowed: bool,
+}
+
+impl<'a> BoundedWriter<'a> {
+    /// Wraps `buf` as an empty sink whose capacity is `buf.len()`.
+    #[inline]
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self {
+            buf,
+            len: 0,
+            overflowed: false,
+        }
+    }
+}
+
+impl core::fmt::Write for BoundedWriter<'_> {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        // `self.len <= self.buf.len()` is an invariant, so this cannot underflow
+        // and the comparison cannot overflow.
+        if bytes.len() > self.buf.len() - self.len {
+            self.overflowed = true;
+            return Err(core::fmt::Error);
+        }
+        let end = self.len + bytes.len();
+        self.buf[self.len..end].copy_from_slice(bytes);
+        self.len = end;
+        Ok(())
+    }
+}
+
 /// Formatted write to the gzip file — port of C `gzvprintf` (`gzwrite.c`
 /// L420-L485, the `gz_vacate`-based variant).
 ///
@@ -1177,6 +1274,20 @@ fn gz_vacate(state: &mut GzState) -> bool {
 /// `src/ffi/gz.rs`. The formatted bytes are staged in the free second half of
 /// the double-sized input buffer and then compressed, exactly mirroring the C
 /// `vsnprintf`-into-`next` sequence.
+///
+/// # Formatting is bounded and allocation-free
+///
+/// The text is rendered straight into `in_buf[have ..]` through the private
+/// `BoundedWriter` sink, whose capacity is fixed at `size - 1` before formatting
+/// begins. Nothing is allocated, and a caller-controlled format string cannot
+/// grow the destination: the first fragment that does not fit ends
+/// [`core::fmt::write`] and the call reports `0`, exactly as C reports `0` when
+/// `vsnprintf` truncates. The `size - 1` bound is C's own effective capacity —
+/// C reserves the final byte of the `size`-byte window as an overflow sentinel
+/// (`next[state->size - 1] = 0` at C L453, re-tested at C L472), so the longest
+/// result C can accept is `size - 1` bytes. Expressing that as the sink's
+/// capacity replaces both the sentinel write and the `len >= size` re-test with
+/// a bound the writer cannot cross.
 ///
 /// Returns the number of formatted bytes written, `0` if the result did not fit
 /// in the buffer, or a negative [`ReturnCode`] code on error.
@@ -1212,22 +1323,39 @@ pub fn gzvprintf(state: &mut GzState, args: core::fmt::Arguments<'_>) -> i32 {
 
     // Format into the free region. The buffered input occupies `in_buf[0..have]`
     // (`next_in == in`), so formatting begins at offset `have`; the buffer is
-    // double-sized, so at least `size` bytes are available there (C L471-L473).
+    // double-sized, so `size` bytes are available there whenever `gz_vacate`
+    // freed the second half (C L450-L453).
+    //
+    // The capacity is C's effective one, `size - 1`, because C reserves the last
+    // byte of the window as an overflow sentinel. It is additionally clamped to
+    // what physically remains, which only bites in the one corner C gets wrong:
+    // after a non-blocking stall left `have > size`, C still writes
+    // `next[state->size - 1]`, i.e. up to `in[3 * size - 2]`, past the end of a
+    // `2 * size` buffer. This port formats into whatever room is genuinely left
+    // and reports `0` if the result no longer fits, instead of reproducing the
+    // overrun.
     let start = state.have;
-    let mut formatted = String::new();
-    let _ = core::fmt::write(&mut formatted, args);
-    let bytes = formatted.as_bytes();
-    let len = bytes.len();
+    let cap = state.size.saturating_sub(1).min(state.in_buf.len() - start);
+    let (len, overflowed) = {
+        let mut sink = BoundedWriter::new(&mut state.in_buf[start..start + cap]);
+        let outcome = core::fmt::write(&mut sink, args);
+        // A `Display`/`Debug` impl may itself fail; C sees that as a negative
+        // `vsnprintf` return, which its `(unsigned)len >= state->size` test also
+        // turns into `0`.
+        (sink.len, sink.overflowed || outcome.is_err())
+    };
 
-    // Check that the result fits in the buffer (C L488-L489): C requires the
-    // formatted length to be non-zero and strictly less than `size`.
-    if len == 0 || len >= state.size {
+    // Check that the result fits in the buffer (C L471-L473): C rejects a
+    // zero-length result, a length that reached `size`, and a clobbered
+    // sentinel. Here the length can never reach `size` — the sink stops at
+    // `size - 1` — so the three collapse into "nothing formatted" or
+    // "did not fit".
+    if len == 0 || overflowed {
         return 0;
     }
 
-    // Copy the formatted bytes in and update the buffer and position
-    // (C L492-L494).
-    state.in_buf[start..start + len].copy_from_slice(bytes);
+    // Account for the bytes the sink already placed in `in_buf` and advance the
+    // stream position (C L476-L477).
     state.have += len;
     state.pos += len as i64;
 
@@ -1505,7 +1633,7 @@ mod tests {
             pos: 0,
             mode: GzMode::Write,
             file: GzFile::new(file),
-            path: path.display().to_string(),
+            path: path.as_os_str().as_encoded_bytes().to_vec(),
             size: 0,
             want,
             in_buf: Vec::new(),
@@ -1599,10 +1727,15 @@ mod tests {
         // sibling that stands in for the destination recovering.
         let wedged = TempFile::new("afdefect1");
         let good = wedged.sibling("recovered.gz");
-        let data = corpus(4096);
+        let data = corpus(65536);
 
-        // `want = 64` keeps `size` small, so the engine fills the output scratch
-        // area (and therefore has pending output) almost immediately.
+        // `want = 64` keeps the scratch area small, so the first block the engine
+        // emits overflows it. The payload has to be large enough to *reach* that
+        // block: produced bytes leave the area only when it fills or a flush
+        // arrives (`gzwrite.c` L112-L114), and a `Z_NO_FLUSH` `deflate` holds its
+        // symbols until the symbol buffer is full — so a 4 KiB write to a
+        // destination that rejects every `write(2)` still succeeds, in reference
+        // zlib exactly as here. 64 KiB crosses the boundary with room to spare.
         let mut state = new_write_state(&wedged, 64, 6, 0, 0);
         wedge_destination(&mut state, &wedged);
 
@@ -1653,7 +1786,10 @@ mod tests {
     #[test]
     fn a_failed_write_still_accounts_for_the_ingested_input() {
         let wedged = TempFile::new("afdefect2");
-        let data = corpus(8192);
+        // Large enough that `deflate` emits a block and overflows the 64-byte
+        // scratch area, which is the only thing that makes a `Z_NO_FLUSH` step
+        // touch the destination at all (`gzwrite.c` L112-L114).
+        let data = corpus(65536);
 
         let mut state = new_write_state(&wedged, 64, 6, 0, 0);
         wedge_destination(&mut state, &wedged);
@@ -1700,6 +1836,12 @@ mod tests {
     /// fatal error; [`gz_comp`]'s compaction therefore clamps against the live
     /// value rather than the snapshot it took before the call, so buffered input
     /// is never resurrected on a stream that has just been declared dead.
+    ///
+    /// The flush is `Z_FINISH` rather than `Z_NO_FLUSH` because that is what makes
+    /// the destination be touched at all: produced bytes leave the scratch area
+    /// only when the area fills or a flush arrives (`gzwrite.c` L112-L114), and
+    /// 100 bytes of `Z_NO_FLUSH` input fill nothing. The bookkeeping under test is
+    /// identical on either path — what fails is the write, not the flush code.
     #[test]
     fn a_fatal_write_error_does_not_resurrect_buffered_input() {
         let wedged = TempFile::new("afdefect2_haveclamp");
@@ -1713,7 +1855,7 @@ mod tests {
         state.in_buf[..data.len()].copy_from_slice(&data);
         state.have = data.len();
 
-        assert!(gz_comp(&mut state, FlushMode::NoFlush).is_err());
+        assert!(gz_comp(&mut state, FlushMode::Finish).is_err());
         assert!(!state.again);
         assert_eq!(
             state.have, 0,
@@ -1789,11 +1931,17 @@ mod tests {
         );
 
         // Retry against a destination that behaves: the remainder is delivered and
-        // the window re-anchors so the next `deflate` gets the whole scratch area.
+        // the cursor ends at the produced-bytes frontier. Reclaiming the area is
+        // not the drain's job — C does that in the compress loop, and only once the
+        // area is both full and fully delivered (`gzwrite.c` L125-L128).
         state.clear_error();
         drain_pending(&mut state).expect("the retry drains the remainder");
         assert_eq!(state.out_pending, 0, "the window is empty");
-        assert_eq!(state.out_start, 0, "and re-anchored at the front");
+        assert_eq!(
+            state.out_start,
+            window.len(),
+            "and the cursor sits at the frontier, exactly where C leaves `next_out`"
+        );
         assert_eq!(
             read_output(&path),
             window,
@@ -1804,10 +1952,12 @@ mod tests {
     /// A destination that accepts one byte per write must produce **byte-identical**
     /// output to one that accepts everything.
     ///
-    /// This is the guarantee that makes the cursor safe to introduce at all: the
-    /// pending window is re-anchored only when it empties, so `deflate` always
-    /// receives `out_buf[..size]` from index `0` and the compressed byte sequence
-    /// cannot depend on how the destination chunked its acceptance.
+    /// This is the guarantee that makes the cursor safe to introduce at all: a
+    /// drain moves the cursor and never the bytes, and the scratch area is
+    /// reclaimed only once it is both full and fully delivered (`gzwrite.c`
+    /// L125-L128). `deflate` therefore always receives the free tail
+    /// `out_buf[frontier..size]`, whose extent is a function of the bytes already
+    /// produced — never of how the destination chose to chunk its acceptance.
     #[test]
     fn short_writes_do_not_change_a_single_output_byte() {
         let data = corpus(4096);
@@ -1833,7 +1983,12 @@ mod tests {
             );
             assert_eq!(finish_write(&mut state), ReturnCode::Ok);
             assert_eq!(state.out_pending, 0, "nothing was left undelivered");
-            assert_eq!(state.out_start, 0, "the window ends re-anchored");
+            assert!(
+                state.out_start < state.size,
+                "the compress loop never leaves the scratch area full: whenever the \
+                 frontier reaches the end it drains and reclaims (`gzwrite.c` \
+                 L125-L128) before asking `deflate` for more"
+            );
         }
         let actual = read_output(&dribble);
 
@@ -1865,9 +2020,12 @@ mod tests {
     /// Stages `window` as a hand-built pending output window on `state`, exactly
     /// as a `deflate` call that produced those bytes would leave it.
     ///
-    /// Asserts the front-anchored precondition the compress loop guarantees
-    /// (`out_pending == 0 ⇒ out_start == 0`), so a test that starts from a stale
-    /// cursor fails here rather than misattributing the cause later.
+    /// Asserts that the state is a *fresh* one whose window has never been written
+    /// through (`out_pending == 0` and `out_start == 0`), so a test that stages
+    /// onto a partly delivered window fails here rather than misattributing the
+    /// cause later. That pairing is deliberately **not** claimed as a loop
+    /// invariant: after a completed drain the cursor legitimately sits at the
+    /// produced-bytes frontier (see [`gz_deflate_loop`]).
     fn stage_pending_window(state: &mut GzState, window: &[u8]) {
         assert_eq!(state.out_pending, 0, "the window must start empty");
         assert_eq!(state.out_start, 0, "and therefore front-anchored");
@@ -1908,7 +2066,12 @@ mod tests {
         }
 
         assert_eq!(state.out_pending, 0, "every pending byte was delivered");
-        assert_eq!(state.out_start, 0, "and the window re-anchored");
+        assert_eq!(
+            state.out_start,
+            window.len(),
+            "and the cursor sits at the frontier — a drain moves the cursor, never \
+             the bytes"
+        );
         assert!(!state.again, "a completed drain leaves no retry pending");
         assert_eq!(state.err, ReturnCode::Ok, "an EINTR retry is not an error");
         assert_eq!(
@@ -1978,10 +2141,11 @@ mod tests {
     /// Drain branch 3 of 3 — `Ok(0)`: the refusal is reported, and the retained
     /// bytes are neither dropped nor resurrected.
     ///
-    /// A destination that accepts nothing while output remains can take no more, so
-    /// spinning would hang and breaking out silently would lose the tail. Unlike a
-    /// stall this is not advertised as retryable, yet the window must still survive
-    /// intact — the second drain proves it is delivered once and in full.
+    /// A destination that accepts nothing while output remains would hang C's loop
+    /// forever and would lose the tail if this one broke out silently, so it is
+    /// reported — and reported as **retryable**, so the caller can resume exactly
+    /// as C's endless retry eventually would. The window must survive intact: the
+    /// second drain proves it is delivered once and in full.
     #[test]
     fn drain_pending_reports_a_destination_that_accepts_nothing_without_losing_data() {
         let path = TempFile::new("drain_zero");
@@ -2001,7 +2165,11 @@ mod tests {
             assert_eq!(fault::remaining(), 0, "both scripted steps were exercised");
         }
 
-        assert!(!state.again, "`Ok(0)` is not a retryable stall");
+        assert!(
+            state.again,
+            "`Ok(0)` is reported as retryable, so the caller can resume where C \
+             would have kept retrying"
+        );
         assert_eq!(
             state.err,
             ReturnCode::ErrNo,
@@ -2023,7 +2191,12 @@ mod tests {
         state.clear_error();
         drain_pending(&mut state).expect("the resumed drain succeeds");
         assert_eq!(state.out_pending, 0, "everything pending was delivered");
-        assert_eq!(state.out_start, 0, "and the window re-anchored");
+        assert_eq!(
+            state.out_start,
+            window.len(),
+            "and the cursor sits at the frontier — a drain moves the cursor, never \
+             the bytes"
+        );
         assert_eq!(
             read_output(&path),
             window,
@@ -2107,7 +2280,8 @@ mod tests {
     /// progress count, and the unwritten tail is not silently discarded.
     ///
     /// The caller still owns the tail here — no pending window is needed — so an
-    /// accurate `consumed` is the whole of what a resume requires.
+    /// accurate `consumed` plus a retryable report is the whole of what a resume
+    /// requires.
     #[test]
     fn write_direct_reports_a_destination_that_accepts_nothing_with_true_progress() {
         let path = TempFile::new("direct_zero");
@@ -2126,7 +2300,10 @@ mod tests {
             Err(ZlibError::ErrNo),
             "zero progress reports Z_ERRNO rather than spinning"
         );
-        assert!(!state.again, "`Ok(0)` is not a retryable stall");
+        assert!(
+            state.again,
+            "`Ok(0)` is reported as retryable, matching the drain loop"
+        );
         assert_eq!(
             outcome.consumed, 5,
             "the accepted prefix is reported, not zero"
@@ -2255,16 +2432,28 @@ mod tests {
     /// `skip` at its full value, so the retry would regenerate every zero the
     /// engine had already taken: more zeros than the seek asked for, different
     /// output bytes, and the work done twice (CWE-252, CWE-400).
+    ///
+    /// # Reaching a stall inside a `Z_NO_FLUSH` fill
+    ///
+    /// `gz_zero` only ever asks for `Z_NO_FLUSH`, so the destination is touched
+    /// exactly when the scratch area fills (`gzwrite.c` L112-L114) — never merely
+    /// because a `deflate` call produced something. Zeros produce nothing at all
+    /// until a block boundary, so the fill has to run long enough to reach one.
+    /// `Z_HUFFMAN_ONLY` makes that affordable: with string matching disabled every
+    /// input byte becomes one literal symbol, so the symbol buffer fills after
+    /// ~16 K zeros rather than the ~4 MB that level-6 matching would need, and the
+    /// block emitted there overflows the 64-byte area many times over.
     #[test]
     fn a_stalled_zero_fill_credits_the_zeros_it_already_compressed() {
         let path = TempFile::new("zerostall");
-        let mut state = new_write_state(&path, 64, 6, 0, 0);
+        let mut state = new_write_state(&path, 64, 6, crate::constants::Z_HUFFMAN_ONLY, 0);
         gz_init(&mut state).expect("gz_init");
-        let total: i64 = 200;
+        let total: i64 = 20_000;
         state.skip = total;
 
-        // The first chunk of zeros makes `deflate` emit the gzip header, so the
-        // very first drain has something to deliver — and that is what stalls.
+        // Zeros accumulate as literal symbols until the symbol buffer fills; the
+        // block emitted there overflows the 64-byte scratch area, and the drain
+        // that overflow triggers is what stalls.
         {
             let _fault = fault::script(&[fault::Step::WouldBlock]);
             assert!(gz_zero(&mut state).is_err(), "the stall is reported");
@@ -2274,7 +2463,7 @@ mod tests {
         assert_eq!(state.err, ReturnCode::ErrNo);
         assert!(
             state.out_pending > 0,
-            "the header the destination declined is still pending"
+            "the output the destination declined is still pending"
         );
 
         let credited = state.pos;
@@ -2700,6 +2889,147 @@ mod tests {
         let mut state = new_write_state(&path, 8192, 6, 0, 0);
         assert_eq!(gz_write(&mut state, &[]), 0, "empty write consumes nothing");
         assert_eq!(state.size, 0, "an empty write does not trigger gz_init");
+    }
+
+    /// [`BoundedWriter`] accepts fragments while they fit and refuses the first
+    /// one that does not, leaving the accepted prefix intact.
+    ///
+    /// This is the property that makes [`gzvprintf`] allocation-free and bounded
+    /// (finding M6-06): the sink stands in for C's
+    /// `vsnprintf(next, state->size, …)` (`gzwrite.c` L467) and cannot be driven
+    /// past the region it was handed, so a caller-controlled format string can
+    /// neither reallocate nor overrun.
+    #[test]
+    fn bounded_writer_stops_at_its_capacity_without_growing() {
+        use core::fmt::Write as _;
+
+        let mut region = [0u8; 5];
+        {
+            let mut sink = BoundedWriter::new(&mut region);
+            assert!(
+                sink.write_str("abc").is_ok(),
+                "a fragment that fits is taken"
+            );
+            assert_eq!(sink.len, 3);
+            assert!(!sink.overflowed, "nothing has been refused yet");
+            assert!(
+                sink.write_str("xyz").is_err(),
+                "a fragment that does not fit is refused, ending core::fmt::write"
+            );
+            assert!(sink.overflowed, "the refusal is recorded");
+            assert_eq!(sink.len, 3, "a refused fragment is not partially copied");
+            assert!(
+                sink.write_str("de").is_ok(),
+                "the two bytes that do fit are still accepted"
+            );
+            assert_eq!(sink.len, 5, "the sink is now exactly full");
+        }
+        assert_eq!(
+            &region, b"abcde",
+            "only the accepted fragments were written"
+        );
+    }
+
+    /// `gzprintf` reproduces C's effective capacity of `size - 1` and reports
+    /// `0` — never a truncated write, never an allocation — when the formatted
+    /// result does not fit (finding M6-06).
+    ///
+    /// The expected values are the ones a reference C zlib produces with
+    /// `gzbuffer(file, 64)`, measured through the C ABI: `"hello"` → 5, a
+    /// 63-character result → 63, a 64-character result → 0, a 200-character
+    /// result → 0, and a single character → 1 (`gzwrite.c` L471-L473, where the
+    /// reserved sentinel byte at `next[state->size - 1]` is what makes the
+    /// greatest acceptable length `size - 1`).
+    #[test]
+    fn gzprintf_matches_c_effective_capacity_of_size_minus_one() {
+        let path = TempFile::new("printf_cap");
+        let s63 = "a".repeat(63);
+        {
+            let mut state = new_write_state(&path, 64, 6, 0, 0);
+
+            assert_eq!(gzprintf(&mut state, format_args!("hello")), 5);
+            let allocated = state.in_buf.len();
+            assert_eq!(allocated, 128, "the input buffer is double-sized");
+
+            assert_eq!(
+                gzprintf(&mut state, format_args!("{s63}")),
+                63,
+                "63 bytes is the longest result C accepts for size = 64"
+            );
+            let s64 = "b".repeat(64);
+            assert_eq!(
+                gzprintf(&mut state, format_args!("{s64}")),
+                0,
+                "a result that reaches `size` is rejected outright"
+            );
+            let s200 = "c".repeat(200);
+            assert_eq!(
+                gzprintf(&mut state, format_args!("{s200}")),
+                0,
+                "a far longer result is rejected without growing anything"
+            );
+            assert_eq!(gzprintf(&mut state, format_args!("z")), 1);
+
+            assert_eq!(
+                state.in_buf.len(),
+                allocated,
+                "a rejected result never reallocated the preallocated buffer"
+            );
+            assert_eq!(
+                state.err,
+                ReturnCode::Ok,
+                "an over-long result is reported as 0, not as an error"
+            );
+            assert_eq!(finish_write(&mut state), ReturnCode::Ok);
+        }
+        assert_eq!(
+            gunzip(&read_output(&path)),
+            format!("hello{s63}z").into_bytes(),
+            "exactly the accepted results reached the member, in order"
+        );
+    }
+
+    /// The formatted text is rendered *into* the preallocated gzip input buffer
+    /// rather than into a temporary allocation, so it is already staged for
+    /// compression the moment formatting ends (finding M6-06; C L450-L453
+    /// formats at `state->in + avail_in`).
+    #[test]
+    fn gzprintf_renders_directly_into_the_preallocated_input_buffer() {
+        let path = TempFile::new("printf_inplace");
+        let mut state = new_write_state(&path, 64, 6, 0, 0);
+        assert_eq!(gzprintf(&mut state, format_args!("{}+{}={}", 2, 3, 5)), 5);
+        assert_eq!(state.have, 5, "the bytes are counted as buffered input");
+        assert_eq!(
+            &state.in_buf[..5],
+            b"2+3=5".as_slice(),
+            "and they are sitting in `in_buf` itself, not in a temporary"
+        );
+        assert_eq!(
+            state.pos, 5,
+            "the stream position advanced by exactly the formatted length"
+        );
+    }
+
+    /// A `Display` implementation that itself fails leaves the call reporting
+    /// `0`, mirroring C, whose negative `vsnprintf` return also fails the
+    /// `(unsigned)len >= state->size` test (C L472). Nothing is accounted for,
+    /// so the partial text the failing impl already emitted is ignored exactly
+    /// as C ignores whatever `vsnprintf` left in `next`.
+    #[test]
+    fn gzprintf_reports_zero_when_formatting_itself_fails() {
+        struct Fails;
+        impl core::fmt::Display for Fails {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("partial")?;
+                Err(core::fmt::Error)
+            }
+        }
+
+        let path = TempFile::new("printf_fail");
+        let mut state = new_write_state(&path, 64, 6, 0, 0);
+        assert_eq!(gzprintf(&mut state, format_args!("{Fails}")), 0);
+        assert_eq!(state.have, 0, "nothing was accounted for");
+        assert_eq!(state.pos, 0, "and the stream position did not move");
     }
 
     #[test]

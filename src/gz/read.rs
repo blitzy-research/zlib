@@ -75,6 +75,99 @@ fn zlib_to_io(code: ReturnCode, msg: Option<&str>) -> io::Error {
     }
 }
 
+/// Capacity of the stack buffer [`os_error_text`] renders into.
+///
+/// C's equivalent is `zstrerror()`, i.e. `strerror(errno)` (`gzguts.h`
+/// L126-L137) — a pointer to static storage, so C allocates nothing at all to
+/// report an OS error. The longest `strerror` text in glibc is well under 100
+/// bytes, and Rust's [`io::Error`] rendering appends at most
+/// `" (os error -2147483648)"` (24 bytes) to it, so 192 bytes holds every real
+/// message with room to spare while keeping the stack frame trivial.
+const OS_ERROR_TEXT_CAP: usize = 192;
+
+/// A fixed-capacity stack buffer that renders a value's
+/// [`core::fmt::Display`] text **without allocating**.
+///
+/// This exists so that reporting an ordinary OS read failure cannot itself fail
+/// (finding M4-12). `ToString::to_string` allocates through the global
+/// allocator, which is *infallible*: an allocation failure there calls
+/// `handle_alloc_error` and aborts the process. Aborting is not an outcome a C
+/// caller can intercept, and it is not what reference zlib does — C reports
+/// `Z_ERRNO` with a static `strerror` string and leaves the stream usable, and
+/// even its own message *store* downgrades an allocation failure to
+/// `Z_MEM_ERROR` rather than dying (`gzlib.c` L540-L585). Rendering into this
+/// buffer keeps the whole path allocation-free up to
+/// [`GzState::error`](crate::gz::state::GzState::error), which is already fully
+/// fallible.
+///
+/// Overflow is dropped rather than reported: the text is diagnostic, so a
+/// truncated message is strictly better than no error at all. Truncation always
+/// lands on a `char` boundary, so [`Self::as_str`] never has to deal with a
+/// split code point.
+struct OsErrorText {
+    /// Rendered bytes; only `buf[..len]` is meaningful.
+    buf: [u8; OS_ERROR_TEXT_CAP],
+    /// Number of bytes rendered so far; always `<= OS_ERROR_TEXT_CAP`.
+    len: usize,
+}
+
+impl OsErrorText {
+    /// An empty buffer.
+    #[inline]
+    fn new() -> Self {
+        Self {
+            buf: [0; OS_ERROR_TEXT_CAP],
+            len: 0,
+        }
+    }
+
+    /// The rendered text.
+    ///
+    /// Cannot fail: every byte was copied from a `char`-boundary-aligned prefix
+    /// of a `&str`, so the contents are valid UTF-8 by construction. The
+    /// fallback keeps the function total without `unsafe`.
+    #[inline]
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl core::fmt::Write for OsErrorText {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let room = self.buf.len() - self.len;
+        if room == 0 {
+            // Already full: drop the remainder and keep reporting success so a
+            // multi-fragment `Display` still completes.
+            return Ok(());
+        }
+        // Copy the longest prefix that fits, backing off to the previous `char`
+        // boundary when the cut would split a code point.
+        let mut take = s.len().min(room);
+        while take > 0 && !s.is_char_boundary(take) {
+            take -= 1;
+        }
+        self.buf[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
+        self.len += take;
+        Ok(())
+    }
+}
+
+/// Renders `err`'s message into a bounded stack buffer, allocating nothing.
+///
+/// The C counterpart is `zstrerror()` (`gzguts.h` L126-L137), used at every
+/// `gz_error(state, Z_ERRNO, zstrerror())` site. See [`OsErrorText`] for why the
+/// rendering must not allocate.
+fn os_error_text(err: &io::Error) -> OsErrorText {
+    use core::fmt::Write as _;
+
+    let mut text = OsErrorText::new();
+    // `OsErrorText::write_str` is infallible, so the only `Err` this can produce
+    // comes from the `Display` impl itself; a partial message is still worth
+    // reporting, so the result is deliberately ignored.
+    let _ = write!(&mut text, "{err}");
+    text
+}
+
 // ===========================================================================
 // Phase 1 — low-level input: gz_load, gz_avail.
 // ===========================================================================
@@ -93,6 +186,11 @@ fn zlib_to_io(code: ReturnCode, msg: Option<&str>) -> io::Error {
 ///   already read the call still succeeds, otherwise a [`ReturnCode::ErrNo`]
 ///   error is recorded.
 /// * Any other error records [`ReturnCode::ErrNo`].
+///
+/// The OS message is rendered through [`os_error_text`], so this path performs
+/// **no allocation** before reaching the (already fallible)
+/// [`GzState::error`](crate::gz::state::GzState::error) store — reporting a read
+/// failure can never itself abort the process.
 ///
 /// `into` must not alias a field of `state` (callers pass either a user buffer or
 /// a buffer temporarily moved out of the state with [`std::mem::take`]), which is
@@ -124,8 +222,14 @@ pub(crate) fn gz_load(
                         return Ok(());
                     }
                 }
-                let msg = e.to_string();
-                state.error(ReturnCode::ErrNo, Some(&msg));
+                // Render the OS message into a bounded stack buffer rather than
+                // an infallibly allocated `String`: an allocation failure while
+                // *reporting* an ordinary read error would abort the process,
+                // where C reports `Z_ERRNO` with a static `strerror` string and
+                // carries on (`gzread.c` L41-L42, `gzguts.h` L126-L137). See
+                // `os_error_text` (finding M4-12).
+                let text = os_error_text(&e);
+                state.error(ReturnCode::ErrNo, Some(text.as_str()));
                 return Err(ZlibError::ErrNo);
             }
         }
@@ -1035,11 +1139,10 @@ pub(crate) fn finish_read(state: &GzState) -> ReturnCode {
 mod tests {
     use super::*;
     use crate::gz::state::GzFile;
+    use crate::gz::test_temp::TempFile;
     use crate::stream::ZStream;
     use std::fs::File;
-    use std::io::Write as _;
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::path::Path;
 
     /// A 32-byte gzip member decoding to `"hello, world"` (produced by reference
     /// zlib / `gzip`). Used to exercise the gzip decode path end to end.
@@ -1062,26 +1165,34 @@ mod tests {
         44, 0, 64, 163, 41, 65, 200, 0, 0, 0,
     ];
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    /// Returns a unique temporary path (never committed; cleaned up per test).
-    fn unique_temp_path(tag: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        p.push(format!(
-            "blitzy_adhoc_test_gzread_{tag}_{}_{n}",
-            std::process::id()
-        ));
-        p
-    }
-
-    /// Writes `bytes` to a fresh temp file and returns its path.
-    fn write_temp(tag: &str, bytes: &[u8]) -> PathBuf {
-        let path = unique_temp_path(tag);
-        let mut f = File::create(&path).expect("create temp file");
-        f.write_all(bytes).expect("write temp file");
-        f.flush().expect("flush temp file");
-        path
+    /// Writes `bytes` to a freshly created fixture and returns its guard.
+    ///
+    /// # Why a guard rather than a bare `PathBuf`
+    ///
+    /// The previous helper named `temp_dir()/blitzy_adhoc_test_gzread_<tag>_<pid>_<n>`
+    /// — fully computable by any other user on the host — and materialized it with
+    /// [`File::create`], which opens `O_CREAT | O_TRUNC` *without* `O_EXCL` and
+    /// follows a final-component symlink. A link planted at the predicted name
+    /// therefore redirected the fixture write to a target of the planter's choosing
+    /// and truncated it on the way (CWE-377 insecure temporary file, CWE-59 link
+    /// following). The per-test `remove_file(&path).ok()` calls did not help: a
+    /// failing assertion unwinds straight past them.
+    ///
+    /// [`TempFile`] moves the uniqueness onto a directory created with `mkdir(2)`
+    /// create-new semantics — which skips rather than adopts or deletes an occupied
+    /// name — writes the payload with `create_new`, and removes the whole directory
+    /// from [`Drop`], including while unwinding. See [`crate::gz::test_temp`].
+    ///
+    /// The returned guard must stay bound for as long as the fixture is read.
+    fn write_temp(tag: &str, bytes: &[u8]) -> TempFile {
+        let temp = TempFile::named(&std::format!("gzread_{tag}"), "fixture.bin");
+        {
+            use std::io::Write as _;
+            let mut f = temp.create();
+            f.write_all(bytes).expect("write the fixture");
+            f.flush().expect("flush the fixture");
+        }
+        temp
     }
 
     /// Builds a `GzState` open for reading over `path`, with I/O buffer size
@@ -1095,7 +1206,7 @@ mod tests {
             pos: 0,
             mode: GzMode::Read,
             file: GzFile::new(file),
-            path: path.to_string_lossy().into_owned(),
+            path: path.as_os_str().as_encoded_bytes().to_vec(),
             size: 0,
             want,
             in_buf: Vec::new(),
@@ -1136,6 +1247,119 @@ mod tests {
         out
     }
 
+    /// [`os_error_text`] reproduces exactly the text an infallible
+    /// `to_string()` would have produced for a real OS error, so replacing the
+    /// allocation changed nothing a caller can observe (finding M4-12).
+    #[test]
+    fn os_error_text_matches_the_allocating_rendering() {
+        // ENOENT (2) is the one raw errno value with the same meaning on every
+        // platform this crate builds for.
+        let err = io::Error::from_raw_os_error(2);
+        let rendered = os_error_text(&err);
+        assert!(
+            !rendered.as_str().is_empty(),
+            "an OS error always renders to something"
+        );
+        assert_eq!(
+            rendered.as_str(),
+            err.to_string(),
+            "the bounded rendering is byte-for-byte the allocating one"
+        );
+    }
+
+    /// Rendering never overflows the stack buffer, and a message longer than
+    /// the buffer is cut on a `char` boundary so [`OsErrorText::as_str`] stays
+    /// valid UTF-8 (finding M4-12).
+    #[test]
+    fn os_error_text_truncates_on_a_char_boundary() {
+        use core::fmt::Write as _;
+
+        // Fill to one byte short of capacity, then offer a three-byte code
+        // point: it cannot fit, and no partial code point may be kept.
+        let mut text = OsErrorText::new();
+        let filler = "x".repeat(OS_ERROR_TEXT_CAP - 1);
+        assert!(text.write_str(&filler).is_ok());
+        assert_eq!(text.len, OS_ERROR_TEXT_CAP - 1);
+        assert!(
+            text.write_str("€").is_ok(),
+            "an over-long fragment is dropped, not reported"
+        );
+        assert_eq!(
+            text.len,
+            OS_ERROR_TEXT_CAP - 1,
+            "a code point that does not fit is dropped whole"
+        );
+        assert_eq!(
+            text.as_str(),
+            filler,
+            "the retained prefix is exactly the bytes that fit"
+        );
+
+        // A single fragment far longer than the buffer is truncated to capacity.
+        let mut text = OsErrorText::new();
+        let long = "ab".repeat(OS_ERROR_TEXT_CAP);
+        assert!(text.write_str(&long).is_ok());
+        assert_eq!(text.len, OS_ERROR_TEXT_CAP, "the buffer filled exactly");
+        assert_eq!(text.as_str().len(), OS_ERROR_TEXT_CAP);
+
+        // Multi-byte code points are never split even when the cut lands inside
+        // one: 96 three-byte characters occupy 288 bytes, so the 64th character
+        // straddles the 192-byte limit.
+        let mut text = OsErrorText::new();
+        let wide = "€".repeat(96);
+        assert!(text.write_str(&wide).is_ok());
+        assert_eq!(
+            text.len, OS_ERROR_TEXT_CAP,
+            "192 is a multiple of 3, so exactly 64 characters fit"
+        );
+        assert_eq!(
+            text.as_str(),
+            "€".repeat(64),
+            "the truncation landed on a code-point boundary"
+        );
+    }
+
+    /// The OS-error path of [`gz_load`] must not reach the global allocator: an
+    /// allocation failure while reporting an ordinary read error would abort the
+    /// process, where C reports `Z_ERRNO` with a static `strerror` string
+    /// (finding M4-12).
+    ///
+    /// Enforced structurally because the failure it guards against is an abort,
+    /// which no runtime assertion can observe. Only `gz_load`'s own body is
+    /// scanned, so the idiomatic [`Read`]/[`BufRead`] bridge — which is not a C
+    /// entry point and must hand [`io::Error`] an owned payload — is unaffected.
+    #[test]
+    fn the_gz_load_error_path_allocates_nothing() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/gz/read.rs");
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+        let start = src
+            .find("pub(crate) fn gz_load(")
+            .expect("gz_load is defined in this file");
+        let rest = &src[start..];
+        let end = rest.find("\n}\n").expect("gz_load has a closing brace");
+        let body = &rest[..end];
+
+        // Built at run time so this test's own source does not match itself.
+        for needle in [
+            format!("to_{}()", "string"),
+            format!("{}!(", "format"),
+            format!("{}::new()", "String"),
+            format!("{}::from(", "String"),
+            format!("to_{}()", "owned"),
+        ] {
+            assert!(
+                !body.contains(&needle),
+                "gz_load must not allocate to report an OS error, found `{needle}`"
+            );
+        }
+        assert!(
+            body.contains("os_error_text(&e)"),
+            "gz_load reports the OS message through the bounded stack renderer"
+        );
+    }
+
     #[test]
     fn decompresses_a_gzip_member() {
         let path = write_temp("hello", HELLO_GZIP);
@@ -1150,7 +1374,6 @@ mod tests {
         assert_eq!(state.direct, 0);
 
         drop(state);
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1167,7 +1390,6 @@ mod tests {
         assert_eq!(state.err, ReturnCode::Ok);
 
         drop(state);
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1180,7 +1402,6 @@ mod tests {
         assert_eq!(state.how, How::Copy);
 
         drop(state);
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1194,7 +1415,6 @@ mod tests {
         assert_eq!(state.err, ReturnCode::Ok);
 
         drop(state);
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1207,7 +1427,6 @@ mod tests {
         assert_eq!(read_all(&mut state), expected);
 
         drop(state);
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1220,7 +1439,6 @@ mod tests {
         assert!(state.past, "reading past EOF must set `past`");
 
         drop(state);
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1233,7 +1451,6 @@ mod tests {
         assert_eq!(gzgetc(&mut state), -1);
 
         drop(state);
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1249,7 +1466,6 @@ mod tests {
         assert_eq!(gzgetc(&mut state), -1);
 
         drop(state);
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1265,7 +1481,6 @@ mod tests {
         assert_eq!(read_all(&mut state), b"hello, world");
 
         drop(state);
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1286,7 +1501,6 @@ mod tests {
         assert!(state.past);
 
         drop(state);
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1301,7 +1515,6 @@ mod tests {
         assert_eq!(buf[3], 0);
 
         drop(state);
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1315,7 +1528,6 @@ mod tests {
         assert_eq!(got, b"hello, world");
 
         drop(state);
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1336,7 +1548,6 @@ mod tests {
         assert_eq!(state.read_line(&mut line).expect("read_line"), 0);
 
         drop(state);
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1350,7 +1561,6 @@ mod tests {
         assert_eq!(finish_read(&state), ReturnCode::BufError);
 
         drop(state);
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1366,6 +1576,5 @@ mod tests {
         assert_eq!(gzgets(&mut state, &mut buf), None);
 
         drop(state);
-        std::fs::remove_file(&path).ok();
     }
 }

@@ -1200,6 +1200,19 @@ fn probe_null_and_stateless_calls() {
 /// rather than a finding about the library. The reachable, *defined* violations
 /// are a null `next_out` — rejected unconditionally, with no `avail_out`
 /// qualifier — and a positive `avail_in` paired with a null `next_in`.
+///
+/// Both of those are *authorized* by the callees' own safety contracts, not
+/// merely tolerated by them: the `# Safety` sections of `zlib_rs::ffi::deflate`
+/// and `zlib_rs::ffi::inflate` each carry a "pre-dereference validation — the
+/// two defined rejection cases" clause naming exactly this pair, and state that
+/// `stream_buffers_valid` tests them before `input_slice`/`output_slice` bridge
+/// anything, so no pointer is dereferenced and no slice is formed from a null
+/// base. That is what makes these calls sound rather than a contract violation
+/// the fuzzer happens to survive, and it is why the two shapes are asserted
+/// here: the guarantee is part of the published API, so a regression that moved
+/// either test after the bridging would be a real defect. The complementary
+/// shape `avail_in == 0` with `next_in == NULL` is plainly legal under the same
+/// clause — nothing is read — and is exercised immediately after each pair.
 fn probe_buffer_validation() {
     let good = version_ok();
     let size = stream_size_ok();
@@ -1216,8 +1229,12 @@ fn probe_buffer_validation() {
     );
     ds.next_out = ptr::null_mut();
     ds.avail_out = 0;
-    // SAFETY: a null `next_out` is a defined, rejected configuration — the shim
-    // tests the pointer before bridging it to a slice.
+    // SAFETY: a null `next_out` is one of the two configurations `deflate`'s
+    // "pre-dereference validation" clause defines as rejected rather than
+    // undefined: `stream_buffers_valid` tests the pointer before it is bridged to
+    // a slice, unconditionally and with no `avail_out` qualifier. Every other
+    // obligation in that contract holds — `ds` is a live, exclusively-owned
+    // `z_stream` initialised above, and no buffer aliases another or the struct.
     assert_exact_code(
         unsafe { deflate(&mut ds, Z_NO_FLUSH) },
         Contract::Deflate,
@@ -1229,8 +1246,11 @@ fn probe_buffer_validation() {
     ds.avail_out = out.len() as c_uint;
     ds.next_in = ptr::null();
     ds.avail_in = 7;
-    // SAFETY: a positive `avail_in` with a null `next_in` is likewise rejected
-    // before any read; nothing is dereferenced.
+    // SAFETY: a positive `avail_in` with a null `next_in` is the second case that
+    // same clause defines as rejected before any read, so nothing is dereferenced
+    // and the count is never used to form a slice. `next_out` now addresses
+    // `out`, which is live, writable, and disjoint from both the (null) input and
+    // the stream struct.
     assert_exact_code(
         unsafe { deflate(&mut ds, Z_NO_FLUSH) },
         Contract::Deflate,
@@ -1302,7 +1322,10 @@ fn probe_buffer_validation() {
     );
     is.next_out = ptr::null_mut();
     is.avail_out = 0;
-    // SAFETY: a null `next_out` is a defined, rejected configuration.
+    // SAFETY: as on the deflate side, a null `next_out` is a defined, rejected
+    // configuration under `inflate`'s own "pre-dereference validation" clause —
+    // the same `stream_buffers_valid` test, ahead of any bridging. No `gz_header`
+    // is registered on this handle, so that clause of the contract is vacuous.
     assert_exact_code(
         unsafe { inflate(&mut is, Z_NO_FLUSH) },
         Contract::Inflate,
@@ -1314,8 +1337,9 @@ fn probe_buffer_validation() {
     is.avail_out = out.len() as c_uint;
     is.next_in = ptr::null();
     is.avail_in = 7;
-    // SAFETY: a positive `avail_in` with a null `next_in` is rejected before any
-    // read.
+    // SAFETY: a positive `avail_in` with a null `next_in` is the second defined
+    // rejection case in that clause, refused before any read. `out` is the only
+    // live region and it aliases neither the null input nor the stream struct.
     assert_exact_code(
         unsafe { inflate(&mut is, Z_NO_FLUSH) },
         Contract::Inflate,

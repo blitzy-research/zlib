@@ -569,6 +569,311 @@ impl HeaderPublication {
     }
 }
 
+// ===========================================================================
+// ForeignGzHeader — the live, borrowed, allocation-free header view
+// ===========================================================================
+
+/// A gzip header that is owned by a **C caller**, borrowed for the duration of
+/// one engine call.
+///
+/// # Why this type exists
+///
+/// C's `deflateSetHeader` stores nothing but a pointer — `strm->state->gzhead =
+/// head` (`deflate.c` L717) — and allocates nothing. Every field is then re-read
+/// *lazily, at emission time*, inside `deflate()` (`deflate.c` L1092-L1188) and
+/// inside `deflateBound` (`deflate.c` L893-L907). Two consequences follow, and
+/// both are observable:
+///
+/// 1. **Mutations are honored.** A caller may set a header, mutate `head->name`,
+///    and only then call `deflate()`; C emits the *new* name. An implementation
+///    that deep-copied at registration would emit the stale one and produce
+///    different gzip bytes — a violation of the byte-identity requirement
+///    (AAP §0.8.1 D-1).
+/// 2. **Registration cannot fail for want of memory.** C returns only `Z_OK` or
+///    `Z_STREAM_ERROR`. A deep copy introduces a `Z_MEM_ERROR` that reference
+///    zlib can never produce.
+///
+/// This type reproduces both properties. It holds **borrowed slices**, never
+/// owned buffers, so constructing one allocates nothing, and it is rebuilt from
+/// the caller's live struct on every entry point that reads the header.
+///
+/// # Layering
+///
+/// The type lives here, in the layer-5 `gz_header` module, so that the layer-6
+/// deflate engine can consume it while the raw-pointer work — testing the
+/// caller's pointers for null, scanning `name`/`comment` for their terminating
+/// NUL, and materializing the slices — stays confined to `src/ffi`, the sole
+/// sanctioned `unsafe` zone (AAP §0.6.2). Holding and reading a borrowed slice
+/// needs no `unsafe`, so this module and the engine remain `unsafe`-free.
+///
+/// # Granularity equivalence
+///
+/// C re-reads the caller's memory *per byte* (`s->gzhead->name[s->gzindex++]`),
+/// whereas the FFI materializes these slices once per engine call. The two are
+/// equivalent: a caller cannot mutate its header *during* a call, because the C
+/// API is synchronous and single-threaded, so per-call and per-byte freshness
+/// observe exactly the same bytes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ForeignGzHeader<'a> {
+    /// C `head->text`, read at emission (`deflate.c` L1092).
+    pub text: bool,
+    /// C `head->time`, the MTIME written little-endian (`deflate.c` L1098-L1101).
+    pub time: u32,
+    /// C `head->os`, written as `os & 0xff` (`deflate.c` L1105).
+    pub os: i32,
+    /// C `head->hcrc`: when set, a two-byte header CRC-16 is appended
+    /// (`deflate.c` L1110, L1188-L1195).
+    pub hcrc: bool,
+    /// The caller's `extra` field: exactly `head->extra_len & 0xffff` bytes when
+    /// `head->extra != Z_NULL`, otherwise [`None`] (`deflate.c` L1106-L1108,
+    /// L1118-L1137).
+    pub extra: Option<&'a [u8]>,
+    /// The caller's `name`, up to but excluding its terminating NUL, or [`None`]
+    /// when `head->name == Z_NULL` (`deflate.c` L1145-L1158).
+    pub name: Option<&'a [u8]>,
+    /// The caller's `comment`, up to but excluding its terminating NUL, or
+    /// [`None`] when `head->comment == Z_NULL` (`deflate.c` L1167-L1180).
+    pub comment: Option<&'a [u8]>,
+}
+
+/// Which gzip header, if any, a deflate stream will emit.
+///
+/// This is the safe-Rust counterpart of C's single `gz_header *gzhead` field
+/// (`deflate.h` L106). C distinguishes only "null" from "some pointer"; Rust
+/// must additionally distinguish *who owns the storage*, because the idiomatic
+/// API hands the engine an owned [`GzHeader`] while the C ABI lends it a live
+/// struct it must not copy (see [`ForeignGzHeader`]).
+///
+/// The enum is `Clone` and allocation-free in every arm except [`Owned`](Self::Owned),
+/// whose clone duplicates the caller's own vectors. `deflateCopy` therefore
+/// duplicates an owned header and shares a foreign one — which is precisely
+/// what C does, since its `zmemcpy` of `deflate_state` copies the `gzhead`
+/// *pointer* (`deflate.c` L1345).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum GzHeaderSlot {
+    /// No header was set: C `gzhead == Z_NULL`. The default gzip header is
+    /// emitted (`deflate.c` L1072-L1090).
+    #[default]
+    None,
+    /// A header supplied through the idiomatic Rust API and owned by the engine.
+    Owned(GzHeader),
+    /// A header supplied through the C ABI and owned by the caller. No contents
+    /// are stored: they are re-read from the caller's struct on every entry
+    /// point that needs them, exactly as C re-reads through its pointer.
+    Foreign,
+}
+
+impl GzHeaderSlot {
+    /// Whether a header is registered at all, i.e. C's `gzhead != Z_NULL`.
+    ///
+    /// This is the *only* predicate the engine may use to decide between the
+    /// default header and a caller-supplied one, because it is the only one C
+    /// has.
+    #[inline]
+    #[must_use]
+    pub const fn is_set(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// The owned header, if this slot holds one.
+    #[inline]
+    #[must_use]
+    pub const fn owned(&self) -> Option<&GzHeader> {
+        match self {
+            Self::Owned(h) => Some(h),
+            Self::None | Self::Foreign => None,
+        }
+    }
+}
+
+/// A uniform, borrowed view over whichever header source a stream has.
+///
+/// Header emission must read identical fields regardless of whether the header
+/// is engine-owned or caller-owned, so both arms of [`GzHeaderSlot`] are
+/// normalized into this single borrowed shape before any byte is written. That
+/// keeps one copy of the emission logic — the copy whose byte-for-byte
+/// agreement with `deflate.c` is what the byte-identity gate proves — instead of
+/// two that could drift apart.
+///
+/// Because every payload is a borrowed slice, normalizing allocates nothing.
+/// This deliberately replaces an earlier implementation that cloned `extra`,
+/// `name`, and `comment` once per emission phase purely to satisfy the borrow
+/// checker: those clones were three allocations per gzip member that C does not
+/// make, and they could be re-run on every re-entry into a partially emitted
+/// phase (AAP §0.6.5 requires allocation-count parity).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HeaderFields<'a> {
+    /// C `head->text`.
+    pub text: bool,
+    /// C `head->time`.
+    pub time: u32,
+    /// C `head->os`.
+    pub os: i32,
+    /// C `head->hcrc`.
+    pub hcrc: bool,
+    /// C `head->extra`, exactly `extra_len` bytes, or [`None`] when absent.
+    pub extra: Option<&'a [u8]>,
+    /// C `head->name` without its NUL, or [`None`] when absent.
+    pub name: Option<&'a [u8]>,
+    /// C `head->comment` without its NUL, or [`None`] when absent.
+    pub comment: Option<&'a [u8]>,
+}
+
+impl<'a> HeaderFields<'a> {
+    /// Borrows an engine-owned header.
+    #[must_use]
+    pub fn from_owned(h: &'a GzHeader) -> Self {
+        Self {
+            text: h.text,
+            time: h.time,
+            os: h.os,
+            hcrc: h.hcrc,
+            extra: h.extra.as_deref(),
+            name: h.name.as_deref(),
+            comment: h.comment.as_deref(),
+        }
+    }
+
+    /// Borrows a caller-owned header lent for this call.
+    #[must_use]
+    pub const fn from_foreign(h: &ForeignGzHeader<'a>) -> Self {
+        Self {
+            text: h.text,
+            time: h.time,
+            os: h.os,
+            hcrc: h.hcrc,
+            extra: h.extra,
+            name: h.name,
+            comment: h.comment,
+        }
+    }
+
+    /// Resolves a slot plus an optional lent foreign header into one view.
+    ///
+    /// Returns [`None`] exactly when C would see `gzhead == Z_NULL`. A
+    /// [`Foreign`](GzHeaderSlot::Foreign) slot with no lent header also yields
+    /// [`None`]: that combination means an entry point that cannot reach the
+    /// caller's struct is being asked about it, and emitting a *default* header
+    /// is the only safe reading — never inventing fields.
+    #[must_use]
+    pub fn resolve(slot: &'a GzHeaderSlot, lent: Option<&ForeignGzHeader<'a>>) -> Option<Self> {
+        match slot {
+            GzHeaderSlot::None => None,
+            GzHeaderSlot::Owned(h) => Some(Self::from_owned(h)),
+            GzHeaderSlot::Foreign => lent.map(Self::from_foreign),
+        }
+    }
+}
+
+/// A **borrowed, caller-owned** set of gzip-header output buffers that the
+/// decoder writes into directly while parsing — the read direction's counterpart
+/// of [`ForeignGzHeader`].
+///
+/// # Why the decoder needs this
+///
+/// C's `inflate` never accumulates the header anywhere of its own: each decoded
+/// byte is stored straight into the caller's buffer through
+/// `state->head->name[state->length++]` and friends (`inflate.c` L614-L621,
+/// L632-L637, L654-L659), and the guards on those stores re-read the caller's
+/// live `extra`/`name`/`comment` pointers *and* their live `extra_max`/
+/// `name_max`/`comm_max` capacities on **every** byte. Two consequences follow
+/// that a snapshot taken at `inflateGetHeader` time cannot reproduce:
+///
+/// * A caller may install (or replace, or withdraw) a sink buffer after
+///   registering the header but before the bytes arrive, and C honors it.
+/// * A caller may change a capacity mid-parse, and C truncates against the new
+///   value.
+///
+/// It also means the decoder allocates nothing for the header. Capturing into
+/// owned vectors instead introduces an allocation on a path where C has none,
+/// and therefore a `Z_MEM_ERROR` C cannot return.
+///
+/// # Shape
+///
+/// Each field is `Some` exactly when the corresponding C pointer is non-null,
+/// and the slice length is that field's live capacity, so the decoder's store
+/// predicate is the ordinary `Option`-plus-bounds test rather than a raw pointer
+/// comparison. Holding the borrow for the duration of one engine call is
+/// equivalent to C's per-byte re-read, because the synchronous single-threaded C
+/// API gives a caller no opportunity to mutate its header *during* a call.
+///
+/// The type carries no `unsafe`; materializing it from a raw `gz_header` is the
+/// FFI boundary's job.
+#[derive(Debug, Default)]
+pub struct ForeignGzHeaderSink<'a> {
+    /// The stream's declared `XLEN`, as currently visible in the caller's
+    /// `extra_len` field.
+    ///
+    /// C derives the write offset for the extra field as `head->extra_len -
+    /// state->length` (`inflate.c` L616-L617) — that is, from the caller's own
+    /// struct, re-read on each pass — so it is part of the live view rather than
+    /// engine state.
+    pub extra_len: u32,
+    /// The caller's `extra` buffer, bounded by its live `extra_max`
+    /// (`inflate.c` L614-L621).
+    pub extra: Option<&'a mut [u8]>,
+    /// The caller's `name` buffer, bounded by its live `name_max`
+    /// (`inflate.c` L632-L637).
+    pub name: Option<&'a mut [u8]>,
+    /// The caller's `comment` buffer, bounded by its live `comm_max`
+    /// (`inflate.c` L654-L659).
+    pub comment: Option<&'a mut [u8]>,
+}
+
+impl<'a> ForeignGzHeaderSink<'a> {
+    /// Stores `byte` at `index` in the `name` buffer if the buffer exists and
+    /// the index is within its live capacity, reporting whether it was stored.
+    ///
+    /// Reproduces C's `if (head != NULL && head->name != NULL && length <
+    /// head->name_max) head->name[length++] = byte;` (`inflate.c` L632-L637):
+    /// the index advances only on a store, so a name longer than the buffer is
+    /// truncated and left unterminated exactly as in C.
+    #[inline]
+    pub fn store_name(&mut self, index: usize, byte: u8) -> bool {
+        Self::store(self.name.as_deref_mut(), index, byte)
+    }
+
+    /// Stores `byte` at `index` in the `comment` buffer, bounded by its live
+    /// capacity. C `inflate.c` L654-L659; see [`store_name`](Self::store_name).
+    #[inline]
+    pub fn store_comment(&mut self, index: usize, byte: u8) -> bool {
+        Self::store(self.comment.as_deref_mut(), index, byte)
+    }
+
+    /// Copies as much of `src` as fits into the `extra` buffer starting at
+    /// `offset`, returning how many bytes were stored.
+    ///
+    /// Reproduces C's clamped `zmemcpy(head->extra + len, next, len + copy >
+    /// head->extra_max ? head->extra_max - len : copy)` (`inflate.c`
+    /// L614-L621), including the enclosing `len < head->extra_max` guard: an
+    /// offset already at or beyond the live capacity stores nothing.
+    #[inline]
+    pub fn store_extra(&mut self, offset: usize, src: &[u8]) -> usize {
+        let Some(buf) = self.extra.as_deref_mut() else {
+            return 0;
+        };
+        if offset >= buf.len() {
+            return 0;
+        }
+        let room = buf.len() - offset;
+        let n = if src.len() > room { room } else { src.len() };
+        buf[offset..offset + n].copy_from_slice(&src[..n]);
+        n
+    }
+
+    /// Shared bounds-checked single-byte store for `name`/`comment`.
+    #[inline]
+    fn store(buf: Option<&mut [u8]>, index: usize, byte: u8) -> bool {
+        match buf {
+            Some(b) if index < b.len() => {
+                b[index] = byte;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

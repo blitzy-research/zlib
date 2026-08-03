@@ -83,25 +83,26 @@ except the two MSRV rows.
 
 | Gate | Command | Result |
 |------|---------|--------|
-| Test suite (default features) | `cargo test --locked` | **860 passed / 0 failed / 0 ignored** |
-| Test suite (all features) | `cargo test --locked --all-features` | **873 passed / 0 failed / 0 ignored** |
-| Test suite (`no_std`) | `cargo test --locked --no-default-features` | **634 passed / 0 failed / 0 ignored** |
-| Test suite (`no-std` feature) | `cargo test --locked --no-default-features --features no-std` | **634 passed / 0 failed / 0 ignored** |
+| Test suite (default features) | `cargo test --locked` | **956 passed / 0 failed / 0 ignored** |
+| Test suite (all features) | `cargo test --locked --all-features` | **969 passed / 0 failed / 0 ignored** |
+| Test suite (`no_std`) | `cargo test --locked --no-default-features` | **695 passed / 0 failed / 0 ignored** |
+| Test suite (`no-std` feature) | `cargo test --locked --no-default-features --features no-std` | **695 passed / 0 failed / 0 ignored** |
 | Formatting | `cargo fmt --all -- --check` | exit 0 |
 | Lints | `cargo clippy --locked --all-targets --all-features -- -D warnings` | exit 0 |
 | API docs | `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features` | exit 0, 0 warnings |
-| Published docs | `mkdocs build --strict --site-dir "$(mktemp -d)/site"` | exit 0, 0 warnings |
+| Published docs | `mkdocs build --strict --site-dir "$(mktemp -d)/site"` | exit 0, 0 strict diagnostics (see note) |
 | MSRV build | `cargo +1.85.0 build --locked` | exit 0 |
 | MSRV type-check | `cargo +1.85.0 check --locked --all-targets` | exit 0 |
 | Exported C symbols | `nm -D --defined-only target/release/libzlib_rs.so` | **95**, all type `T` |
-| Packaged crate | `cargo package --locked --list` | **75** files; the unpacked archive re-runs its own suite at 860 |
+| Packaged crate | `cargo package --locked --list` | **76** files; the unpacked archive re-runs its own suite at 956 |
 | Live byte-identity sweep | `cargo test --locked --features c-oracle --test c_oracle` | **3750/3750** and **50/50** byte-identical |
 
-The 860 default-feature tests decompose as **705** in-crate unit tests, **128**
-integration tests (`checksum` 23, `gzip_compat` 15, `inflate_coverage` 29,
-`interop` 30, `regression` 12, `round_trip` 19), and **27** doctests.
+The 956 default-feature tests decompose as **797** in-crate unit tests, **130**
+integration tests (`checksum` 23, `gzip_compat` 17, `inflate_coverage` 29,
+`interop` 30, `regression` 12, `round_trip` 19), and **29** doctests (28
+runnable plus one `compile_fail`).
 `--all-features` adds the 13 tests of the opt-in live C-oracle harness. Under
-`--no-default-features` the total is **512** unit + **97** integration + **25**
+`--no-default-features` the total is **571** unit + **97** integration + **27**
 doctests; the `gzip_compat` suite correctly reports 0 because the whole `gz*`
 file API is feature-gated off.
 
@@ -115,6 +116,14 @@ anywhere in `src`, `tests`, `benches`, `build.rs`, or `fuzz/fuzz_targets`.
 capability that cannot be exercised in a given build is expressed by a
 feature gate or a run-time probe that *passes with a printed notice*, never by
 `#[ignore]`.
+
+One note on the published-docs row: `mkdocs build --strict` exits 0 and emits
+**zero MkDocs strict diagnostics** — no `WARNING` and no `ERROR` from MkDocs, its
+plugins, or this project's content. The Material theme does print one banner of its
+own, an upstream advisory from the Material for MkDocs team about the forthcoming
+MkDocs 2.0. That banner is a vendor notice rather than a build diagnostic: it is
+independent of this repository's content, `--strict` does not fail on it, and no
+change here can suppress it.
 
 ## Highlights
 
@@ -353,13 +362,40 @@ The gzip layer offers a `.gz`-aware file API layered over `std::fs` and
 `std::io`, closely following zlib's `gz*` functions. It is available with the
 default `gz-io` feature.
 
-```rust,ignore
-use zlib_rs::gz::{gzopen, gzwrite, gzclose};
+The `gz*` family reports failure through return values rather than panics, so
+every result has to be inspected — a discarded return code silently loses a
+short write or an unflushed trailer:
 
-// Write a gzip-compressed file, then close to flush the trailer.
+```rust,ignore
+use zlib_rs::ReturnCode;
+use zlib_rs::gz::{gzclose, gzopen, gzwrite};
+
+let payload: &[u8] = b"hello, gzip\n";
+
 let mut file = gzopen("hello.txt.gz", "wb").expect("gzopen failed");
-let _ = gzwrite(&mut file, b"hello, gzip\n");
-let _ = gzclose(file);
+
+// `gzwrite` returns the number of bytes written, or 0 on error. A short write
+// is a failure, so it is compared against the full payload length.
+let written = gzwrite(&mut file, payload);
+assert_eq!(
+    written,
+    payload.len() as i32,
+    "gzwrite wrote {written} of {} bytes",
+    payload.len(),
+);
+
+// `gzclose` is mandatory rather than optional: `GzState`'s `Drop` is
+// deliberately empty of finishing logic, because a destructor cannot surface a
+// deferred compression or I/O error. Dropping a writer releases its buffers and
+// file descriptor but leaves the final deflate block and the gzip trailer
+// unwritten, so the close must happen explicitly *and* its code must be checked.
+let rc = gzclose(file);
+assert_eq!(
+    rc,
+    ReturnCode::Ok.as_c_int(),
+    "gzclose failed: {:?}",
+    ReturnCode::from_c_int(rc),
+);
 ```
 
 ## Usage — C drop-in (FFI)
@@ -429,16 +465,28 @@ gzip magic=1f 8b  compressed=30918  restored=50000  inflate_rc=1  bytes=byte-exa
 ```
 
 The dynamic run is a 50,000-byte streaming round trip at `windowBits = 31`,
-recovered byte-exactly with correct `1f 8b` gzip framing. CI's `c-abi-linkage`
+recovered byte-exactly with correct `1f 8b` gzip framing. Every field above is a
+fixed expectation except `compressed=`, which is a property of that run's input
+bytes: re-running with different 50,000 bytes changes the compressed length and
+nothing else. CI's `c-abi-linkage`
 job runs the equivalent check on four feature rows and additionally asserts that
 the dynamic export set matches the `zlib.map` contract on every one of them.
 
-Release artifacts, default features, built by `cargo build --locked --release` on
-stable 1.97.1: `libzlib_rs.rlib` ≈ 2.3 MiB, `libzlib_rs.so` ≈ 620 KiB,
-`libzlib_rs.a` ≈ 21 MiB. These are a dated observation rather than a budget — no
-gate asserts them, and they drift with the compiler; the same build on the MSRV
-floor's older LLVM comes out marginally smaller, as
-[`rust-toolchain.toml`](rust-toolchain.toml) records.
+Release artifact sizes, observed on **2026-08-03** with **stable 1.97.1**, the
+**default** feature set, `cargo build --locked --release`, into this repository's
+default `target/release/` (no `CARGO_TARGET_DIR` override): `libzlib_rs.rlib`
+≈ 2.7 MiB (2,791,948 B), `libzlib_rs.so` ≈ 646 KiB (660,944 B), `libzlib_rs.a`
+≈ 21.4 MiB (22,441,620 B).
+
+Read those as a dated, environment-specific observation rather than a budget or an
+invariant. No gate asserts them; they move with the compiler, the feature row, and
+the profile — the same build on the MSRV floor's older LLVM comes out marginally
+smaller, as [`rust-toolchain.toml`](rust-toolchain.toml) records. The `.rlib` figure
+is the least durable of the three, because an rlib embeds absolute build paths and
+therefore changes size when the checkout directory or `CARGO_TARGET_DIR` changes,
+with no change to a single line of source. Exact byte counts are deliberately not
+published here: reproduce them locally with
+`stat -c '%s' target/release/libzlib_rs.{rlib,so,a}` if you need them.
 
 > **`gzclose` stays mandatory.** `GzState`'s `Drop` frees every buffer and tears
 > down the engine, but is **intentionally empty of *finishing* logic**: a
@@ -654,16 +702,30 @@ Both lockfiles are committed deliberately, because the crate ships
 `cdylib`/`staticlib` distributables and reproducible offline builds need exact
 resolved versions.
 
-One `cargo-deny` policy governs that closure — [`deny.toml`](deny.toml) —
-evaluated once per graph. There is deliberately no sibling `fuzz/deny.toml`, and
-both invocations name the policy explicitly, because `cargo-deny` resolves
-configuration from the *target* manifest's workspace root and would otherwise fall
-back to built-in defaults for the detached fuzz workspace:
+Two `cargo-deny` policies govern that closure, **one per graph**:
+[`deny.toml`](deny.toml) over the 89 root packages and
+[`fuzz/deny.toml`](fuzz/deny.toml) over the 13 fuzz-only packages. Both
+invocations name their policy explicitly, because `cargo-deny` resolves
+configuration from the *target* manifest's workspace root and a discovery miss
+falls back to built-in defaults — silently, and a silent fallback looks exactly
+like a pass:
 
 ```sh
-cargo deny --locked --config deny.toml check
-cargo deny --locked --manifest-path fuzz/Cargo.toml --config deny.toml check
+# Root graph: 89 packages, against the policy that governs them.
+cargo deny --locked --config deny.toml check \
+  -A unused-wrapper -A license-exception-not-encountered
+
+# Detached fuzz workspace: 13 packages, against their own policy.
+cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check
 ```
+
+Both command lines are reproduced exactly as
+[`.github/workflows/audit.yml`](.github/workflows/audit.yml) runs them, the root
+`-A` allowances included. Those two allowances are not optional decoration:
+measured on this tree the root invocation reports `0 errors, 0 warnings` with them
+and, without them, still exits 0 but emits `warning[unused-wrapper]` and
+`warning[license-exception-not-encountered]`. The fuzz command line carries no
+allowance at all, because its policy is shaped for the graph it governs.
 
 The policy sets `[advisories]`, `[licenses]`, `[bans]`, and `[sources]` with
 `all-features = true`, denies yanked crates, and bounds advisory staleness. Its
@@ -678,11 +740,13 @@ every duplication in this project is dev-only and the check would otherwise repo
 `crate@version` `skip` entries so an *unreviewed* duplicate fails the build rather
 than merely printing a warning. The two things the fuzz graph legitimately needs —
 a C-toolchain build dependency and an NCSA-licensed `libfuzzer-sys` — are scoped,
-not waived: `cc` stays banned but carries `wrappers = ["libfuzzer-sys"]`, and NCSA
-is granted crate-scoped rather than globally. Because one policy spans two graph
-shapes, each invocation allows exactly the "unused configuration" codes that the
-*other* graph enforces; both then report `0 errors, 0 warnings` across all four
-checks.
+not waived, in **both** files: `cc` stays banned but carries
+`wrappers = ["libfuzzer-sys"]`, and NCSA is granted crate-scoped rather than
+globally. On the root graph neither crate is present, so those two entries are
+latent defence in depth and the root invocation allows exactly their two
+"unused configuration" codes; on the fuzz graph they are load-bearing, so that
+invocation needs no suppressions at all. Both report `0 errors, 0 warnings`
+across all four checks.
 
 [`.github/workflows/audit.yml`](.github/workflows/audit.yml) runs the gate on
 push, pull request, a daily schedule, and manual dispatch, as four independent
@@ -691,16 +755,18 @@ another's verdict:
 
 | Job | What it proves |
 | --- | --- |
-| `policy-integrity` | `deny.toml` still declares every governed table and holds every load-bearing key at its reviewed value, and no sibling `fuzz/deny.toml` has reappeared. Guards against section-level erosion, which would otherwise pass vacuously. |
+| `policy-integrity` | Both `deny.toml` and `fuzz/deny.toml` are present, still declare every governed table, still hold every load-bearing key at its reviewed value, and still agree with each other on every shared key. Guards against a deleted policy and against section-level erosion, which would otherwise pass vacuously. |
 | `cargo-audit` | No known advisory affects either lockfile — the root graph and the detached fuzz graph are both scanned. |
-| `cargo-deny` | The root graph satisfies all four categories: licences, advisories, bans, sources. |
-| `cargo-deny-fuzz` | The detached fuzz graph satisfies the same root `deny.toml`. |
+| `cargo-deny` | The root graph satisfies all four categories against `deny.toml`: licences, advisories, bans, sources. |
+| `cargo-deny-fuzz` | The detached fuzz graph satisfies the same four categories against `fuzz/deny.toml`. |
 
 Those four jobs are the **only** place either tool runs.
 [`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml) builds and fuzzes the
 harnesses and nothing else — it declares no `cargo-deny` job — so the
-supply-chain gate has exactly one home and the tool pin, the `--locked`
-discipline and the lockfile assertion cannot drift between two copies of it. The
+supply-chain *gate* has exactly one home and the tool pin, the `--locked`
+discipline and the lockfile assertion cannot drift between two copies of it. (Two
+policy *files* are not two gates: they are one gate reading the right rulebook per
+graph, and `policy-integrity` asserts they never disagree.) The
 trade-off is recorded rather than glossed: because a job in another workflow
 cannot be a `needs:` predecessor, a policy verdict can no longer sequence *ahead
 of* a fuzzing campaign within one run. It still blocks the same pull request, as
@@ -752,47 +818,63 @@ That is **40 modules** under `src/`, layered as
 `{deflate, inflate}` → `gz` → `ffi`, mirroring the C `#include` layering with no
 extra top-level modules.
 
-**Where the layering bends — four upward references.** The ordering above is the
-architecture, and it is what keeps `deflate` and `inflate` strict peers (neither
-references the other). It is *not* a claim that the module graph is acyclic:
-measured from the source text, exactly **four** `use` sites point upward, and they
-are the reason three module pairs reference each other — `deflate`↔`stream`,
-`inflate`↔`stream`, and `deflate`↔`util`.
+**The layering is acyclic, and a test enforces it.** Every `use crate::…` in the
+shipped library points at a *strictly lower* layer. There are no upward edges and
+no same-layer edges, so `stream`/`gz_header` and `deflate`/`inflate` are strict
+peers that never reference each other, and the module graph contains no cycle at
+all.
+
+Nothing in the compiler enforces that — a Rust crate is one compilation unit, so an
+upward `use` compiles perfectly and the layering would erode silently. The
+invariant is therefore mechanical: `the_module_graph_has_no_upward_edges` in
+`src/lib.rs` re-derives the entire edge set from the source text of every file
+under `src/` and fails on any reference that does not point downward, naming the
+file, the line and both layer numbers.
 
 ```sh
-# The only upward `use` declarations in the crate — four lines, no more:
-grep -nE '^\s*(pub )?use crate::(deflate|inflate)' \
-     src/stream.rs src/util/compress.rs src/util/uncompress.rs
-#   src/stream.rs:179:          use crate::deflate::state::DeflateState;
-#   src/stream.rs:181:          use crate::inflate::state::InflateState;
-#   src/util/compress.rs:45:    use crate::deflate::{deflate, deflate_end, deflate_init};
-#   src/util/uncompress.rs:45:  use crate::inflate::{inflate, inflate_end, inflate_init};
+# The enforced invariant, and the analysis it runs:
+cargo test --lib the_module_graph_has_no_upward_edges
 ```
 
-The regex is anchored to the start of a line on purpose. An unanchored search for
-`crate::deflate\|crate::inflate` across the same three files returns ten further
-matches, every one of them inside a `//!`, `///`, or `//` comment — intra-doc links
-and prose, not dependencies.
+The check is deliberately two-tiered, because the shipped library and the test
+configuration are different compilation units:
 
-- [`src/stream.rs`](src/stream.rs) names `DeflateState` and `InflateState` because
-  `StreamState` — the Rust counterpart of C's `z_stream.state` — **owns** the engine
-  state as `Box<DeflateState>` / `Box<InflateState>`. C breaks the same relationship
-  with an opaque forward declaration (`struct internal_state FAR *state`); an owning
-  enum cannot, and that ownership is exactly what makes `deflateEnd` unforgettable.
-- [`src/util/compress.rs`](src/util/compress.rs) and
-  [`src/util/uncompress.rs`](src/util/uncompress.rs) call the engines, because
-  `compress.c` and `uncompr.c` call `deflate()` and `inflate()`. Those two
-  translation units are mapped under `src/util/`, while `zutil.h`'s `OS_CODE` and
-  `PRESET_DICT` live in `src/util/mod.rs` and are needed by `src/deflate/mod.rs` —
-  so both directions follow from the C-to-Rust file mapping rather than from a
-  layering mistake.
+- **Shipped code** — every file with its `#[cfg(test)]` items removed — must be
+  strictly one-way. This is the graph that is built, linked and published, and it
+  is what lets each layer be read and reviewed without the layers above it.
+- **`#[cfg(test)]` code** may hold exceptions, but only the three enumerated in
+  `TEST_ONLY_CROSS_LAYER_EXCEPTIONS`, each with its rationale on record: `stream`
+  drives the counting `alloc_func`/`free_func` hook that lives in
+  `crate::ffi::alloc::test_hook`, because building a real C hook pair needs
+  raw-pointer `unsafe` and that is permitted only under `src/ffi/**`; and the two
+  engines decode each other's output, because an in-crate round trip is the only
+  way to assert emitted bytes without `std` or a third-party codec. The list is an
+  allow-list rather than a blanket exemption, so a *new* test-only inversion fails
+  the test until it is justified — and a stale entry fails it too.
 
-Both are module *references*, not a build or initialisation cycle: a Rust crate is
-a single compilation unit, so intra-crate module paths are resolved together and
-impose no ordering constraint — unlike C, where the `#include` graph must be acyclic
-to compile at all. Nor does `unsafe` containment rest on the graph shape: it is
-enforced by `#![deny(unsafe_code)]` plus exactly two scoped carve-outs, as described
-under [How the `unsafe` boundary is enforced](#how-the-unsafe-boundary-is-enforced).
+Two design decisions are what make the shipped graph one-way, and both mirror C
+rather than working around it:
+
+- [`src/stream.rs`](src/stream.rs) owns the engine state as an opaque
+  `Box<dyn EngineState>` and names neither `DeflateState` nor `InflateState`. The
+  typed views live *above* it, in `crate::deflate::state::DeflateStream` and
+  `crate::inflate::state::InflateStream`, so the layer-5 handle keeps C's ownership
+  semantics — the thing that makes `deflateEnd` unforgettable — while remaining
+  exactly as incurious about the engines as C's opaque forward declaration
+  `struct internal_state FAR *state`.
+- The one-call façades are split the way the C `#include` graph splits them.
+  `compress.c` and `uncompr.c` *include* `zlib.h` and *drive* the engines, so they
+  sit above the engine rather than beside `zutil.h`: the bit-exact `compressBound`
+  formula and the complete C driver loops stay in `src/util/` behind the
+  `OneCallDeflate`/`OneCallInflate` port traits, while the engine-owning adapters
+  and the public `compress`/`compress2`/`uncompress`/`uncompress2` entry points
+  live in `src/deflate/mod.rs` and `src/inflate/mod.rs`. `zutil.h`'s `OS_CODE` and
+  `PRESET_DICT` remain in `src/util/mod.rs`, and `src/deflate/mod.rs` reading them
+  is now an ordinary downward edge.
+
+`unsafe` containment does not rest on the graph shape in any case: it is enforced
+by `#![deny(unsafe_code)]` plus exactly two scoped carve-outs, as described under
+[How the `unsafe` boundary is enforced](#how-the-unsafe-boundary-is-enforced).
 
 The CRC-32 lookup tables are not checked in: `build.rs`
 regenerates them at build time in pure safe `std` Rust with no build-dependencies,
@@ -937,7 +1019,7 @@ Platform claims deserve platform coverage, so here is the boundary, drawn honest
 `.github/workflows/ci.yml` runs **twelve jobs**:
 
 - **Natively executed, full test suite:** `ubuntu-latest` across five feature rows
-  (default, `--all-features`, `std,gzip,gz-io`, `+simd`, and `--no-default-features`
+  (default, `--all-features`, `std,gzip,gz-io`, `std,simd`, and `--no-default-features`
   build-only), plus **`windows-latest` (x86_64)** and **`macos-latest` (aarch64)**.
   Every row asserts its own host triple via `rustc -vV` and its own `runner.arch`,
   so a runner label that silently changes architecture fails the job instead of
@@ -990,7 +1072,7 @@ that were previously tracked as open items are now closed:
   [Compatibility and RFCs](#compatibility-and-rfcs) for the full grid.
 - **`no_std` test coverage (done).** The full test suite compiles and passes
   under `cargo test --locked --no-default-features` (and `--features no-std`) —
-  **634 tests, 0 failed, 0 ignored** in both rows — and CI runs both as blocking
+  **695 tests, 0 failed, 0 ignored** in both rows — and CI runs both as blocking
   gates, plus a bare-metal `thumbv7em-none-eabihf` build job.
 - **Cross-platform CI (done).** Native Windows and macOS rows run the real suite;
   aarch64, 32-bit x86, and big-endian s390x are cross type-checked. The residual

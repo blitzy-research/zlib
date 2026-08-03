@@ -37,82 +37,67 @@
 #   `@<ref>` signal `dtolnay/rust-toolchain` normally reads its channel from, the
 #   nightly install below names its channel explicitly with `with: toolchain:`.
 #
-#   cargo-fuzz builds libFuzzer harnesses and therefore REQUIRES a Rust
-#   *nightly* toolchain: it relies on `-Z` sanitizer / coverage instrumentation
-#   that is not available on stable.
-#
-#   Installing nightly is not the same as selecting it: the repository root
-#   carries a `rust-toolchain.toml` pinning `channel = "1.85.0"`, rustup resolves
-#   a toolchain file (precedence rank 4) BEFORE the default toolchain (rank 5)
-#   that `dtolnay/rust-toolchain` sets, and cargo-fuzz resolves its toolchain
-#   from the repository root even though `fuzz/` is a detached workspace -- so
-#   without an override a bare `cargo fuzz build` here would run the pinned MSRV
-#   and fail with "the option `Z` is only accepted on the nightly compiler".
-#
-#   THE OVERRIDE IS THE JOB-LEVEL `RUSTUP_TOOLCHAIN: nightly-2026-08-01`, AND IT IS THE
-#   ONLY ONE. It is rustup override rank 2, which beats the rank-4 toolchain
-#   file, and being an environment variable it is inherited by the nested
-#   `cargo build` invocations cargo-fuzz spawns - which a per-command `+nightly`
-#   shorthand is not. The cargo invocations below are therefore deliberately
-#   UNPREFIXED, and the "Verify the resolved toolchain is nightly" step asserts
-#   the ambient resolution before anything is built, so a lost override fails
-#   loudly instead of surfacing as an opaque `-Z` parse error part-way through.
-#   Do NOT add `+nightly` back: a prefix on each command would make that
-#   assertion vacuous for the commands that carry it while leaving cargo-fuzz's
-#   own child processes governed by the env var anyway, so the two mechanisms
-#   would have to be kept in step for no gain.
-#
-#   LOCALLY there is no job-level env, so a contributor does need to say it
-#   once: either `RUSTUP_TOOLCHAIN=nightly-2026-08-01 cargo fuzz build` or the
-#   `cargo +nightly-2026-08-01 fuzz ...` shorthand. Name the DATE either way - a
-#   bare `+nightly` resolves to whatever was published this morning, which is the
-#   one thing the pin below exists to prevent. See the header of
-#   `fuzz/Cargo.toml` and the "VERSION RESOLUTION" section of
-#   `rust-toolchain.toml`.
-#
-#   THE NIGHTLY IS DATE-PINNED to `nightly-2026-08-01`, not the floating `nightly`
-#   channel: a floating channel changes the sanitizer flags and the `-Z` surface
-#   underneath a weekly job, where the resulting failure is maximally hard to
-#   attribute. The date and the installed `with: toolchain:` input must move
-#   together, and `CONTRIBUTING.md` names the same date for local reproducers.
-#
-#   THE NIGHTLY IS DATE-PINNED, and `cargo-fuzz` is version-pinned to 0.13.2 with
-#   an assertion. A weekly job whose compiler and whose tool both float is the one
-#   place in this repository where a red build can be caused by something that is
-#   not in any commit, and where the cause has already moved on by the time anyone
-#   looks. Both pins and their refresh procedure are documented on the steps that
-#   carry them; bump the date in the install step and in the `expected_nightly`
-#   assertion together.
-#
 #   The in-repo `fuzz/` crate is a DETACHED workspace (it carries its own
 #   `[workspace]` table, so root `cargo build`/`test`/`clippy`/`fmt` never touch
 #   it). It ships five libFuzzer targets: `fuzz_inflate`,
 #   `fuzz_deflate_roundtrip`, `fuzz_gzip`, `fuzz_checksum`, and
-#   `fuzz_ffi_roundtrip`. The `cargo-fuzz` job below builds all of them and then
-#   fuzzes each for a bounded budget; a discovered crash/timeout writes a
-#   reproducer under `fuzz/artifacts` and fails the pipeline.
+#   `fuzz_ffi_roundtrip`. The `cargo-fuzz` job below FORMAT-CHECKS and LINTS that
+#   workspace, builds all five targets, and then fuzzes each for a bounded
+#   budget; a discovered crash/timeout writes a reproducer under `fuzz/artifacts`
+#   and fails the pipeline.
 #
 # TOOLCHAIN SELECTION - THIS WORKFLOW MUST OPT OUT OF THE REPOSITORY PIN
 # ======================================================================
-#   cargo-fuzz injects nightly-only `-Z` sanitizer and coverage flags, so it
-#   REQUIRES nightly. Installing nightly is not selecting it: the root
-#   `rust-toolchain.toml` pins `channel = "1.85.0"`, and a rustup toolchain FILE
-#   outranks the `rustup default` that `dtolnay/rust-toolchain` sets. It is also
-#   discovered by walking UP from the current directory, so it reaches the detached
-#   `fuzz/` workspace - an unprefixed `cargo fuzz build` (or `cargo install
-#   cargo-fuzz`) would run on 1.85.0 and fail with "the option `Z` is only accepted
-#   on the nightly compiler".
+#   cargo-fuzz builds libFuzzer harnesses and therefore REQUIRES a Rust
+#   *nightly* toolchain: it injects `-Z` sanitizer / coverage instrumentation
+#   that is not available on stable.
 #
-#   Two mechanisms therefore state nightly, and the job-level one is what actually
-#   selects it: the `cargo-fuzz` job sets `RUSTUP_TOOLCHAIN: nightly-2026-08-01`
-#   (rank 2), and the job then ASSERTS what it resolved - both that it is *a*
-#   nightly and that it is that exact dated channel - before building anything.
-#   The steps below are consequently UNPREFIXED; "THE OVERRIDE IS THE JOB-LEVEL
-#   ..." above is the single authority on why, and on how to make the same
-#   selection locally. Do NOT "fix" this by deleting the repository pin or by
-#   pointing `rust-toolchain.toml`'s `channel` at nightly: the first reopens the
-#   local/CI MSRV asymmetry, the second puts every contributor's library build on
-#   an unstable compiler.
+#   INSTALLING NIGHTLY IS NOT SELECTING IT. The repository root carries a
+#   `rust-toolchain.toml` pinning `channel = "1.85.0"`, and rustup resolves a
+#   toolchain FILE (precedence rank 4) BEFORE the `rustup default` that
+#   `dtolnay/rust-toolchain` sets (rank 5). That file is discovered by walking UP
+#   from the working directory, so it reaches the detached `fuzz/` workspace too,
+#   and cargo-fuzz resolves its toolchain from the repository root in any case.
+#   Without an override, `cargo install cargo-fuzz`, `cargo fuzz build` and
+#   `cargo fuzz run` all execute on the pinned MSRV and fail with "the option
+#   `Z` is only accepted on the nightly compiler".
+#
+#   THE OVERRIDE IS THE JOB-LEVEL `RUSTUP_TOOLCHAIN: nightly-2026-08-01`, AND IT
+#   IS THE ONLY ONE. It is rustup override rank 2, which beats the rank-4
+#   toolchain file, and being an environment variable it is inherited by the
+#   nested `cargo build` invocations cargo-fuzz spawns - which a per-command
+#   `+nightly` shorthand is NOT. The cargo invocations in this workflow are
+#   therefore deliberately UNPREFIXED, and the "Verify the resolved toolchain is
+#   nightly" step asserts the ambient resolution before anything is built - both
+#   that it is *a* nightly and that it is that exact dated channel - so a lost
+#   override fails loudly instead of surfacing as an opaque `-Z` parse error
+#   part-way through. Do NOT add `+nightly` back: a prefix on each command would
+#   make that assertion vacuous for the commands carrying it, while cargo-fuzz's
+#   own child processes stayed governed by the env var anyway, so two mechanisms
+#   would have to be kept in step for no gain.
+#
+#   LOCALLY there is no job-level env, so a contributor does have to say it once,
+#   per command or per shell: either `RUSTUP_TOOLCHAIN=nightly-2026-08-01 cargo
+#   fuzz build` or the `cargo +nightly-2026-08-01 fuzz ...` shorthand. That is
+#   the whole of the local/CI difference - CI states the selection once at job
+#   level and repeats it nowhere, local runs state it themselves. See the header
+#   of `fuzz/Cargo.toml` and the "THIS FILE IS NOT A STRAITJACKET" section of
+#   `rust-toolchain.toml`.
+#
+#   BOTH PINS ARE DATED, deliberately: the toolchain is `nightly-2026-08-01`
+#   rather than the floating `nightly` channel, and `cargo-fuzz` is pinned to
+#   0.13.2 with an assertion. A floating channel moves the sanitizer flags and
+#   the `-Z` surface underneath a WEEKLY job, which is the one place in this
+#   repository where a red build can be caused by something that is in no commit
+#   and whose cause has already moved on by the time anyone looks. The date must
+#   move in the install step's `with: toolchain:` input and in the
+#   `expected_nightly` assertion together, and `CONTRIBUTING.md` names the same
+#   date for local reproducers.
+#
+#   Do NOT "fix" any of this by deleting the repository pin or by pointing
+#   `channel` at nightly: the first reopens the local/CI MSRV asymmetry, the
+#   second puts every contributor's ordinary library build on an unstable
+#   compiler.
 #
 # SUPPLY-CHAIN POLICY - OWNED BY `audit.yml`, NOT BY THIS FILE
 # ============================================================
@@ -121,24 +106,21 @@
 #   policy would (correctly) reject four of them, since the harness legitimately
 #   needs a C-toolchain build dependency (`cc`, for the libFuzzer runtime shim)
 #   and an NCSA-licensed `libfuzzer-sys`, neither of which the crate proper may
-#   ever acquire. Those 13 are governed by the repository's single root policy
-#   `deny.toml`, aimed at this graph with `--manifest-path fuzz/Cargo.toml --config deny.toml`.
+#   ever acquire. Those 13 are therefore governed by their OWN reviewed policy,
+#   `fuzz/deny.toml`, aimed at this graph with
+#   `--manifest-path fuzz/Cargo.toml --config fuzz/deny.toml`. One policy per
+#   graph is what lets each file state the truth about its own closure at full
+#   severity, with no suppression flags on this graph at all.
 #
-#   THAT POLICY IS ENFORCED IN `audit.yml`, AND NOWHERE ELSE. There is exactly
-#   ONE policy file in this repository - the root `deny.toml`. `fuzz/deny.toml`
-#   deliberately does not exist, and `audit.yml`'s `policy-integrity` job fails if
-#   one ever appears, because two files would be two places for the same allow
-#   list, the same skip set and the same advisory ignores to drift apart. The one
-#   file is aimed at BOTH graphs instead: `--config deny.toml` is passed
-#   explicitly on the fuzz side, which is the whole reason a sibling copy is
-#   unnecessary.
-#
-#   `.github/workflows/audit.yml` is the workflow that evaluates it, across four
-#   jobs - `cargo-deny` for the root graph, `cargo-deny-fuzz` for this one,
-#   `cargo-audit` for advisories over both lockfiles, and `policy-integrity` for
-#   the structural integrity of that single policy file. THIS workflow builds and
+#   BOTH POLICIES ARE ENFORCED IN `audit.yml`, AND NOWHERE ELSE. Two policy
+#   FILES, one evaluator: `deny.toml` governs the 89-package root graph,
+#   `fuzz/deny.toml` governs these 13, and `.github/workflows/audit.yml` is the
+#   workflow that evaluates both - `cargo-deny` for the root graph,
+#   `cargo-deny-fuzz` for this one, `cargo-audit` for advisories over both
+#   lockfiles, and `policy-integrity` for the structural integrity of both policy
+#   files plus their agreement on every shared key. THIS workflow builds and
 #   fuzzes; it runs no `cargo-deny` and no `cargo-audit` job, and it must not grow
-#   one. A second copy of the gate is not defence in depth: it is a second place
+#   one. A second copy of the GATE is not defence in depth: it is a second place
 #   for the tool pin, the `--locked` discipline and the lockfile assertion to
 #   drift out of step with the first.
 #
@@ -147,7 +129,7 @@
 #   failure blocked fuzzing within the same run. A job in another workflow cannot
 #   be a `needs:` predecessor, so that intra-run SEQUENCING is genuinely given
 #   up. What replaces it is broader TRIGGER coverage, not a weaker gate:
-#   `audit.yml` evaluates the root `deny.toml` on `push`, on `pull_request`, on a
+#   `audit.yml` evaluates both policies on `push`, on `pull_request`, on a
 #   daily 05:00 cron and on `workflow_dispatch`, whereas the removed job only ran
 #   on `pull_request`, the Monday 03:00 cron and manual dispatch - it never saw a
 #   direct push at all. So every trigger this workflow has is also a trigger
@@ -160,15 +142,15 @@
 #   minute.
 #
 #   THE TOOL PIN AND THE `--locked` DISCIPLINE LIVE WITH THE GATE. `cargo-deny`
-#   is pinned to 0.20.2 in `audit.yml` because that is the release the one policy
-#   file was authored and validated against, and every invocation there passes
+#   is pinned to 0.20.2 in `audit.yml` because that is the release both policy
+#   files were authored and validated against, and every invocation there passes
 #   `--locked` and then asserts that neither lockfile moved. That matters: without
 #   `--locked`, cargo-deny re-resolves the graph, may REWRITE `fuzz/Cargo.lock` on
 #   the runner, and still reports `ok` - measured on this repository, a single
 #   un-`--locked` invocation moved `fuzz/Cargo.lock` from sha256 prefix 522d40b9
 #   to 5ffba8d2 while printing all four `ok` lines. The reasoning is recorded
-#   once, in `audit.yml` and in the root `deny.toml`; it is deliberately not
-#   duplicated here.
+#   once, in `audit.yml` and in the two policy files themselves; it is
+#   deliberately not duplicated here.
 #
 #   `cargo-fuzz` - the one tool this workflow DOES install - is PINNED to 0.13.2,
 #   installed from an integrity-verified source tree, and asserted after install.
@@ -289,18 +271,24 @@ concurrency:
 
 jobs:
   # The only job in this workflow. Building and fuzzing the harnesses is all this
-  # file does: the supply-chain policy over the root `deny.toml` is owned and enforced
-  # by `audit.yml`, so there is deliberately no `cargo-deny` job here and no
-  # `needs:` on one. See "SUPPLY-CHAIN POLICY" in the header for what that
-  # trade-off costs and what it buys.
+  # file does: the supply-chain policy over both graphs -- `deny.toml` for the root
+  # graph and `fuzz/deny.toml` for this workspace -- is owned and enforced by
+  # `audit.yml`, so there is deliberately no `cargo-deny` job here and no `needs:`
+  # on one. See "SUPPLY-CHAIN POLICY" in the header for what that trade-off costs
+  # and what it buys.
   cargo-fuzz:
     name: cargo-fuzz (libFuzzer)
     runs-on: ubuntu-latest
     # Backstop against a pathological hang consuming a full runner slot, sized so
     # it can NEVER truncate a scheduled campaign: the longest budget is 600s over
     # five sequential targets (50 minutes), plus the cargo-fuzz install, the
-    # harness build and the corpus restore/save, which lands the worst realistic
-    # case around 60-65 minutes. 120 leaves roughly a 2x margin. A timeout that
+    # detached-workspace quality gates, the harness build and the corpus
+    # restore/save, which lands the worst realistic case around 60-65 minutes. 120
+    # leaves roughly a 2x margin. The quality gates in step 4 are a rounding error
+    # against that arithmetic and do not move it: measured cold on a fresh target
+    # directory, `clippy --all-targets` took 11s and the `--no-default-features`
+    # build of all five harnesses took 8s, with `fmt --check` effectively
+    # instantaneous. A timeout that
     # cut fuzzing short would be a silent coverage reduction reported as a red
     # build with no finding, so this number must stay well above the arithmetic
     # above if the budget is ever raised again.
@@ -352,25 +340,45 @@ jobs:
           # so relying on the default would silently install stable wherever
           # another channel was intended.
           toolchain: nightly-2026-08-01
-          # `components:` IS REQUIRED HERE, not defensive. A dated nightly channel
-          # installs `cargo`, `rustc` and `rust-std` and nothing else - neither
-          # `clippy` nor `rustfmt` is part of that set. Step 4 below runs
-          # `cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check` and two
-          # `cargo clippy ... -- -D warnings` invocations, and the job-level
-          # `RUSTUP_TOOLCHAIN: nightly-2026-08-01` means they resolve against THIS
-          # toolchain, not the stable one another workflow installs. Without this
-          # line all three die on `no such command` before they can gate anything,
-          # leaving the detached fuzz workspace formatted and linted by nothing -
-          # exactly the hole finding TEST-09 was raised to close.
+          # AND THE COMPONENTS MUST BE NAMED TOO. This step provisions exactly what
+          # it is asked for and nothing more: a channel installed without this input
+          # carries `rustc`, `cargo` and `rust-std` alone, so `cargo fmt` and
+          # `cargo clippy` have no shim to dispatch to. That is not a nightly
+          # peculiarity - `ci.yml` names the same pair on both of its STABLE
+          # toolchain steps for the same reason.
           #
-          # Both components ship for nightly channels, so requesting them cannot
-          # make the install fail; if a future dated nightly ever drops one, this
-          # step fails loudly at install time instead of the quality gate silently
-          # ceasing to exist.
+          # The consequence was not subtle. Step 4 runs one `cargo fmt
+          # --manifest-path fuzz/Cargo.toml --all -- --check` and two
+          # `cargo clippy ... -- -D warnings` gates over the detached fuzz
+          # workspace, resolved against THIS toolchain because of the job-level
+          # `RUSTUP_TOOLCHAIN: nightly-2026-08-01`, and every one of them failed with
+          # `error: 'cargo-fmt' is not installed for the toolchain
+          # 'nightly-2026-08-01-x86_64-unknown-linux-gnu'`, several minutes and one
+          # cargo-fuzz build after the step that should have installed it. The
+          # harness code those gates exist to check was never examined at all, so
+          # the `[lints.clippy]` table in `fuzz/Cargo.toml` was again a rule with no
+          # enforcer - the very condition step 4 was added to end, and the hole
+          # finding TEST-09 was raised to close.
+          #
+          # Step 2a probes both shims before anything else is built, so losing this
+          # input again fails in seconds with a named cause. Both components ship for
+          # nightly channels, so requesting them cannot make the install fail; if a
+          # future dated nightly ever drops one, this step fails loudly at install
+          # time instead of the quality gate silently ceasing to exist.
           components: clippy, rustfmt
 
       # 2a. Fail loudly if the nightly override is ever lost, instead of meeting it
       #     as an opaque `-Z` parse error part-way through the build.
+      #
+      #     It checks the CHANNEL and then the COMPONENTS, because "the toolchain we
+      #     asked for" means both and each fails differently. A lost channel fails at
+      #     the first nightly-only flag; a lost component fails in step 4 with
+      #     `error: 'cargo-fmt' is not installed`, minutes later and worded as though
+      #     the toolchain were fine and the request unreasonable. Probing the two
+      #     shims here converts that into a named failure at second fifteen, and it
+      #     does so through the shims rather than a `rustup component list` entry
+      #     because the shims are what step 4 actually dispatches to. `ci.yml`'s
+      #     `lint` job probes the same pair in the same place for the same reason.
       - name: Verify the resolved toolchain is nightly
         run: |
           set -euo pipefail
@@ -396,6 +404,36 @@ jobs:
                " resolved '$active'. Bump the pin on the install step above and this"\
                " assertion together, or restore the one that was changed."; exit 1 ;;
           esac
+          # And that the channel arrived with the two components step 4 needs. The
+          # probes carry their own handler rather than being left to `set -e` so the
+          # log names WHICH input went missing and WHICH gate that disarms; both are
+          # reported before exiting, because losing one input loses both components
+          # and a half-diagnosis would send a reader back for a second run.
+          #
+          # `|| { ... }` rather than `if ! ...; then`: the probe must keep `--version`
+          # as its own token. `cargo clippy` is a graph-resolving subcommand, and
+          # the `--locked` contract test in `src/lib.rs` exempts a version query by
+          # reading the argument that FOLLOWS the subcommand - `--version;` is not
+          # `--version`, so the semicolon form would read as an unlocked clippy run.
+          echo "components installed on the pinned nightly:"
+          rustup component list --installed
+          missing=0
+          cargo fmt --version || {
+            echo "::error::cargo fmt does not resolve on ${expected_nightly}. The"\
+                 " 'components:' input on the install step above no longer requests"\
+                 " rustfmt, so the format check in step 4 would fail on a missing"\
+                 " shim instead of on the harness sources it exists to read."
+            missing=1
+          }
+          cargo clippy --version || {
+            echo "::error::cargo clippy does not resolve on ${expected_nightly}. The"\
+                 " 'components:' input on the install step above no longer requests"\
+                 " clippy, so both clippy gates in step 4 would fail on a missing"\
+                 " shim and the deny-level lints in fuzz/Cargo.toml would again have"\
+                 " no enforcer."
+            missing=1
+          }
+          [ "$missing" -eq 0 ] || exit 1
 
       # 3. Install the cargo-fuzz subcommand (the libFuzzer front-end) from an
       #    INTEGRITY-VERIFIED source tree rather than straight off the network.
@@ -609,7 +647,7 @@ jobs:
           fi
           echo "Cargo.lock and fuzz/Cargo.lock are unchanged after the build"
 
-      # 5. Restore each target's libFuzzer corpus, one cache entry PER TARGET.
+      # 6. Restore each target's libFuzzer corpus, one cache entry PER TARGET.
       #    `cargo fuzz` keys corpora by target name under `fuzz/corpus/<target>/`,
       #    so the paths below must match the five `[[bin]]` names in
       #    `fuzz/Cargo.toml` character for character. Separate keys mean one
@@ -811,7 +849,7 @@ jobs:
           fi
           echo "Cargo.lock and fuzz/Cargo.lock are byte-identical to the commit under test"
 
-      # 7. On failure (a crash/timeout reproducer was written), publish the
+      # 8. On failure (a crash/timeout reproducer was written), publish the
       #    cargo-fuzz artifacts directory so the offending input is retrievable.
       - name: Upload crash artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

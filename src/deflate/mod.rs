@@ -73,16 +73,17 @@ use crate::checksum::adler32;
 #[cfg(feature = "gzip")]
 use crate::checksum::crc32;
 use crate::constants::{
-    DEF_MEM_LEVEL, MAX_WBITS, Strategy, WrapMode, Z_BLOCK, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
-    Z_FINISH, Z_FULL_FLUSH, Z_NO_FLUSH, Z_PARTIAL_FLUSH, parse_window_bits,
+    DEF_MEM_LEVEL, FlushMode, MAX_WBITS, Strategy, WrapMode, Z_BLOCK, Z_DEFAULT_COMPRESSION,
+    Z_DEFLATED, Z_FINISH, Z_FULL_FLUSH, Z_NO_FLUSH, Z_PARTIAL_FLUSH, parse_window_bits,
 };
 use crate::error::{ReturnCode, ZlibError};
 #[cfg(feature = "gzip")]
-use crate::gz_header::GzHeader;
+use crate::gz_header::{ForeignGzHeader, GzHeader, GzHeaderSlot, HeaderFields};
 use crate::stream::{Allocator, ZStream};
 
-use crate::deflate::state::{BUF_SIZE, MIN_MATCH, NIL};
+use crate::deflate::state::{BUF_SIZE, DeflateStream, MIN_MATCH, NIL};
 use crate::deflate::strategy::rank;
+use crate::util::compress::{OneCallDeflate, OneCallStep, compress2_tracked_with};
 
 // ---------------------------------------------------------------------------
 // Shared `zutil.h` constants.
@@ -555,13 +556,25 @@ pub fn deflate_set_dictionary<A: Allocator>(
 ///
 /// Port of C `deflateGetDictionary` (`deflate.c` L625-L641). The returned
 /// length is `min(strstart + lookahead, w_size)`. When `dictionary` is
-/// `Some(dst)`, the most recent `len` window bytes are copied into `dst`; the
-/// caller must ensure `dst` is at least the returned length. Pass `None` to
-/// query only the length.
+/// `Some(dst)`, the most recent `len` window bytes are copied into `dst` and
+/// every byte of `dst` beyond `len` is left untouched. Pass `None` to query only
+/// the length — the idiomatic spelling of the `Z_NULL` destination C callers use
+/// to size a buffer before fetching into it.
 ///
 /// # Errors
 ///
 /// [`ZlibError::StreamError`] if `strm` has no deflate state installed.
+///
+/// # Panics
+///
+/// If `dictionary` is `Some(dst)` and `dst` is **shorter** than the length this
+/// function would return. C cannot detect that case at all — it is handed a bare
+/// `Bytef *` and writes `len` bytes through it, so an undersized buffer is silent
+/// memory corruption. Rust is handed the destination's length, so the same
+/// mistake is caught and reported instead. Callers that do not already know the
+/// length must query it first (`None`) and pass a buffer of at least that size;
+/// the C-ABI shim in `src/ffi/deflate.rs` does exactly that, so it can never
+/// reach this panic.
 pub fn deflate_get_dictionary<A: Allocator>(
     strm: &ZStream<A>,
     dictionary: Option<&mut [u8]>,
@@ -573,6 +586,17 @@ pub fn deflate_get_dictionary<A: Allocator>(
     }
     if let Some(dst) = dictionary {
         if len != 0 {
+            // Stated explicitly rather than left to the slice index below, so the
+            // documented precondition names itself when it is violated. Slicing
+            // `dst[..len]` would already panic, but only with a bare "range end
+            // index out of range", which tells the caller nothing about which
+            // contract they broke or how to satisfy it.
+            assert!(
+                dst.len() >= len,
+                "deflate_get_dictionary destination holds {} bytes but the dictionary is \
+                 {len}; query the length with `None` first",
+                dst.len()
+            );
             let start = s.strstart + s.lookahead - len;
             dst[..len].copy_from_slice(&s.window[start..start + len]);
         }
@@ -604,7 +628,44 @@ pub fn deflate_set_header<A: Allocator>(
     if s.wrap != 2 {
         return Err(ZlibError::StreamError);
     }
-    s.gzhead = head;
+    s.gzhead = match head {
+        Some(h) => GzHeaderSlot::Owned(h),
+        None => GzHeaderSlot::None,
+    };
+    Ok(ReturnCode::Ok)
+}
+
+/// Registers a **caller-owned** gzip header, the C ABI's counterpart of
+/// [`deflate_set_header`].
+///
+/// Port of C `deflateSetHeader` (`deflate.c` L714-L719) on the path where the
+/// header lives in the caller's memory. `present` mirrors `head != Z_NULL`: C
+/// simply assigns the pointer, so a null one clears the header exactly as an
+/// idiomatic [`None`] does.
+///
+/// No contents are stored — that is the whole point. The engine records only
+/// *that* a foreign header exists and re-reads it through
+/// [`GzHeaderSlot::Foreign`] on every entry point that needs it, so this call
+/// allocates nothing and, like C, cannot fail for want of memory.
+///
+/// # Errors
+///
+/// [`ZlibError::StreamError`] if `strm` has no deflate state installed, or the
+/// stream is not gzip-framed (`wrap != 2`) — both exactly as C.
+#[cfg(feature = "gzip")]
+pub(crate) fn deflate_set_header_foreign<A: Allocator>(
+    strm: &mut ZStream<A>,
+    present: bool,
+) -> DeflateResult {
+    let s = strm.deflate_state_mut().ok_or(ZlibError::StreamError)?;
+    if s.wrap != 2 {
+        return Err(ZlibError::StreamError);
+    }
+    s.gzhead = if present {
+        GzHeaderSlot::Foreign
+    } else {
+        GzHeaderSlot::None
+    };
     Ok(ReturnCode::Ok)
 }
 
@@ -744,6 +805,26 @@ pub fn deflate_tune<A: Allocator>(
 /// any user gzip-header fields for gzip.
 #[must_use]
 pub fn deflate_bound_z<A: Allocator>(strm: &ZStream<A>, source_len: usize) -> usize {
+    deflate_bound_z_lending(
+        strm,
+        source_len,
+        #[cfg(feature = "gzip")]
+        None,
+    )
+}
+
+/// [`deflate_bound_z`], additionally lending a live caller-owned gzip header.
+///
+/// C's `deflateBound` reads `s->gzhead->extra_len`, `->name`, `->comment` and
+/// `->hcrc` through the stored pointer (`deflate.c` L893-L907), so a stream whose
+/// header lives in caller memory can only be bounded correctly if that memory is
+/// reachable. The C ABI shim therefore lends the live header here exactly as it
+/// does for `deflate` itself.
+pub(crate) fn deflate_bound_z_lending<A: Allocator>(
+    strm: &ZStream<A>,
+    source_len: usize,
+    #[cfg(feature = "gzip")] lent: Option<&ForeignGzHeader<'_>>,
+) -> usize {
     // Upper bound for fixed blocks with 9-bit literals (~13% + a constant).
     let fixedlen = source_len
         .saturating_add(source_len >> 3)
@@ -773,14 +854,16 @@ pub fn deflate_bound_z<A: Allocator>(strm: &ZStream<A>, source_len: usize) -> us
         2 => {
             // gzip wrapper: fixed 18 plus any user-supplied header fields.
             let mut w = 18usize;
-            if let Some(h) = s.gzhead.as_ref() {
-                if let Some(extra) = h.extra.as_ref() {
+            // C reads the *live* header here too (`deflate.c` L893-L907), so the
+            // bound must come from the same borrowed view emission uses.
+            if let Some(h) = HeaderFields::resolve(&s.gzhead, lent) {
+                if let Some(extra) = h.extra {
                     w += 2 + extra.len();
                 }
-                if let Some(name) = h.name.as_ref() {
+                if let Some(name) = h.name {
                     w += name.len() + 1; // field bytes plus the NUL terminator
                 }
-                if let Some(comment) = h.comment.as_ref() {
+                if let Some(comment) = h.comment {
                     w += comment.len() + 1;
                 }
                 if h.hcrc {
@@ -823,6 +906,22 @@ pub fn deflate_bound<A: Allocator>(strm: &ZStream<A>, source_len: usize) -> usiz
     deflate_bound_z(strm, source_len)
 }
 
+/// [`deflate_bound`], additionally lending a live caller-owned gzip header.
+///
+/// See [`deflate_bound_z_lending`] for why the lend is required.
+pub(crate) fn deflate_bound_lending<A: Allocator>(
+    strm: &ZStream<A>,
+    source_len: usize,
+    #[cfg(feature = "gzip")] lent: Option<&ForeignGzHeader<'_>>,
+) -> usize {
+    deflate_bound_z_lending(
+        strm,
+        source_len,
+        #[cfg(feature = "gzip")]
+        lent,
+    )
+}
+
 // ===========================================================================
 // The deflate() driver.
 // ===========================================================================
@@ -837,7 +936,238 @@ pub fn deflate_bound<A: Allocator>(strm: &ZStream<A>, source_len: usize) -> usiz
 /// `Z_FINISH` — writes the trailer. Every early-return checkpoint of the C
 /// driver is reproduced so that streaming with a small output buffer behaves
 /// identically.
-fn deflate_run(s: &mut DeflateState, io: &mut IoContext, flush: i32) -> ReturnCode {
+/// Emits the gzip member header (RFC 1952) from a **borrowed** view of whichever
+/// header the stream has.
+///
+/// Port of the `GZIP`/`EXTRA`/`NAME`/`COMMENT`/`HCRC` phase ladder of C `deflate`
+/// (`deflate.c` L1063-L1198). `head` is [`None`] exactly when C would see
+/// `s->gzhead == Z_NULL`, in which case the default header is written
+/// (`deflate.c` L1072-L1090).
+///
+/// # Why the header arrives borrowed
+///
+/// C never copies the caller's header: it re-reads through `s->gzhead` every time
+/// it needs a field. Passing a borrowed [`HeaderFields`] reproduces that exactly
+/// and has two consequences this function depends on. Caller mutations made after
+/// registration but before emission are honored, which is required for
+/// byte-identical output (AAP §0.8.1 D-1); and nothing is allocated here, which an
+/// earlier implementation could not claim because it cloned `extra`, `name`, and
+/// `comment` once per phase — and re-cloned them on every re-entry into a phase
+/// that had been interrupted by a full pending buffer.
+///
+/// # Return value
+///
+/// [`Some`] means "return this code from `deflate` immediately", reproducing C's
+/// early exits when the pending buffer could not be fully flushed. [`None`] means
+/// the header is complete and compression may proceed.
+#[cfg(feature = "gzip")]
+fn emit_gzip_header(
+    s: &mut DeflateState,
+    io: &mut IoContext,
+    head: Option<&HeaderFields<'_>>,
+) -> Option<ReturnCode> {
+    if s.status == DeflateStatus::Gzip {
+        // The gzip header checksum is a CRC-32 over the header bytes.
+        io.adler = crc32(0, &[]);
+        s.put_byte(31);
+        s.put_byte(139);
+        s.put_byte(8);
+
+        // Snapshot the scalars into a `Copy` tuple so `s` can be mutated
+        // freely below. The three byte payloads stay borrowed.
+        let head_info = head.map(|h| {
+            (
+                h.text,
+                h.hcrc,
+                h.extra.is_some(),
+                h.name.is_some(),
+                h.comment.is_some(),
+                h.time,
+                h.os,
+                h.extra.map_or(0usize, <[u8]>::len),
+            )
+        });
+        let xfl: u8 = if s.level == 9 {
+            2
+        } else if s.strategy.as_c_int() >= Strategy::HuffmanOnly.as_c_int() || s.level < 2 {
+            4
+        } else {
+            0
+        };
+
+        match head_info {
+            None => {
+                // Default header: zero MTIME/flags, XFL, then OS.
+                s.put_byte(0);
+                s.put_byte(0);
+                s.put_byte(0);
+                s.put_byte(0);
+                s.put_byte(0);
+                s.put_byte(xfl);
+                s.put_byte(OS_CODE);
+                s.status = DeflateStatus::Busy;
+                s.flush_pending(io);
+                if s.pending != 0 {
+                    s.last_flush = -1;
+                    return Some(ReturnCode::Ok);
+                }
+            }
+            Some((text, hcrc, has_extra, has_name, has_comment, time, os, extra_len)) => {
+                let flag: u8 = (if text { 1 } else { 0 })
+                    + (if hcrc { 2 } else { 0 })
+                    + (if has_extra { 4 } else { 0 })
+                    + (if has_name { 8 } else { 0 })
+                    + (if has_comment { 16 } else { 0 });
+                s.put_byte(flag);
+                s.put_byte((time & 0xff) as u8);
+                s.put_byte(((time >> 8) & 0xff) as u8);
+                s.put_byte(((time >> 16) & 0xff) as u8);
+                s.put_byte(((time >> 24) & 0xff) as u8);
+                s.put_byte(xfl);
+                s.put_byte((os & 0xff) as u8);
+                if has_extra {
+                    // The 2-byte little-endian XLEN (low 16 bits).
+                    s.put_byte((extra_len & 0xff) as u8);
+                    s.put_byte(((extra_len >> 8) & 0xff) as u8);
+                }
+                if hcrc {
+                    io.adler = crc32(io.adler, &s.pending_buf[..s.pending]);
+                }
+                s.gzindex = 0;
+                s.status = DeflateStatus::Extra;
+            }
+        }
+    }
+
+    if s.status == DeflateStatus::Extra {
+        // The bytes are read straight out of the borrowed view, so the
+        // pending buffer (a field of `s`) can be written without cloning.
+        if let Some(extra) = head.and_then(|h| h.extra) {
+            let gz_hcrc = head.is_some_and(|h| h.hcrc);
+            let extra_len = extra.len() & 0xffff;
+            let mut beg = s.pending;
+            let mut left = extra_len - s.gzindex;
+            while s.pending + left > s.pending_buf_size {
+                let copy = s.pending_buf_size - s.pending;
+                s.pending_buf[s.pending..s.pending + copy]
+                    .copy_from_slice(&extra[s.gzindex..s.gzindex + copy]);
+                s.pending = s.pending_buf_size;
+                hcrc_update(s, io, gz_hcrc, beg);
+                s.gzindex += copy;
+                s.flush_pending(io);
+                if s.pending != 0 {
+                    s.last_flush = -1;
+                    return Some(ReturnCode::Ok);
+                }
+                beg = 0;
+                left -= copy;
+            }
+            s.pending_buf[s.pending..s.pending + left]
+                .copy_from_slice(&extra[s.gzindex..s.gzindex + left]);
+            s.pending += left;
+            hcrc_update(s, io, gz_hcrc, beg);
+            s.gzindex = 0;
+        }
+        s.status = DeflateStatus::Name;
+    }
+
+    if s.status == DeflateStatus::Name {
+        if let Some(name) = head.and_then(|h| h.name) {
+            let gz_hcrc = head.is_some_and(|h| h.hcrc);
+            let mut beg = s.pending;
+            loop {
+                if s.pending == s.pending_buf_size {
+                    hcrc_update(s, io, gz_hcrc, beg);
+                    s.flush_pending(io);
+                    if s.pending != 0 {
+                        s.last_flush = -1;
+                        return Some(ReturnCode::Ok);
+                    }
+                    beg = 0;
+                }
+                // C reads bytes (including the C-string NUL) until it hits
+                // 0. The borrowed view excludes the NUL, so emit a 0 past
+                // its end (`deflate.c` L1158: `val = s->gzhead->name[...]`).
+                let val = if s.gzindex < name.len() {
+                    name[s.gzindex]
+                } else {
+                    0
+                };
+                s.gzindex += 1;
+                s.put_byte(val);
+                if val == 0 {
+                    break;
+                }
+            }
+            hcrc_update(s, io, gz_hcrc, beg);
+            s.gzindex = 0;
+        }
+        s.status = DeflateStatus::Comment;
+    }
+
+    if s.status == DeflateStatus::Comment {
+        if let Some(comment) = head.and_then(|h| h.comment) {
+            let gz_hcrc = head.is_some_and(|h| h.hcrc);
+            let mut beg = s.pending;
+            loop {
+                if s.pending == s.pending_buf_size {
+                    hcrc_update(s, io, gz_hcrc, beg);
+                    s.flush_pending(io);
+                    if s.pending != 0 {
+                        s.last_flush = -1;
+                        return Some(ReturnCode::Ok);
+                    }
+                    beg = 0;
+                }
+                let val = if s.gzindex < comment.len() {
+                    comment[s.gzindex]
+                } else {
+                    0
+                };
+                s.gzindex += 1;
+                s.put_byte(val);
+                if val == 0 {
+                    break;
+                }
+            }
+            hcrc_update(s, io, gz_hcrc, beg);
+        }
+        s.status = DeflateStatus::Hcrc;
+    }
+
+    if s.status == DeflateStatus::Hcrc {
+        let gz_hcrc = head.is_some_and(|h| h.hcrc);
+        if gz_hcrc {
+            if s.pending + 2 > s.pending_buf_size {
+                s.flush_pending(io);
+                if s.pending != 0 {
+                    s.last_flush = -1;
+                    return Some(ReturnCode::Ok);
+                }
+            }
+            s.put_byte((io.adler & 0xff) as u8);
+            s.put_byte(((io.adler >> 8) & 0xff) as u8);
+            io.adler = crc32(0, &[]);
+        }
+        s.status = DeflateStatus::Busy;
+
+        // Compression must start with an empty pending buffer.
+        s.flush_pending(io);
+        if s.pending != 0 {
+            s.last_flush = -1;
+            return Some(ReturnCode::Ok);
+        }
+    }
+
+    None
+}
+
+fn deflate_run(
+    s: &mut DeflateState,
+    io: &mut IoContext,
+    flush: i32,
+    #[cfg(feature = "gzip")] lent: Option<&ForeignGzHeader<'_>>,
+) -> ReturnCode {
     // The status/flush combination and output availability are checked first
     // (the null-pointer checks of C are unrepresentable with safe slices).
     if s.status == DeflateStatus::Finish && flush != Z_FINISH {
@@ -913,198 +1243,19 @@ fn deflate_run(s: &mut DeflateState, io: &mut IoContext, flush: i32) -> ReturnCo
     }
 
     // ---------------------------- gzip header ----------------------------
+    // C keeps only a `gz_header *` and re-reads it here, at emission time
+    // (`deflate.c` L1092-L1188). The slot is moved out of `s` for the duration so
+    // that borrowing the header payload cannot conflict with the writes into
+    // `s.pending_buf`; it is restored on every exit path. This is what lets the
+    // emission code read borrowed slices instead of cloning `extra`, `name`, and
+    // `comment` once per phase (AAP §0.6.5: allocation-count parity with C).
     #[cfg(feature = "gzip")]
     {
-        if s.status == DeflateStatus::Gzip {
-            // The gzip header checksum is a CRC-32 over the header bytes.
-            io.adler = crc32(0, &[]);
-            s.put_byte(31);
-            s.put_byte(139);
-            s.put_byte(8);
-
-            // Extract the header fields as owned/Copy values so `s` can be
-            // mutated freely below without holding a borrow of `s.gzhead`.
-            let head_info = s.gzhead.as_ref().map(|h| {
-                (
-                    h.text,
-                    h.hcrc,
-                    h.extra.is_some(),
-                    h.name.is_some(),
-                    h.comment.is_some(),
-                    h.time,
-                    h.os,
-                    h.extra.as_ref().map_or(0usize, |e| e.len()),
-                )
-            });
-            let xfl: u8 = if s.level == 9 {
-                2
-            } else if s.strategy.as_c_int() >= Strategy::HuffmanOnly.as_c_int() || s.level < 2 {
-                4
-            } else {
-                0
-            };
-
-            match head_info {
-                None => {
-                    // Default header: zero MTIME/flags, XFL, then OS.
-                    s.put_byte(0);
-                    s.put_byte(0);
-                    s.put_byte(0);
-                    s.put_byte(0);
-                    s.put_byte(0);
-                    s.put_byte(xfl);
-                    s.put_byte(OS_CODE);
-                    s.status = DeflateStatus::Busy;
-                    s.flush_pending(io);
-                    if s.pending != 0 {
-                        s.last_flush = -1;
-                        return ReturnCode::Ok;
-                    }
-                }
-                Some((text, hcrc, has_extra, has_name, has_comment, time, os, extra_len)) => {
-                    let flag: u8 = (if text { 1 } else { 0 })
-                        + (if hcrc { 2 } else { 0 })
-                        + (if has_extra { 4 } else { 0 })
-                        + (if has_name { 8 } else { 0 })
-                        + (if has_comment { 16 } else { 0 });
-                    s.put_byte(flag);
-                    s.put_byte((time & 0xff) as u8);
-                    s.put_byte(((time >> 8) & 0xff) as u8);
-                    s.put_byte(((time >> 16) & 0xff) as u8);
-                    s.put_byte(((time >> 24) & 0xff) as u8);
-                    s.put_byte(xfl);
-                    s.put_byte((os & 0xff) as u8);
-                    if has_extra {
-                        // The 2-byte little-endian XLEN (low 16 bits).
-                        s.put_byte((extra_len & 0xff) as u8);
-                        s.put_byte(((extra_len >> 8) & 0xff) as u8);
-                    }
-                    if hcrc {
-                        io.adler = crc32(io.adler, &s.pending_buf[..s.pending]);
-                    }
-                    s.gzindex = 0;
-                    s.status = DeflateStatus::Extra;
-                }
-            }
-        }
-
-        if s.status == DeflateStatus::Extra {
-            // Clone the "extra" bytes so the pending buffer (a field of `s`) can
-            // be mutated while we read the source data.
-            if let Some(extra) = s.gzhead.as_ref().and_then(|h| h.extra.clone()) {
-                let gz_hcrc = s.gzhead.as_ref().is_some_and(|h| h.hcrc);
-                let extra_len = extra.len() & 0xffff;
-                let mut beg = s.pending;
-                let mut left = extra_len - s.gzindex;
-                while s.pending + left > s.pending_buf_size {
-                    let copy = s.pending_buf_size - s.pending;
-                    s.pending_buf[s.pending..s.pending + copy]
-                        .copy_from_slice(&extra[s.gzindex..s.gzindex + copy]);
-                    s.pending = s.pending_buf_size;
-                    hcrc_update(s, io, gz_hcrc, beg);
-                    s.gzindex += copy;
-                    s.flush_pending(io);
-                    if s.pending != 0 {
-                        s.last_flush = -1;
-                        return ReturnCode::Ok;
-                    }
-                    beg = 0;
-                    left -= copy;
-                }
-                s.pending_buf[s.pending..s.pending + left]
-                    .copy_from_slice(&extra[s.gzindex..s.gzindex + left]);
-                s.pending += left;
-                hcrc_update(s, io, gz_hcrc, beg);
-                s.gzindex = 0;
-            }
-            s.status = DeflateStatus::Name;
-        }
-
-        if s.status == DeflateStatus::Name {
-            if let Some(name) = s.gzhead.as_ref().and_then(|h| h.name.clone()) {
-                let gz_hcrc = s.gzhead.as_ref().is_some_and(|h| h.hcrc);
-                let mut beg = s.pending;
-                loop {
-                    if s.pending == s.pending_buf_size {
-                        hcrc_update(s, io, gz_hcrc, beg);
-                        s.flush_pending(io);
-                        if s.pending != 0 {
-                            s.last_flush = -1;
-                            return ReturnCode::Ok;
-                        }
-                        beg = 0;
-                    }
-                    // C reads bytes (including the C-string NUL) until it hits
-                    // 0. Our stored name has no NUL, so emit a 0 past its end.
-                    let val = if s.gzindex < name.len() {
-                        name[s.gzindex]
-                    } else {
-                        0
-                    };
-                    s.gzindex += 1;
-                    s.put_byte(val);
-                    if val == 0 {
-                        break;
-                    }
-                }
-                hcrc_update(s, io, gz_hcrc, beg);
-                s.gzindex = 0;
-            }
-            s.status = DeflateStatus::Comment;
-        }
-
-        if s.status == DeflateStatus::Comment {
-            if let Some(comment) = s.gzhead.as_ref().and_then(|h| h.comment.clone()) {
-                let gz_hcrc = s.gzhead.as_ref().is_some_and(|h| h.hcrc);
-                let mut beg = s.pending;
-                loop {
-                    if s.pending == s.pending_buf_size {
-                        hcrc_update(s, io, gz_hcrc, beg);
-                        s.flush_pending(io);
-                        if s.pending != 0 {
-                            s.last_flush = -1;
-                            return ReturnCode::Ok;
-                        }
-                        beg = 0;
-                    }
-                    let val = if s.gzindex < comment.len() {
-                        comment[s.gzindex]
-                    } else {
-                        0
-                    };
-                    s.gzindex += 1;
-                    s.put_byte(val);
-                    if val == 0 {
-                        break;
-                    }
-                }
-                hcrc_update(s, io, gz_hcrc, beg);
-            }
-            s.status = DeflateStatus::Hcrc;
-        }
-
-        if s.status == DeflateStatus::Hcrc {
-            let gz_hcrc = s.gzhead.as_ref().is_some_and(|h| h.hcrc);
-            if gz_hcrc {
-                if s.pending + 2 > s.pending_buf_size {
-                    s.flush_pending(io);
-                    if s.pending != 0 {
-                        s.last_flush = -1;
-                        return ReturnCode::Ok;
-                    }
-                }
-                s.put_byte((io.adler & 0xff) as u8);
-                s.put_byte(((io.adler >> 8) & 0xff) as u8);
-                io.adler = crc32(0, &[]);
-            }
-            s.status = DeflateStatus::Busy;
-
-            // Compression must start with an empty pending buffer.
-            s.flush_pending(io);
-            if s.pending != 0 {
-                s.last_flush = -1;
-                return ReturnCode::Ok;
-            }
+        let slot = core::mem::take(&mut s.gzhead);
+        let early = emit_gzip_header(s, io, HeaderFields::resolve(&slot, lent).as_ref());
+        s.gzhead = slot;
+        if let Some(code) = early {
+            return code;
         }
     }
 
@@ -1225,6 +1376,34 @@ pub fn deflate<A: Allocator>(
     output: &mut [u8],
     flush: i32,
 ) -> DeflateOutcome {
+    deflate_lending(
+        strm,
+        input,
+        output,
+        flush,
+        #[cfg(feature = "gzip")]
+        None,
+    )
+}
+
+/// [`deflate`], additionally lending the engine a **live** caller-owned gzip
+/// header for the duration of this one call.
+///
+/// This is the entry point the C ABI uses. C's `deflateSetHeader` stores only a
+/// pointer, and `deflate` re-reads through it at emission time (`deflate.c` L717,
+/// L1092-L1188), so the shim re-materializes `lent` from the caller's struct on
+/// every call instead of copying it once at registration. `lent` is [`Some`]
+/// exactly when the stream's slot is [`GzHeaderSlot::Foreign`] and the caller's
+/// pointer is still live; the idiomatic [`deflate`] passes [`None`] because an
+/// engine-owned header needs no lending.
+#[must_use]
+pub(crate) fn deflate_lending<A: Allocator>(
+    strm: &mut ZStream<A>,
+    input: &[u8],
+    output: &mut [u8],
+    flush: i32,
+    #[cfg(feature = "gzip")] lent: Option<&ForeignGzHeader<'_>>,
+) -> DeflateOutcome {
     // Flush range check (C: `flush > Z_BLOCK || flush < 0`).
     if !(0..=Z_BLOCK).contains(&flush) {
         return DeflateOutcome {
@@ -1241,7 +1420,13 @@ pub fn deflate<A: Allocator>(
     io.adler = strm.adler;
 
     let code = match strm.deflate_state_mut() {
-        Some(s) => deflate_run(s, &mut io, flush),
+        Some(s) => deflate_run(
+            s,
+            &mut io,
+            flush,
+            #[cfg(feature = "gzip")]
+            lent,
+        ),
         None => ReturnCode::StreamError,
     };
 
@@ -1501,12 +1686,22 @@ pub fn deflate_end<A: Allocator>(strm: &mut ZStream<A>) -> DeflateResult {
 /// bookkeeping (totals, checksum, data type, message) is copied to match C's
 /// whole-`z_stream` copy.
 ///
-/// The copy is allocator-preserving: all six buffers — the state-object
-/// reservation mirroring C's `ZALLOC(strm, 1, sizeof(deflate_state))`
-/// (`deflate.c` L1330-L1333) plus the five working buffers — are re-allocated
-/// through the **same** `AllocHook` as the source, so a caller who installed a
-/// custom arena does not find the copy living in the global heap, and the
-/// caller observes the same request count C issues (AAP §0.6.5).
+/// The copy is allocator-preserving: **five allocations in total** — the
+/// state-object reservation mirroring C's
+/// `ZALLOC(strm, 1, sizeof(deflate_state))` (`deflate.c` L1335) plus the four
+/// working buffers `window`, `prev`, `head` and `pending_buf` (`deflate.c`
+/// L1342-L1345) — are re-allocated through the **same** `AllocHook` as the
+/// source, so a caller who installed a custom arena does not find the copy
+/// living in the global heap, and the caller observes the same request count C
+/// issues (AAP §0.6.5). The symbol region is not a fifth working buffer: it is
+/// overlaid inside `pending_buf` at offset `lit_bufsize`, exactly as C
+/// re-derives `ds->sym_buf = ds->pending_buf + ds->lit_bufsize` after the copy
+/// (`deflate.c` L1367), so it carries no request of its own.
+///
+/// Only the live region of each working buffer is duplicated, which is what C
+/// copies (`deflate.c` L1353-L1368); see
+/// [`DeflateState::try_clone`] for the region-by-region schedule.
+///
 /// The copy is fallible for the same reason C's is: the state object and each
 /// buffer are re-allocated through the allocator that backs them — via the
 /// state's internal `try_copy` helper, which combines the field-by-field
@@ -1544,6 +1739,168 @@ pub fn deflate_copy<A: Allocator>(dest: &mut ZStream<A>, source: &ZStream<A>) ->
     dest.msg = source.msg;
     dest.set_deflate_state(cloned);
     Ok(ReturnCode::Ok)
+}
+
+// ===========================================================================
+// One-call façade — the engine-owning half of C `compress.c`
+//
+// C `compress.c` is a separate translation unit that `#include`s `zlib.h` and
+// calls `deflateInit`/`deflate`/`deflateEnd`, so in the `#include` order it sits
+// ABOVE the engine, not beside `zutil.h`. The Rust layering reflects that: the
+// bit-exact sizing formula and the complete `compress2_z` driver loop live in
+// `crate::util::compress` (layer 3, engine-free and generic over the
+// `OneCallDeflate` port it declares), and the engine adapter plus the three
+// C-named entry points live here (layer 6). That is what keeps the module graph
+// one-way — layer 3 never names an engine (AAP §0.3.1, §0.4.2 B2) — while the
+// crate root still re-exports `compress`, `compress2`, and `compress_bound`
+// under exactly the names `zlib.h` publishes.
+// ===========================================================================
+
+/// The [`OneCallDeflate`] adapter: a private, self-contained stream driven by the
+/// layer-3 `compress2_z` transcription.
+///
+/// It exists only for the duration of one `compress`/`compress2` call and holds
+/// nothing beyond the stream itself, so the three trait methods are literally the
+/// three C calls `compress2_z` makes.
+struct OneCallDeflateEngine {
+    /// The stream this call owns, initialised by [`OneCallDeflate::begin`].
+    strm: ZStream,
+}
+
+impl OneCallDeflate for OneCallDeflateEngine {
+    /// C `deflateInit(&stream, level)` (`compress.c` L40).
+    ///
+    /// `ZStream::new` installs the default (global) allocator, exactly as C
+    /// `compress2_z` zeroes `zalloc`/`zfree`/`opaque` so `deflateInit` substitutes
+    /// its own. An invalid `level` surfaces as [`ReturnCode::StreamError`] and an
+    /// allocation failure as [`ReturnCode::MemError`].
+    fn begin(level: i32) -> Result<Self, ReturnCode> {
+        let mut strm = ZStream::new();
+        deflate_init(&mut strm, level).map_err(ReturnCode::from)?;
+        Ok(Self { strm })
+    }
+
+    /// C `deflate(&stream, flush)` (`compress.c` L58).
+    fn step(&mut self, input: &[u8], output: &mut [u8], flush: FlushMode) -> OneCallStep {
+        let outcome = deflate(&mut self.strm, input, output, flush.as_c_int());
+        OneCallStep {
+            consumed: outcome.consumed,
+            produced: outcome.produced,
+            code: outcome.code,
+        }
+    }
+
+    /// C `deflateEnd(&stream)` (`compress.c` L65).
+    ///
+    /// C ignores the return value, and so does this: the outcome of the call has
+    /// already been decided. Dropping the stream afterwards is safe because
+    /// `deflate_end` clears the state, so the `Drop` is a no-op (no double free).
+    fn end(&mut self) {
+        let _ = deflate_end(&mut self.strm);
+    }
+}
+
+/// Compresses `source` into `dest` at the given compression `level`, returning
+/// the number of bytes written to `dest`.
+///
+/// Faithful port of C `compress2_z` (`compress.c` L24-L66). `level` has the same
+/// meaning as in `deflateInit`: `0` ([`Z_NO_COMPRESSION`]) through `9`
+/// ([`Z_BEST_COMPRESSION`]), or `-1` ([`Z_DEFAULT_COMPRESSION`]) to request the
+/// library default. `dest` must be at least
+/// [`compress_bound(source.len())`](crate::util::compress_bound) bytes for the
+/// call to be guaranteed to succeed.
+///
+/// Empty inputs are valid: an empty `source` still produces a complete zlib
+/// stream (header, one empty block, and the Adler-32 trailer), so `dest` must
+/// have room for at least those bytes. An empty `dest` therefore yields
+/// [`ReturnCode::BufError`] — matching the C behavior — because not even the
+/// two-byte header fits.
+///
+/// [`Z_NO_COMPRESSION`]: crate::constants::Z_NO_COMPRESSION
+/// [`Z_BEST_COMPRESSION`]: crate::constants::Z_BEST_COMPRESSION
+///
+/// # Errors
+///
+/// * [`ReturnCode::StreamError`] — `level` is outside the valid set
+///   (`-1` or `0..=9`); reported by the deflate initializer.
+/// * [`ReturnCode::BufError`] — `dest` was too small to hold the complete
+///   compressed stream.
+/// * [`ReturnCode::MemError`] — the engine could not allocate its working
+///   buffers, mirroring C `Z_MEM_ERROR`.
+///
+/// # Examples
+///
+/// ```
+/// # use zlib_rs::{compress2, compress_bound, uncompress, Z_BEST_COMPRESSION};
+/// let plain = b"one-call compression at the maximum level";
+/// let mut zlib = vec![0u8; compress_bound(plain.len())];
+/// let n = compress2(&mut zlib, plain, Z_BEST_COMPRESSION).unwrap();
+///
+/// let mut out = vec![0u8; plain.len()];
+/// assert_eq!(uncompress(&mut out, &zlib[..n]).unwrap(), plain.len());
+/// assert_eq!(&out[..], plain);
+/// ```
+pub fn compress2(dest: &mut [u8], source: &[u8], level: i32) -> Result<usize, ReturnCode> {
+    // The produced-byte count is already carried by the `Ok` arm, so the
+    // out-parameter is discarded here. The C-ABI shims call `compress2_tracked`
+    // directly instead, because C publishes the produced length on its error
+    // paths too (`compress.c` L63).
+    let mut produced = 0usize;
+    compress2_tracked(dest, source, level, &mut produced)
+}
+
+/// Compresses `source` into `dest` at `level`, reporting the produced byte count
+/// through `produced` on **every** path that reaches the deflate loop.
+///
+/// This is the tracked core of [`compress2`] — identical logic, plus an
+/// out-parameter that mirrors C `compress2_z`'s *unconditional*
+/// `*destLen = (z_size_t)(stream.next_out - dest);` (`compress.c` L63). C runs
+/// that assignment after the loop and before `deflateEnd`, so it reports a
+/// partial length on the `Z_BUF_ERROR` path just as it does on success. The
+/// C-ABI shims in `src/ffi/util.rs` need that count to reproduce the behavior
+/// exactly; [`compress2`] keeps its `Result<usize, ReturnCode>` shape and simply
+/// discards the out-parameter, since its `Ok` arm already carries the length.
+///
+/// # Errors
+///
+/// Identical to [`compress2`].
+pub(crate) fn compress2_tracked(
+    dest: &mut [u8],
+    source: &[u8],
+    level: i32,
+    produced: &mut usize,
+) -> Result<usize, ReturnCode> {
+    compress2_tracked_with::<OneCallDeflateEngine>(dest, source, level, produced)
+}
+
+/// Compresses `source` into `dest` at the library default compression level,
+/// returning the number of bytes written to `dest`.
+///
+/// Faithful port of C `compress_z` / `compress` (`compress.c` L77-L85): a
+/// convenience wrapper that forwards to [`compress2`] with
+/// [`Z_DEFAULT_COMPRESSION`]. As with [`compress2`], `dest` must be at least
+/// [`compress_bound(source.len())`](crate::util::compress_bound) bytes to be
+/// guaranteed sufficient.
+///
+/// # Errors
+///
+/// Returns the same errors as [`compress2`]: [`ReturnCode::BufError`] if `dest`
+/// is too small (a bad `level` cannot occur here, as the level is fixed).
+///
+/// # Examples
+///
+/// ```
+/// # use zlib_rs::{compress, compress_bound, uncompress};
+/// let plain = b"the quick brown fox";
+/// let mut zlib = vec![0u8; compress_bound(plain.len())];
+/// let n = compress(&mut zlib, plain).unwrap();
+///
+/// let mut out = vec![0u8; plain.len()];
+/// assert_eq!(uncompress(&mut out, &zlib[..n]).unwrap(), plain.len());
+/// assert_eq!(&out[..], plain);
+/// ```
+pub fn compress(dest: &mut [u8], source: &[u8]) -> Result<usize, ReturnCode> {
+    compress2(dest, source, Z_DEFAULT_COMPRESSION)
 }
 
 // ===========================================================================
@@ -1952,6 +2309,213 @@ mod tests {
         assert_eq!(row.nice_length, 128);
         assert_eq!(row.max_chain, 128);
         assert_eq!(row.func, CompressFunc::Slow);
+    }
+
+    /// C `deflateGetDictionary` (`deflate.c` L625-L641) answers two questions in
+    /// one call: how many window bytes currently constitute the dictionary
+    /// (`min(strstart + lookahead, w_size)`), and — when a destination is
+    /// supplied — what those bytes are.
+    ///
+    /// This covers the four cases that have no other witness in the suite: no
+    /// installed state, an empty window, a length-only query (`None`, the
+    /// idiomatic spelling of C's `Z_NULL` destination), and a destination
+    /// **larger** than the reported length. The last one matters because the
+    /// engine must write exactly `len` bytes and no more: a port that filled the
+    /// caller's whole slice would corrupt memory the caller still owns, and the
+    /// contract this function documents ("`dst` is at least the returned length")
+    /// permits a longer buffer, not merely an exact-sized one.
+    ///
+    /// The truncation and window-slide halves of the contract are asserted
+    /// separately below, because both need a small window to reach.
+    #[test]
+    fn deflate_get_dictionary_reports_and_copies_the_live_window() {
+        // Without an installed state there is no window to report on, exactly as
+        // C's `deflateStateCheck` rejection produces `Z_STREAM_ERROR`.
+        let bare: ZStream = ZStream::new();
+        assert_eq!(
+            deflate_get_dictionary(&bare, None),
+            Err(ZlibError::StreamError),
+            "no state means no dictionary"
+        );
+        let mut untouched = [0xa5u8; 4];
+        assert_eq!(
+            deflate_get_dictionary(&bare, Some(&mut untouched)),
+            Err(ZlibError::StreamError)
+        );
+        assert_eq!(
+            untouched, [0xa5u8; 4],
+            "a rejected call must not write to the destination"
+        );
+
+        // A freshly initialized stream has `strstart == lookahead == 0`, so the
+        // dictionary is empty and the `len != 0` guard must suppress the copy
+        // entirely rather than writing a zero-length slice's worth of anything.
+        let mut strm = init(6, MAX_WBITS, DEF_MEM_LEVEL, Strategy::Default);
+        assert_eq!(deflate_get_dictionary(&strm, None), Ok(0));
+        let mut sink = [0xa5u8; 8];
+        assert_eq!(deflate_get_dictionary(&strm, Some(&mut sink)), Ok(0));
+        assert_eq!(
+            sink, [0xa5u8; 8],
+            "an empty dictionary must not write a single byte"
+        );
+
+        // A dictionary shorter than the window comes back verbatim. `w_size` here
+        // is 32 KiB, so nothing is truncated and nothing has slid.
+        const DICT: &[u8] = b"the quick brown fox jumps over the lazy dog";
+        deflate_set_dictionary(&mut strm, DICT).expect("a preset dictionary is accepted");
+        assert_eq!(
+            deflate_get_dictionary(&strm, None),
+            Ok(DICT.len()),
+            "the length-only query reports the dictionary length"
+        );
+
+        let mut exact = vec![0u8; DICT.len()];
+        assert_eq!(
+            deflate_get_dictionary(&strm, Some(&mut exact)),
+            Ok(DICT.len())
+        );
+        assert_eq!(exact, DICT, "the exact bytes, in order");
+
+        // A destination longer than the reported length receives exactly `len`
+        // bytes; every byte past that stays as the caller left it.
+        let mut oversized = vec![0x5au8; DICT.len() + 16];
+        assert_eq!(
+            deflate_get_dictionary(&strm, Some(&mut oversized)),
+            Ok(DICT.len())
+        );
+        assert_eq!(&oversized[..DICT.len()], DICT);
+        assert!(
+            oversized[DICT.len()..].iter().all(|&b| b == 0x5a),
+            "bytes beyond the dictionary length must be left untouched"
+        );
+    }
+
+    /// An **undersized** destination is a caller contract violation, and the port
+    /// turns it into a deterministic panic rather than the silent memory
+    /// corruption C would produce.
+    ///
+    /// C `deflateGetDictionary` receives a bare `Bytef *` with no length and
+    /// writes `min(strstart + lookahead, w_size)` bytes through it, so a caller
+    /// who guessed the size too small overruns their own buffer with no
+    /// diagnostic anywhere. The Rust signature carries the destination's length,
+    /// so the same mistake is detectable — and this test pins that it is
+    /// *detected* rather than papered over. A port that silently truncated to
+    /// `dst.len()` would be worse than either: it would return a short
+    /// dictionary while reporting the full length, and a caller passing it back
+    /// to `deflateSetDictionary` would then produce a stream that decodes to the
+    /// wrong bytes with no error at any step.
+    #[test]
+    #[should_panic(expected = "destination holds 42 bytes but the dictionary is 43")]
+    fn deflate_get_dictionary_rejects_an_undersized_destination() {
+        const DICT: &[u8] = b"the quick brown fox jumps over the lazy dog";
+        let mut strm = init(6, MAX_WBITS, DEF_MEM_LEVEL, Strategy::Default);
+        deflate_set_dictionary(&mut strm, DICT).expect("a preset dictionary is accepted");
+        assert_eq!(deflate_get_dictionary(&strm, None), Ok(DICT.len()));
+
+        // One byte short of the reported length.
+        let mut too_small = vec![0u8; DICT.len() - 1];
+        let _ = deflate_get_dictionary(&strm, Some(&mut too_small));
+    }
+
+    /// A preset dictionary longer than the window keeps only its **tail**: C
+    /// advances the pointer (`dictionary += dictLength - s->w_size`) and clamps
+    /// the length (`deflate.c` L596-L601), so the retained bytes are the most
+    /// recent `w_size`, not the first `w_size`.
+    ///
+    /// `windowBits = 9` (a 512-byte window) makes the truncation reachable with a
+    /// small fixture; the payload is a non-repeating ramp so keeping the wrong
+    /// half is impossible to mistake for keeping the right one.
+    #[test]
+    fn deflate_get_dictionary_keeps_the_tail_of_an_oversized_dictionary() {
+        const W_BITS: i32 = 9;
+        let w_size = 1usize << W_BITS;
+        let mut strm = init(6, W_BITS, DEF_MEM_LEVEL, Strategy::Default);
+        assert_eq!(
+            strm.deflate_state().expect("init installs a state").w_size,
+            w_size
+        );
+
+        // Three times the window, so the truncation is unambiguous.
+        let dict: Vec<u8> = (0..(w_size * 3) as u32).map(|i| (i % 251) as u8).collect();
+        deflate_set_dictionary(&mut strm, &dict).expect("an oversized dictionary is accepted");
+
+        assert_eq!(
+            deflate_get_dictionary(&strm, None),
+            Ok(w_size),
+            "the dictionary is clamped to the window size"
+        );
+        let mut got = vec![0u8; w_size];
+        assert_eq!(deflate_get_dictionary(&strm, Some(&mut got)), Ok(w_size));
+        assert_eq!(
+            got,
+            dict[dict.len() - w_size..],
+            "the retained bytes are the tail of the dictionary, not its head"
+        );
+    }
+
+    /// After the window has slid, the dictionary is still the most recent
+    /// `strstart + lookahead` bytes that passed through the encoder — and that
+    /// count is deliberately **not** re-derived from how much input was fed.
+    ///
+    /// This is the case a naive port gets wrong twice over. First, `start =
+    /// strstart + lookahead - len` indexes a window whose contents have been
+    /// memmoved down by `w_size` one or more times, so an off-by-`w_size` here
+    /// returns plausible but wrong history. Second, C `fill_window` performs
+    /// `s->strstart -= wsize` on every slide (`deflate.c` L280-L288), which
+    /// leaves `strstart` somewhere in `[MAX_DIST(s), w_size)` rather than pinned
+    /// at the window size — so `deflateGetDictionary` reports **fewer** than
+    /// `w_size` bytes even though the window physically retains more history.
+    /// That is counter-intuitive and is exactly why it is asserted rather than
+    /// assumed: a port that "helpfully" reported `w_size` here would diverge
+    /// from C on every stream longer than one window.
+    ///
+    /// A 512-byte window and a 4000-byte payload force several slides (proven by
+    /// [`DeflateState::slid`]), and the non-repeating ramp payload makes any
+    /// offset error visible.
+    #[test]
+    fn deflate_get_dictionary_follows_the_window_across_slides() {
+        const W_BITS: i32 = 9;
+        let w_size = 1usize << W_BITS;
+        let mut strm = init(6, W_BITS, DEF_MEM_LEVEL, Strategy::Default);
+
+        let payload: Vec<u8> = (0..4000u32)
+            .map(|i| (i.wrapping_mul(37) % 253) as u8)
+            .collect();
+        let mut out = vec![0u8; deflate_bound(&strm, payload.len()) + 64];
+        let outcome = deflate(&mut strm, &payload, &mut out, Z_FINISH);
+        assert_eq!(outcome.code, ReturnCode::StreamEnd);
+        assert_eq!(outcome.consumed, payload.len(), "all input consumed");
+
+        let expected_len = {
+            let s = strm.deflate_state().expect("init installs a state");
+            assert_eq!(s.lookahead, 0, "Z_FINISH drains the lookahead");
+            assert!(
+                s.slid,
+                "the window must have slid for this test to mean anything"
+            );
+            assert!(
+                s.strstart < payload.len(),
+                "a slid window cannot hold the whole payload linearly (strstart {})",
+                s.strstart
+            );
+            (s.strstart + s.lookahead).min(w_size)
+        };
+        assert!(
+            expected_len > 0 && expected_len <= w_size,
+            "the reported length stays inside the window (got {expected_len})"
+        );
+
+        assert_eq!(deflate_get_dictionary(&strm, None), Ok(expected_len));
+        let mut got = vec![0u8; expected_len];
+        assert_eq!(
+            deflate_get_dictionary(&strm, Some(&mut got)),
+            Ok(expected_len)
+        );
+        assert_eq!(
+            got,
+            payload[payload.len() - expected_len..],
+            "the dictionary is the most recent strstart+lookahead input bytes"
+        );
     }
 
     /// Each [`DeflateConfig`] setter is a pure single-field write, and
@@ -2513,5 +3077,305 @@ mod tests {
             payload,
             "the emitted match distance must be valid, so the stream round-trips"
         );
+    }
+
+    // =======================================================================
+    // One-call façade — round trips and error paths for `compress` / `compress2`
+    //
+    // Relocated here with the entry points themselves: `crate::util::compress`
+    // is layer 3 and may not name an engine, so the tests that drive the real
+    // engine belong in the layer that owns it (AAP §0.3.1, §0.4.2 B2). The
+    // engine-free sizing formula and the scripted-engine driver tests stay in
+    // `crate::util::compress`.
+    //
+    // These decompress with `flate2` (its pure-Rust `miniz_oxide` backend) to
+    // prove the emitted stream is valid zlib. `std` is available under
+    // `cfg(test)` even though the crate is `no_std`, so `Vec`, `vec!`, and
+    // `std::io` may be used freely here.
+    // =======================================================================
+
+    use crate::util::compress_bound;
+    use flate2::read::ZlibDecoder;
+    use std::io::Read;
+
+    // ---------------------------------------------------------------------
+    // Round-trip helpers
+    // ---------------------------------------------------------------------
+
+    /// Decompresses a complete zlib stream with `flate2`, returning the bytes.
+    fn inflate_with_flate2(compressed: &[u8]) -> Vec<u8> {
+        let mut decoder = ZlibDecoder::new(compressed);
+        let mut out = Vec::new();
+        decoder
+            .read_to_end(&mut out)
+            .expect("compress2 must emit a valid zlib stream");
+        out
+    }
+
+    /// Compresses `data` at `level` into a `compress_bound`-sized buffer, then
+    /// verifies it decompresses back to `data`.
+    fn assert_round_trip(level: i32, data: &[u8]) {
+        let mut buf = vec![0u8; compress_bound(data.len())];
+        let produced = compress2(&mut buf, data, level)
+            .unwrap_or_else(|err| panic!("compress2 at level {level} failed: {err:?}"));
+        let restored = inflate_with_flate2(&buf[..produced]);
+        assert_eq!(restored, data, "round-trip mismatch at level {level}");
+    }
+
+    /// Deterministic, effectively-incompressible bytes (a simple LCG), so the
+    /// tests need no `rand` dependency yet still exercise the stored-block path.
+    fn pseudo_random(len: usize) -> Vec<u8> {
+        let mut out = vec![0u8; len];
+        let mut state: u32 = 0x1234_5678;
+        for byte in &mut out {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *byte = (state >> 24) as u8;
+        }
+        out
+    }
+
+    // ---------------------------------------------------------------------
+    // compress2 — round-trip across representative inputs and every level
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn compress2_round_trips_all_inputs_and_levels() {
+        let empty: Vec<u8> = Vec::new();
+        let small = b"hello, zlib-rs one-call compression!".to_vec();
+        let compressible = vec![b'A'; 50_000]; // long run — compresses tiny
+        let incompressible = pseudo_random(40_000); // ~stored size
+
+        for &level in &[0i32, 1, 6, 9, Z_DEFAULT_COMPRESSION] {
+            assert_round_trip(level, &empty);
+            assert_round_trip(level, &small);
+            assert_round_trip(level, &compressible);
+            assert_round_trip(level, &incompressible);
+        }
+    }
+
+    #[test]
+    fn compress2_highly_compressible_shrinks() {
+        // A 50 KiB single-byte run must compress to far fewer bytes at level 9.
+        let data = vec![b'Q'; 50_000];
+        let mut buf = vec![0u8; compress_bound(data.len())];
+        let produced = compress2(&mut buf, &data, 9).expect("compress2 failed");
+        assert!(produced < data.len() / 10, "expected strong compression");
+        assert_eq!(inflate_with_flate2(&buf[..produced]), data);
+    }
+
+    #[test]
+    fn compress2_empty_input_with_adequate_dest_succeeds() {
+        // 16 >= compress_bound(0) == 13, so the header + empty block + trailer fit.
+        let mut buf = [0u8; 16];
+        let produced = compress2(&mut buf, &[], 6).expect("empty-input compress2 failed");
+        assert!(
+            produced > 0,
+            "an empty input still emits header + block + trailer"
+        );
+        assert_eq!(inflate_with_flate2(&buf[..produced]), Vec::<u8>::new());
+    }
+
+    // ---------------------------------------------------------------------
+    // Error paths
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn compress2_too_small_dest_yields_buf_error() {
+        let data = vec![b'Z'; 4096];
+        // One byte cannot even hold the two-byte zlib header.
+        let mut tiny = [0u8; 1];
+        assert_eq!(compress2(&mut tiny, &data, 6), Err(ReturnCode::BufError));
+    }
+
+    #[test]
+    fn compress2_invalid_level_yields_stream_error() {
+        let data = b"some data to compress";
+        let mut buf = [0u8; 64];
+        // Above the valid 0..=9 range.
+        assert_eq!(compress2(&mut buf, data, 42), Err(ReturnCode::StreamError));
+        // Below the range and not the Z_DEFAULT_COMPRESSION (-1) sentinel.
+        assert_eq!(compress2(&mut buf, data, -2), Err(ReturnCode::StreamError));
+    }
+
+    // ---------------------------------------------------------------------
+    // compress2_tracked — the produced-count out-parameter
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn compress2_tracked_reports_the_count_on_every_post_init_path() {
+        let data = vec![b'Q'; 4096];
+
+        // Success: the out-parameter agrees with the `Ok` payload.
+        let mut roomy = vec![0u8; compress_bound(data.len())];
+        let mut produced = usize::MAX;
+        let n = compress2_tracked(&mut roomy, &data, 6, &mut produced).expect("ok");
+        assert_eq!(produced, n, "the out-parameter matches the returned length");
+
+        // Buffer error: C writes `next_out - dest` at `compress.c` L63 on this
+        // path too, so the bytes that fit are reported — and they are a
+        // byte-exact prefix of the complete stream.
+        let mut short = [0u8; 12];
+        let mut produced = usize::MAX;
+        assert_eq!(
+            compress2_tracked(&mut short, &data, 6, &mut produced),
+            Err(ReturnCode::BufError)
+        );
+        assert_eq!(produced, short.len(), "the partial count is reported");
+        assert_eq!(&short[..], &roomy[..short.len()]);
+
+        // Invalid level: C zeroes the count at `compress.c` L36 before the
+        // failing `deflateInit` (L42-L43), so zero is reported.
+        let mut buf = [0u8; 64];
+        let mut produced = usize::MAX;
+        assert_eq!(
+            compress2_tracked(&mut buf, &data, 42, &mut produced),
+            Err(ReturnCode::StreamError)
+        );
+        assert_eq!(produced, 0, "a failed initializer reports zero bytes");
+    }
+
+    // ---------------------------------------------------------------------
+    // compress — the default-level convenience wrapper
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn compress_default_level_round_trips() {
+        let data = b"the quick brown fox jumps over the lazy dog. ".repeat(200);
+        let mut buf = vec![0u8; compress_bound(data.len())];
+        let produced = compress(&mut buf, &data).expect("compress failed");
+        assert_eq!(inflate_with_flate2(&buf[..produced]), data);
+    }
+
+    #[test]
+    fn compress_matches_compress2_default_level() {
+        // `compress` must be exactly `compress2(.., Z_DEFAULT_COMPRESSION)`.
+        let data = b"determinism check: compress == compress2(-1)".repeat(64);
+        let mut buf_a = vec![0u8; compress_bound(data.len())];
+        let mut buf_b = vec![0u8; compress_bound(data.len())];
+        let na = compress(&mut buf_a, &data).unwrap();
+        let nb = compress2(&mut buf_b, &data, Z_DEFAULT_COMPRESSION).unwrap();
+        assert_eq!(na, nb);
+        assert_eq!(buf_a[..na], buf_b[..nb], "identical bytes expected");
+    }
+
+    // =======================================================================
+    // Shared `zutil.h` constants — engine-side cross-checks
+    //
+    // Relocated from `crate::util`'s own test module: `util` is layer 3 and may
+    // not name an engine, not even under `cfg(test)` (AAP §0.3.1, §0.4.2 B2,
+    // enforced by `the_module_graph_has_no_upward_edges` in `src/lib.rs`). The
+    // assertions themselves are unchanged — they check that this module's
+    // differently-typed aliases still agree with `util`'s canonical values, and
+    // that the gzip header this module emits carries the one platform-selected
+    // `OS_CODE`.
+    // =======================================================================
+
+    #[cfg(feature = "gzip")]
+    use crate::util::OS_CODE;
+    use crate::util::{
+        DYN_TREES, MAX_MATCH as UTIL_MAX_MATCH, MIN_MATCH as UTIL_MIN_MATCH, STATIC_TREES,
+        STORED_BLOCK,
+    };
+
+    /// The expected gzip OS byte for the target this test module is compiled for,
+    /// derived from the same `cfg` predicates `OS_CODE` itself uses — but derived
+    /// *here*, independently, so a mistake in a single `cfg` attribute cannot make
+    /// both sides agree.
+    ///
+    /// Written as a `cfg`-selected constant rather than a runtime `if` so that
+    /// **every** target gets exactly one value and the assertions below can never
+    /// be vacuous: on a target where no arm applied the constant would not exist
+    /// and this module would fail to compile.
+    #[cfg(all(feature = "gzip", windows))]
+    const EXPECTED_OS_CODE: u8 = 10;
+    #[cfg(all(feature = "gzip", not(windows), target_vendor = "apple"))]
+    const EXPECTED_OS_CODE: u8 = 19;
+    #[cfg(all(feature = "gzip", not(windows), not(target_vendor = "apple")))]
+    const EXPECTED_OS_CODE: u8 = 3;
+    /// The differently-typed aliases the engines keep for arithmetic locality
+    /// still agree with the canonical values above.
+    ///
+    /// Without this guard the two sets could drift silently: nothing in the
+    /// compiler relates `crate::deflate::trees::STORED_BLOCK` (an `i32`, needed
+    /// by `send_bits`) or `crate::deflate::state::MIN_MATCH` (a `usize`, needed
+    /// for window indexing) to the `u8`/`usize` values published here.
+    #[test]
+    fn engine_aliases_agree_with_the_canonical_values() {
+        use crate::deflate::state::{MAX_MATCH as ST_MAX, MIN_MATCH as ST_MIN};
+        use crate::deflate::trees::{
+            DYN_TREES as TR_DYN, STATIC_TREES as TR_STATIC, STORED_BLOCK as TR_STORED,
+        };
+
+        assert_eq!(TR_STORED, i32::from(STORED_BLOCK), "trees::STORED_BLOCK");
+        assert_eq!(TR_STATIC, i32::from(STATIC_TREES), "trees::STATIC_TREES");
+        assert_eq!(TR_DYN, i32::from(DYN_TREES), "trees::DYN_TREES");
+        assert_eq!(ST_MIN, UTIL_MIN_MATCH, "state::MIN_MATCH");
+        assert_eq!(ST_MAX, UTIL_MAX_MATCH, "state::MAX_MATCH");
+    }
+
+    /// The gzip header this crate emits carries the canonical [`OS_CODE`] — the
+    /// one platform-selected definition — at RFC 1952 offset 9.
+    ///
+    /// This is the assertion that catches the defect the test exists for: if
+    /// `crate::deflate` were to hard-code an `OS_CODE = 3` of its own, then on
+    /// Windows or Apple it would emit `3` where reference zlib emits `10` or
+    /// `19` — diverging from byte-identity on those targets while every
+    /// Linux-only gate stayed green.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn gzip_header_emits_the_canonical_os_code() {
+        const DATA: &[u8] = b"gzip header operating-system byte";
+
+        let mut strm: ZStream = ZStream::new();
+        // windowBits 31 == 15 + 16: gzip framing.
+        deflate_init2(&mut strm, 6, Z_DEFLATED, 31, 8, Strategy::Default).expect("init");
+        let mut out = alloc::vec![0u8; DATA.len() * 2 + 128];
+        let r = deflate(&mut strm, DATA, &mut out, Z_FINISH);
+        assert_eq!(r.code, ReturnCode::StreamEnd);
+        out.truncate(r.produced);
+        deflate_end(&mut strm).expect("end");
+
+        // RFC 1952 §2.3: ID1 ID2 CM FLG MTIME[4] XFL OS -> OS is byte 9.
+        assert!(out.len() > 9, "a gzip member has at least a 10-byte header");
+        assert_eq!(out[0], 0x1f, "ID1");
+        assert_eq!(out[1], 0x8b, "ID2");
+        assert_eq!(out[2], 8, "CM == Z_DEFLATED");
+        assert_eq!(
+            out[9], OS_CODE,
+            "the emitted OS byte must be the single canonical OS_CODE"
+        );
+        assert_eq!(
+            out[9], EXPECTED_OS_CODE,
+            "and it must be the platform value"
+        );
+    }
+
+    /// A caller-supplied [`GzHeader`](crate::gz_header::GzHeader) overrides the
+    /// OS byte, exactly as C writes `s->gzhead->os & 0xff` (`deflate.c` L1105)
+    /// instead of `OS_CODE` (L1081) when a header is installed. The override path
+    /// must therefore *not* be rewired to the canonical constant.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn supplied_header_overrides_the_os_code() {
+        use crate::gz_header::GzHeader;
+
+        const DATA: &[u8] = b"explicit gzip header";
+        const CUSTOM_OS: u8 = 7; // old Mac OS, zutil.h L149
+
+        let mut strm: ZStream = ZStream::new();
+        deflate_init2(&mut strm, 6, Z_DEFLATED, 31, 8, Strategy::Default).expect("init");
+        let head = GzHeader {
+            os: i32::from(CUSTOM_OS),
+            ..GzHeader::default()
+        };
+        deflate_set_header(&mut strm, Some(head)).expect("set header");
+
+        let mut out = alloc::vec![0u8; DATA.len() * 2 + 128];
+        let r = deflate(&mut strm, DATA, &mut out, Z_FINISH);
+        assert_eq!(r.code, ReturnCode::StreamEnd);
+        out.truncate(r.produced);
+        deflate_end(&mut strm).expect("end");
+
+        assert_eq!(out[9], CUSTOM_OS, "a supplied header wins over OS_CODE");
     }
 }

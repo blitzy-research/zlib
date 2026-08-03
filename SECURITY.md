@@ -238,8 +238,10 @@ a Rust panic never unwinds across the C ABI, which would be undefined behaviour.
 The consequence for a C consumer is direct: **a reachable panic aborts the host
 process**, which is a denial of service. Reachable-panic reports are therefore in
 scope. The boundary already converts the foreseeable cases into ordinary `Z_*`
-error codes through the `guard_int` / `guard_ulong` / `guard_ptr` / `guard_off`
-family in [`src/ffi/types.rs`](src/ffi/types.rs); those guards exist to make
+error codes through the eight-strong `guard_int` / `guard_ulong` / `guard_ptr` /
+`guard_off` / `guard_long` / `guard_size` / `guard_const_ptr` / `guard_void`
+family in [`src/ffi/types.rs`](src/ffi/types.rs), each defined twice so the `std`
+and `no_std` builds guard identically; those guards exist to make
 boundary failures deterministic, so a panic that escapes them is exactly the kind
 of finding this section wants.
 
@@ -389,20 +391,37 @@ Both lockfiles are committed deliberately, because the crate ships
 `cdylib`/`staticlib` distributables and reproducible offline builds need exact
 resolved versions.
 
-**The gate.** A single `cargo-deny` policy governs that closure —
-[`deny.toml`](deny.toml) — evaluated twice, once per dependency graph. There is
-deliberately no sibling `fuzz/deny.toml`: a blocking supply-chain verdict must come
-from a policy reviewed on this repository's normal review surface, and a second
-policy file governing a blocking gate is a second place for the standard to drift.
-Both invocations name the file explicitly with `--config deny.toml`, because
+**The gate.** `cargo-deny` governs that closure through **one reviewed policy per
+graph**: [`deny.toml`](deny.toml) over the 89 root packages and
+[`fuzz/deny.toml`](fuzz/deny.toml) over the 13 fuzz-only packages. Both files are
+reviewed on this repository's normal review surface, both are asserted structurally
+by CI, and both are compared against each other so "two policies" can never become
+"two standards". Each invocation names its file explicitly with `--config`, because
 `cargo-deny` otherwise resolves configuration from the *target* manifest's
-workspace root and would fall back to built-in defaults for the fuzz graph — a
-fallback that looks exactly like a pass:
+workspace root and a discovery miss falls back to built-in defaults — a fallback
+that looks exactly like a pass:
 
 ```sh
-cargo deny --locked --config deny.toml check
-cargo deny --locked --manifest-path fuzz/Cargo.toml --config deny.toml check
+# Root graph: 89 packages, against the policy that governs them.
+cargo deny --locked --config deny.toml check \
+  -A unused-wrapper -A license-exception-not-encountered
+
+# Detached fuzz workspace: 13 packages, against their own policy.
+cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check
 ```
+
+Those are the invocations verbatim, `-A` allowances included, as
+[`.github/workflows/audit.yml`](.github/workflows/audit.yml) runs them and as
+[`CONTRIBUTING.md`](CONTRIBUTING.md) documents them. Reproducing the gate means
+reproducing the flags. Measured on this tree, the root invocation reports
+`0 errors, 0 warnings` with the pair; dropped, it still exits 0 but emits
+`warning[unused-wrapper]` and `warning[license-exception-not-encountered]` — a
+reviewer-facing erosion rather than a gate failure, which is exactly why the pair is
+stated rather than left implicit. The fuzz invocation needs no allowance at all,
+because its policy is shaped for its own graph. Both allowed codes name entries the
+**root** policy retains as latent defence in depth for crates that are absent from the
+root graph, and both stay at full severity on the fuzz invocation, where those crates
+do live — so nothing is waived in both places at once.
 
 The policy declares `[advisories]`, `[licenses]`, `[bans]`, and `[sources]`,
 resolves with `all-features = true`, denies yanked crates, and bounds
@@ -413,18 +432,23 @@ measured, nine triples reduced coverage from 89 crates to 86, silently dropping 
 `spirv`-only and `uefi`-only leaves from licence and ban review), and names `cc`,
 `bindgen`, `pkg-config`, `libz-sys`, and the bzip2/lzma/zstd/brotli families in
 `[bans] deny` so the zero-C-dependency and single-codec properties cannot erode by
-accident. The two concessions the fuzz graph needs are scoped rather than relaxed:
-the `cc` ban carries `wrappers = ["libfuzzer-sys"]`, so every *other* path to a C
-toolchain is still an error, and `libfuzzer-sys`'s mandatory NCSA term is granted
-through a crate-scoped `[[licenses.exceptions]]` entry rather than added to the
-global allow list.
+accident. The two concessions the fuzz graph needs are scoped rather than relaxed —
+in **both** files, stated identically, so the boundary reads the same wherever an
+auditor opens it: the `cc` ban carries `wrappers = ["libfuzzer-sys"]`, so every
+*other* path to a C toolchain is still an error, and `libfuzzer-sys`'s mandatory
+NCSA term is granted through a crate-scoped `[[licenses.exceptions]]` entry rather
+than added to the global allow list. `fuzz/deny.toml` differs from the root policy
+only where the graphs genuinely differ: it allows exactly the three licences its 13
+packages use and carries `skip = []`, since the four acknowledged duplicate majors
+are root-graph-only.
 [`.github/workflows/audit.yml`](.github/workflows/audit.yml) is the single owner of
-that gate. It runs `cargo-audit` over **both** lockfiles and evaluates the policy over
-**both** graphs — the root graph in its `cargo-deny` job and the detached fuzz graph in
-its `cargo-deny-fuzz` job — on every push and pull request and on a daily schedule
-(`cron: '0 5 * * *'`), and asserts that neither lockfile was rewritten. A fourth job,
-`policy-integrity`, reads the policy file and fails if any load-bearing key has drifted
-from the value reviewed here — or if a sibling `fuzz/deny.toml` ever reappears.
+that gate. It runs `cargo-audit` over **both** lockfiles and evaluates **both**
+policies — the root graph against `deny.toml` in its `cargo-deny` job and the
+detached fuzz graph against `fuzz/deny.toml` in its `cargo-deny-fuzz` job — on every
+push and pull request and on a daily schedule (`cron: '0 5 * * *'`), and asserts that
+neither lockfile was rewritten. A fourth job, `policy-integrity`, parses both policy
+files and fails if either is missing, if any load-bearing key has drifted from the
+value reviewed here, or if the two disagree on any key they share.
 
 [`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml) deliberately declares **no**
 `cargo-deny` job of its own, so fuzzing is not gated on a policy verdict inside its own
@@ -516,8 +540,8 @@ contain `unsafe` at all:
 
 | Location | Unsafe-bearing code lines |
 |----------|---------------------------|
-| `src/ffi/` (carve-out 1 — the designated boundary) | **1,123** — `inflate.rs` 309, `deflate.rs` 236, `util.rs` 159, `gz.rs` 150, `types.rs` 113, `mod.rs` 101, `alloc.rs` 55 |
-| `src/lib.rs` (carve-out 2 — the freestanding runtime block, plus the boundary tests that police it) | **48**, split **22 / 26**. The **22** sit inside the private `mod no_std_support` (L207–L422): the libc-backed `#[global_allocator]`, the `#[panic_handler]`, and the personality symbol. The other **26** are all inside `#[cfg(test)] mod tests` — the boundary scanner's own parsing logic, its assertion messages, and the deliberately adversarial corpus it is fed. **No executable `unsafe` exists anywhere else in the file**, and an in-crate test asserts precisely that rather than trusting it |
+| `src/ffi/` (carve-out 1 — the designated boundary) | **1,497** — `inflate.rs` 478, `deflate.rs` 333, `gz.rs` 186, `util.rs` 184, `types.rs` 148, `mod.rs` 106, `alloc.rs` 62 |
+| `src/lib.rs` (carve-out 2 — the freestanding runtime block, plus the boundary tests that police it) | **49**, split **22 / 27**. The **22** sit inside the private `mod no_std_support` (L207–L422): the libc-backed `#[global_allocator]`, the `#[panic_handler]`, and the personality symbol. The other **27** are all inside `#[cfg(test)] mod tests` — the boundary scanner's own parsing logic, its assertion messages, and the deliberately adversarial corpus it is fed. **No executable `unsafe` exists anywhere else in the file**, and an in-crate test asserts precisely that rather than trusting it |
 | `src/deflate/`, `src/inflate/`, `src/checksum/`, `src/gz/`, `src/util/`, `src/error.rs`, `src/constants.rs`, `src/gz_header.rs` | **0** |
 | `src/stream.rs` | **2**, and both are `type` aliases only — `ZallocFn` and `ZfreeFn` merely *name* the C hook signatures the crate interoperates with. `grep -c "unsafe {"` on that file returns **0**, and the module carries its own `#![deny(unsafe_code)]` |
 
@@ -534,14 +558,14 @@ done
 One reconciliation is worth stating explicitly, because a slightly different
 scan yields a slightly different number for `src/lib.rs` and neither is wrong.
 A stricter variant that *also* discards text following a trailing `//` reports
-**46** instead of 48. The two lines that drop out are the string literals
+**47** instead of 49. The two lines that drop out are the string literals
 `"// unsafe\n"` and `"//! unsafe\n"` inside the boundary test's corpus, which
 exist for the sole purpose of proving that the scanner ignores commented-out
 `unsafe`. The table quotes the whole-line-comment variant throughout so that
 `src/ffi/`, `src/lib.rs`, and `src/stream.rs` are all measured by one identical
 method; a mixed methodology would make the rows incomparable.
 
-Every `unsafe` block that does exist is justified in place: **388** `// SAFETY:`
+Every `unsafe` block that does exist is justified in place: **513** `// SAFETY:`
 comments across `src/`, with `#![warn(clippy::undocumented_unsafe_blocks)]` and
 `#![warn(missing_docs)]` promoted to hard errors by the `-D warnings` lint gate.
 Containment is checked four independent ways — the `deny` attribute, that lint
@@ -581,9 +605,9 @@ derivation: [Exported symbol reconciliation](README.md#exported-symbol-reconcili
 
 | Command | Result |
 |---------|--------|
-| `cargo test --locked` | **860 passed / 0 failed / 0 ignored** (705 unit, 128 integration, 27 doctests) |
-| `cargo test --locked --all-features` | **873 passed / 0 failed / 0 ignored** (adds the 13 live C-oracle tests) |
-| `cargo test --locked --no-default-features` | **634 passed / 0 failed / 0 ignored** |
+| `cargo test --locked` | **956 passed / 0 failed / 0 ignored** (797 unit, 130 integration, 29 doctests) |
+| `cargo test --locked --all-features` | **969 passed / 0 failed / 0 ignored** (adds the 13 live C-oracle tests) |
+| `cargo test --locked --no-default-features` | **695 passed / 0 failed / 0 ignored** (571 unit, 97 integration, 27 doctests) |
 
 The **ignored-test count is zero in every configuration and stays zero**. A
 capability that cannot be exercised in a given build is expressed by a feature
@@ -626,16 +650,24 @@ workspace that the root build never pulls in.
 runs each on a weekly schedule (`cron: '0 3 * * 1'`) and on pull requests, with a
 per-target budget of **120 s on a pull request and 600 s otherwise**, at
 `-max_len=65536 -rss_limit_mb=2048`. Supply-chain policy over the fuzz graph is not
-enforced by that workflow: the root `deny.toml` is aimed at that graph by `audit.yml`'s
+enforced by that workflow: `fuzz/deny.toml` is aimed at that graph by `audit.yml`'s
 `cargo-deny-fuzz` job on every push and pull request.
 Each target's corpus is persisted between runs, and crash artifacts are uploaded
 on failure. The fuzz crate builds with `overflow-checks = true`, so an arithmetic
 overflow is a finding rather than a wrap.
 
-Cumulative campaign results — **attributed, not re-measured here** — are
-approximately **1.13 million executions with 0 crashes** to date. Treat that as
-recorded history: the number a fresh CI run produces is bounded by the budgets
-above, not by that total.
+Campaign results — **attributed, not re-measured here** — record
+**1,674,289 executions with 0 crashes and 0 crash artifacts** for a single sweep
+that replicated this workflow's exact invocation on the pinned
+`nightly-2026-08-01` at the pull-request budget of 120 s per target
+(`fuzz_inflate` 912,404 · `fuzz_gzip` 318,608 · `fuzz_deflate_roundtrip` 226,262 ·
+`fuzz_ffi_roundtrip` 134,558 · `fuzz_checksum` 82,457). That is a single-campaign
+total at a stated budget, not a cumulative lifetime count, and it moves with the
+budget and the corpus; an earlier baseline's "roughly 1.13 million executions" is
+a historical datum no single command reproduces. What is durable is the mechanism:
+the cached per-target corpus means coverage accumulates across runs instead of
+restarting each week. `doc/technical-specifications.md` §0.6.7 records the same
+figure with its full invocation.
 
 ### Honest limitations
 
@@ -672,10 +704,12 @@ sits here:
   assertion that the freestanding runtime block — the libc-backed allocator, the
   abort panic handler, the personality shim — was genuinely compiled. **`no_std`
   has been validated on a hosted target and compile-verified for bare metal; it
-  has not been exercised on real embedded hardware.** 633 passing hosted tests do
+  has not been exercised on real embedded hardware.** 695 passing hosted tests do
   not prove an embedded target works.
-- **Human code review across the full Rust surface (≈ 57,000 lines under `src/`)
-  is outstanding**, and it is the highest-severity remaining hardening item
+- **Human code review across the full Rust surface — 71,795 lines across 40 files
+  under `src/`, measured on 2026-08-03 with
+  `find src -name '*.rs' -print0 | xargs -0 wc -l` — is outstanding**, and it is
+  the highest-severity remaining hardening item
   precisely because it cannot be automated away. Everything above is machine
   evidence; none of it substitutes for a reviewer.
 - **No third-party security audit, penetration test, certification, or CVE
@@ -696,7 +730,8 @@ The same boundary is drawn, job by job, in
 | [`README.md`](README.md) | Overview, feature matrix, measured evidence, the drop-in ABI, and the portability boundary |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution workflow, the blocking quality gates, and the MSRV policy |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release history for the Rust crate; `Security` entries record every fix |
-| [`deny.toml`](deny.toml) | The single supply-chain policy, evaluated over both the root and fuzz graphs |
+| [`deny.toml`](deny.toml) | The supply-chain policy for the 89-package root graph |
+| [`fuzz/deny.toml`](fuzz/deny.toml) | The supply-chain policy for the 13-package detached fuzz graph |
 | [`Cargo.toml`](Cargo.toml) | Crate identity, the feature contract, profiles, and the published-crate `exclude` list |
 | [`LICENSE`](LICENSE) | The zlib/libpng license, carried forward from upstream |
 

@@ -6,7 +6,21 @@
 //! re-exported from the crate root (`lib.rs`). Every compression or
 //! decompression operation borrows a `&mut ZStream`; the concrete engine logic
 //! lives in [`crate::deflate`] and [`crate::inflate`], which operate on the
-//! [`DeflateState`] / [`InflateState`] this handle owns.
+//! engine state this handle owns.
+//!
+//! # Layering: why the engine state is opaque here
+//!
+//! This module is layer 5 of the seven-layer graph (AAP §0.3.1 / §0.4.2 B2) and
+//! the compression engines are layer 6, so imports must run *downward only*:
+//! `stream` may not name `DeflateState` or `InflateState`. It therefore owns its
+//! engine through the layer-local `EngineState` trait object and exposes
+//! type-generic accessors (`ZStream::engine_state`,
+//! `ZStream::engine_state_mut`, …). Each engine implements `EngineState` in
+//! its own module and publishes a typed view of it there
+//! (`crate::deflate::state::DeflateStream`, `crate::inflate::state::InflateStream`),
+//! which is where the concrete names legitimately live. Ownership, `Drop`
+//! semantics, and the "at most one engine" invariant are unchanged — only the
+//! direction of the naming is.
 //!
 //! # Relationship to the C `z_stream`
 //!
@@ -21,12 +35,15 @@
 //!   (use-after-free / double-free).
 //!
 //! Here the engine state is owned through a `StreamState` enum that holds
-//! *at most one* boxed engine (`None`, `Deflate(Box<…>)`, or
-//! `Inflate(Box<…>)`), so "no state", "deflate state", and "inflate state" are
-//! distinct, checked cases (AAP §0.3.2 Type-State / Ownership). Because the box
-//! and every owned buffer inside it are released by `Drop`, RAII fully subsumes
-//! `deflateEnd`/`inflateEnd` (AAP §0.3.2 RAII / §0.6.3 Memory Ownership Model) —
-//! there is nothing for the caller to remember to free.
+//! *at most one* boxed engine (`None` or `Engine(Box<dyn EngineState>)`), and
+//! every installed engine reports its direction through
+//! `EngineState::engine_kind`, so "no state", "deflate state", and "inflate
+//! state" are distinct, checked cases (AAP §0.3.2 Type-State / Ownership). The
+//! typed accessors are keyed on the concrete engine type, so an inflate routine
+//! handed a deflate stream observes [`None`] rather than a mistyped state.
+//! Because the box and every owned buffer inside it are released by `Drop`, RAII
+//! fully subsumes `deflateEnd`/`inflateEnd` (AAP §0.3.2 RAII / §0.6.3 Memory
+//! Ownership Model) — there is nothing for the caller to remember to free.
 //!
 //! ## Field mapping (`z_stream` → [`ZStream`])
 //!
@@ -171,14 +188,13 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::any::Any;
 use core::ffi::{c_uint, c_void};
 use core::fmt;
 use core::ops::{Deref, DerefMut};
 
 use crate::constants::DataType;
-use crate::deflate::state::DeflateState;
 use crate::error::ReturnCode;
-use crate::inflate::state::InflateState;
 
 // ===========================================================================
 // Allocator abstraction (replaces the C `zalloc`/`zfree`/`opaque` triple)
@@ -592,8 +608,16 @@ pub trait ForeignBuffer<T: Copy + Default + ZeroValid> {
 // `src/ffi/**`, yet they are needed *by* this module. The resolution is
 // dependency inversion, the same pattern [`ForeignBuffer`] already uses: this
 // module owns the interface, and the boundary supplies the implementation. No
-// item under `crate::ffi` is named anywhere in this file, so no `stream -> ffi`
-// edge exists (AAP §0.3.2 C4).
+// item under `crate::ffi` is named anywhere in the shipped half of this file, so
+// the shipped graph carries no `stream -> ffi` edge (AAP §0.3.2 C4).
+//
+// The `#[cfg(test)]` module at the bottom does name one: a real C
+// `alloc_func`/`free_func` pair is raw-pointer machinery, so the counting hook
+// used to assert the has-hook contract lives in `crate::ffi::alloc::test_hook`
+// and is merely *driven* from here. That reference is confined to a compilation
+// configuration that is never built into the library, and it is enumerated in
+// `TEST_ONLY_CROSS_LAYER_EXCEPTIONS` in `src/lib.rs`, where the module-graph
+// test rejects any test-only inversion that is not on that list.
 //
 // Both traits are `pub(crate)`, so they are neither nameable nor implementable
 // from outside the crate: the blanket implementations in `crate::ffi::alloc` are
@@ -641,6 +665,290 @@ pub(crate) trait ForeignAlloc: Copy + Default + ZeroValid + 'static {
         items: usize,
         item_size: usize,
     ) -> Option<Box<dyn ForeignBuffer<Self>>>;
+}
+
+/// Foreign (caller-`zalloc`'d) *engine-state* placement — the capability behind
+/// [`EngineReservation`].
+///
+/// Reference zlib does not put its engine state on some private heap: it charges
+/// the caller's allocator for it, with a single
+/// `ZALLOC(strm, 1, sizeof(deflate_state))` (`deflate.c` L305) or
+/// `ZALLOC(strm, 1, sizeof(struct inflate_state))` (`inflate.c` L198,
+/// `infback.c` L51). A caller who installs a bounded arena therefore expects the
+/// state itself to come out of that arena and to be handed back through `zfree`.
+/// This trait is what makes that true here: the reservation it returns *is* the
+/// state's home, not a placeholder charged alongside a private allocation.
+///
+/// Declared here and implemented for every `Sized + 'static` type by a blanket
+/// implementation in the sanctioned `crate::ffi::alloc` zone, which owns the hook
+/// invocation, the alignment check, the in-place move, and the `zfree`-on-drop.
+///
+/// Implementations must request `(1, size_of::<Self>())` so the hook sees the
+/// same one-region, one-item shape C uses, must return [`None`] — with any region
+/// already obtained released through `zfree` — rather than falling back to the
+/// global allocator, and must never write to the region before the state is
+/// moved into it (AAP §0.6.2, §0.6.3 has-hook clause, §0.6.5).
+///
+/// # The one place this port cannot match C's argument pair
+///
+/// C passes `sizeof(struct inflate_state)`; this port passes
+/// `size_of::<Self>()`, and the two differ (7160 against 7272 for inflate, 5968
+/// against 6136 for deflate) because the Rust state is not layout-identical to
+/// the C struct. Holding the real state *and* advertising C's byte count are
+/// mutually exclusive, so this port keeps the property zlib's contract actually
+/// exposes — one request, made at C's point in the sequence, with C's failure
+/// timing (AAP §0.6.5) — and lets the byte count be its own. Nothing in the zlib
+/// API lets a caller assert a particular `size` argument, and C's own value
+/// already varies with `LIT_MEM` and with the target's pointer width.
+pub(crate) trait ForeignEnginePlace: Sized + 'static {
+    /// Requests `(1, size_of::<Self>())` from `hook` and returns the region as an
+    /// unfilled home, or [`None`] if the caller's `zalloc` refused it or returned
+    /// a region misaligned for `Self`.
+    fn try_reserve_foreign(hook: AllocHook) -> Option<Box<dyn ForeignEngineHome<Self>>>;
+}
+
+/// A caller-`zalloc`'d region large enough and aligned for one engine state,
+/// reserved but not yet filled.
+///
+/// Splitting reservation from filling is what lets the request happen where C
+/// makes it — *before* the working buffers — while the state value itself is
+/// still being built. Dropping an unfilled home releases the region through the
+/// caller's `zfree`, which is what C's early-return paths do.
+pub(crate) trait ForeignEngineHome<E: 'static>: 'static {
+    /// Moves `engine` into the reserved region and yields the owning handle.
+    ///
+    /// Returns [`None`] when the type-erasing owner cannot be allocated, in which
+    /// case the reservation is released by this home's own `Drop` and `engine` is
+    /// dropped — freeing its working buffers back through the same hook, which is
+    /// what C's failure paths do before returning `Z_MEM_ERROR`. Reporting the
+    /// failure rather than aborting is required: zlib answers heap exhaustion with
+    /// a return code (AAP §0.6.5).
+    fn fill(self: Box<Self>, engine: E) -> Option<Box<dyn ForeignEngine<E>>>;
+}
+
+/// An engine state that lives in memory the caller's `zalloc` returned, released
+/// through the same hook's `zfree` when dropped.
+///
+/// The accessors hand out ordinary borrows, so every layer above this module
+/// works with `&E` / `&mut E` and never sees a pointer (AAP §0.6.2).
+pub(crate) trait ForeignEngine<E: 'static>: 'static {
+    /// Borrows the engine state.
+    fn get(&self) -> &E;
+
+    /// Mutably borrows the engine state.
+    fn get_mut(&mut self) -> &mut E;
+}
+
+/// The single owning handle for an engine state, backed **either** by the Rust
+/// global allocator **or** by the caller's `zalloc`/`zfree` pair — the
+/// state-shaped counterpart of [`AllocBuffer`].
+///
+/// Both engines hand their state to a stream as a [`BoxedEngine`], and both
+/// recover it the same way, so exactly one code path exists regardless of who
+/// owns the memory. Dereferencing costs a two-arm branch and never a type
+/// lookup, which matters because the decoder touches its state hundreds of times
+/// per call.
+///
+/// # Cost of the uniform handle
+///
+/// On the global-allocator path this adds one 24-byte allocation per stream — the
+/// `Box` holding this enum — on top of the `Box<E>` that already existed. That is
+/// deliberate: it is what lets `StreamState` stay a single non-generic
+/// `Box<dyn EngineState>` while the hook path keeps its state out of the global
+/// heap entirely. Nothing observes it, because a stream with no hook installed
+/// exposes no allocation accounting at all.
+pub(crate) enum EngineBox<E: EngineState + 'static> {
+    /// Global-allocator storage — the historical, hook-free path.
+    Owned {
+        /// The state itself, on the Rust heap.
+        engine: Box<E>,
+        /// Normally **empty**, with a no-op drop.
+        ///
+        /// It is non-empty only for a custom Rust [`Allocator`] that asked to be
+        /// charged for the state footprint but, handing out typed slice buffers,
+        /// cannot host the state value; see [`EngineReservation`]. Declared *after*
+        /// `engine` so it is released after the state's working buffers, which is
+        /// C's `deflateEnd`/`inflateEnd` order (state last). No C caller can reach
+        /// this: an active hook takes the [`Foreign`](EngineBox::Foreign) arm and an
+        /// inactive one is never charged.
+        ///
+        /// Named with a leading underscore because it is a pure drop guard: nothing
+        /// ever reads it, its whole job is to reach the allocator's `zfree` at the
+        /// right moment.
+        _footprint: AllocBuffer<u8>,
+    },
+    /// Caller-`zalloc`'d storage, reached through the safe [`ForeignEngine`]
+    /// interface so this module never touches the raw pointer.
+    Foreign(Box<dyn ForeignEngine<E>>),
+}
+
+/// An engine state boxed for installation into a [`ZStream`].
+///
+/// The extra `Box` is what erases `E` so [`StreamState`] can stay non-generic;
+/// see [`EngineBox`].
+pub(crate) type BoxedEngine<E> = Box<EngineBox<E>>;
+
+impl<E: EngineState + 'static> EngineBox<E> {
+    /// Moves `engine` onto the global heap fallibly, yielding [`None`] rather
+    /// than aborting when it cannot be satisfied.
+    #[inline]
+    pub(crate) fn try_owned(engine: E) -> Option<BoxedEngine<E>> {
+        Self::try_owned_charged(engine, AllocBuffer::default())
+    }
+
+    /// [`try_owned`](Self::try_owned) while holding an accounting reservation a
+    /// custom Rust [`Allocator`] insisted on being charged for.
+    #[inline]
+    fn try_owned_charged(engine: E, footprint: AllocBuffer<u8>) -> Option<BoxedEngine<E>> {
+        let engine = try_box(engine)?;
+        try_box(EngineBox::Owned {
+            engine,
+            _footprint: footprint,
+        })
+    }
+
+    /// `true` when the engine's bytes live in memory a caller's `zalloc` returned
+    /// rather than on the Rust global heap.
+    ///
+    /// This is what makes the M6-10 contract assertable: the counterpart of
+    /// [`AllocBuffer::is_foreign`] for the state itself, so a test can prove the
+    /// caller's arena really holds the engine and not merely a same-sized
+    /// reservation beside it.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn is_foreign(&self) -> bool {
+        matches!(self, EngineBox::Foreign(_))
+    }
+}
+
+impl<E: EngineState + 'static> Deref for EngineBox<E> {
+    type Target = E;
+
+    #[inline]
+    fn deref(&self) -> &E {
+        match self {
+            EngineBox::Owned { engine, .. } => engine,
+            EngineBox::Foreign(home) => home.get(),
+        }
+    }
+}
+
+impl<E: EngineState + 'static> DerefMut for EngineBox<E> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut E {
+        match self {
+            EngineBox::Owned { engine, .. } => engine,
+            EngineBox::Foreign(home) => home.get_mut(),
+        }
+    }
+}
+
+impl<E: EngineState + 'static> EngineState for EngineBox<E> {
+    #[inline]
+    fn engine_kind(&self) -> EngineKind {
+        (**self).engine_kind()
+    }
+
+    /// Delegates to the wrapped state, so a downcast asks for `E` — the concrete
+    /// engine — and not for this wrapper. That is what keeps
+    /// [`ZStream::engine_state`] unchanged by the introduction of this type.
+    #[inline]
+    fn as_any(&self) -> &dyn Any {
+        (**self).as_any()
+    }
+
+    #[inline]
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        (**self).as_any_mut()
+    }
+
+    /// Returns *this wrapper*, not the wrapped state: the owning view has to stay
+    /// the handle, because a foreign-backed state cannot be moved out of the
+    /// caller's region without allocating somewhere else. `downcast::<EngineBox<E>>`
+    /// is therefore the spelling the engines use, and it is allocation-free.
+    #[inline]
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+/// The reservation half of hook-backed engine placement: made where C makes its
+/// state `ZALLOC`, filled once the state value is complete.
+///
+/// Which of the three arms is taken is decided entirely by the allocator, and the
+/// decision is what makes the C ABI faithful without breaking the Rust-native
+/// extension point:
+///
+/// | `reserves_state_footprint()` | `hook().is_active()` | Arm | Who reaches it |
+/// |---|---|---|---|
+/// | `false` | — | [`Global`](Self::Global) | [`DefaultAllocator`]; a C caller with null `zalloc`/`zfree` |
+/// | `true` | `true` | [`Foreign`](Self::Foreign) | every C caller with an installed hook — the state lives in *their* memory |
+/// | `true` | `false` | [`Charged`](Self::Charged) | a custom Rust [`Allocator`] only |
+///
+/// The middle row is the one the C ABI always takes, and it is the one that makes
+/// the caller's `zalloc` the real owner of the `deflate_state` /
+/// `inflate_state`. The last row exists because an [`Allocator`] hands out typed
+/// slice buffers and therefore cannot host an arbitrary Rust value; charging it and
+/// holding the region beside a globally boxed state keeps its request count and
+/// failure timing C-equivalent, which is the only thing that path can observe.
+/// [`CAllocator`](crate::ffi::types::CAllocator) reports
+/// `reserves_state_footprint() == hook().is_active()`, so no C caller can ever
+/// land there.
+pub(crate) enum EngineReservation<E: EngineState + ForeignEnginePlace + 'static> {
+    /// The caller's `zalloc` returned the region the state itself will occupy.
+    Foreign(Box<dyn ForeignEngineHome<E>>),
+    /// A custom Rust [`Allocator`] was charged for the footprint; the state is
+    /// boxed globally and the charge travels with it.
+    Charged(AllocBuffer<u8>),
+    /// No charge: the `Box` already *is* the allocation.
+    Global,
+}
+
+impl<E: EngineState + ForeignEnginePlace + 'static> EngineReservation<E> {
+    /// Charges `alloc` for one engine footprint if it reserves them, in C's
+    /// position in the allocation sequence.
+    ///
+    /// The request is always shaped `(1, size_of::<E>())` — one state object — so an
+    /// inspecting allocator sees the same `items` C passes and a `size` that is this
+    /// port's own `sizeof`. It cannot be C's `sizeof`: the region *is* the state's
+    /// home and this port's states are legitimately larger than C's, so the two
+    /// requirements are mutually exclusive and AAP §0.6.5 asks for the count and the
+    /// failure timing, which this preserves.
+    ///
+    /// Returns [`None`] only when a charge was attempted and refused — the
+    /// `Z_MEM_ERROR` C reports from its failed state `ZALLOC`.
+    #[inline]
+    pub(crate) fn take<A: Allocator>(alloc: &A) -> Option<Self> {
+        if !alloc.reserves_state_footprint() {
+            return Some(Self::Global);
+        }
+        let hook = alloc.hook();
+        if hook.is_active() {
+            Some(Self::Foreign(E::try_reserve_foreign(hook)?))
+        } else {
+            Some(Self::Charged(
+                alloc.allocate_zeroed_items::<u8>(1, size_of::<E>())?,
+            ))
+        }
+    }
+
+    /// Moves `engine` into the reserved region, or onto the global heap when the
+    /// reservation was not a foreign one.
+    ///
+    /// Returns [`None`] whenever the global heap cannot hold the small owning
+    /// handles this port needs to keep the state's memory type-erased. The
+    /// caller-`zalloc`'d region itself was already secured by
+    /// [`take`](Self::take) and is never re-requested here, so C's request
+    /// *count* is unaffected either way; a refusal is reported as `Z_MEM_ERROR`
+    /// exactly as C reports a refused `ZALLOC`, and never aborts.
+    #[inline]
+    pub(crate) fn fill(self, engine: E) -> Option<BoxedEngine<E>> {
+        match self {
+            Self::Foreign(home) => try_box(EngineBox::Foreign(home.fill(engine)?)),
+            Self::Charged(footprint) => EngineBox::try_owned_charged(engine, footprint),
+            Self::Global => EngineBox::try_owned(engine),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1244,46 +1552,99 @@ impl Allocator for HookAllocator {
 // StreamState — the owned engine state (replaces the C `internal_state *`)
 // ===========================================================================
 
-/// The engine state owned by a [`ZStream`], replacing the C
+/// Which direction an installed engine drives.
+///
+/// This is layer 5's *complete* knowledge of the layer-6 engines: enough to
+/// answer `is_deflate()` / `is_inflate()` and to render [`fmt::Debug`], and
+/// nothing more. It deliberately does not name either engine type (AAP §0.3.1 /
+/// §0.4.2 B2 — imports run downward only).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum EngineKind {
+    /// A compression engine (`crate::deflate`).
+    Deflate,
+    /// A decompression engine (`crate::inflate`).
+    Inflate,
+}
+
+impl EngineKind {
+    /// Returns a short, allocation-free label, used by [`fmt::Debug`] on
+    /// [`StreamState`] and [`ZStream`].
+    #[inline]
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            EngineKind::Deflate => "Deflate",
+            EngineKind::Inflate => "Inflate",
+        }
+    }
+}
+
+/// The opaque engine state a [`ZStream`] owns — the replacement for the C
 /// `internal_state *state` pointer (`zlib.h` L99).
 ///
-/// A stream is in exactly one of three states, and the enum makes that a
-/// type-level invariant:
+/// The two compression engines live one layer *above* this module, so `stream`
+/// cannot name `DeflateState` or `InflateState` without introducing an upward
+/// edge into the module graph (AAP §0.3.1, §0.4.2 B2). Instead each engine
+/// implements this trait in its own module, and `stream` owns it as
+/// `Box<dyn EngineState>`. Callers that need the concrete engine recover it with
+/// [`ZStream::engine_state`] / [`ZStream::engine_state_mut`], which downcast on
+/// the engine's own [`TypeId`](core::any::TypeId): asking for the wrong engine
+/// yields [`None`], so the C hazard of dispatching an inflate routine on a
+/// deflate state remains unrepresentable.
+///
+/// [`as_any`](EngineState::as_any) and its siblings exist because trait
+/// *upcasting* (`&dyn EngineState` → `&dyn Any`) only became available in Rust
+/// 1.86 and this crate's MSRV is 1.85.0 (`Cargo.toml` `rust-version`); the
+/// explicit accessors are the portable spelling of the same coercion.
+pub(crate) trait EngineState: Any {
+    /// Which direction this engine drives.
+    fn engine_kind(&self) -> EngineKind;
+
+    /// Shared [`Any`] view, used by [`ZStream::engine_state`] to downcast.
+    fn as_any(&self) -> &dyn Any;
+
+    /// Mutable [`Any`] view, used by [`ZStream::engine_state_mut`].
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    /// Owning [`Any`] view, used when an engine is taken out of the stream and
+    /// must be recovered as its concrete boxed type.
+    fn into_any(self: Box<Self>) -> Box<dyn Any>;
+}
+
+/// The engine slot of a [`ZStream`]: either empty or holding exactly one engine.
+///
+/// A stream is in exactly one of three states, and the type makes that an
+/// invariant:
 ///
 /// * [`StreamState::None`] — not yet initialised for either direction
 ///   (equivalent to a C `state == Z_NULL`).
-/// * [`StreamState::Deflate`] — owns a [`DeflateState`] for compression.
-/// * [`StreamState::Inflate`] — owns an [`InflateState`] for decompression.
+/// * [`StreamState::Engine`] with [`EngineKind::Deflate`] — a compression engine.
+/// * [`StreamState::Engine`] with [`EngineKind::Inflate`] — a decompression engine.
 ///
-/// Modelling the two engines as one enum (rather than a pair of
-/// `Option<Box<…>>` fields, the shape sketched in AAP §0.6.3) is a deliberate
-/// tightening: it is *impossible* to simultaneously hold a deflate and an
-/// inflate state, so the C hazard of dispatching an inflate routine on a deflate
-/// state — or vice-versa — cannot be expressed. The [`Option`]-returning
-/// accessors on [`ZStream`] ([`deflate_state`](ZStream::deflate_state),
-/// [`inflate_state`](ZStream::inflate_state), …) recover the ergonomic
+/// Modelling the slot as *one* enum (rather than a pair of `Option<Box<…>>`
+/// fields, the shape sketched in AAP §0.6.3) is a deliberate tightening: it is
+/// *impossible* to simultaneously hold a deflate and an inflate state. The
+/// [`Option`]-returning accessors on [`ZStream`]
+/// ([`engine_state`](ZStream::engine_state), …) recover the ergonomic
 /// `Option<&…>` view the AAP describes.
 ///
-/// The variant payloads are [`Box`]ed because the engine states are large: at
-/// the defaults a [`DeflateState`] owns roughly 256 KiB of working buffers in
-/// four allocations — the same count and the same byte total as reference zlib,
-/// because the symbol region is overlaid inside `pending_buf` exactly as C
-/// overlays it (see its "Memory footprint" section) — and an [`InflateState`] is
-/// about 7 KiB plus its on-demand window. Boxing keeps `ZStream` itself small, and it makes this
-/// enum the crate's single owner of an engine: `StreamState::Deflate(Box<…>)` /
-/// `StreamState::Inflate(Box<…>)` is where the C `internal_state *` pointer
-/// went. The engines' own buffers are [`AllocBuffer`]s, so an engine may be
-/// backed by the caller's `zalloc`/`zfree` while the `Box` around it is always a
-/// global-allocator allocation.
+/// The payload is [`Box`]ed because the engine states are large: at the defaults
+/// a deflate state owns roughly 256 KiB of working buffers in four allocations —
+/// the same count and the same byte total as reference zlib, because the symbol
+/// region is overlaid inside `pending_buf` exactly as C overlays it — and an
+/// inflate state is about 7 KiB plus its on-demand window. Boxing keeps
+/// `ZStream` itself small, and it makes this enum the crate's single owner of an
+/// engine: `StreamState::Engine(Box<dyn EngineState>)` is where the C
+/// `internal_state *` pointer went. The engines' own buffers are
+/// [`AllocBuffer`]s, so an engine may be backed by the caller's
+/// `zalloc`/`zfree` while the `Box` around it is a global-allocator allocation.
 #[derive(Default)]
 pub(crate) enum StreamState {
     /// No engine has been initialised (C `state == Z_NULL`).
     #[default]
     None,
-    /// A compression engine is installed.
-    Deflate(Box<DeflateState>),
-    /// A decompression engine is installed.
-    Inflate(Box<InflateState>),
+    /// An engine is installed; [`EngineState::engine_kind`] says which.
+    Engine(Box<dyn EngineState>),
 }
 
 impl StreamState {
@@ -1294,18 +1655,29 @@ impl StreamState {
         matches!(self, StreamState::None)
     }
 
+    /// Returns the installed engine's direction, or [`None`] when the slot is
+    /// empty.
+    #[inline]
+    #[must_use]
+    pub(crate) fn kind(&self) -> Option<EngineKind> {
+        match self {
+            StreamState::None => None,
+            StreamState::Engine(engine) => Some(engine.engine_kind()),
+        }
+    }
+
     /// Returns `true` if a compression engine is installed.
     #[inline]
     #[must_use]
     pub(crate) fn is_deflate(&self) -> bool {
-        matches!(self, StreamState::Deflate(_))
+        self.kind() == Some(EngineKind::Deflate)
     }
 
     /// Returns `true` if a decompression engine is installed.
     #[inline]
     #[must_use]
     pub(crate) fn is_inflate(&self) -> bool {
-        matches!(self, StreamState::Inflate(_))
+        self.kind() == Some(EngineKind::Inflate)
     }
 
     /// Returns a short, allocation-free label for the active variant, used by
@@ -1314,19 +1686,17 @@ impl StreamState {
     #[inline]
     #[must_use]
     fn kind_str(&self) -> &'static str {
-        match self {
-            StreamState::None => "None",
-            StreamState::Deflate(_) => "Deflate",
-            StreamState::Inflate(_) => "Inflate",
+        match self.kind() {
+            None => "None",
+            Some(kind) => kind.as_str(),
         }
     }
 }
 
 impl fmt::Debug for StreamState {
-    /// Prints only the variant name. Neither [`DeflateState`] nor
-    /// [`InflateState`] implements [`Debug`] (they hold large working buffers
-    /// whose contents are not useful to dump), so the payload is deliberately
-    /// elided.
+    /// Prints only the variant name. Neither engine state implements [`Debug`]
+    /// (they hold large working buffers whose contents are not useful to dump),
+    /// so the payload is deliberately elided.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.kind_str())
     }
@@ -1517,34 +1887,37 @@ impl<A: Allocator> ZStream<A> {
 
     // -- engine-state management (used by the deflate/inflate init routines) --
 
-    /// Installs a compression engine, replacing any previously installed state.
+    /// Installs an engine, replacing any previously installed state.
     ///
-    /// Called by the deflate initialisation path once it has built the
-    /// [`DeflateState`]. Any engine previously held is dropped (its buffers
+    /// Called by the deflate/inflate initialisation paths once they have built
+    /// their engine state. Any engine previously held is dropped (its buffers
     /// freed) as part of the assignment — the RAII replacement for the C
     /// `deflateEnd`/`inflateEnd` that would otherwise be required first.
-    #[inline]
-    pub(crate) fn set_deflate_state(&mut self, state: Box<DeflateState>) {
-        self.state = StreamState::Deflate(state);
-    }
-
-    /// Installs a decompression engine, replacing any previously installed
-    /// state. The dual of [`set_deflate_state`](Self::set_deflate_state).
-    #[inline]
-    pub(crate) fn set_inflate_state(&mut self, state: Box<InflateState>) {
-        self.state = StreamState::Inflate(state);
-    }
-
-    /// Removes and returns the current engine state, leaving the stream in the
-    /// [`StreamState::None`] state.
     ///
-    /// Used by the `deflateEnd`/`inflateEnd` shims: taking the state and letting
+    /// The engine type is generic, so this module never names either concrete
+    /// engine (AAP §0.3.1, §0.4.2 B2). The typed spellings the engines expose —
+    /// `set_deflate_state` / `set_inflate_state` — are thin forwards defined in
+    /// `crate::deflate::state` and `crate::inflate::state`.
+    #[inline]
+    pub(crate) fn set_engine_state<E: EngineState + 'static>(&mut self, state: BoxedEngine<E>) {
+        self.state = StreamState::Engine(state);
+    }
+
+    /// Removes and returns the current engine, leaving the stream in the
+    /// [`StreamState::None`] state; returns [`None`] when no engine was
+    /// installed.
+    ///
+    /// Used by the `deflateEnd`/`inflateEnd` shims: taking the engine and letting
     /// the returned value drop performs the teardown. (Simply calling
     /// [`clear_state`](Self::clear_state), or dropping the whole `ZStream`,
-    /// achieves the same release.)
+    /// achieves the same release.) It is also how `inflate()` decouples the
+    /// borrow of the engine from the borrow of the surrounding stream fields.
     #[inline]
-    pub(crate) fn take_state(&mut self) -> StreamState {
-        core::mem::take(&mut self.state)
+    pub(crate) fn take_engine_state(&mut self) -> Option<Box<dyn EngineState>> {
+        match core::mem::take(&mut self.state) {
+            StreamState::None => None,
+            StreamState::Engine(engine) => Some(engine),
+        }
     }
 
     /// Drops the current engine state, returning the stream to
@@ -1554,52 +1927,42 @@ impl<A: Allocator> ZStream<A> {
         self.state = StreamState::None;
     }
 
-    /// Borrows the installed compression engine, or [`None`] if the stream holds
-    /// no state or an inflate state.
+    /// Returns the installed engine's direction, or [`None`] when the stream
+    /// holds no engine.
     #[inline]
     #[must_use]
-    pub(crate) fn deflate_state(&self) -> Option<&DeflateState> {
+    pub(crate) fn engine_kind(&self) -> Option<EngineKind> {
+        self.state.kind()
+    }
+
+    /// Borrows the installed engine as `E`, or [`None`] if the stream holds no
+    /// state or an engine of a different type.
+    ///
+    /// The downcast is on `E`'s own [`TypeId`](core::any::TypeId), so requesting
+    /// the wrong engine can never yield a mistyped reference — the type-level
+    /// replacement for C's unchecked `internal_state *` cast.
+    #[inline]
+    #[must_use]
+    pub(crate) fn engine_state<E: EngineState>(&self) -> Option<&E> {
         match &self.state {
-            StreamState::Deflate(state) => Some(state),
-            _ => None,
+            StreamState::Engine(engine) => engine.as_any().downcast_ref::<E>(),
+            StreamState::None => None,
         }
     }
 
-    /// Mutably borrows the installed compression engine, or [`None`]. The hot
-    /// path for `deflate()`, which repeatedly advances the engine.
+    /// Mutably borrows the installed engine as `E`, or [`None`]. The hot path
+    /// for `deflate()` / `inflate()`, which repeatedly advance the engine.
     #[inline]
     #[must_use]
-    pub(crate) fn deflate_state_mut(&mut self) -> Option<&mut DeflateState> {
+    pub(crate) fn engine_state_mut<E: EngineState>(&mut self) -> Option<&mut E> {
         match &mut self.state {
-            StreamState::Deflate(state) => Some(state),
-            _ => None,
+            StreamState::Engine(engine) => engine.as_any_mut().downcast_mut::<E>(),
+            StreamState::None => None,
         }
     }
 
-    /// Borrows the installed decompression engine, or [`None`] if the stream
-    /// holds no state or a deflate state.
-    #[inline]
-    #[must_use]
-    pub(crate) fn inflate_state(&self) -> Option<&InflateState> {
-        match &self.state {
-            StreamState::Inflate(state) => Some(state),
-            _ => None,
-        }
-    }
-
-    /// Mutably borrows the installed decompression engine, or [`None`]. The hot
-    /// path for `inflate()`.
-    #[inline]
-    #[must_use]
-    pub(crate) fn inflate_state_mut(&mut self) -> Option<&mut InflateState> {
-        match &mut self.state {
-            StreamState::Inflate(state) => Some(state),
-            _ => None,
-        }
-    }
-
-    /// Mutably borrows the installed decompression engine **together with** a
-    /// shared borrow of this stream's allocator, or [`None`].
+    /// Mutably borrows the installed engine as `E` **together with** a shared
+    /// borrow of this stream's allocator, or [`None`].
     ///
     /// `state` and `alloc` are distinct fields, so borrowing one mutably and the
     /// other immutably is sound; the compiler cannot see that through two
@@ -1610,10 +1973,12 @@ impl<A: Allocator> ZStream<A> {
     /// bypassing it (AAP §0.6.3).
     #[inline]
     #[must_use]
-    pub(crate) fn inflate_state_and_allocator(&mut self) -> Option<(&mut InflateState, &A)> {
+    pub(crate) fn engine_state_and_allocator<E: EngineState>(&mut self) -> Option<(&mut E, &A)> {
         match &mut self.state {
-            StreamState::Inflate(state) => Some((state, &self.alloc)),
-            _ => None,
+            StreamState::Engine(engine) => {
+                Some((engine.as_any_mut().downcast_mut::<E>()?, &self.alloc))
+            }
+            StreamState::None => None,
         }
     }
 
@@ -1733,6 +2098,74 @@ mod tests {
     use super::*;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
+    // -----------------------------------------------------------------------
+    // Layer-local test engines
+    //
+    // `stream` is layer 5 and the real engines are layer 6, so these tests must
+    // not reach up to `crate::deflate::state::DeflateState` /
+    // `crate::inflate::state::InflateState` — doing so would reintroduce exactly
+    // the upward edge the production code was restructured to remove (AAP
+    // §0.3.1, §0.4.2 B2), and `the_module_graph_has_no_upward_edges` in
+    // `src/lib.rs` would fail. The engine slot is generic over `EngineState`, so
+    // the slot's own contract — install, downcast, take, replace, render — is
+    // fully exercisable with two minimal in-module engines. The real engines'
+    // integration with the slot is covered where they are defined.
+    // -----------------------------------------------------------------------
+
+    /// A minimal stand-in for a compression engine.
+    struct TestDeflateEngine {
+        /// A payload byte, so the downcast is observably returning *this* value.
+        tag: u8,
+    }
+
+    impl EngineState for TestDeflateEngine {
+        fn engine_kind(&self) -> EngineKind {
+            EngineKind::Deflate
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+        fn into_any(self: Box<Self>) -> Box<dyn Any> {
+            self
+        }
+    }
+
+    /// A minimal stand-in for a decompression engine.
+    struct TestInflateEngine {
+        /// Mirrors the real engine's `wrap` field closely enough to assert on.
+        wrap: i32,
+    }
+
+    impl EngineState for TestInflateEngine {
+        fn engine_kind(&self) -> EngineKind {
+            EngineKind::Inflate
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+        fn into_any(self: Box<Self>) -> Box<dyn Any> {
+            self
+        }
+    }
+
+    /// Installs a test decompression engine with the given `wrap`.
+    ///
+    /// Placement goes through [`EngineBox::try_owned`], the global-heap arm of the
+    /// same wrapper the real engines use, so these tests exercise the production
+    /// installation path rather than a shortcut around it.
+    fn install_inflate<A: Allocator>(strm: &mut ZStream<A>, wrap: i32) {
+        strm.set_engine_state(
+            EngineBox::try_owned(TestInflateEngine { wrap })
+                .expect("the test heap holds an engine"),
+        );
+    }
+
     #[test]
     fn new_has_expected_defaults() {
         let strm = ZStream::new();
@@ -1750,8 +2183,9 @@ mod tests {
         assert!(!strm.has_state());
         assert!(!strm.is_deflate());
         assert!(!strm.is_inflate());
-        assert!(strm.deflate_state().is_none());
-        assert!(strm.inflate_state().is_none());
+        assert!(strm.engine_kind().is_none());
+        assert!(strm.engine_state::<TestDeflateEngine>().is_none());
+        assert!(strm.engine_state::<TestInflateEngine>().is_none());
     }
 
     #[test]
@@ -1797,37 +2231,73 @@ mod tests {
     fn install_and_take_inflate_state() {
         let mut strm = ZStream::new();
 
-        // A raw-deflate (wrap = 0) inflate state with a 32 KiB window.
-        strm.set_inflate_state(InflateState::new(0, 15));
+        // A raw-deflate (wrap = 0) decompression engine.
+        install_inflate(&mut strm, 0);
 
         assert!(strm.has_state());
         assert!(strm.is_inflate());
         assert!(!strm.is_deflate());
-        assert!(strm.inflate_state().is_some());
-        // The deflate accessor must not see the inflate state.
-        assert!(strm.deflate_state().is_none());
+        assert_eq!(strm.engine_kind(), Some(EngineKind::Inflate));
+        assert_eq!(
+            strm.engine_state::<TestInflateEngine>().map(|s| s.wrap),
+            Some(0)
+        );
+        // Asking for the other engine must not see this one: the downcast is on
+        // the concrete type, so a wrong-direction request yields `None` instead
+        // of C's unchecked `internal_state *` reinterpretation.
+        assert!(strm.engine_state::<TestDeflateEngine>().is_none());
 
         // Mutable access resolves to the same live state.
-        assert!(strm.inflate_state_mut().is_some());
+        assert!(strm.engine_state_mut::<TestInflateEngine>().is_some());
+        assert!(strm.engine_state_mut::<TestDeflateEngine>().is_none());
 
-        // Taking the state hands back the `Inflate` variant and empties the
-        // stream; the returned box drops here, freeing the state (RAII stands in
-        // for `inflateEnd`).
-        let taken = strm.take_state();
-        assert!(taken.is_inflate());
+        // Taking the engine hands back the boxed state and empties the stream;
+        // the returned box drops here, freeing the state (RAII stands in for
+        // `inflateEnd`).
+        let taken = strm.take_engine_state().expect("an engine was installed");
+        assert_eq!(taken.engine_kind(), EngineKind::Inflate);
         assert!(!strm.has_state());
-        assert!(strm.inflate_state().is_none());
+        assert!(strm.engine_kind().is_none());
+        assert!(strm.engine_state::<TestInflateEngine>().is_none());
+        // Taking again from an empty slot reports `None` rather than panicking.
+        assert!(strm.take_engine_state().is_none());
+
+        // The removed engine is still fully usable through the opaque handle,
+        // which is what lets `inflate()` hold it across a call while `strm` stays
+        // borrowable for `msg` / `total_in` / `adler`.
+        assert_eq!(
+            taken
+                .as_any()
+                .downcast_ref::<TestInflateEngine>()
+                .map(|s| s.wrap),
+            Some(0)
+        );
+        // And it can be reinstalled through the typed setter. `into_any` on a
+        // placed engine yields the *wrapper*, not the inner state — that is what
+        // makes taking and reinstalling allocation-free even when the engine lives
+        // in caller-supplied memory — so the downcast asks for `EngineBox<E>`,
+        // exactly as `take_inflate_state` does.
+        let reboxed = taken
+            .into_any()
+            .downcast::<EngineBox<TestInflateEngine>>()
+            .expect("the kind check established the concrete type");
+        strm.set_engine_state(reboxed);
+        assert!(strm.is_inflate());
+        assert_eq!(
+            strm.engine_state::<TestInflateEngine>().map(|s| s.wrap),
+            Some(0)
+        );
     }
 
     #[test]
     fn clear_state_returns_to_none() {
         let mut strm = ZStream::new();
-        strm.set_inflate_state(InflateState::new(1, 15));
+        install_inflate(&mut strm, 1);
         assert!(strm.has_state());
 
         strm.clear_state();
         assert!(!strm.has_state());
-        assert!(strm.inflate_state().is_none());
+        assert!(strm.engine_state::<TestInflateEngine>().is_none());
     }
 
     #[test]
@@ -1835,9 +2305,28 @@ mod tests {
         // Installing a second engine drops the first without any explicit
         // teardown — the RAII replacement for a forgotten `inflateEnd`.
         let mut strm = ZStream::new();
-        strm.set_inflate_state(InflateState::new(0, 15));
-        strm.set_inflate_state(InflateState::new(2, 15));
+        install_inflate(&mut strm, 0);
+        install_inflate(&mut strm, 2);
         assert!(strm.is_inflate());
+        assert_eq!(
+            strm.engine_state::<TestInflateEngine>().map(|s| s.wrap),
+            Some(2),
+            "the second install must have replaced the first"
+        );
+
+        // Installing the *other* direction likewise replaces, and the typed
+        // accessors follow: only one engine can ever be live.
+        strm.set_engine_state(
+            EngineBox::try_owned(TestDeflateEngine { tag: 7 })
+                .expect("the test heap holds an engine"),
+        );
+        assert!(strm.is_deflate());
+        assert!(!strm.is_inflate());
+        assert_eq!(
+            strm.engine_state::<TestDeflateEngine>().map(|s| s.tag),
+            Some(7)
+        );
+        assert!(strm.engine_state::<TestInflateEngine>().is_none());
     }
 
     #[test]
@@ -1955,8 +2444,10 @@ mod tests {
     #[test]
     fn stream_state_debug_prints_variant_name() {
         assert_eq!(alloc::format!("{:?}", StreamState::None), "None");
-        let inflate = StreamState::Inflate(InflateState::new(0, 15));
+        let inflate = StreamState::Engine(Box::new(TestInflateEngine { wrap: 0 }));
         assert_eq!(alloc::format!("{inflate:?}"), "Inflate");
+        let deflate = StreamState::Engine(Box::new(TestDeflateEngine { tag: 0 }));
+        assert_eq!(alloc::format!("{deflate:?}"), "Deflate");
     }
 
     // -----------------------------------------------------------------------

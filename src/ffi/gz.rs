@@ -43,7 +43,7 @@
 //! performs every mode-grammar rejection and every `malloc` before storing the
 //! descriptor in `state->fd` (`gzlib.c` L150-L197 and L206-L210 precede L263), so
 //! **no** `gzdopen` failure closes the caller's descriptor. This shim matches
-//! that: the mode is pre-validated before `File::from_raw_fd`, and every
+//! that: the mode is pre-validated before `adopt_descriptor`, and every
 //! allocation failure after adoption releases the descriptor rather than closing
 //! it. There are two such points and each has its own release mechanism:
 //!
@@ -52,8 +52,8 @@
 //!   of them dissolves the adopted `File` with `core::mem::forget`, which needs no
 //!   `unsafe` and keeps that layer's zero-`unsafe` guarantee.
 //! * *Here*, if the opaque handle allocation fails after the state was built
-//!   successfully — the descriptor is lifted out with `into_raw_fd`, which
-//!   likewise ends Rust ownership without closing.
+//!   successfully — the descriptor is lifted out with `release_descriptor`,
+//!   which likewise ends Rust ownership without closing.
 //!
 //! # `gzgetc` / `gzgetc_` — live `gzFile_s` prefix
 //!
@@ -182,7 +182,10 @@ use alloc::boxed::Box;
 #[cfg(all(unix, feature = "gz-io"))]
 use std::os::fd::FromRawFd;
 
-#[cfg(all(unix, feature = "gz-io"))]
+#[cfg(all(windows, feature = "gz-io"))]
+use std::os::windows::io::FromRawHandle;
+
+#[cfg(all(any(unix, windows), feature = "gz-io"))]
 use crate::gz::GzFile;
 #[cfg(feature = "gz-io")]
 use crate::gz::{self, GzMode, GzState};
@@ -209,31 +212,6 @@ const Z_ERRNO: c_int = ReturnCode::ErrNo.as_c_int();
 // ===========================================================================
 // Local helpers
 // ===========================================================================
-
-/// Panic guard for the `z_size_t`-returning shims (`gzfread` / `gzfwrite`).
-///
-/// [`crate::ffi::types`] provides `guard_int` / `guard_off` / `guard_ptr` but no
-/// `usize` variant, so this mirrors the same catch-and-default behavior for
-/// [`z_size_t`]. `gz-io` implies `std`, so [`std::panic::catch_unwind`] is
-/// always available here.
-#[cfg(feature = "gz-io")]
-#[inline]
-fn guard_size(
-    default: z_size_t,
-    f: impl FnOnce() -> z_size_t + core::panic::UnwindSafe,
-) -> z_size_t {
-    std::panic::catch_unwind(f).unwrap_or(default)
-}
-
-/// Panic guard for the sole `*const c_char`-returning shim (`gzerror`).
-#[cfg(feature = "gz-io")]
-#[inline]
-fn guard_const_ptr<T>(
-    default: *const T,
-    f: impl FnOnce() -> *const T + core::panic::UnwindSafe,
-) -> *const T {
-    std::panic::catch_unwind(f).unwrap_or(default)
-}
 
 /// Converts a non-null C path string into an owned [`std::path::PathBuf`].
 ///
@@ -599,7 +577,7 @@ unsafe extern "system" {
 /// This is the `unsafe` half of the C `close(state->fd)` step that
 /// [`crate::gz::gzclose_r_release`] and [`crate::gz::gzclose_w_release`]
 /// deliberately leave undone: [`std::fs::File`]'s [`Drop`] discards the result,
-/// but zlib reports a failure as [`Z_ERRNO`], so the descriptor must be closed
+/// but zlib reports a failure as [`Z_ERRNO`](crate::error::ReturnCode::ErrNo), so the descriptor must be closed
 /// explicitly to observe it.
 ///
 /// Returns `true` on success, `false` if the platform reported an error.
@@ -728,6 +706,136 @@ fn box_state(result: Result<Box<GzState>, ReturnCode>) -> gzFile {
     }
 }
 
+// POSIX `fcntl`, the one way to reconcile an already-open descriptor's
+// close-on-exec and non-blocking state with what a gzip mode string asked for.
+// Declared here for the same reason `close`, `CloseHandle` and `_get_osfhandle`
+// are: it resolves against the platform C runtime, never against a C zlib, so the
+// zero-C-dependency rule is preserved, and the raw call is confined to this
+// boundary module — `src/gz/**` stays `unsafe`-free (AAP §0.8.1 D-6).
+#[cfg(feature = "gz-io")]
+#[cfg(unix)]
+unsafe extern "C" {
+    /// `int fcntl(int fd, int cmd, ...)`
+    ///
+    /// Declared variadic, exactly as POSIX specifies it, so the compiler emits a
+    /// conforming variadic call. `F_GETFD`/`F_GETFL` take no third argument;
+    /// `F_SETFD`/`F_SETFL` take one `int`.
+    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+}
+
+/// `fcntl` command: get the descriptor flags (`FD_CLOEXEC`).
+#[cfg(feature = "gz-io")]
+#[cfg(unix)]
+const F_GETFD: c_int = 1;
+/// `fcntl` command: set the descriptor flags.
+#[cfg(feature = "gz-io")]
+#[cfg(unix)]
+const F_SETFD: c_int = 2;
+/// `fcntl` command: get the file status flags (`O_NONBLOCK`, …).
+#[cfg(feature = "gz-io")]
+#[cfg(unix)]
+const F_GETFL: c_int = 3;
+/// `fcntl` command: set the file status flags.
+#[cfg(feature = "gz-io")]
+#[cfg(unix)]
+const F_SETFL: c_int = 4;
+
+/// Reconciles a descriptor **opened by path** with the close-on-exec state C
+/// would have given it.
+///
+/// C puts `O_CLOEXEC` into `oflag` only for mode `'e'` (`gzlib.c` L134-L138) and
+/// then calls `open(path, oflag, 0666)`, so without `'e'` the descriptor is
+/// **not** close-on-exec and survives an `exec`. A Rust [`std::fs::File`] is
+/// close-on-exec unconditionally, so the divergence is in the *absence* of the
+/// flag, and matching C means clearing `FD_CLOEXEC` here (finding M6-02).
+///
+/// `O_NONBLOCK` needs nothing on this path: it *is* expressible as an open flag
+/// and `crate::gz` already passes it through `OpenOptionsExt::custom_flags`.
+///
+/// A failing `fcntl` is ignored, exactly as C ignores its own `fcntl` results.
+/// The consequence of an ignored failure is a descriptor that is close-on-exec
+/// when C's would not have been — the pre-existing behaviour, never anything
+/// less safe.
+///
+/// This applies to the **C ABI only**. The idiomatic `crate::gz::gzopen` keeps
+/// the standard library's always-close-on-exec descriptors, which is strictly
+/// safer and carries no C obligation.
+#[cfg(feature = "gz-io")]
+#[cfg(unix)]
+fn reconcile_opened_descriptor(state: &GzState, mode: &[u8]) {
+    use std::os::fd::AsRawFd;
+
+    if gz::descriptor_request(mode).cloexec {
+        // C asked for `O_CLOEXEC`, which is what `File::open` already produced.
+        return;
+    }
+
+    let fd = state.file.as_raw_fd();
+    // SAFETY: `fd` is owned by `state.file`, which is alive for this call, so it
+    // is a valid open descriptor. `F_GETFD` reads flags and takes no third
+    // argument.
+    let flags = unsafe { fcntl(fd, F_GETFD) };
+    if flags < 0 {
+        return;
+    }
+    let cleared = flags & !crate::gz::DescriptorRequest::FD_CLOEXEC;
+    if cleared != flags {
+        // SAFETY: as above; `F_SETFD` takes exactly one `int` argument, supplied
+        // here, and the descriptor is still owned by `state.file`.
+        let _ = unsafe { fcntl(fd, F_SETFD, cleared) };
+    }
+}
+
+/// Reconciles an **adopted** descriptor (`gzdopen`) with the status flags C sets
+/// on it.
+///
+/// C never calls `open` on this path, so it applies the requested bit with
+/// `fcntl` instead:
+///
+/// ```c
+/// if (oflag & O_NONBLOCK)
+///     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+/// if (oflag & O_CLOEXEC)
+///     fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | O_CLOEXEC);
+/// ```
+///
+/// (`gzlib.c` L253-L263.) Only the first is reproduced, and that is deliberate:
+/// **C's second `fcntl` is a no-op on every POSIX platform.** `F_SETFD`'s only
+/// defined flag is `FD_CLOEXEC`, which is `1`, whereas `O_CLOEXEC` is a
+/// completely different bit (`0o2000000` on Linux); Linux implements `F_SETFD` as
+/// `set_close_on_exec(fd, arg & FD_CLOEXEC)`, so OR-ing `O_CLOEXEC` contributes
+/// nothing at all. Measured against reference zlib: an adopted descriptor that
+/// started *without* close-on-exec still has none after `gzdopen(fd, "wbe")`,
+/// and one that started *with* it keeps it. Reproducing the no-op would mean
+/// setting close-on-exec where C does not (finding M6-03).
+///
+/// A failing `fcntl` is ignored, as in C.
+#[cfg(feature = "gz-io")]
+#[cfg(unix)]
+fn reconcile_adopted_descriptor(state: &GzState, mode: &[u8]) {
+    use std::os::fd::AsRawFd;
+
+    if !gz::descriptor_request(mode).nonblock {
+        return;
+    }
+
+    let fd = state.file.as_raw_fd();
+    // SAFETY: `fd` is owned by `state.file`, which is alive for this call.
+    // `F_GETFL` reads the status flags and takes no third argument.
+    let flags = unsafe { fcntl(fd, F_GETFL) };
+    if flags < 0 {
+        return;
+    }
+    // SAFETY: as above; `F_SETFL` takes exactly one `int` argument.
+    let _ = unsafe {
+        fcntl(
+            fd,
+            F_SETFL,
+            flags | crate::gz::DescriptorRequest::O_NONBLOCK,
+        )
+    };
+}
+
 // ===========================================================================
 // Phase 1 — Open shims  (<- gzlib.c)
 // ===========================================================================
@@ -758,10 +866,20 @@ pub unsafe extern "C" fn gzopen(path: *const c_char, mode: *const c_char) -> gzF
                 return ptr::null_mut();
             };
             // SAFETY: `mode` is non-null (checked) and NUL-terminated.
-            let Ok(mode_str) = (unsafe { CStr::from_ptr(mode) }).to_str() else {
-                return ptr::null_mut();
-            };
-            box_state(gz::gzopen(pathbuf, mode_str))
+            //
+            // `to_bytes`, not `to_str`: C walks the mode one raw byte at a time and
+            // ignores every byte it does not recognise (`gzlib.c` L113-L170), so
+            // `"rb\xff"` opens exactly what `"rb"` opens. Requiring UTF-8 here would
+            // turn that accepted open into `NULL`.
+            let mode_bytes = unsafe { CStr::from_ptr(mode) }.to_bytes();
+            let opened = gz::gzopen_bytes(pathbuf, mode_bytes);
+            // C's descriptor is close-on-exec only for mode `'e'`; a Rust `File`
+            // always is. See `reconcile_opened_descriptor`.
+            #[cfg(unix)]
+            if let Ok(state) = opened.as_ref() {
+                reconcile_opened_descriptor(state, mode_bytes);
+            }
+            box_state(opened)
         })
     }
 }
@@ -790,15 +908,127 @@ pub unsafe extern "C" fn gzopen64(path: *const c_char, mode: *const c_char) -> g
                 return ptr::null_mut();
             };
             // SAFETY: `mode` is non-null (checked) and NUL-terminated.
-            let Ok(mode_str) = (unsafe { CStr::from_ptr(mode) }).to_str() else {
-                return ptr::null_mut();
-            };
-            box_state(gz::gzopen64(pathbuf, mode_str))
+            //
+            // `to_bytes`, not `to_str`: C walks the mode one raw byte at a time and
+            // ignores every byte it does not recognise (`gzlib.c` L113-L170), so
+            // `"rb\xff"` opens exactly what `"rb"` opens. Requiring UTF-8 here would
+            // turn that accepted open into `NULL`.
+            let mode_bytes = unsafe { CStr::from_ptr(mode) }.to_bytes();
+            let opened = gz::gzopen64_bytes(pathbuf, mode_bytes);
+            // See `gzopen` — identical descriptor reconciliation.
+            #[cfg(unix)]
+            if let Ok(state) = opened.as_ref() {
+                reconcile_opened_descriptor(state, mode_bytes);
+            }
+            box_state(opened)
         })
     }
 }
 
-/// `gzFile gzdopen(int fd, const char *mode)`  *(Unix)*
+// Windows CRT `_get_osfhandle`: maps a CRT `int` file descriptor onto the OS
+// `HANDLE` backing it, which is what a Rust `std::fs::File` owns on Windows.
+// Declaring the CRT entry point directly is the approach this module already
+// takes for `close` and `CloseHandle`; it resolves against the platform C
+// runtime, never against a C zlib, so the zero-C-dependency rule is preserved.
+#[cfg(feature = "gz-io")]
+#[cfg(windows)]
+unsafe extern "C" {
+    /// Returns the OS handle backing CRT descriptor `fd`, or `-1`/`-2` when that
+    /// descriptor is not open.
+    fn _get_osfhandle(fd: c_int) -> isize;
+}
+
+/// Adopts the caller's raw descriptor into a [`std::fs::File`] that owns it.
+///
+/// # Why an invalid descriptor is adopted rather than rejected
+///
+/// `zlib.h` L1422-L1426 states the contract outright: `gzdopen` returns `NULL`
+/// "if there was insufficient memory to allocate the gzFile state, if an invalid
+/// mode was specified …, or if fd is -1", and "the file descriptor is not used
+/// until the next gz\* read, write, seek, or close operation, so gzdopen will not
+/// detect if fd is invalid (unless fd is -1)". C implements exactly that: one
+/// `fd == -1` test (`gzlib.c` L300) and no other descriptor validation at all.
+///
+/// So a descriptor that is negative-but-not-`-1`, or merely closed, must open
+/// successfully and fail at the *first* read, write, seek or close. Rejecting it
+/// here would turn C's **deferred** [`Z_ERRNO`](crate::error::ReturnCode::ErrNo) into an **immediate** `NULL`,
+/// denying the caller the very handle it needs to read that error from. This
+/// helper therefore adopts unconditionally; `fd == -1` is screened by the caller,
+/// before adoption, because that is the one case C screens too.
+///
+/// # Safety
+///
+/// The caller transfers ownership of `fd`: nothing else may own or close it. The
+/// descriptor need *not* be open — the raw-conversion contract of
+/// [`std::fs::File`] is about sole ownership, and every operation on a closed
+/// descriptor simply fails, which is precisely the deferred error C exhibits.
+#[cfg(feature = "gz-io")]
+#[cfg(unix)]
+unsafe fn adopt_descriptor(fd: c_int) -> std::fs::File {
+    // SAFETY: forwarded verbatim from this function's own contract — the caller
+    // transferred sole ownership of `fd`, so wrapping it here creates exactly one
+    // owner and no other Rust value can close it.
+    unsafe { std::fs::File::from_raw_fd(fd) }
+}
+
+/// Windows counterpart of `adopt_descriptor`, resolving the CRT descriptor to
+/// the OS handle a [`std::fs::File`] owns on this platform.
+///
+/// The rejection policy, and the reason an invalid descriptor is adopted rather
+/// than refused, are identical to the Unix twin — see its documentation.
+///
+/// One Windows-only residual difference is deliberate and documented rather than
+/// silent: C's Windows build keeps the CRT `int` descriptor and closes it with
+/// `_close`, releasing both the OS handle *and* the CRT table slot, whereas a
+/// [`std::fs::File`] owns the `HANDLE` and closes it with `CloseHandle`, leaving
+/// the CRT slot allocated. The observable close result — the value
+/// [`gzclose`]/[`gzclose_w`] reports — comes from closing the handle either way,
+/// so the ABI-visible behaviour matches; only the CRT-internal slot differs, and
+/// a caller must not `_close` a descriptor whose ownership it has handed away.
+#[cfg(feature = "gz-io")]
+#[cfg(windows)]
+unsafe fn adopt_descriptor(fd: c_int) -> std::fs::File {
+    // SAFETY: `_get_osfhandle` only reads the CRT's own descriptor table and
+    // reports `-1`/`-2` for a descriptor that is not open, so it is safe to call
+    // for any `int`, valid or not.
+    let raw = unsafe { _get_osfhandle(fd) };
+
+    // SAFETY: the caller transferred sole ownership of `fd`, so the handle the CRT
+    // reports for it has exactly one owner, which now becomes this `File`. A
+    // `-1`/`-2` result (`INVALID_HANDLE_VALUE`) is adopted deliberately rather
+    // than rejected — see the Unix twin for why C's deferred-failure contract
+    // requires it. Every `ReadFile`/`WriteFile` on such a handle fails, raising
+    // the same `Z_ERRNO` C raises on its first `_read`.
+    unsafe { std::fs::File::from_raw_handle(raw as *mut core::ffi::c_void) }
+}
+
+/// Ends Rust ownership of `file`'s descriptor **without closing it**, handing it
+/// back to the caller exactly as it was passed in.
+///
+/// This is the release half of the `gzdopen` ownership contract: C never reaches
+/// its allocation failures with the descriptor stored (`gzlib.c` assigns
+/// `state->fd` only at the open/adopt step), so no `gzdopen` failure may close
+/// what the caller still owns.
+#[cfg(feature = "gz-io")]
+#[cfg(unix)]
+fn release_descriptor(file: std::fs::File) {
+    use std::os::fd::IntoRawFd;
+
+    let _ = file.into_raw_fd();
+}
+
+/// Windows counterpart of `release_descriptor`: dissolves the [`std::fs::File`]
+/// without `CloseHandle`, leaving both the OS handle and the CRT descriptor the
+/// caller passed in open and usable.
+#[cfg(feature = "gz-io")]
+#[cfg(windows)]
+fn release_descriptor(file: std::fs::File) {
+    use std::os::windows::io::IntoRawHandle;
+
+    let _ = file.into_raw_handle();
+}
+
+/// `gzFile gzdopen(int fd, const char *mode)`
 ///
 /// Associates a `gz*` stream with an already-open file descriptor. On **success**
 /// ownership of `fd` transfers to the returned handle, which closes it in
@@ -811,20 +1041,34 @@ pub unsafe extern "C" fn gzopen64(path: *const c_char, mode: *const c_char) -> g
 /// no C failure path closes the caller's descriptor and a C caller may retry or
 /// `close(fd)` itself. This shim reproduces that contract on every failure path:
 ///
-/// * a negative `fd`, a null `mode`, and a non-UTF-8 `mode` are rejected before
-///   `File::from_raw_fd`, so the descriptor is never adopted;
+/// * `fd == -1` and a null `mode` are rejected before `adopt_descriptor`, so
+///   the descriptor is never adopted;
 /// * an **invalid mode string** (`"r+"`, `"rT"`, `"wG"`, a string with no
 ///   `r`/`w`/`a`, …) is rejected by `crate::gz::validate_mode`, also before
 ///   adoption — this is the check C performs at `gzlib.c` L150-L197; and
 /// * if the handle allocation fails after adoption, the descriptor is released
-///   back to the OS-owned world with `into_raw_fd` rather than closed — the
-///   analogue of C's `malloc` failure at `gzlib.c` L206-L210, which likewise
+///   back to the OS-owned world with `release_descriptor` rather than closed —
+///   the analogue of C's `malloc` failure at `gzlib.c` L206-L210, which likewise
 ///   leaves `fd` open.
 ///
 /// Returns `NULL` on any of those failures.
 ///
+/// # Which descriptors are rejected — exactly one
+///
+/// Only `fd == -1`. Every other `int`, including a negative one and a closed one,
+/// yields a live handle whose first read, write, seek or close reports
+/// [`Z_ERRNO`](crate::error::ReturnCode::ErrNo), because that is the documented C contract (`zlib.h` L1422-L1426,
+/// `gzlib.c` L300). `adopt_descriptor` carries the full argument.
+///
+/// # The mode is bytes, not UTF-8
+///
+/// C walks the mode one raw byte at a time and ignores every byte it does not
+/// recognise (`gzlib.c` L113-L170), so `"rb\xff"` opens exactly what `"rb"`
+/// opens. The mode is therefore read with [`CStr::to_bytes`](core::ffi::CStr::to_bytes) and never required
+/// to be valid UTF-8.
+///
 /// [`File`]: std::fs::File
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzdopen(fd: c_int, mode: *const c_char) -> gzFile {
     #[cfg(not(feature = "gz-io"))]
@@ -836,28 +1080,45 @@ pub unsafe extern "C" fn gzdopen(fd: c_int, mode: *const c_char) -> gzFile {
     #[cfg(feature = "gz-io")]
     {
         guard_ptr(ptr::null_mut(), || -> gzFile {
-            if mode.is_null() || fd < 0 {
+            // `fd == -1` is the ONLY descriptor C rejects (`gzlib.c` L300); every
+            // other value is adopted and its errors deferred to the first
+            // operation. Widening this test to `fd < 0` would refuse handles C
+            // hands back.
+            if mode.is_null() || fd == -1 {
                 return ptr::null_mut();
             }
+            // `to_bytes`, not `to_str`: C walks the mode one raw byte at a time and
+            // ignores every byte it does not recognise (`gzlib.c` L113-L170), so
+            // `"rb\xff"` opens exactly what `"rb"` opens.
+            //
             // SAFETY: `mode` is non-null (checked) and NUL-terminated.
-            let Ok(mode_str) = (unsafe { CStr::from_ptr(mode) }).to_str() else {
-                return ptr::null_mut();
-            };
+            let mode_bytes = unsafe { CStr::from_ptr(mode) }.to_bytes();
             // C `gz_open` validates the whole mode grammar before it takes the
             // caller's descriptor, so every rejection must happen while `fd` is still
             // the caller's. Adopting first and letting the open fail would close a
             // descriptor C leaves open — an ownership divergence a C caller cannot
             // detect and that turns its own later `close(fd)` into a double close.
-            if gz::validate_mode(mode_str).is_err() {
+            if gz::validate_mode(mode_bytes).is_err() {
                 return ptr::null_mut();
             }
-            // SAFETY: the caller transfers ownership of `fd`, a valid open OS file
-            // descriptor (negatives rejected above). Adoption happens only now, with
-            // the mode already proven acceptable, so the remaining failure mode is an
-            // exhausted heap — handled by releasing the descriptor below rather than
-            // closing it.
-            let file = unsafe { std::fs::File::from_raw_fd(fd) };
-            dopen_state(gz::gzdopen(file, mode_str))
+            // SAFETY: the caller transfers ownership of `fd` (the `-1` sentinel is
+            // screened above), so nothing else owns or will close it. Adoption
+            // happens only now, with the mode already proven acceptable, so the
+            // remaining failure mode is an exhausted heap — handled by releasing the
+            // descriptor below rather than closing it. The descriptor need not be
+            // open: `adopt_descriptor` documents why C's contract requires adopting
+            // an invalid one and deferring the error.
+            let file = unsafe { adopt_descriptor(fd) };
+            let opened = gz::gzdopen_bytes(file, mode_bytes);
+            // C applies `O_NONBLOCK` to an adopted descriptor with `fcntl`,
+            // because it never calls `open` here. See
+            // `reconcile_adopted_descriptor` for why its companion `O_CLOEXEC`
+            // `fcntl` is deliberately *not* reproduced.
+            #[cfg(unix)]
+            if let Ok(state) = opened.as_ref() {
+                reconcile_adopted_descriptor(state, mode_bytes);
+            }
+            dopen_state(opened)
         })
     }
 }
@@ -871,11 +1132,11 @@ pub unsafe extern "C" fn gzdopen(fd: c_int, mode: *const c_char) -> gzFile {
 /// [`std::fs::File`] whose [`Drop`] *would* close it, so it is lifted out of the
 /// state before the fallible boxing and only put back once that boxing has
 /// succeeded. If the boxing fails the descriptor is handed back to the OS-owned
-/// world with `into_raw_fd`, deliberately leaving it open for the caller —
-/// precisely what "the caller still owns `fd`" means — while the rest of the
+/// world with `release_descriptor`, deliberately leaving it open for the caller
+/// — precisely what "the caller still owns `fd`" means — while the rest of the
 /// state drops, matching C's `free(state)`.
 #[cfg(feature = "gz-io")]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn dopen_state(result: Result<Box<GzState>, ReturnCode>) -> gzFile {
     // The mode was pre-validated, so a mode rejection cannot reach here; an
     // exhausted allocator can, because `gzdopen`/`gz_open` allocate the `<fd:N>`
@@ -918,26 +1179,26 @@ fn dopen_state(result: Result<Box<GzState>, ReturnCode>) -> gzFile {
         }
         None => {
             // Allocation failed. C never got this far with the descriptor, so
-            // give it back to the caller unclosed: `into_raw_fd` dissolves the
-            // `File` without closing, leaving `fd` exactly as the caller passed
-            // it. `handle` (and with it the buffers) drops here — C's
+            // give it back to the caller unclosed: `release_descriptor` dissolves
+            // the `File` without closing, leaving `fd` exactly as the caller
+            // passed it. `handle` (and with it the buffers) drops here — C's
             // `free(state)`.
             if let Some(file) = released {
-                use std::os::fd::IntoRawFd;
-                let _ = file.into_raw_fd();
+                release_descriptor(file);
             }
             ptr::null_mut()
         }
     }
 }
 
-/// `gzFile gzdopen(int fd, const char *mode)`  *(non-Unix fallback)*
+/// `gzFile gzdopen(int fd, const char *mode)`  *(neither Unix nor Windows)*
 ///
-/// Adopting a raw C `int` file descriptor is a POSIX concept with no portable
-/// `std` equivalent off Unix (Windows uses `HANDLE`s). The symbol is retained
-/// for ABI completeness but always fails here; use [`gzopen`]/`gzopen_w`
-/// instead on such targets.
-#[cfg(not(unix))]
+/// Adopting a raw C `int` file descriptor requires a platform primitive that maps
+/// it onto whatever `std` owns — `from_raw_fd` on Unix, `_get_osfhandle` plus
+/// `from_raw_handle` on Windows (both implemented above). Targets that are
+/// neither expose no such primitive, so the symbol is retained for ABI
+/// completeness but always fails here; use [`gzopen`]/`gzopen_w` instead.
+#[cfg(not(any(unix, windows)))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzdopen(_fd: c_int, _mode: *const c_char) -> gzFile {
     ptr::null_mut()
@@ -1004,7 +1265,21 @@ pub unsafe extern "C" fn gzsetparams(file: gzFile, level: c_int, strategy: c_int
 /// `int gzread(gzFile file, voidp buf, unsigned len)`
 ///
 /// Reads up to `len` uncompressed bytes into `buf`. Returns the number of bytes
-/// actually read (`0` at end of file), or `-1` on error or a null handle/buffer.
+/// actually read (`0` at end of file), or `-1` on error or a null handle.
+///
+/// # A null `buf` with `len == 0`
+///
+/// C never inspects `buf`. It validates the handle and the direction, clears any
+/// recoverable error, and then calls the internal `gz_read`, whose very first
+/// statement is `if (len == 0) return 0;` (`gzread.c` L321-L322) — so the buffer
+/// pointer is never touched and `gzread(file, NULL, 0)` answers `0`, exactly like
+/// `gzread(file, buf, 0)`. This shim reproduces that: `buf` is rejected only when
+/// `len` is nonzero.
+///
+/// A null `buf` with a nonzero `len` is *undefined behaviour in C* — reference
+/// zlib passes the pointer to `memcpy` and segfaults. Returning `-1` there is a
+/// deliberately safe superset of the C contract, not a divergence from any
+/// defined behaviour.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzread(file: gzFile, buf: voidp, len: c_uint) -> c_int {
     #[cfg(not(feature = "gz-io"))]
@@ -1016,15 +1291,25 @@ pub unsafe extern "C" fn gzread(file: gzFile, buf: voidp, len: c_uint) -> c_int 
     #[cfg(feature = "gz-io")]
     {
         guard_int(-1, || {
-            if file.is_null() || buf.is_null() {
+            // C inspects `buf` nowhere; a zero-length request returns before the
+            // pointer is used (`gzread.c` L321-L322). Only a nonzero length makes a
+            // null buffer unusable.
+            if file.is_null() || (buf.is_null() && len != 0) {
                 return -1;
             }
             // SAFETY: non-null handle; borrowed, not owned.
             let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
             let state = &mut *guard;
-            // SAFETY: `buf` is non-null (checked) and, per the C contract, valid for
-            // writes of `len` bytes.
-            let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
+            let out: &mut [u8] = if len == 0 {
+                // No bytes are requested, so no buffer is formed - `buf` may legally
+                // be null here and `from_raw_parts_mut` requires non-null even for a
+                // zero length.
+                &mut []
+            } else {
+                // SAFETY: `buf` is non-null (checked above, since `len != 0`) and, per
+                // the C contract, valid for writes of `len` bytes.
+                unsafe { slice::from_raw_parts_mut(buf as *mut u8, len as usize) }
+            };
             gz::gzread(state, out)
         })
     }
@@ -1158,9 +1443,14 @@ pub unsafe extern "C" fn gzgets(file: gzFile, buf: *mut c_char, len: c_int) -> *
             // SAFETY: non-null handle; borrowed, not owned.
             let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
             let state = &mut *guard;
+            // `.cast::<u8>()` rather than `as *mut u8`: `c_char` is `i8` on x86_64
+            // but `u8` on aarch64 and s390x, where the `as` form becomes an
+            // identity cast and `clippy::unnecessary_cast` fires — a lint a
+            // Linux/x86_64-only lane never surfaces. The method form expresses the
+            // same reinterpretation on every target with no lint exemption.
             // SAFETY: `buf` is non-null (checked) and valid for `len` bytes
             // (`len > 0` checked). The idiomatic writer NUL-terminates within it.
-            let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
+            let out = unsafe { slice::from_raw_parts_mut(buf.cast::<u8>(), len as usize) };
             match gz::gzgets(state, out) {
                 Some(_) => buf,
                 None => ptr::null_mut(),
@@ -1447,6 +1737,40 @@ pub extern "C" fn gzprintf(_file: gzFile, _format: *const c_char) -> c_int {
 // `i64` and the result is narrowed to `z_off_t` (`c_long`) at the boundary,
 // exactly matching the C `off_t`/`off64_t` split.
 
+/// Narrows a 64-bit offset to the C `z_off_t`, answering `-1` when the value does
+/// not fit — the exact contract of the three narrow `gz*` entry points.
+///
+/// All three spell it identically in C (`gzlib.c` L437-L442, L459-L464,
+/// L486-L491):
+///
+/// ```text
+/// ret = gztell64(file);
+/// return ret == (z_off_t)ret ? (z_off_t)ret : -1;
+/// ```
+///
+/// The comparison is the whole point: the value is narrowed, widened back, and
+/// accepted only if it survived the round trip. A bare `as` cast would instead
+/// truncate silently, and truncation is not a harmless approximation here — it
+/// manufactures a *plausible* offset. On a 32-bit target, `gztell` after seeking
+/// to `1 << 40` truncates to `0`, so a caller checking for the documented `-1`
+/// sees success and reads a position that is off by a terabyte. Reference C
+/// answers `-1`; this helper is what makes the port answer `-1` too.
+///
+/// On targets where `z_off_t` is already 64 bits (LP64 Unix, which is where the
+/// suite runs) the round trip is the identity and the branch is never taken; the
+/// guard exists for ILP32 and LLP64 (32-bit Unix, and Windows, where `c_long` is
+/// 32 bits regardless of pointer width).
+#[cfg(feature = "gz-io")]
+#[inline]
+fn narrow_off(wide: z_off64_t) -> z_off_t {
+    let narrow = wide as z_off_t;
+    if z_off64_t::from(narrow) == wide {
+        narrow
+    } else {
+        -1
+    }
+}
+
 /// `z_off_t gzseek(gzFile file, z_off_t offset, int whence)`
 ///
 /// Repositions the stream. Returns the resulting uncompressed offset, or `-1`
@@ -1461,7 +1785,7 @@ pub unsafe extern "C" fn gzseek(file: gzFile, offset: z_off_t, whence: c_int) ->
 
     #[cfg(feature = "gz-io")]
     {
-        guard_off(-1, || {
+        narrow_off(guard_off(-1, || {
             if file.is_null() {
                 return -1;
             }
@@ -1470,8 +1794,8 @@ pub unsafe extern "C" fn gzseek(file: gzFile, offset: z_off_t, whence: c_int) ->
             let state = &mut *guard;
             // Widen the C `off_t` to the engine's 64-bit offset. On 32-bit targets
             // (`z_off_t == i32`) this is a real widening; on 64-bit it is a no-op.
-            gz::gzseek(state, offset as z_off64_t, whence)
-        }) as z_off_t
+            gz::gzseek(state, z_off64_t::from(offset), whence)
+        }))
     }
 }
 
@@ -1539,7 +1863,7 @@ pub unsafe extern "C" fn gztell(file: gzFile) -> z_off_t {
 
     #[cfg(feature = "gz-io")]
     {
-        guard_off(-1, || {
+        narrow_off(guard_off(-1, || {
             if file.is_null() {
                 return -1;
             }
@@ -1547,7 +1871,7 @@ pub unsafe extern "C" fn gztell(file: gzFile) -> z_off_t {
             let guard = GzBorrow::new(unsafe { gz_handle(file) });
             let state = &*guard;
             gz::gztell(state)
-        }) as z_off_t
+        }))
     }
 }
 
@@ -1590,7 +1914,7 @@ pub unsafe extern "C" fn gzoffset(file: gzFile) -> z_off_t {
 
     #[cfg(feature = "gz-io")]
     {
-        guard_off(-1, || {
+        narrow_off(guard_off(-1, || {
             if file.is_null() {
                 return -1;
             }
@@ -1598,7 +1922,7 @@ pub unsafe extern "C" fn gzoffset(file: gzFile) -> z_off_t {
             let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
             let state = &mut *guard;
             gz::gzoffset(state)
-        }) as z_off_t
+        }))
     }
 }
 
@@ -1757,8 +2081,9 @@ pub unsafe extern "C" fn gzclearerr(file: gzFile) {
 
     #[cfg(feature = "gz-io")]
     {
-        // Void return: catch any panic and swallow it (never unwind into C).
-        let _ = std::panic::catch_unwind(|| {
+        // Void return: there is no value to substitute, so the canonical
+        // `void` guard simply swallows the panic (never unwind into C).
+        guard_void(|| {
             if file.is_null() {
                 return;
             }
@@ -1916,11 +2241,10 @@ pub unsafe extern "C" fn gzopen_w(path: *const u16, mode: *const c_char) -> gzFi
             let units = unsafe { slice::from_raw_parts(path, len) };
             use std::os::windows::ffi::OsStringExt;
             let os = std::ffi::OsString::from_wide(units);
-            // SAFETY: `mode` is non-null (checked) and NUL-terminated.
-            let Ok(mode_str) = (unsafe { CStr::from_ptr(mode) }).to_str() else {
-                return ptr::null_mut();
-            };
-            box_state(gz::gzopen(std::path::PathBuf::from(os), mode_str))
+            // SAFETY: `mode` is non-null (checked) and NUL-terminated. Bytes, not
+            // UTF-8: see the note in `gzopen`.
+            let mode_bytes = unsafe { CStr::from_ptr(mode) }.to_bytes();
+            box_state(gz::gzopen_bytes(std::path::PathBuf::from(os), mode_bytes))
         })
     }
 }
@@ -1933,23 +2257,49 @@ pub unsafe extern "C" fn gzopen_w(path: *const u16, mode: *const c_char) -> gzFi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gz::test_temp::{TempFile, create_new_file};
     use std::ffi::CString;
-    use std::path::PathBuf;
 
-    /// Builds a process-unique temp path (and its `CString` form) for a test.
-    fn unique_path(tag: &str) -> (PathBuf, CString) {
-        let mut p = std::env::temp_dir();
-        p.push(std::format!(
-            "zlibrs_ffi_gz_{tag}_{}.gz",
-            std::process::id()
-        ));
-        let c = CString::new(p.to_str().expect("temp path is valid UTF-8")).unwrap();
-        (p, c)
+    /// A hardened temporary `.gz` path (and its `CString` form) for a test.
+    ///
+    /// The returned [`TempFile`] guard owns an exclusively created, caller-private
+    /// directory and removes it — with everything inside — when it drops, including
+    /// on the unwinding path taken by a failing assertion. Callers must therefore
+    /// keep the guard bound for as long as the path is needed and must **not** call
+    /// `remove_file` themselves.
+    ///
+    /// Tests that reach the file only through `cpath` still bind the guard, as
+    /// `let (_path, cpath) = …`. That leading underscore silences the unused-variable
+    /// lint **without** dropping the value — unlike `let _ = …`, which would drop the
+    /// guard immediately and delete the directory before `gzopen` ever saw it. Do not
+    /// "tidy" such a binding away.
+    ///
+    /// # Why not `temp_dir().join(format!("…_{pid}.gz"))`
+    ///
+    /// That name is computable by anyone on the host from public information, and
+    /// the `gzopen(…, "wb")` this module tests resolves it with `O_TRUNC` and
+    /// *without* `O_EXCL` — so a symlink planted at the predicted name redirects
+    /// every write to a target of the planter's choosing and truncates it on the way
+    /// (CWE-377 insecure temporary file, CWE-59 link following, CWE-367
+    /// time-of-check/time-of-use through the `remove_file`-then-open sequences the
+    /// old helper relied on). Moving the uniqueness onto an exclusively created
+    /// private directory removes all three: see
+    /// [`crate::gz::test_temp`] for the full rationale.
+    ///
+    /// # Panics
+    ///
+    /// If no private directory can be created, or if the resulting path is not
+    /// valid UTF-8 (it cannot be: every component is ASCII by construction).
+    fn unique_path(tag: &str) -> (TempFile, CString) {
+        let temp = TempFile::new(tag);
+        let c = CString::new(temp.path().to_str().expect("temp path is valid UTF-8"))
+            .expect("temp path contains no interior NUL");
+        (temp, c)
     }
 
     #[test]
     fn write_then_read_round_trip() {
-        let (path, cpath) = unique_path("rt");
+        let (_path, cpath) = unique_path("rt");
         let data = b"hello, gzip world!\nsecond line with more bytes\n";
         unsafe {
             // Write path: open "wb", write, close_w.
@@ -1972,12 +2322,11 @@ mod tests {
             assert_eq!(gzeof(rf), 1);
             assert_eq!(gzclose_r(rf), Z_OK);
         }
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn puts_gets_getc_round_trip() {
-        let (path, cpath) = unique_path("lines");
+        let (_path, cpath) = unique_path("lines");
         unsafe {
             let wf = gzopen(cpath.as_ptr(), c"wb".as_ptr());
             assert!(!wf.is_null());
@@ -2000,7 +2349,6 @@ mod tests {
             assert_eq!(gzgetc_(rf), -1);
             assert_eq!(gzclose_r(rf), Z_OK);
         }
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -2088,7 +2436,7 @@ mod tests {
     /// proves the divergence is confined to the raw C-variadic ABI.
     #[test]
     fn variadic_printf_stubs_fail_on_a_valid_write_handle() {
-        let (path, cpath) = unique_path("printfstub");
+        let (_path, cpath) = unique_path("printfstub");
 
         // The behavior asserted below is the one the flags word advertises;
         // assert them together so the pair can never drift apart silently.
@@ -2152,7 +2500,6 @@ mod tests {
             assert_eq!(gzeof(rf), 1);
             assert_eq!(gzclose_r(rf), Z_OK);
         }
-        let _ = std::fs::remove_file(&path);
     }
 
     /// The control for [`variadic_printf_stubs_fail_on_a_valid_write_handle`]:
@@ -2165,7 +2512,7 @@ mod tests {
     /// than "formatted writes do not work in this crate".
     #[test]
     fn idiomatic_printf_renders_through_the_same_handle() {
-        let (path, cpath) = unique_path("printfctl");
+        let (_path, cpath) = unique_path("printfctl");
         unsafe {
             let wf = gzopen(cpath.as_ptr(), c"wb".as_ptr());
             assert!(!wf.is_null(), "gzopen for write returned NULL");
@@ -2204,7 +2551,6 @@ mod tests {
             assert_eq!(&buf[..8], b"2+3=5 ok");
             assert_eq!(gzclose_r(rf), Z_OK);
         }
-        let _ = std::fs::remove_file(&path);
     }
 
     /// The two `gz`-local panic guards behave exactly like their
@@ -2255,7 +2601,7 @@ mod tests {
 
     #[test]
     fn gzbuffer_before_and_after_io() {
-        let (path, cpath) = unique_path("buf");
+        let (_path, cpath) = unique_path("buf");
         unsafe {
             let wf = gzopen(cpath.as_ptr(), c"wb".as_ptr());
             assert!(!wf.is_null());
@@ -2268,7 +2614,6 @@ mod tests {
             assert_eq!(gzbuffer(wf, 8192), -1);
             assert_eq!(gzclose_w(wf), Z_OK);
         }
-        let _ = std::fs::remove_file(&path);
     }
 
     #[cfg(unix)]
@@ -2279,8 +2624,9 @@ mod tests {
         let data = b"descriptor round trip\n";
         unsafe {
             // Write via a descriptor handed to gzdopen.
-            let file = std::fs::File::create(&path).unwrap();
-            let fd = file.into_raw_fd();
+            // Exclusive creation: no symlink at this name is followed and
+            // nothing is truncated (the directory did not exist a moment ago).
+            let fd = path.create().into_raw_fd();
             let wf = gzdopen(fd, c"wb".as_ptr());
             assert!(!wf.is_null());
             assert_eq!(
@@ -2302,7 +2648,6 @@ mod tests {
             assert_eq!(&buf[..], &data[..]);
             assert_eq!(gzclose_r(rf), Z_OK);
         }
-        let _ = std::fs::remove_file(&path);
     }
 
     /// The live `gzFile_s` prefix lets the C `gzgetc(g)` *macro* consume
@@ -2315,7 +2660,7 @@ mod tests {
     /// library call absorbs the delta and continues byte-exactly.
     #[test]
     fn gzgetc_macro_prefix_reconcile() {
-        let (path, cpath) = unique_path("c2prefix");
+        let (_path, cpath) = unique_path("c2prefix");
         let data = b"ABCDEFGHIJ";
         unsafe {
             // Write known bytes and close.
@@ -2369,7 +2714,6 @@ mod tests {
             assert_eq!(gztell(rf), data.len() as z_off_t);
             assert_eq!(gzclose_r(rf), Z_OK);
         }
-        let _ = std::fs::remove_file(&path);
     }
 
     // =======================================================================
@@ -2500,8 +2844,6 @@ mod tests {
             assert_eq!(&rest, b" and more");
             assert_eq!(gzclose_r(rf), Z_OK);
         }
-
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A refused close must leave the live `gzFile_s` prefix **bit-for-bit**
@@ -2514,7 +2856,7 @@ mod tests {
     /// effect.
     #[test]
     fn refused_close_leaves_the_gzgetc_prefix_untouched() {
-        let (path, cpath) = unique_path("refuseprefix");
+        let (_path, cpath) = unique_path("refuseprefix");
         let data = b"ABCDEFGHIJ";
         unsafe {
             let wf = gzopen(cpath.as_ptr(), c"wb".as_ptr());
@@ -2556,7 +2898,6 @@ mod tests {
             assert_eq!(gzgetc(rf), b'C' as c_int);
             assert_eq!(gzclose_r(rf), Z_OK);
         }
-        let _ = std::fs::remove_file(&path);
     }
 
     /// `gzclose` accepts either direction, dispatching as C's
@@ -2584,7 +2925,6 @@ mod tests {
             assert_eq!(gzclose(rf), Z_OK, "gzclose closes a reader");
         }
         assert_eq!(decode_gzip_file(&path), data.to_vec());
-        let _ = std::fs::remove_file(&path);
     }
 
     /// Probes whether `fd` is still an open descriptor, without taking ownership
@@ -2620,7 +2960,13 @@ mod tests {
         let rejected: [&core::ffi::CStr; 6] = [c"r+", c"rT", c"wG", c"b", c"", c"9"];
 
         let (path, _cpath) = unique_path("dopenfail");
-        std::fs::write(&path, b"seed").unwrap();
+        // Seed exclusively: `std::fs::write` truncates and follows a link, which
+        // the guard's private directory makes moot but which must not be relied on.
+        {
+            use std::io::Write as _;
+            let mut seed = path.create();
+            seed.write_all(b"seed").expect("seed the fixture");
+        }
 
         for mode in rejected {
             let fd = std::fs::File::open(&path).unwrap().into_raw_fd();
@@ -2643,11 +2989,374 @@ mod tests {
             drop(unsafe { std::fs::File::from_raw_fd(fd) });
         }
 
-        // A negative descriptor is rejected outright (C `if (fd == -1 || ...)`).
+        // The `-1` sentinel is the ONE descriptor C rejects outright
+        // (`gzlib.c` L300 `if (fd == -1 || ...)`). Every other value is adopted
+        // and its errors deferred — see
+        // `gzdopen_rejects_only_the_minus_one_sentinel`.
         // SAFETY: no descriptor is dereferenced on this path.
         assert!(unsafe { gzdopen(-1, c"rb".as_ptr()) }.is_null());
+    }
+
+    /// `gzdopen` rejects **exactly one** descriptor value: the `-1` sentinel.
+    ///
+    /// `zlib.h` L1422-L1426 is explicit — `gzdopen` returns `NULL` "if fd is -1",
+    /// and "the file descriptor is not used until the next gz\* read, write, seek,
+    /// or close operation, so gzdopen will not detect if fd is invalid (unless fd
+    /// is -1)". C implements precisely that: one `fd == -1` test (`gzlib.c` L300)
+    /// and no other descriptor validation at all.
+    ///
+    /// So a descriptor that is negative-but-not-`-1`, or simply not open, must
+    /// **open successfully** and surface [`Z_ERRNO`](crate::error::ReturnCode::ErrNo) at the *first* operation. The
+    /// values asserted here are the ones measured against reference zlib: right
+    /// after the open `gzerror` reports no error at all, the first read returns
+    /// `-1` with `errnum == Z_ERRNO` and a non-empty message, and the close
+    /// likewise reports `Z_ERRNO` because closing that descriptor fails.
+    ///
+    /// A guard of `fd < 0` — which is what a naive port writes — would refuse a
+    /// handle C hands back, and in doing so would deny the caller the very handle
+    /// it needs to read the deferred error from.
+    #[test]
+    fn gzdopen_rejects_only_the_minus_one_sentinel() {
+        // Only `-1`.
+        // SAFETY: no descriptor is dereferenced when the sentinel is rejected.
+        assert!(
+            unsafe { gzdopen(-1, c"rb".as_ptr()) }.is_null(),
+            "gzlib.c L300: fd == -1 is rejected outright"
+        );
+
+        // `-5` and a large unallocated descriptor are both adopted, and both defer.
+        //
+        // Asserted on Unix only. The *implementation* is platform-generic and
+        // faithful on both — `adopt_descriptor` adopts whatever the platform
+        // reports, exactly as C stores whatever `int` it was handed — but on
+        // Windows what an out-of-range CRT descriptor *does* is decided by the
+        // CRT's invalid-parameter handler, which `_get_osfhandle` invokes and
+        // whose default action is CRT-version-specific. Reference zlib has the
+        // identical exposure there (its `_read` validates the descriptor through
+        // the same handler), so matching C means inheriting it; what would be
+        // wrong is to pin a specific outcome to it in an assertion.
+        #[cfg(unix)]
+        for fd in [-5 as c_int, 9999 as c_int] {
+            // SAFETY: `fd` is not the `-1` sentinel and `mode` is a NUL-terminated
+            // literal. Adopting an invalid descriptor is the documented C contract;
+            // the handle is closed below.
+            let gz = unsafe { gzdopen(fd, c"rb".as_ptr()) };
+            assert!(
+                !gz.is_null(),
+                "gzdopen must ADOPT fd {fd} and defer the error, as C does"
+            );
+
+            // Immediately after the open, C has reported nothing.
+            let mut errnum: c_int = 12345;
+            // SAFETY: `gz` is a live handle from `gzdopen`; `errnum` is a valid
+            // out-parameter.
+            let msg = unsafe { gzerror(gz, &raw mut errnum) };
+            assert_eq!(errnum, Z_OK, "a fresh gzdopen handle carries no error");
+            assert!(
+                !msg.is_null(),
+                "gzerror never returns NULL for a live handle"
+            );
+            // SAFETY: `msg` is a non-null NUL-terminated string owned by the handle.
+            assert!(
+                unsafe { CStr::from_ptr(msg) }.to_bytes().is_empty(),
+                "the message is empty until an operation fails"
+            );
+
+            // The first read is where the invalid descriptor finally shows up.
+            let mut buf = [0u8; 8];
+            // SAFETY: `gz` is live and `buf` is valid for `buf.len()` bytes.
+            let got = unsafe { gzread(gz, buf.as_mut_ptr() as voidp, buf.len() as c_uint) };
+            assert_eq!(got, -1, "the deferred read must fail");
+            // SAFETY: as above.
+            let msg = unsafe { gzerror(gz, &raw mut errnum) };
+            assert_eq!(errnum, Z_ERRNO, "the deferred failure is an OS error");
+            // SAFETY: as above.
+            assert!(
+                !unsafe { CStr::from_ptr(msg) }.to_bytes().is_empty(),
+                "a failed read must leave a message"
+            );
+
+            // Closing that descriptor fails too, so the close reports Z_ERRNO.
+            // SAFETY: `gz` is live and is consumed here.
+            assert_eq!(
+                unsafe { gzclose_r(gz) },
+                Z_ERRNO,
+                "closing an invalid descriptor reports Z_ERRNO"
+            );
+        }
+    }
+
+    /// The mode string is parsed as raw **bytes**, so a mode that is not valid
+    /// UTF-8 opens exactly what its recognised bytes describe.
+    ///
+    /// C walks the mode one byte at a time and its `switch` ends in
+    /// `default: /* could consider as an error, but just ignore */ ;`
+    /// (`gzlib.c` L113-L170), so `"rb\xff"` is `"rb"` with one ignored byte.
+    /// Requiring UTF-8 at the shim would reject a mode reference zlib accepts —
+    /// measured as six divergent probe lines before this fix.
+    #[test]
+    fn a_non_utf8_mode_opens_exactly_what_its_recognised_bytes_describe() {
+        let (path, cpath) = unique_path("modebytes");
+        let payload = b"non-utf8 mode payload\n";
+
+        // Three modes with a byte that is not valid UTF-8 in any position, plus a
+        // level digit after one of them to prove parsing continues past the byte.
+        let write_mode = CString::new(std::vec![b'w', b'b', b'9', 0xfe]).unwrap();
+        let read_modes = [
+            CString::new(std::vec![b'r', b'b', 0xff]).unwrap(),
+            CString::new(std::vec![0xff, b'r', b'b']).unwrap(),
+            CString::new(std::vec![b'r', 0x80, b'b']).unwrap(),
+        ];
+
+        unsafe {
+            // `wb` + '9' + 0xFE — the digit must still be seen as the level.
+            let wf = gzopen(cpath.as_ptr(), write_mode.as_ptr());
+            assert!(!wf.is_null(), "a non-UTF-8 write mode must still open");
+            assert_eq!(
+                gzwrite(wf, payload.as_ptr() as voidpc, payload.len() as c_uint),
+                payload.len() as c_int
+            );
+            assert_eq!(gzclose_w(wf), Z_OK);
+
+            for mode in &read_modes {
+                let rf = gzopen(cpath.as_ptr(), mode.as_ptr());
+                assert!(
+                    !rf.is_null(),
+                    "a non-UTF-8 read mode must open exactly as C does"
+                );
+                let mut buf = std::vec![0u8; payload.len()];
+                assert_eq!(
+                    gzread(rf, buf.as_mut_ptr() as voidp, buf.len() as c_uint),
+                    payload.len() as c_int
+                );
+                assert_eq!(&buf[..], &payload[..]);
+                assert_eq!(gzclose_r(rf), Z_OK);
+            }
+
+            // The same must hold through `gzdopen`, which shares the parser.
+            // Releasing a descriptor to hand to `gzdopen` is a Unix-only step.
+            #[cfg(unix)]
+            {
+                use std::os::fd::IntoRawFd;
+
+                let fd = std::fs::File::open(&path).unwrap().into_raw_fd();
+                let df = gzdopen(fd, read_modes[0].as_ptr());
+                assert!(
+                    !df.is_null(),
+                    "gzdopen must accept a non-UTF-8 mode too (fd is adopted)"
+                );
+                let mut buf = std::vec![0u8; payload.len()];
+                assert_eq!(
+                    gzread(df, buf.as_mut_ptr() as voidp, buf.len() as c_uint),
+                    payload.len() as c_int
+                );
+                assert_eq!(&buf[..], &payload[..]);
+                assert_eq!(gzclose_r(df), Z_OK);
+            }
+        }
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// `gzread(file, NULL, 0)` returns `0`, not `-1`.
+    ///
+    /// C validates the handle, the direction and the error ladder, calls
+    /// `gz_error(state, Z_OK, NULL)`, checks `(int)len < 0`, and then enters
+    /// `gz_read`, whose first statement is
+    /// `if (len == 0) return 0;` (`gzread.c` L321-L322). **`buf` is never
+    /// inspected on that path.** A blanket null-`buf` rejection therefore answers
+    /// `-1` where C answers `0`.
+    ///
+    /// A null `buf` with a *non-zero* length is genuine undefined behaviour in C
+    /// (reference zlib segfaults there), so this port's `-1` for that case is a
+    /// deliberate safe superset and is asserted here to stay that way.
+    #[test]
+    fn a_zero_length_read_ignores_the_buffer_pointer_entirely() {
+        let (path, cpath) = unique_path("zeroread");
+        let payload = b"zero-length reads must not disturb the stream\n";
+
+        unsafe {
+            let wf = gzopen(cpath.as_ptr(), c"wb".as_ptr());
+            assert!(!wf.is_null());
+            assert_eq!(
+                gzwrite(wf, payload.as_ptr() as voidpc, payload.len() as c_uint),
+                payload.len() as c_int
+            );
+            assert_eq!(gzclose_w(wf), Z_OK);
+
+            let rf = gzopen(cpath.as_ptr(), c"rb".as_ptr());
+            assert!(!rf.is_null());
+
+            // The finding, twice over: a null buffer with a zero length is a no-op
+            // that succeeds, and so is a real buffer with a zero length.
+            assert_eq!(
+                gzread(rf, ptr::null_mut(), 0),
+                0,
+                "gzread.c L321-L322: len == 0 returns 0 before `buf` is looked at"
+            );
+            let mut buf = std::vec![0u8; payload.len()];
+            assert_eq!(gzread(rf, buf.as_mut_ptr() as voidp, 0), 0);
+
+            // Neither call reported an error, and neither consumed anything: the
+            // full payload is still there.
+            let mut errnum: c_int = 12345;
+            let _ = gzerror(rf, &raw mut errnum);
+            assert_eq!(errnum, Z_OK, "a zero-length read is not an error");
+            assert_eq!(
+                gzread(rf, buf.as_mut_ptr() as voidp, buf.len() as c_uint),
+                payload.len() as c_int,
+                "a zero-length read must not consume the stream"
+            );
+            assert_eq!(&buf[..], &payload[..]);
+            assert_eq!(gzclose_r(rf), Z_OK);
+
+            // A null HANDLE is still rejected, zero length or not.
+            assert_eq!(gzread(ptr::null_mut(), ptr::null_mut(), 0), -1);
+            // A null buffer with a NON-zero length stays rejected: C is UB there,
+            // and refusing is the safe superset.
+            let rf = gzopen(cpath.as_ptr(), c"rb".as_ptr());
+            assert!(!rf.is_null());
+            assert_eq!(
+                gzread(rf, ptr::null_mut(), 4),
+                -1,
+                "null buf + nonzero len is UB in C; this port refuses it"
+            );
+            assert_eq!(gzclose_r(rf), Z_OK);
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The narrowing seek/tell/offset entry points refuse a value their `z_off_t`
+    /// cannot represent, rather than truncating it.
+    ///
+    /// All three C wrappers are the same three lines — narrow, widen back, accept
+    /// only if the round trip survived:
+    ///
+    /// ```c
+    /// z_off64_t ret = gzseek64(file, (z_off64_t)offset, whence);
+    /// return ret == (z_off_t)ret ? (z_off_t)ret : -1;
+    /// ```
+    ///
+    /// (`gzlib.c` L437-L442, L459-L464, L486-L491.) A bare `as z_off_t` cast
+    /// truncates instead: measured on `i686-unknown-linux-gnu`, after
+    /// `gzseek64(f, 1 << 40)` reference C answers `gztell() == -1` while the
+    /// truncating port answered `0` — a plausible offset, wrong by a terabyte,
+    /// that a caller checking for `-1` accepts.
+    ///
+    /// The boundary assertion below is width-conditional by construction: where
+    /// `z_off_t` is as wide as `z_off64_t` no value is unrepresentable, and the
+    /// `checked_add` yields `None`. The behaviour on a narrow target is proven by
+    /// the 32-bit acceptance probe; what is asserted unconditionally here is that
+    /// every representable value round-trips unchanged, and — structurally, below
+    /// — that all three entry points actually route through the helper.
+    #[test]
+    fn a_narrowed_offset_that_cannot_round_trip_becomes_minus_one() {
+        for representable in [
+            0 as z_off64_t,
+            1,
+            -1,
+            10,
+            z_off64_t::from(z_off_t::MAX),
+            z_off64_t::from(z_off_t::MIN),
+        ] {
+            assert_eq!(
+                narrow_off(representable),
+                representable as z_off_t,
+                "a representable offset must survive unchanged"
+            );
+        }
+
+        if let Some(beyond) = z_off64_t::from(z_off_t::MAX).checked_add(1) {
+            assert_eq!(
+                narrow_off(beyond),
+                -1,
+                "gzlib.c L437-L442: a value the narrow type cannot hold becomes -1"
+            );
+            assert_eq!(narrow_off(z_off64_t::MAX), -1);
+        }
+        if let Some(below) = z_off64_t::from(z_off_t::MIN).checked_sub(1) {
+            assert_eq!(narrow_off(below), -1);
+            assert_eq!(narrow_off(z_off64_t::MIN), -1);
+        }
+    }
+
+    /// Structural companion to
+    /// `a_narrowed_offset_that_cannot_round_trip_becomes_minus_one`: each of the
+    /// three narrowing entry points must route its wide result through
+    /// [`narrow_off`], and none may cast a guard result straight to `z_off_t`.
+    ///
+    /// The value test above cannot fail on a 64-bit host, where `z_off_t` is
+    /// already 64 bits wide and nothing is unrepresentable. This assertion has
+    /// teeth on every target: reintroducing the truncating `as z_off_t` cast fails
+    /// it here, immediately, on the development host.
+    #[test]
+    fn every_narrowing_offset_entry_point_routes_through_narrow_off() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ffi/gz.rs");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("{} must be readable: {err}", path.display()));
+
+        // Consider the SHIPPED code only. The assertions below name the very
+        // fragments they look for, so the test module has to be excised or every
+        // needle would match its own spelling here.
+        let module_marker = "\nmod tests {";
+        let shipped = match text.find(module_marker) {
+            Some(at) => &text[..at],
+            None => panic!("the test module marker must be present"),
+        };
+        // Drop line comments so prose about the old cast cannot satisfy or defeat
+        // the assertions either.
+        let code = shipped
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<std::vec::Vec<_>>()
+            .join("\n");
+
+        // The helper exists exactly once.
+        let definition = std::format!("fn {}(", "narrow_off");
+        assert_eq!(
+            code.matches(&definition).count(),
+            1,
+            "narrow_off must be defined exactly once"
+        );
+
+        // It is applied exactly three times — once per narrowing entry point.
+        let application = std::format!("{}({}(", "narrow_off", "guard_off");
+        assert_eq!(
+            code.matches(&application).count(),
+            3,
+            "gzseek, gztell and gzoffset must each wrap their guard in narrow_off"
+        );
+
+        // And the truncating cast this replaced is gone from the shipped code.
+        let truncating_cast = std::format!("}}) as {}", "z_off_t");
+        assert!(
+            !code.contains(&truncating_cast),
+            "a bare cast of a guard result to the narrow offset type silently \
+             truncates on 32-bit targets (gzlib.c L437-L442 refuses instead)"
+        );
+
+        // The helper itself must perform the round trip, not merely narrow. On a
+        // 64-bit host no value is unrepresentable, so the value test above cannot
+        // catch a helper quietly reduced to a bare cast; this can.
+        let at = code.find(&definition).expect("narrow_off must be present");
+        let rest = &code[at..];
+        let helper = &rest[..rest
+            .find("\n}")
+            .expect("narrow_off must be a complete item")];
+        let round_trip = std::format!("{}::from(narrow) == wide", "z_off64_t");
+        assert!(
+            helper.contains(&round_trip),
+            "narrow_off must widen the narrowed value back and compare, which is \
+             C's `ret == (z_off_t)ret` test (gzlib.c L441)"
+        );
+        assert!(
+            helper.contains("-1"),
+            "narrow_off must answer -1 when the round trip fails"
+        );
     }
 
     /// A **successful** `gzdopen` takes ownership: the descriptor stays open while
@@ -2661,7 +3370,7 @@ mod tests {
 
         let (path, _cpath) = unique_path("dopenown");
         let data = b"ownership test";
-        let fd = std::fs::File::create(&path).unwrap().into_raw_fd();
+        let fd = path.create().into_raw_fd();
 
         // SAFETY: `fd` is a live descriptor being handed to `gzdopen`, and the
         // mode is a NUL-terminated literal.
@@ -2686,7 +3395,6 @@ mod tests {
         );
 
         assert_eq!(decode_gzip_file(&path), data.to_vec());
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A failing platform close surfaces as `Z_ERRNO` from **both** finalizers,
@@ -2744,15 +3452,13 @@ mod tests {
             assert!(!wf.is_null());
             assert_eq!(gzclose_w(wf), Z_OK);
         }
-
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A wrong-direction rejection outranks a close failure, because a refused
     /// close releases no descriptor and therefore never reaches `close(2)`.
     #[test]
     fn close_failure_does_not_mask_a_wrong_direction_rejection() {
-        let (path, cpath) = unique_path("failmask");
+        let (_path, cpath) = unique_path("failmask");
         unsafe {
             let wf = gzopen(cpath.as_ptr(), c"wb".as_ptr());
             assert!(!wf.is_null());
@@ -2767,7 +3473,6 @@ mod tests {
             // disarmed.
             assert_eq!(gzclose_w(wf), Z_OK);
         }
-        let _ = std::fs::remove_file(&path);
     }
 
     /// [`finish_close`]'s full precedence table: a released descriptor that closes
@@ -2781,35 +3486,38 @@ mod tests {
         assert_eq!(finish_close(Z_STREAM_ERROR, None), Z_STREAM_ERROR);
         assert_eq!(finish_close(Z_OK, None), Z_OK);
 
+        // Each arm consumes a descriptor, so each needs its own file: exclusive
+        // creation cannot re-truncate one path four times, which is precisely the
+        // property that makes it safe. All four are siblings inside the guard's
+        // private directory and are removed with it.
+        let fresh = |name: &str| create_new_file(&path.sibling(name));
+
         // Descriptor released and the close succeeds: status passes through, for
         // both a success and a preserved error status.
-        let f = std::fs::File::create(&path).unwrap();
-        assert_eq!(finish_close(Z_OK, Some(f)), Z_OK);
-        let f = std::fs::File::create(&path).unwrap();
+        assert_eq!(finish_close(Z_OK, Some(fresh("ok.bin"))), Z_OK);
         let buf_error = ReturnCode::BufError.as_c_int();
-        assert_eq!(finish_close(buf_error, Some(f)), buf_error);
+        assert_eq!(
+            finish_close(buf_error, Some(fresh("buferr.bin"))),
+            buf_error
+        );
 
         // Descriptor released and the close fails: Z_ERRNO overrides everything.
-        let f = std::fs::File::create(&path).unwrap();
         assert_eq!(
-            with_forced_close_failure(|| finish_close(Z_OK, Some(f))),
+            with_forced_close_failure(|| finish_close(Z_OK, Some(fresh("failok.bin")))),
             Z_ERRNO
         );
-        let f = std::fs::File::create(&path).unwrap();
         assert_eq!(
-            with_forced_close_failure(|| finish_close(buf_error, Some(f))),
+            with_forced_close_failure(|| finish_close(buf_error, Some(fresh("failerr.bin")))),
             Z_ERRNO,
             "a close failure overrides an accumulated error status too"
         );
-
-        let _ = std::fs::remove_file(&path);
     }
 
     /// `take_for_close` reclaims the box only for a matching direction, and the
     /// `CloseDirection::Either` screen accepts both live directions.
     #[test]
     fn take_for_close_only_claims_a_matching_direction() {
-        let (path, cpath) = unique_path("takeonly");
+        let (_path, cpath) = unique_path("takeonly");
         unsafe {
             let wf = gzopen(cpath.as_ptr(), c"wb".as_ptr());
             assert!(!wf.is_null());
@@ -2833,7 +3541,6 @@ mod tests {
                 gz::gzclose_r_release(claimed.expect("reader was claimed").state);
             assert_eq!(finish_close(status, released), Z_OK);
         }
-        let _ = std::fs::remove_file(&path);
     }
 
     /// `gzopen_w` — the Windows-only wide-character open — must actually *work*,
@@ -2862,15 +3569,18 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn wide_path_open_round_trip() {
+        use crate::gz::test_temp::TempDir;
         use std::os::windows::ffi::OsStrExt as _;
 
-        // Non-ASCII code units make the UTF-16 decode load-bearing.
-        let mut path = std::env::temp_dir();
-        path.push(std::format!(
-            "zlibrs_ffi_gz_wide_\u{e9}\u{4e2d}_{}.gz",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
+        // Non-ASCII code units make the UTF-16 decode load-bearing, so the *file
+        // name* keeps them. The uniqueness and exclusivity live on the enclosing
+        // directory instead: it is created with `mkdir(2)` create-new semantics, so
+        // this name cannot have been pre-placed as a symlink, and the guard removes
+        // the whole directory on drop -- including when an assertion unwinds, which
+        // the previous fixed `%TEMP%\…_<pid>.gz` path plus manual `remove_file`
+        // could not do.
+        let dir = TempDir::new("ffi_gz_wide");
+        let path = dir.child("wide_\u{e9}\u{4e2d}.gz");
         // C's `const wchar_t *` is NUL-terminated; `encode_wide` is not.
         let wide: std::vec::Vec<u16> = path
             .as_os_str()
@@ -2942,6 +3652,235 @@ mod tests {
                 gzopen_w(wide.as_ptr(), ptr::null()).is_null(),
                 "a null mode must be refused"
             );
+        }
+    }
+
+    /// Reads the raw descriptor out of a live `gzFile` handle.
+    ///
+    /// `state.file` owns the descriptor for as long as the handle is open, so the
+    /// returned value is valid until the matching `gzclose*`; nothing here takes
+    /// ownership of it.
+    ///
+    /// # Safety
+    ///
+    /// `file` must be a non-null, not-yet-closed handle produced by
+    /// `gzopen*`/`gzdopen`.
+    #[cfg(unix)]
+    unsafe fn handle_fd(file: gzFile) -> c_int {
+        use std::os::fd::AsRawFd;
+        // SAFETY: per the contract `file` is a live handle, so `gz_handle`'s
+        // requirements are met; the borrow ends with this expression and only a
+        // `Copy` descriptor number is read out of it.
+        unsafe { gz_handle(file).state.file.as_raw_fd() }
+    }
+
+    /// `fcntl(fd, F_GETFD) & FD_CLOEXEC`, as a bool — the exact quantity the C
+    /// acceptance probe prints as `cloexec=`.
+    #[cfg(unix)]
+    fn fd_cloexec(fd: c_int) -> bool {
+        // SAFETY: `fd` is a live descriptor owned by the caller's handle;
+        // `F_GETFD` reads the descriptor flags and takes no third argument.
+        let flags = unsafe { fcntl(fd, F_GETFD) };
+        assert!(flags >= 0, "F_GETFD must succeed on a live descriptor");
+        flags & crate::gz::DescriptorRequest::FD_CLOEXEC != 0
+    }
+
+    /// `fcntl(fd, F_GETFL) & O_NONBLOCK`, as a bool — the exact quantity the C
+    /// acceptance probe prints as `nonblock=`.
+    #[cfg(unix)]
+    fn fd_nonblock(fd: c_int) -> bool {
+        // SAFETY: as above; `F_GETFL` reads the file status flags and takes no
+        // third argument.
+        let flags = unsafe { fcntl(fd, F_GETFL) };
+        assert!(flags >= 0, "F_GETFL must succeed on a live descriptor");
+        flags & crate::gz::DescriptorRequest::O_NONBLOCK != 0
+    }
+
+    /// A descriptor `gzopen`ed **without** mode `e` must not be close-on-exec, and
+    /// one opened **with** `e` must be (finding M6-02).
+    ///
+    /// C accumulates `oflag` in its mode loop and adds `O_CLOEXEC` only for `'e'`
+    /// (`gzlib.c` L134-L138), then calls `open(path, oflag, 0666)`. Reference zlib
+    /// therefore hands back an *inheritable* descriptor for every ordinary mode
+    /// string and a close-on-exec one only for `'e'`. A [`std::fs::File`] is
+    /// close-on-exec unconditionally, so the divergence is in the **absence** of
+    /// the flag: without [`reconcile_opened_descriptor`] a C caller that
+    /// `fork`s and `exec`s while holding an open gzip file would lose it.
+    ///
+    /// The asserted values are the ones measured against reference zlib, probe
+    /// cases `m1_wb_fdstate` (`cloexec=0 nonblock=0`), `m2_wbe_fdstate`
+    /// (`cloexec=1 nonblock=0`), `m3_rb_fdstate` (`cloexec=0 nonblock=0`),
+    /// `m4_rbe_fdstate` (`cloexec=1 nonblock=0`) and `m5_wbN_fdstate`
+    /// (`cloexec=0 nonblock=1`).
+    #[cfg(unix)]
+    #[test]
+    fn gzopen_reproduces_c_close_on_exec_state() {
+        let (path, cpath) = unique_path("openflags");
+        // SAFETY: `cpath` is a NUL-terminated path, every mode is a C string
+        // literal, and each handle is read only while open and closed exactly once.
+        unsafe {
+            // ---- write, no `e`: C asks for no O_CLOEXEC, so the flag is clear.
+            let wf = gzopen(cpath.as_ptr(), c"wb".as_ptr());
+            assert!(!wf.is_null(), "gzopen \"wb\" must succeed");
+            let fd = handle_fd(wf);
+            assert!(
+                !fd_cloexec(fd),
+                "mode \"wb\" asks for no O_CLOEXEC, so FD_CLOEXEC must be clear"
+            );
+            assert!(!fd_nonblock(fd), "mode \"wb\" asks for no O_NONBLOCK");
+            assert_eq!(gzclose_w(wf), Z_OK);
+
+            // ---- write, with `e`: C asks for O_CLOEXEC explicitly.
+            let ef = gzopen(cpath.as_ptr(), c"wbe".as_ptr());
+            assert!(!ef.is_null(), "gzopen \"wbe\" must succeed");
+            let fd = handle_fd(ef);
+            assert!(
+                fd_cloexec(fd),
+                "mode \"wbe\" asks for O_CLOEXEC, so FD_CLOEXEC must be set"
+            );
+            assert!(!fd_nonblock(fd), "mode \"wbe\" asks for no O_NONBLOCK");
+            assert_eq!(gzclose_w(ef), Z_OK);
+
+            // ---- read, no `e`: the same rule, the other direction.
+            let rf = gzopen(cpath.as_ptr(), c"rb".as_ptr());
+            assert!(!rf.is_null(), "gzopen \"rb\" must succeed");
+            assert!(
+                !fd_cloexec(handle_fd(rf)),
+                "mode \"rb\" asks for no O_CLOEXEC either"
+            );
+            assert_eq!(gzclose_r(rf), Z_OK);
+
+            // ---- read, with `e`.
+            let ref_ = gzopen(cpath.as_ptr(), c"rbe".as_ptr());
+            assert!(!ref_.is_null(), "gzopen \"rbe\" must succeed");
+            assert!(
+                fd_cloexec(handle_fd(ref_)),
+                "mode \"rbe\" asks for O_CLOEXEC"
+            );
+            assert_eq!(gzclose_r(ref_), Z_OK);
+
+            // ---- `N` alone must not smuggle close-on-exec back in, and must
+            //      still deliver the non-blocking descriptor it asked for.
+            let nf = gzopen(cpath.as_ptr(), c"wbN".as_ptr());
+            assert!(!nf.is_null(), "gzopen \"wbN\" must succeed");
+            let fd = handle_fd(nf);
+            assert!(!fd_cloexec(fd), "mode \"wbN\" still asks for no O_CLOEXEC");
+            assert!(fd_nonblock(fd), "mode \"N\" must open non-blocking");
+            assert_eq!(gzclose_w(nf), Z_OK);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `gzdopen` must apply `O_NONBLOCK` for mode `N` and must leave the adopted
+    /// descriptor's close-on-exec state exactly as the caller left it
+    /// (finding M6-03).
+    ///
+    /// C has no `open` call on this path, so it reconciles with `fcntl`
+    /// (`gzlib.c` L253-L263):
+    ///
+    /// ```c
+    /// if (oflag & O_NONBLOCK) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    /// if (oflag & O_CLOEXEC)  fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | O_CLOEXEC);
+    /// ```
+    ///
+    /// The second call is a **no-op** on every POSIX platform — `F_SETFD`'s only
+    /// defined flag is `FD_CLOEXEC` (`1`) while `O_CLOEXEC` is a different bit
+    /// entirely (`0o2000000` on Linux), and Linux computes
+    /// `set_close_on_exec(fd, arg & FD_CLOEXEC)` — which is exactly why
+    /// [`reconcile_adopted_descriptor`] omits it. This test pins that down from
+    /// **both** starting states, so a future "completion" of the pair fails here
+    /// rather than silently making descriptors close-on-exec that C leaves alone.
+    ///
+    /// The asserted values are the ones measured against reference zlib: probe
+    /// cases `m7_dopen_wbe` (started `cloexec=0` → still `cloexec=0`),
+    /// `m11_dopen_wbe` (started `cloexec=1` → still `cloexec=1`),
+    /// `m8_after_dopen_wbeN` and `m10_after_dopen_rbeN` (`nonblock=1`), and
+    /// `m6_after_dopen_wb` (no `N`, still `nonblock=0`).
+    #[cfg(unix)]
+    #[test]
+    fn gzdopen_applies_nonblock_and_never_touches_close_on_exec() {
+        use std::os::fd::IntoRawFd;
+
+        let (path, _cpath) = unique_path("dopenflags");
+        std::fs::write(&path, b"seed").unwrap();
+
+        // A fresh descriptor on `path` with FD_CLOEXEC forced to `want` and
+        // O_NONBLOCK clear — the two starting states the C probe measures.
+        let fresh = |want: bool| -> c_int {
+            let fd = std::fs::File::open(&path).unwrap().into_raw_fd();
+            let target = if want {
+                crate::gz::DescriptorRequest::FD_CLOEXEC
+            } else {
+                0
+            };
+            // SAFETY: `fd` was just produced by `File::open` and is owned by this
+            // closure's caller; `F_SETFD` takes exactly one `int`, supplied here.
+            assert!(
+                unsafe { fcntl(fd, F_SETFD, target) } >= 0,
+                "F_SETFD must succeed on a freshly opened descriptor"
+            );
+            assert_eq!(fd_cloexec(fd), want, "the starting state must be exact");
+            assert!(!fd_nonblock(fd), "a freshly opened file is blocking");
+            fd
+        };
+
+        for started_cloexec in [false, true] {
+            // ---- mode with `N`: O_NONBLOCK on, FD_CLOEXEC untouched.
+            let fd = fresh(started_cloexec);
+            // SAFETY: `fd` is a live descriptor and the mode is a C string
+            // literal; the handle is closed exactly once below.
+            let f = unsafe { gzdopen(fd, c"rbeN".as_ptr()) };
+            assert!(!f.is_null(), "gzdopen \"rbeN\" must succeed");
+            // SAFETY: `f` is the live handle just returned by `gzdopen`.
+            let adopted = unsafe { handle_fd(f) };
+            assert!(
+                fd_nonblock(adopted),
+                "mode \"N\" must set O_NONBLOCK on the adopted descriptor"
+            );
+            assert_eq!(
+                fd_cloexec(adopted),
+                started_cloexec,
+                "gzdopen must not change close-on-exec (started {started_cloexec})"
+            );
+            // SAFETY: `f` is a live reader handle, closed exactly once.
+            assert_eq!(unsafe { gzclose_r(f) }, Z_OK);
+
+            // ---- mode `e` without `N`: neither flag moves, because C's
+            //      O_CLOEXEC `fcntl` is the proven no-op.
+            let fd = fresh(started_cloexec);
+            // SAFETY: as above.
+            let f = unsafe { gzdopen(fd, c"rbe".as_ptr()) };
+            assert!(!f.is_null(), "gzdopen \"rbe\" must succeed");
+            // SAFETY: as above.
+            let adopted = unsafe { handle_fd(f) };
+            assert!(
+                !fd_nonblock(adopted),
+                "without \"N\" the adopted descriptor stays blocking"
+            );
+            assert_eq!(
+                fd_cloexec(adopted),
+                started_cloexec,
+                "C's O_CLOEXEC fcntl is a no-op, so \"e\" must change nothing \
+                 (started {started_cloexec})"
+            );
+            // SAFETY: as above.
+            assert_eq!(unsafe { gzclose_r(f) }, Z_OK);
+
+            // ---- no flags at all: still nothing moves.
+            let fd = fresh(started_cloexec);
+            // SAFETY: as above.
+            let f = unsafe { gzdopen(fd, c"rb".as_ptr()) };
+            assert!(!f.is_null(), "gzdopen \"rb\" must succeed");
+            // SAFETY: as above.
+            let adopted = unsafe { handle_fd(f) };
+            assert!(!fd_nonblock(adopted), "plain \"rb\" stays blocking");
+            assert_eq!(
+                fd_cloexec(adopted),
+                started_cloexec,
+                "plain \"rb\" must not change close-on-exec (started {started_cloexec})"
+            );
+            // SAFETY: as above.
+            assert_eq!(unsafe { gzclose_r(f) }, Z_OK);
         }
 
         let _ = std::fs::remove_file(&path);

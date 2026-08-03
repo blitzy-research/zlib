@@ -64,8 +64,9 @@
 #     not "every job". Of the 17 jobs across the three workflows, 16 invoke
 #     `cargo`/`rustc`/`rustup` and all 16 carry the override; the seventeenth,
 #     `audit.yml`'s `policy-integrity`, runs no Rust binary at all — it is a pure
-#     `python3` structural check over `deny.toml` and the workflow files, which
-#     also asserts that no sibling `fuzz/deny.toml` has reappeared, and it
+#     `python3` structural check over `deny.toml`, `fuzz/deny.toml` and the
+#     workflow files, which also asserts that neither policy file has gone missing
+#     and that the two agree on every shared key, and it
 #     installs no toolchain. It therefore correctly sets no
 #     `RUSTUP_TOOLCHAIN`, and adding one would imply a dependency it does not have.
 #
@@ -74,9 +75,10 @@
 #         "builds on exactly the declared MSRV", so the version it runs belongs
 #         in the job, not inherited from a file it does not own.
 #       * `.github/workflows/ci.yml` `build-test`, `no-std-tests`, `lint`,
-#         `benches`, `build-script-tests`, `unsafe-boundary`, `c-abi-linkage`,
-#         `cross-targets`, `bare-metal-no-std`, `package-verify` — the other ten
-#         of ci.yml's eleven jobs, all `RUSTUP_TOOLCHAIN: stable`. Without it each
+#         `docs`, `benches`, `build-script-tests`, `unsafe-boundary`,
+#         `c-abi-linkage`, `cross-targets`, `bare-metal-no-std`,
+#         `package-verify` — the other eleven
+#         of ci.yml's twelve jobs, all `RUSTUP_TOOLCHAIN: stable`. Without it each
 #         of them resolves to the pin: most would still PASS (the crate is
 #         MSRV-clean — see the measured results below) while silently ceasing to
 #         cover current stable, and `lint` would run the floor's clippy instead of
@@ -90,17 +92,19 @@
 #         from source with `cargo install <tool> --locked`, and neither
 #         `cargo-audit` nor `cargo-deny` is guaranteed to compile on the MSRV
 #         floor, so the pin is what they must NOT inherit.
-#       * `.github/workflows/fuzz.yml` `cargo-fuzz` — `RUSTUP_TOOLCHAIN:
-#         nightly`. `cargo-fuzz` needs nightly for the `-Z` sanitizer/coverage
-#         instrumentation it injects, and it resolves its toolchain from the
-#         repository root, so this file reaches the detached `fuzz/` workspace
-#         too. Without the override, `cargo install cargo-fuzz`, `cargo fuzz
-#         build`, and `cargo fuzz run` all execute on the pin and fail with
-#         "1 nightly option were parsed". Locally: `cargo +nightly fuzz …`, or
-#         `RUSTUP_TOOLCHAIN=nightly cargo fuzz build`.
+#       * `.github/workflows/fuzz.yml` `cargo-fuzz` —
+#         `RUSTUP_TOOLCHAIN: nightly-2026-08-01`, a DATE-PINNED nightly rather
+#         than the floating `nightly` channel. `cargo-fuzz` needs nightly for the
+#         `-Z` sanitizer/coverage instrumentation it injects, and it resolves its
+#         toolchain from the repository root, so this file reaches the detached
+#         `fuzz/` workspace too. Without the override, `cargo install
+#         cargo-fuzz`, `cargo fuzz build`, and `cargo fuzz run` all execute on
+#         the pin and fail with "1 nightly option were parsed". Locally, name it
+#         explicitly: `cargo +nightly-2026-08-01 fuzz …`, or
+#         `RUSTUP_TOOLCHAIN=nightly-2026-08-01 cargo fuzz build`.
 #         Measured, from the repository root: a bare `cargo fuzz build` fails
 #         with `error: 1 nightly option were parsed` before any harness is
-#         produced, while `RUSTUP_TOOLCHAIN=nightly cargo fuzz build` succeeds.
+#         produced, while naming that nightly explicitly succeeds.
 #         That job is the ONLY job in `fuzz.yml`; supply-chain policy over the
 #         fuzz graph lives in `audit.yml`'s `cargo-deny-fuzz`, not there.
 #
@@ -250,8 +254,10 @@
 # * TO TEST ON A DIFFERENT COMPILER, DON'T EDIT THIS FILE. Use `cargo +stable …`
 #   / `cargo +nightly …`, or export `RUSTUP_TOOLCHAIN`. Editing the pin changes
 #   it for everyone.
-# * FUZZING IS ALWAYS EXPLICITLY NIGHTLY: `cargo +nightly fuzz build`,
-#   `cargo +nightly fuzz run <target>`. `cargo-fuzz` is a nightly-only,
+# * FUZZING IS ALWAYS EXPLICITLY NIGHTLY, AND DATE-PINNED:
+#   `cargo +nightly-2026-08-01 fuzz build`,
+#   `cargo +nightly-2026-08-01 fuzz run <target>` -- the same nightly
+#   `.github/workflows/fuzz.yml` pins and asserts. `cargo-fuzz` is a nightly-only,
 #   CI-installed tool and deliberately never a manifest dependency, so the
 #   default toolchain must never be nightly. Note that this file reaches the
 #   detached `fuzz/` workspace too, since `rustup` discovers it by walking up.

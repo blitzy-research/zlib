@@ -101,6 +101,33 @@ unsafe fn as_bytes<'a>(ptr: *const Bytef, len: usize) -> &'a [u8] {
 /// case is backed by a dangling-but-aligned non-null pointer (exactly how
 /// `<&mut [u8]>::default()` is built), so no memory is ever accessed.
 ///
+/// # The `next_out` sentinel (`uncompr.c` L42-L43)
+///
+/// The non-nullness of that empty slice is **load-bearing**, not incidental.
+/// C's `uncompress2_z` cannot hand a null `next_out` to `inflate`, so when the
+/// caller passes `dest == NULL` with a zero capacity it substitutes a pointer
+/// to its own on-stack `stream.reserved` word:
+///
+/// ```text
+/// if (left == 0 && dest == Z_NULL)
+///     dest = (Bytef *)&stream.reserved;       /* next_out cannot be NULL */
+/// ```
+///
+/// This function reproduces the *effect* of that substitution rather than the
+/// address: for `(null, 0)` it yields a non-null, well-aligned, zero-length
+/// slice, which is precisely what a zero-capacity non-null `next_out` is. That
+/// is why `uncompress2(NULL, &0, …)` behaves identically to
+/// `uncompress2(buf, &0, …)` in this port, exactly as it does in C — the
+/// equivalence is asserted for every uncompress entry point by the unit test
+/// `the_null_dest_sentinel_matches_a_non_null_zero_capacity_dest`.
+/// Returning a null pointer here instead would make `inflate` reject the call
+/// with `Z_STREAM_ERROR` and change both the return code and the reported
+/// consumed length.
+///
+/// The compress wrappers deliberately do **not** get a sentinel: C keeps the
+/// caller's `dest` in `stream.next_out` verbatim (`compress.c` L45) and lets
+/// `deflate` refuse a null one. See `c_null_next_out`.
+///
 /// # Safety
 ///
 /// When `ptr` is non-null and `len > 0`, the caller must guarantee that `ptr`
@@ -123,6 +150,51 @@ unsafe fn as_bytes_mut<'a>(ptr: *mut Bytef, len: usize) -> &'a mut [u8] {
 // Phase 1 — One-call compression wrappers (port of `compress.c`)
 // ===========================================================================
 
+/// Does this `dest` reproduce C's null `next_out`, which `deflate` refuses?
+///
+/// C's one-call compress wrappers keep the caller's `dest` in
+/// `stream.next_out` verbatim (`compress.c` L45) and let the first `deflate`
+/// call adjudicate it — they have no counterpart to the `stream.reserved`
+/// sentinel that `uncompr.c` L42-L43 installs on the decompress side. A null
+/// `dest` reaching this point therefore necessarily has `cap == 0`, because the
+/// coupling check (`compress.c` L31-L33) already rejected a null `dest` paired
+/// with a non-zero capacity. C consequently enters the deflate loop with
+/// `next_out == Z_NULL` and `avail_out == 0`, and `deflate` refuses it at
+/// `deflate.c` L990:
+///
+/// ```text
+/// if (strm->next_out == Z_NULL ||
+///     (strm->avail_in != 0 && strm->next_in == Z_NULL) ||
+///     (s->status == FINISH_STATE && flush != Z_FINISH)) {
+///     ERR_RETURN(strm, Z_STREAM_ERROR);
+/// }
+/// if (strm->avail_out == 0) ERR_RETURN(strm, Z_BUF_ERROR);
+/// ```
+///
+/// The null test comes **first**, so C answers `Z_STREAM_ERROR` and never
+/// reaches the `avail_out == 0` test that would yield `Z_BUF_ERROR`. Because a
+/// Rust `&mut [u8]` cannot be null, the safe engine sees an ordinary empty
+/// output buffer and reports `Z_BUF_ERROR`; the distinction has to be drawn
+/// here, at the only layer that still holds the pointer.
+///
+/// The reported length is unaffected either way: C zeroes `*destLen` at
+/// `compress.c` L36 and then assigns `next_out - dest`, which is `0` on this
+/// path, at L63.
+///
+/// # Ordering against `deflateInit`
+///
+/// C runs `deflateInit` (`compress.c` L42) *before* the loop, so an invalid
+/// `level` is rejected there rather than by `deflate` — but `deflateInit` also
+/// answers `Z_STREAM_ERROR` for a bad level, which makes the two orderings
+/// indistinguishable to a caller. The remaining `deflateInit` failure,
+/// `Z_MEM_ERROR`, *would* be distinguishable, but these entry points zero the
+/// allocator hooks (`compress.c` L38-L40), so there is no caller-supplied
+/// allocator that can fail and the global path aborts rather than returning.
+#[inline]
+fn c_null_next_out(dest: *mut Bytef) -> bool {
+    dest.is_null()
+}
+
 /// Compresses `source` into `dest` at the given `level`, writing the produced
 /// length back through `dest_len`.
 ///
@@ -142,6 +214,14 @@ unsafe fn as_bytes_mut<'a>(ptr: *mut Bytef, len: usize) -> &'a mut [u8] {
 ///   `deflateEnd`, so a `Z_BUF_ERROR` reports the bytes that did fit rather than
 ///   zero. A failing `deflateInit` reports `0`, because C zeroes the field at
 ///   `compress.c` L36 before initializing (`compress.c` L42-L43).
+///
+/// A null `dest` paired with `*dest_len == 0` passes validation and then earns
+/// `Z_STREAM_ERROR` — **not** `Z_BUF_ERROR` — because C hands the null pointer
+/// to `deflate`, which rejects `next_out == Z_NULL` before testing
+/// `avail_out` (`deflate.c` L990). See `c_null_next_out`. This is the one
+/// place where the one-call compress and uncompress wrappers deliberately
+/// differ: `uncompr.c` L42-L43 installs a non-null sentinel, `compress.c` does
+/// not.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn compress2(
     dest: *mut Bytef,
@@ -162,6 +242,16 @@ pub unsafe extern "C" fn compress2(
         if (source_len > 0 && source.is_null()) || (cap > 0 && dest.is_null()) {
             return Z_STREAM_ERROR;
         }
+        // A null `dest` survives validation only with `cap == 0`, and C's first
+        // `deflate` call then refuses `next_out == Z_NULL` with
+        // `Z_STREAM_ERROR` before ever testing `avail_out`. See
+        // [`c_null_next_out`]. `*dest_len` is still published as zero, which is
+        // what C reports on this path.
+        if c_null_next_out(dest) {
+            // SAFETY: `dest_len` is non-null (checked above).
+            unsafe { *dest_len = 0 };
+            return Z_STREAM_ERROR;
+        }
         // SAFETY: the pointer/length couplings were validated above, so both
         // slices are sound (empty when the corresponding length is zero).
         let src = unsafe { as_bytes(source, source_len as usize) };
@@ -174,7 +264,7 @@ pub unsafe extern "C" fn compress2(
         // (`compress.c` L63). Publishing it on the error arm too is what makes a
         // `Z_BUF_ERROR` report the bytes that did fit, as C does.
         let mut produced = 0usize;
-        let result = util::compress2_tracked(dst, src, level, &mut produced);
+        let result = crate::deflate::compress2_tracked(dst, src, level, &mut produced);
         // SAFETY: `dest_len` is non-null (checked above); C writes the reported
         // length unconditionally after the loop, before returning.
         unsafe { *dest_len = produced as uLongf };
@@ -207,6 +297,15 @@ pub unsafe extern "C" fn compress2_z(
         if (source_len > 0 && source.is_null()) || (cap > 0 && dest.is_null()) {
             return Z_STREAM_ERROR;
         }
+        // As in [`compress2`]: C hands the null pointer straight to `deflate`,
+        // which refuses it with `Z_STREAM_ERROR` (`deflate.c` L990) rather than
+        // the `Z_BUF_ERROR` an empty-but-non-null buffer would earn. See
+        // [`c_null_next_out`].
+        if c_null_next_out(dest) {
+            // SAFETY: `dest_len` is non-null (checked above).
+            unsafe { *dest_len = 0 };
+            return Z_STREAM_ERROR;
+        }
         // SAFETY: the pointer/length couplings were validated above.
         let src = unsafe { as_bytes(source, source_len) };
         // SAFETY: as established above, the dest pointer/length coupling was
@@ -215,7 +314,7 @@ pub unsafe extern "C" fn compress2_z(
         // As in [`compress2`]: the count is reported on every path that reaches
         // the deflate loop, mirroring `compress.c` L63.
         let mut produced = 0usize;
-        let result = util::compress2_tracked(dst, src, level, &mut produced);
+        let result = crate::deflate::compress2_tracked(dst, src, level, &mut produced);
         // SAFETY: `dest_len` is non-null (checked above).
         unsafe { *dest_len = produced };
         match result {
@@ -350,7 +449,7 @@ unsafe fn uncompress2_engine(
         return (consumed, produced, Err(ReturnCode::MemError.as_c_int()));
     }
 
-    let result = match util::uncompress2(dst, src, &mut consumed, &mut produced) {
+    let result = match crate::inflate::uncompress2(dst, src, &mut consumed, &mut produced) {
         Ok(_) => Ok(()),
         Err(rc) => Err(rc.as_c_int()),
     };
@@ -521,7 +620,7 @@ pub unsafe extern "C" fn adler32(adler: uLong, buf: *const Bytef, len: uInt) -> 
         // SAFETY: `buf` is non-null (checked above) and, per the caller's
         // contract, valid for reads of `len` bytes (empty when `len == 0`).
         let s = unsafe { as_bytes(buf, len as usize) };
-        checksum::adler32(adler as u32, s) as uLong
+        checksum::adler32(ulong_to_u32(adler), s) as uLong
     })
 }
 
@@ -534,7 +633,7 @@ pub unsafe extern "C" fn adler32_z(adler: uLong, buf: *const Bytef, len: z_size_
         }
         // SAFETY: `buf` is non-null (checked above) and valid for `len` bytes.
         let s = unsafe { as_bytes(buf, len) };
-        checksum::adler32(adler as u32, s) as uLong
+        checksum::adler32(ulong_to_u32(adler), s) as uLong
     })
 }
 
@@ -544,7 +643,7 @@ pub unsafe extern "C" fn adler32_z(adler: uLong, buf: *const Bytef, len: z_size_
 pub unsafe extern "C" fn adler32_combine(adler1: uLong, adler2: uLong, len2: z_off_t) -> uLong {
     // Pure arithmetic over the values — no pointers, provably panic-free, so no
     // guard is required.
-    checksum::adler32_combine(adler1 as u32, adler2 as u32, off_to_i64(len2)) as uLong
+    checksum::adler32_combine(ulong_to_u32(adler1), ulong_to_u32(adler2), off_to_i64(len2)) as uLong
 }
 
 /// 64-bit-offset variant of [`adler32_combine`] (C `adler32_combine64`).
@@ -553,7 +652,7 @@ pub unsafe extern "C" fn adler32_combine(adler1: uLong, adler2: uLong, len2: z_o
 /// width differs (`z_off64_t` is always `i64`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn adler32_combine64(adler1: uLong, adler2: uLong, len2: z_off64_t) -> uLong {
-    checksum::adler32_combine(adler1 as u32, adler2 as u32, len2) as uLong
+    checksum::adler32_combine(ulong_to_u32(adler1), ulong_to_u32(adler2), len2) as uLong
 }
 
 // ===========================================================================
@@ -575,7 +674,7 @@ pub unsafe extern "C" fn crc32(crc: uLong, buf: *const Bytef, len: uInt) -> uLon
         // SAFETY: `buf` is non-null (checked above) and, per the caller's
         // contract, valid for reads of `len` bytes (empty when `len == 0`).
         let s = unsafe { as_bytes(buf, len as usize) };
-        checksum::crc32(crc as u32, s) as uLong
+        checksum::crc32(ulong_to_u32(crc), s) as uLong
     })
 }
 
@@ -588,7 +687,7 @@ pub unsafe extern "C" fn crc32_z(crc: uLong, buf: *const Bytef, len: z_size_t) -
         }
         // SAFETY: `buf` is non-null (checked above) and valid for `len` bytes.
         let s = unsafe { as_bytes(buf, len) };
-        checksum::crc32(crc as u32, s) as uLong
+        checksum::crc32(ulong_to_u32(crc), s) as uLong
     })
 }
 
@@ -596,13 +695,13 @@ pub unsafe extern "C" fn crc32_z(crc: uLong, buf: *const Bytef, len: z_size_t) -
 /// where `len2` is the byte length of the second stream (C `crc32_combine`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn crc32_combine(crc1: uLong, crc2: uLong, len2: z_off_t) -> uLong {
-    checksum::crc32_combine(crc1 as u32, crc2 as u32, off_to_i64(len2)) as uLong
+    checksum::crc32_combine(ulong_to_u32(crc1), ulong_to_u32(crc2), off_to_i64(len2)) as uLong
 }
 
 /// 64-bit-offset variant of [`crc32_combine`] (C `crc32_combine64`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn crc32_combine64(crc1: uLong, crc2: uLong, len2: z_off64_t) -> uLong {
-    checksum::crc32_combine(crc1 as u32, crc2 as u32, len2) as uLong
+    checksum::crc32_combine(ulong_to_u32(crc1), ulong_to_u32(crc2), len2) as uLong
 }
 
 /// Pre-compute the combine operator for a second stream of length `len2`,
@@ -622,7 +721,7 @@ pub unsafe extern "C" fn crc32_combine_gen64(len2: z_off64_t) -> uLong {
 /// [`crc32_combine_gen`] (C `crc32_combine_op`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn crc32_combine_op(crc1: uLong, crc2: uLong, op: uLong) -> uLong {
-    checksum::crc32_combine_op(crc1 as u32, crc2 as u32, op as u32) as uLong
+    checksum::crc32_combine_op(ulong_to_u32(crc1), ulong_to_u32(crc2), ulong_to_u32(op)) as uLong
 }
 
 /// Return a pointer to the 256-entry CRC-32 lookup table (C `get_crc_table`).
@@ -992,6 +1091,189 @@ mod tests {
     }
 
     #[test]
+    fn a_null_dest_with_zero_capacity_is_a_stream_error_not_a_buf_error() {
+        // C's one-call compress wrappers have no `next_out` sentinel: they store
+        // the caller's `dest` in `stream.next_out` verbatim (`compress.c` L45)
+        // and the first `deflate` call refuses a null one at `deflate.c` L990,
+        // *before* the `avail_out == 0` test at L995. So a null `dest` with a
+        // zero capacity earns `Z_STREAM_ERROR` while a non-null `dest` with the
+        // same zero capacity earns `Z_BUF_ERROR` — a distinction a Rust
+        // `&mut [u8]` cannot carry, which is why the boundary draws it.
+        //
+        // Verified against a reference C zlib built from the retained in-tree
+        // baseline: every pair below matches it exactly.
+        let src = b"payload";
+        let mut sink = [0u8; 64];
+
+        // -- uLong entry points ---------------------------------------------
+        let mut n: uLongf = 0;
+        let rc = unsafe {
+            compress2(
+                ptr::null_mut(),
+                &mut n,
+                src.as_ptr(),
+                src.len() as uLong,
+                Z_DEFAULT_COMPRESSION,
+            )
+        };
+        assert_eq!(rc, Z_STREAM_ERROR, "null next_out is refused by deflate");
+        assert_eq!(n, 0, "C reports `next_out - dest == 0` on this path");
+
+        let mut n: uLongf = 0;
+        let rc = unsafe {
+            compress2(
+                sink.as_mut_ptr(),
+                &mut n,
+                src.as_ptr(),
+                src.len() as uLong,
+                Z_DEFAULT_COMPRESSION,
+            )
+        };
+        assert_eq!(
+            rc, Z_BUF_ERROR,
+            "a non-null zero-capacity dest is a buffer error"
+        );
+        assert_eq!(n, 0);
+
+        // -- size_t entry points --------------------------------------------
+        let mut nz: z_size_t = 0;
+        let rc = unsafe {
+            compress2_z(
+                ptr::null_mut(),
+                &mut nz,
+                src.as_ptr(),
+                src.len(),
+                Z_DEFAULT_COMPRESSION,
+            )
+        };
+        assert_eq!(rc, Z_STREAM_ERROR);
+        assert_eq!(nz, 0);
+
+        let mut nz: z_size_t = 0;
+        let rc = unsafe {
+            compress2_z(
+                sink.as_mut_ptr(),
+                &mut nz,
+                src.as_ptr(),
+                src.len(),
+                Z_DEFAULT_COMPRESSION,
+            )
+        };
+        assert_eq!(rc, Z_BUF_ERROR);
+        assert_eq!(nz, 0);
+
+        // -- the default-level wrappers inherit the same adjudication -------
+        let mut n: uLongf = 0;
+        let rc = unsafe { compress(ptr::null_mut(), &mut n, src.as_ptr(), src.len() as uLong) };
+        assert_eq!(rc, Z_STREAM_ERROR);
+        assert_eq!(n, 0);
+
+        let mut n: uLongf = 0;
+        let rc = unsafe { compress(sink.as_mut_ptr(), &mut n, src.as_ptr(), src.len() as uLong) };
+        assert_eq!(rc, Z_BUF_ERROR);
+
+        let mut nz: z_size_t = 0;
+        let rc = unsafe { compress_z(ptr::null_mut(), &mut nz, src.as_ptr(), src.len()) };
+        assert_eq!(rc, Z_STREAM_ERROR);
+        assert_eq!(nz, 0);
+
+        let mut nz: z_size_t = 0;
+        let rc = unsafe { compress_z(sink.as_mut_ptr(), &mut nz, src.as_ptr(), src.len()) };
+        assert_eq!(rc, Z_BUF_ERROR);
+
+        // -- a null source with a zero length does not change the verdict ----
+        // C's coupling check passes (`sourceLen > 0` is false), so it still
+        // reaches `deflate` and still refuses the null `next_out`.
+        let mut n: uLongf = 0;
+        let rc = unsafe {
+            compress2(
+                ptr::null_mut(),
+                &mut n,
+                ptr::null(),
+                0,
+                Z_DEFAULT_COMPRESSION,
+            )
+        };
+        assert_eq!(rc, Z_STREAM_ERROR);
+        assert_eq!(n, 0);
+
+        let mut n: uLongf = 0;
+        let rc = unsafe {
+            compress2(
+                sink.as_mut_ptr(),
+                &mut n,
+                ptr::null(),
+                0,
+                Z_DEFAULT_COMPRESSION,
+            )
+        };
+        assert_eq!(
+            rc, Z_BUF_ERROR,
+            "an empty input still needs room for the header"
+        );
+
+        // -- an invalid level is indistinguishable, as it is in C ------------
+        // C rejects the level inside `deflateInit` (`compress.c` L42-L43), which
+        // also answers `Z_STREAM_ERROR`, so both orderings agree.
+        let mut n: uLongf = 0;
+        let rc = unsafe {
+            compress2(
+                ptr::null_mut(),
+                &mut n,
+                src.as_ptr(),
+                src.len() as uLong,
+                42,
+            )
+        };
+        assert_eq!(rc, Z_STREAM_ERROR);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn the_empty_mutable_slice_is_never_null() {
+        // Structural pin on the `next_out` sentinel of `uncompr.c` L42-L43: the
+        // decompress wrappers rely on `as_bytes_mut` *substituting* its own
+        // dangling-but-non-null pointer for a null `dest`, because that is
+        // exactly what C's `dest = (Bytef *)&stream.reserved` does. A port that
+        // forwarded the caller's pointer instead would hand `inflate` a null
+        // `next_out`, which answers `Z_STREAM_ERROR` and changes both the return
+        // code and the reported consumed length.
+        //
+        // The check is an address comparison against the pointer that was passed
+        // in, not a null test. A `&mut [u8]` is non-null by its own type
+        // invariant, so `is_null()` on one is a tautology the compiler can fold
+        // away - clippy's `useless_ptr_null_checks` says exactly that. Comparing
+        // against the input address is the form with teeth: it fails the moment
+        // the empty branch is rewritten to forward `ptr`.
+        let caller: *mut Bytef = ptr::null_mut();
+        // SAFETY: a null pointer with a zero length is the documented
+        // empty-slice case and touches no memory.
+        let empty = unsafe { as_bytes_mut(caller, 0) };
+        assert!(empty.is_empty(), "a zero capacity yields an empty slice");
+        assert_ne!(
+            empty.as_ptr().addr(),
+            caller.addr(),
+            "uncompr.c L42-L43: next_out cannot be NULL, so a null dest must be \
+             replaced by the sentinel rather than forwarded"
+        );
+
+        // A non-null pointer with a zero length is the case the sentinel has to
+        // be indistinguishable from. Its address is deliberately *not* asserted:
+        // C keeps the caller's `dest` there, this port substitutes the sentinel,
+        // and both are correct because a zero-length window is never read. What
+        // must hold is that the call yields an empty slice and touches nothing.
+        let mut byte = 0xA5u8;
+        // SAFETY: `byte` is a live, writable, well-aligned `u8`; the length is
+        // zero so nothing is accessed.
+        let also_empty = unsafe { as_bytes_mut(&raw mut byte, 0) };
+        assert!(also_empty.is_empty());
+        assert_eq!(
+            byte, 0xA5,
+            "a zero-length window must not touch the caller's byte"
+        );
+    }
+
+    #[test]
     fn compress2_reports_partial_output_on_buf_error() {
         // C `compress2_z` writes the produced count unconditionally at
         // `compress.c` L63 — after the loop, before `deflateEnd` — so a
@@ -1205,6 +1487,143 @@ mod tests {
         let rc =
             unsafe { uncompress2(dest.as_mut_ptr(), &mut dest_len, ptr::null(), &mut src_len) };
         assert_eq!(rc, Z_STREAM_ERROR);
+    }
+
+    #[test]
+    fn the_null_dest_sentinel_matches_a_non_null_zero_capacity_dest() {
+        // C `uncompress2_z` cannot hand a null `next_out` to `inflate`, so for a
+        // null `dest` with a zero capacity it substitutes its own stack word:
+        //
+        //   if (left == 0 && dest == Z_NULL)
+        //       dest = (Bytef *)&stream.reserved;   /* next_out cannot be NULL */
+        //
+        // The consequence a caller can observe is that a null `dest` and a
+        // non-null zero-capacity `dest` are *indistinguishable* — same return
+        // code, same reported produced length, same reported consumed length —
+        // including on the path where the stream completes with no output at all
+        // and the call succeeds. This port reproduces the effect rather than the
+        // address (see `as_bytes_mut`), so the equivalence is pinned here for
+        // every entry point rather than left to chance.
+        //
+        // Verified against a reference C zlib built from the retained in-tree
+        // baseline across thirteen such pairs, including preset-dictionary,
+        // trailing-garbage and one- and two-byte truncations.
+        let mut buf = [0u8; 128];
+
+        // A zlib stream of a zero-length input: decodable to completion with no
+        // output space at all, so it exercises the `Z_OK` arm of the sentinel.
+        let mut empty_stream = [0u8; 64];
+        let mut empty_len: uLongf = empty_stream.len() as uLongf;
+        let rc = unsafe {
+            compress2(
+                empty_stream.as_mut_ptr(),
+                &mut empty_len,
+                ptr::null(),
+                0,
+                Z_DEFAULT_COMPRESSION,
+            )
+        };
+        assert_eq!(rc, Z_OK);
+        let empty_stream = &empty_stream[..empty_len as usize];
+
+        // A zlib stream that does produce output, so it exercises the
+        // `Z_BUF_ERROR` arm.
+        let plain: Vec<u8> = (0..96u32).map(|i| (i * 13 + 5) as u8).collect();
+        let mut data_stream = [0u8; 256];
+        let mut data_len: uLongf = data_stream.len() as uLongf;
+        let rc = unsafe {
+            compress2(
+                data_stream.as_mut_ptr(),
+                &mut data_len,
+                plain.as_ptr(),
+                plain.len() as uLong,
+                Z_DEFAULT_COMPRESSION,
+            )
+        };
+        assert_eq!(rc, Z_OK);
+        let data_stream = &data_stream[..data_len as usize];
+
+        // Garbage, so it exercises the `Z_DATA_ERROR` arm.
+        let garbage: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+
+        for (label, stream, expected) in [
+            ("empty stream", empty_stream, Z_OK),
+            ("data stream", data_stream, Z_BUF_ERROR),
+            ("garbage", &garbage[..], Z_DATA_ERROR),
+        ] {
+            // -- uncompress2 (uLong, reports the consumed length) ------------
+            let mut null_dl: uLongf = 0;
+            let mut null_sl: uLong = stream.len() as uLong;
+            let null_rc = unsafe {
+                uncompress2(ptr::null_mut(), &mut null_dl, stream.as_ptr(), &mut null_sl)
+            };
+            let mut buf_dl: uLongf = 0;
+            let mut buf_sl: uLong = stream.len() as uLong;
+            let buf_rc =
+                unsafe { uncompress2(buf.as_mut_ptr(), &mut buf_dl, stream.as_ptr(), &mut buf_sl) };
+            assert_eq!(null_rc, expected, "uncompress2 return code, {label}");
+            assert_eq!(null_rc, buf_rc, "uncompress2 sentinel equivalence, {label}");
+            assert_eq!(null_dl, buf_dl, "uncompress2 produced length, {label}");
+            assert_eq!(null_sl, buf_sl, "uncompress2 consumed length, {label}");
+            assert_eq!(null_dl, 0, "no output space means no output, {label}");
+
+            // -- uncompress2_z (size_t) --------------------------------------
+            let mut null_dl: z_size_t = 0;
+            let mut null_sl: z_size_t = stream.len();
+            let null_rc = unsafe {
+                uncompress2_z(ptr::null_mut(), &mut null_dl, stream.as_ptr(), &mut null_sl)
+            };
+            let mut buf_dl: z_size_t = 0;
+            let mut buf_sl: z_size_t = stream.len();
+            let buf_rc = unsafe {
+                uncompress2_z(buf.as_mut_ptr(), &mut buf_dl, stream.as_ptr(), &mut buf_sl)
+            };
+            assert_eq!(null_rc, expected, "uncompress2_z return code, {label}");
+            assert_eq!(
+                null_rc, buf_rc,
+                "uncompress2_z sentinel equivalence, {label}"
+            );
+            assert_eq!(null_dl, buf_dl, "uncompress2_z produced length, {label}");
+            assert_eq!(null_sl, buf_sl, "uncompress2_z consumed length, {label}");
+
+            // -- uncompress / uncompress_z (source length by value) ----------
+            let mut null_dl: uLongf = 0;
+            let null_rc = unsafe {
+                uncompress(
+                    ptr::null_mut(),
+                    &mut null_dl,
+                    stream.as_ptr(),
+                    stream.len() as uLong,
+                )
+            };
+            let mut buf_dl: uLongf = 0;
+            let buf_rc = unsafe {
+                uncompress(
+                    buf.as_mut_ptr(),
+                    &mut buf_dl,
+                    stream.as_ptr(),
+                    stream.len() as uLong,
+                )
+            };
+            assert_eq!(null_rc, expected, "uncompress return code, {label}");
+            assert_eq!(null_rc, buf_rc, "uncompress sentinel equivalence, {label}");
+            assert_eq!(null_dl, buf_dl, "uncompress produced length, {label}");
+
+            let mut null_dl: z_size_t = 0;
+            let null_rc = unsafe {
+                uncompress_z(ptr::null_mut(), &mut null_dl, stream.as_ptr(), stream.len())
+            };
+            let mut buf_dl: z_size_t = 0;
+            let buf_rc = unsafe {
+                uncompress_z(buf.as_mut_ptr(), &mut buf_dl, stream.as_ptr(), stream.len())
+            };
+            assert_eq!(null_rc, expected, "uncompress_z return code, {label}");
+            assert_eq!(
+                null_rc, buf_rc,
+                "uncompress_z sentinel equivalence, {label}"
+            );
+            assert_eq!(null_dl, buf_dl, "uncompress_z produced length, {label}");
+        }
     }
 
     #[test]

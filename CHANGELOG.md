@@ -164,11 +164,12 @@ every entry in one would have to be invented.
   [`tests/gzip_compat.rs`](tests/gzip_compat.rs); checksum known-answer vectors
   in [`tests/checksum.rs`](tests/checksum.rs); and the two-tier byte-identity and
   wire-format gate in [`tests/interop.rs`](tests/interop.rs).
-  **860 tests pass** by default — 705 in-crate unit tests, 128 integration tests
-  (`checksum` 23, `gzip_compat` 15, `inflate_coverage` 29, `interop` 30,
-  `regression` 12, `round_trip` 19), and 27 doctests — with **0 failed and 0
-  ignored**. `--no-default-features` passes **634** (512 unit + 97 integration +
-  25 doctests) and `--all-features` passes **873**. CI parses every
+  **956 tests pass** by default — 797 in-crate unit tests, 130 integration tests
+  (`checksum` 23, `gzip_compat` 17, `inflate_coverage` 29, `interop` 30,
+  `regression` 12, `round_trip` 19), and 29 doctests (28 runnable plus one
+  `compile_fail`) — with **0 failed and 0 ignored**. `--no-default-features`
+  passes **695** (571 unit + 97 integration + 27 doctests) and `--all-features`
+  passes **969**. CI parses every
   `test result:` line and fails on any failure, on any *ignored* test, or on a
   count below a per-row lower bound, because `cargo test` exits 0 when tests are
   skipped.
@@ -204,8 +205,9 @@ every entry in one would have to be invented.
 - **Repository hygiene shipped with this release:**
   [`rust-toolchain.toml`](rust-toolchain.toml) pinning the toolchain to the MSRV,
   [`clippy.toml`](clippy.toml) and [`rustfmt.toml`](rustfmt.toml) pinning lint
-  and format behaviour, [`deny.toml`](deny.toml) as the single `cargo-deny`
-  policy over the governed dependency closure — evaluated over both the root and
+  and format behaviour, [`deny.toml`](deny.toml) and
+  [`fuzz/deny.toml`](fuzz/deny.toml) as the `cargo-deny` policies over the
+  governed dependency closure — one reviewed policy per graph, the root graph and
   the detached fuzz graph — [`.cargo/config.toml`](.cargo/config.toml),
   [`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md), and this
   file.
@@ -307,7 +309,7 @@ the security properties the initial release establishes.
   aliases only** — `ZallocFn` and `ZfreeFn`, which merely *name* the C hook
   signatures the crate must interoperate with. `grep -c "unsafe {"` on that file
   returns 0, and the module carries its own `#![deny(unsafe_code)]`.)
-- **Every `unsafe` block that does exist is justified in place.** **388
+- **Every `unsafe` block that does exist is justified in place.** **513
   `// SAFETY:` comments** across `src/`, with
   `#![warn(clippy::undocumented_unsafe_blocks)]` and `#![warn(missing_docs)]`
   promoted to hard errors by the `-D warnings` lint gate. Containment is checked
@@ -335,8 +337,9 @@ the security properties the initial release establishes.
 - **Supply-chain gates over the governed closure of 102 packages** — 89 pinned by
   [`Cargo.lock`](Cargo.lock) and 13 by [`fuzz/Cargo.lock`](fuzz/Cargo.lock), both
   committed deliberately because the crate ships `cdylib`/`staticlib`
-  distributables. [`deny.toml`](deny.toml) — the single policy, evaluated over
-  both graphs with an explicit `--config deny.toml` — declares `[advisories]`,
+  distributables. [`deny.toml`](deny.toml) over the root graph and
+  [`fuzz/deny.toml`](fuzz/deny.toml) over the fuzz graph — each named at its call
+  site with an explicit `--config` — declare `[advisories]`,
   `[licenses]`, `[bans]`, and `[sources]`, resolves the graph with
   `all-features = true`, denies yanked crates (`yanked = "deny"`), and bounds
   advisory-database staleness (`maximum-db-staleness = "P7D"`). Its
@@ -345,23 +348,36 @@ the security properties the initial release establishes.
   `[bans] deny` list keeps
   `cc`, `bindgen`, `pkg-config`, `libz-sys`, and the bzip2/lzma/zstd/brotli
   families out of the graph by name.
-  That one policy holds duplicate major versions to the same standard on both
-  graphs (`[bans] multiple-versions = "deny"` with
-  `multiple-versions-include-dev = true`), so an unreviewed duplicate fails the
-  build instead of printing a warning that nothing acts on; the root graph's
-  **four** known dev-only duplications — `rand@0.10.2`, `rand_core@0.10.1`,
-  `getrandom@0.4.3`, and `r-efi@6.0.0`, the chain reached through
-  `quickcheck 1.1.0` — are acknowledged individually with exact-version `skip`
-  entries that expire on the next bump. `r-efi@6.0.0` is the fourth precisely
+  Both policies hold duplicate major versions to the same standard
+  (`[bans] multiple-versions = "deny"` with
+  `multiple-versions-include-dev = true` — the second key is load-bearing, since
+  every duplication here is dev-only and the check would otherwise report `bans ok`
+  regardless), so an unreviewed duplicate fails the build instead of printing a
+  warning that nothing acts on; the root graph's **four** known dev-only
+  duplications — `rand@0.10.2`, `rand_core@0.10.1`, `getrandom@0.4.3`, and
+  `r-efi@6.0.0`, the chain reached through `quickcheck 1.1.0` — are acknowledged
+  individually with exact-version `skip` entries that expire on the next bump, and
+  `skip-tree` is deliberately empty in both files because a subtree waiver would
+  silently widen as the tree changes. `r-efi@6.0.0` is the fourth precisely
   *because* `[graph] targets` is empty: the nine-triple list `deny.toml` used to
-  carry pruned it out of view, which was a coverage hole rather than a
-  refinement, and acknowledging it explicitly is what closing that hole costs.
+  carry pruned it out of view, which was a coverage hole rather than a refinement,
+  and acknowledging it explicitly is what closing that hole costs. The two things
+  the fuzz graph legitimately needs are scoped rather than waived: `cc` stays in
+  `[bans] deny` but carries `wrappers = ["libfuzzer-sys"]`, and NCSA is granted
+  crate-scoped rather than globally — load-bearing in `fuzz/deny.toml`, where those
+  crates live, and kept verbatim in `deny.toml`, where they do not, as latent
+  defence in depth. Run as documented in [`CONTRIBUTING.md`](CONTRIBUTING.md), both
+  invocations report `advisories ok, bans ok, licenses ok, sources ok`: the root
+  command line carries `-A unused-wrapper -A license-exception-not-encountered` for
+  exactly those two latent entries, the fuzz command line carries no allowance at
+  all, and both codes stay at full severity on the graph where they mean something.
   [`.github/workflows/audit.yml`](.github/workflows/audit.yml) runs the gate on
   push, pull request, a daily schedule, and manual dispatch as four independent
-  blocking jobs — `policy-integrity` (the one policy file still declares every
-  governed table and holds every load-bearing key at its reviewed value, and no
-  second policy file has appeared, so section-level erosion cannot pass
-  vacuously), `cargo-audit` (both lockfiles),
+  blocking jobs — `policy-integrity` (both policy files, `deny.toml` and
+  `fuzz/deny.toml`, still exist, still declare every governed table, still hold
+  every load-bearing key at its reviewed value, and still agree on every shared
+  key, so section-level erosion cannot pass vacuously), `cargo-audit` (both
+  lockfiles),
   `cargo-deny` (all four root categories), and `cargo-deny-fuzz` (the detached
   fuzz graph). None declares `needs:`, so one failing category cannot mask
   another's verdict, and those four jobs are the only place either tool runs:
@@ -452,24 +468,36 @@ the security properties the initial release establishes.
   | `cargo fmt --all -- --check` | exit 0 |
   | `cargo clippy --locked --all-targets --all-features -- -D warnings` | exit 0 |
   | `cargo build --locked` | exit 0 |
-  | `cargo test --locked` | **860 passed / 0 failed / 0 ignored** |
-  | `cargo test --locked --no-default-features` | **634 passed / 0 failed / 0 ignored** |
+  | `cargo test --locked` | **956 passed / 0 failed / 0 ignored** |
+  | `cargo test --locked --no-default-features` | **695 passed / 0 failed / 0 ignored** |
   | `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features` | exit 0, 0 warnings |
-  | `mkdocs build --strict` | exit 0, 0 warnings |
+  | `mkdocs build --strict` | exit 0, 0 strict diagnostics |
+
+  On the documentation row, "0 strict diagnostics" means no `WARNING` and no
+  `ERROR` from MkDocs, its plugins, or this project's content. The Material theme
+  additionally prints one advisory banner of its own — an upstream notice from the
+  Material for MkDocs maintainers about the forthcoming MkDocs 2.0. It is a vendor
+  notice rather than a build diagnostic: `--strict` does not fail on it, and nothing
+  in this repository can suppress it.
 
   The ignored-test count is **zero in every configuration and stays zero**. A
   capability that cannot be exercised in a given build is expressed by a feature
   gate or by a run-time probe that passes with a printed notice — never by
   `#[ignore]`.
-- **Release artifacts** from `cargo build --locked --release` on the measuring
-  host, in exact bytes so no rounding convention has to be inferred:
-  `libzlib_rs.rlib` 2,478,440 · `libzlib_rs.so` 635,968 · `libzlib_rs.a`
-  22,397,744 — from a clean build under **default** features with
-  `rustc 1.97.1 (8bab26f4f 2026-07-14)` on `x86_64-unknown-linux-gnu`. Quote
-  these only together with that toolchain and feature set: they move with both,
-  and with any change to the crate's own sources or doc metadata. All three
-  share one output path, so the last feature row built wins — rebuild with the
-  intended features immediately before linking a C consumer.
+- **Release artifacts** from `cargo build --locked --release` under **default**
+  features on `x86_64-unknown-linux-gnu` with `rustc 1.97.1 (8bab26f4f 2026-07-14)`,
+  into the repository's default `target/release/`: `libzlib_rs.rlib` 2,791,948 bytes ·
+  `libzlib_rs.so` 660,944 · `libzlib_rs.a` 22,441,620, observed on **2026-08-03**.
+  Read those as a dated, environment-specific snapshot of one build — not a
+  reproducible invariant and not a size budget: no gate asserts them, and they move
+  with the compiler, the feature row, the profile, and any change to the crate's own
+  sources or doc metadata. The `.rlib` is the least durable of the three, because an
+  rlib embeds absolute build paths and therefore changes size when the checkout
+  directory or `CARGO_TARGET_DIR` changes without a single line of source changing.
+  Reproduce them for your own build with
+  `stat -c '%s' target/release/libzlib_rs.{rlib,so,a}`. All three share one output
+  path, so the last feature row built wins — rebuild with the intended features
+  immediately before linking a C consumer.
 
 ### Known limitations and documented divergences
 
@@ -508,6 +536,16 @@ The list above is exactly the set of divergences a **C caller can observe**. Int
   It is off by default because a version script is a GNU-ld/ELF-only construct and
   no CI row sets the variable, so the opt-in path carries linker-portability risk
   the matrix does not yet retire.
+- **A gzip destination that accepts nothing yields a *retryable* `Z_ERRNO`
+  instead of an endless retry.** C's inner drain loop leaves its output cursor
+  unchanged when `write(2)` returns `0` for a non-empty request and simply tries
+  again forever, which is an unbounded spin inside the library (CWE-835). Both
+  Rust output loops report the condition instead and mark it retryable, so the
+  output cursor and the buffered input are retained, the stream is not declared
+  dead, and `gzwrite` reports its true partial count rather than `0` — a retry
+  therefore reaches exactly the outcome C's spin would have. POSIX allows a `0`
+  return only for a zero-length write, which neither loop ever issues, so the
+  case is as unreachable in practice as C's retry.
 - **The retained C baseline is excluded from the published crate.** It is
   indispensable in-repository — oracle, specification, and the source of the
   official test vectors — and dead weight in a `crates.io` package.

@@ -41,19 +41,22 @@
 //!
 //! # `no_std`
 //!
-//! The implementation is `no_std` + `alloc`: it uses [`alloc::boxed::Box`] and
-//! [`alloc::vec::Vec`] and never references `std`. The I/O callbacks are
-//! expressed as traits so `no_std` callers can supply their own.
+//! The implementation is `no_std` + `alloc`: it uses [`alloc::boxed::Box`] for
+//! the state and never references `std`. Nothing else is heap-allocated — the
+//! decode path holds no owned buffer at all, matching `infback.c`, which
+//! allocates only in `inflateBackInit_`. The I/O callbacks are expressed as
+//! traits so `no_std` callers can supply their own.
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 
 use crate::constants::MAX_WBITS;
 use crate::error::ReturnCode;
 use crate::inflate::fixed::{DISTFIX, LENFIX};
 use crate::inflate::state::{InflateMode, InflateState, TableSource};
 use crate::inflate::tables::{Code, CodeType, inflate_table};
-use crate::stream::{AllocBuffer, AllocHook, Allocator, HookAllocator};
+use crate::stream::{
+    AllocBuffer, AllocHook, Allocator, BoxedEngine, EngineReservation, HookAllocator, try_box,
+};
 
 /// Permutation of the 19 code-length code lengths, as read from a dynamic
 /// block header. Transcribed verbatim from `infback.c` L205-L206 (identical to
@@ -86,16 +89,42 @@ const fn low_mask(n: u32) -> u32 {
 /// it hands back a pointer to a run of input bytes and the count available,
 /// returning `0` to signal end-of-input (or an input error).
 ///
-/// The safe Rust equivalent returns the next chunk of input as a slice. An
-/// **empty** slice signals end-of-input (or an error) exactly as a `0` count
-/// does in C, in which case [`inflate_back`] stops and returns
-/// [`ReturnCode::BufError`]. A non-empty slice is fully consumed before
-/// [`next_input`](InFunc::next_input) is called again, mirroring the C contract
-/// that "the application must not change the provided input until `in()` is
-/// called again".
+/// The safe Rust equivalent splits the C callback into two halves so that the
+/// engine can read *directly out of the provider's own memory* rather than
+/// copying each chunk into a buffer of its own:
+///
+/// * [`advance`](InFunc::advance) performs the C call — it makes the next chunk
+///   current and reports whether one was obtained. `false` signals end-of-input
+///   (or an input error) exactly as a `0` count does in C, in which case
+///   [`inflate_back`] stops and returns [`ReturnCode::BufError`].
+/// * [`chunk`](InFunc::chunk) borrows the chunk made current by the most recent
+///   successful `advance`.
+///
+/// Splitting them is what makes the borrow legal: a single
+/// `fn next(&mut self) -> &[u8]` ties the returned slice to a `&mut self`
+/// borrow, so the engine could not hold the slice while calling any other
+/// method. With the pair, the engine holds only a `&self` borrow for the length
+/// of one expression, and the whole decoder therefore performs **zero
+/// decode-time allocation** — matching `infback.c`, which allocates nothing
+/// once `inflateBackInit_` has returned.
+///
+/// A current chunk is fully consumed before `advance` is called again, mirroring
+/// the C contract that "the application must not change the provided input until
+/// `in()` is called again". Before the first `advance`, and after one that
+/// returned `false`, `chunk` must report a slice whose length still equals the
+/// number of bytes the engine has consumed from it — returning the previous
+/// chunk, or an empty slice, both satisfy that.
 pub trait InFunc {
-    /// Returns the next chunk of input bytes, or an empty slice at end-of-input.
-    fn next_input(&mut self) -> &[u8];
+    /// Makes the next chunk of input current, returning `false` at
+    /// end-of-input.
+    ///
+    /// Returning `true` while [`chunk`](InFunc::chunk) is empty is treated as
+    /// end-of-input too, so an implementation cannot stall the decoder.
+    fn advance(&mut self) -> bool;
+
+    /// Borrows the chunk made current by the most recent successful
+    /// [`advance`](InFunc::advance).
+    fn chunk(&self) -> &[u8];
 
     /// Reports, once at the end of [`inflate_back`], how many bytes of the most
     /// recently yielded chunk were left unconsumed by the engine.
@@ -106,6 +135,44 @@ pub trait InFunc {
     /// unconsumed tail of the last provider buffer. The default is a no-op, so
     /// pure-Rust callers that do not track raw cursors are unaffected.
     fn set_unconsumed(&mut self, _unconsumed: usize) {}
+}
+
+/// What a finished [`inflate_back`] call leaves in the caller's diagnostic slot,
+/// i.e. the fate of C's `strm->msg`.
+///
+/// C keeps the diagnostic on the `z_stream`, which this engine does not have, so
+/// the three reachable outcomes are reported explicitly instead. The distinction
+/// is not cosmetic: `infback.c` returns `Z_STREAM_ERROR` for an uninitialised
+/// stream at L209-L210, which is *before* the `strm->msg = Z_NULL` at L214, so a
+/// rejected call must leave whatever diagnostic the caller already had in place.
+/// Collapsing that into "always clear" would erase a message C preserves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackMsg {
+    /// The call was rejected before C reaches `strm->msg = Z_NULL`
+    /// (`infback.c` L209-L210): any existing diagnostic must be left alone.
+    Untouched,
+    /// C cleared `strm->msg` (`infback.c` L214) and no error site assigned a new
+    /// one — the outcome for a clean decode and for a `Z_BUF_ERROR` exit alike,
+    /// neither of which sets a diagnostic in C.
+    Cleared,
+    /// C cleared `strm->msg` and then assigned this diagnostic at one of the
+    /// twelve `infback.c` error sites. The string is byte-identical to C's.
+    Set(&'static str),
+}
+
+/// The complete result of one [`inflate_back`] call: the C return code together
+/// with the fate of `strm->msg`.
+///
+/// Returned as a value rather than written through a stream because
+/// [`inflate_back`] takes only an [`InflateState`]; an FFI shim publishes both
+/// halves onto the caller's `z_stream`, and a pure-Rust caller can ignore
+/// [`msg`](BackOutcome::msg) entirely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackOutcome {
+    /// The code C's `inflateBack` would have returned.
+    pub code: ReturnCode,
+    /// What C would have left in `strm->msg`.
+    pub msg: BackMsg,
 }
 
 /// Consumes output bytes produced by [`inflate_back`], replacing the C
@@ -138,18 +205,23 @@ pub trait OutFunc {
 /// (`hold`/`bits`), the current input chunk and cursor (`next`/`have`), and the
 /// output-window cursor (`put`/`left`) — together with the two I/O callbacks.
 ///
-/// The current input chunk is held as an owned [`Vec<u8>`] copy of whatever the
-/// [`InFunc`] most recently yielded. Copying (rather than borrowing the
-/// provider's slice for the lifetime of the decode) keeps the whole routine in
-/// safe Rust without fighting the borrow checker over a long-lived borrow of
-/// the provider: the provider's slice is copied in and the borrow released
-/// immediately, so [`InFunc::next_input`] can be called again freely.
+/// The current input chunk is **not** copied: it is read straight out of the
+/// provider through [`InFunc::chunk`], so this type owns no input buffer and the
+/// decode path performs no allocation whatsoever — exactly like `infback.c`,
+/// which allocates only in `inflateBackInit_`. Only a cursor is kept; the
+/// two-method [`InFunc`] split is what keeps that borrow legal in safe Rust.
+///
+/// It also carries the pending diagnostic. C writes `strm->msg` in place at each
+/// error site; there is no `z_stream` here, so the string is accumulated on this
+/// per-call value and reported through [`BackOutcome`]. Keeping it per-call
+/// rather than on [`InflateState`] makes a stale diagnostic unrepresentable.
 struct BackCtx<'a, I: InFunc, O: OutFunc> {
-    /// Owned copy of the current input chunk (C `next`/`have` source buffer).
-    inb: Vec<u8>,
-    /// Read cursor into [`inb`](BackCtx::inb); `inb.len() - next` is the C
+    /// Read cursor into [`InFunc::chunk`]; `chunk().len() - next` is the C
     /// `have`.
     next: usize,
+    /// The diagnostic C would have stored in `strm->msg`, set alongside every
+    /// transition to [`InflateMode::Bad`] and [`None`] until one occurs.
+    msg: Option<&'static str>,
     /// Input bit accumulator (C `hold`; only the low 32 bits are ever used).
     hold: u32,
     /// Number of valid bits currently in [`hold`](BackCtx::hold) (C `bits`).
@@ -177,18 +249,34 @@ impl<I: InFunc, O: OutFunc> BackCtx<'_, I, O> {
     /// input, matching the C macro's `goto inf_leave` with `ret = Z_BUF_ERROR`.
     #[inline]
     fn pull(&mut self) -> Result<(), ReturnCode> {
-        if self.next == self.inb.len() {
-            let chunk = self.src.next_input();
-            if chunk.is_empty() {
+        if self.next == self.src.chunk().len() {
+            // `advance` performs C's `in(in_desc, &next)` call; an empty result
+            // is end-of-input either way, so a provider that answers `true`
+            // while offering nothing cannot stall the decoder.
+            if !self.src.advance() || self.src.chunk().is_empty() {
                 return Err(ReturnCode::BufError);
             }
-            // Copy the chunk into the owned buffer, releasing the borrow of the
-            // provider immediately (reusing the existing allocation).
-            self.inb.clear();
-            self.inb.extend_from_slice(chunk);
             self.next = 0;
         }
         Ok(())
+    }
+
+    /// C `have`: the number of bytes left unconsumed in the current chunk.
+    ///
+    /// Saturating rather than plain subtraction because a provider whose
+    /// `advance` returned `false` is permitted to shrink or empty its reported
+    /// chunk; the cursor then sits at or past the end and C's `have` is `0`.
+    #[inline]
+    fn have(&self) -> usize {
+        self.src.chunk().len().saturating_sub(self.next)
+    }
+
+    /// C's `strm->msg = (char *)"…"; state->mode = BAD;` pair, kept together so
+    /// no error site can set one without the other.
+    #[inline]
+    fn bad(&mut self, state: &mut InflateState, msg: &'static str) {
+        state.mode = InflateMode::Bad;
+        self.msg = Some(msg);
     }
 
     /// C `PULLBYTE()`: pull one input byte into the bit accumulator.
@@ -198,7 +286,8 @@ impl<I: InFunc, O: OutFunc> BackCtx<'_, I, O> {
         // The low `bits` positions are occupied; the new byte's 8 bits sit
         // above them, so `|` is exactly the C `+=` here (no carry, no overflow:
         // `bits < 32` at every call site, so the shift is well-defined).
-        self.hold |= u32::from(self.inb[self.next]) << self.bits;
+        let byte = self.src.chunk()[self.next];
+        self.hold |= u32::from(byte) << self.bits;
         self.next += 1;
         self.bits += 8;
         Ok(())
@@ -376,14 +465,20 @@ pub fn inflate_back_init_in(
 ///
 /// # Allocator schedule
 ///
-/// Two requests, in C's order: the state footprint
-/// (`(1, `[`InflateState::C_LAYOUT_SIZE`]`)`, mirroring
-/// `ZALLOC(strm, 1, sizeof(struct inflate_state))` at `infback.c` L51) followed
-/// by the window (`(1 << window_bits, 1)`). C makes only the first, because its
-/// window comes from the caller; the second is this convenience constructor's
-/// documented divergence, and the FFI shim avoids it entirely by lending the
-/// ABI caller's buffer through the crate-private
-/// `inflate_back_init_borrowed_window`.
+/// Exactly **one** request to `alloc`, immediately after the `window_bits` range
+/// check: the window, `(1 << window_bits, 1)`. That is the same *count* reference
+/// zlib makes and at the same point in the sequence — C's one request is for the
+/// state (`ZALLOC(strm, 1, sizeof(struct inflate_state))`, `infback.c` L51) and
+/// its window comes from the caller, whereas here the window is owned and the
+/// state is placed on the Rust heap. A bounded allocator therefore refuses at the
+/// same position either way.
+///
+/// Substituting the window for the state is this Rust-native convenience
+/// constructor's documented divergence: its signature hands back an owning
+/// [`Box`], which cannot address a caller's region. The FFI `inflateBackInit_`
+/// shim has no such constraint and does it C's way — the ABI caller's buffer is
+/// lent rather than allocated, and the state itself is charged to the caller's
+/// `zalloc` — through the crate-private `inflate_back_init_borrowed_window`.
 ///
 /// # Errors
 ///
@@ -404,7 +499,13 @@ pub fn inflate_back_init_with<A: Allocator>(
     let window = alloc
         .allocate_zeroed::<u8>(1usize << window_bits)
         .ok_or(ReturnCode::MemError)?;
-    inflate_back_init_borrowed_window(alloc, window_bits, window)
+    // Boxing is fallible so global-heap exhaustion becomes `Z_MEM_ERROR` — the
+    // code C returns when its state `ZALLOC` fails (`infback.c` L52-L53) — rather
+    // than an abort.
+    try_box(build_back_state(alloc.hook(), window_bits, || {
+        Some(window)
+    })?)
+    .ok_or(ReturnCode::MemError)
 }
 
 /// Builds a back-inflate state around an **already-provided** window buffer,
@@ -434,42 +535,91 @@ pub fn inflate_back_init_with<A: Allocator>(
 ///
 /// * [`ReturnCode::StreamError`] — `window_bits` is outside `8..=15`, or `window`
 ///   is smaller than `1 << window_bits`.
-/// * [`ReturnCode::MemError`] — the state footprint was refused, or the global
-///   heap could not hold the boxed state.
-pub(crate) fn inflate_back_init_borrowed_window<A: Allocator>(
+/// * [`ReturnCode::MemError`] — the state allocation was refused, or the global
+///   heap could not hold the state on the no-hook path.
+pub(crate) fn inflate_back_init_borrowed_window<A, F>(
     alloc: &A,
     window_bits: i32,
-    window: AllocBuffer<u8>,
-) -> Result<Box<InflateState>, ReturnCode> {
-    // C L33-L35: reject windowBits outside the raw range 8..=15.
+    lend_window: F,
+) -> Result<BoxedEngine<InflateState>, ReturnCode>
+where
+    A: Allocator,
+    F: FnOnce() -> Option<AllocBuffer<u8>>,
+{
+    // C L33-L35: reject windowBits outside the raw range 8..=15. Before any
+    // allocation, exactly as C does.
     if !(MIN_WBITS..=MAX_WBITS).contains(&window_bits) {
-        return Err(ReturnCode::StreamError);
-    }
-    let wsize = 1usize << window_bits;
-    if window.len() < wsize {
         return Err(ReturnCode::StreamError);
     }
 
     // C L51-L53: the state is charged to the caller's allocator and checked
-    // immediately. The state itself lives in a Rust `Box`, so this reservation
-    // exists purely to keep the request count, the `(items, size)` pair and the
-    // failure timing identical to C's (AAP §0.6.5); whether to make it is the
-    // allocator's decision (`Allocator::reserves_state_footprint`).
-    let state_alloc = if alloc.reserves_state_footprint() {
-        alloc
-            .allocate_zeroed_items::<u8>(1, InflateState::C_LAYOUT_SIZE)
-            .ok_or(ReturnCode::MemError)?
-    } else {
-        AllocBuffer::default()
-    };
+    // immediately. This reservation *is* that request, and the region it secures
+    // becomes the finished state's actual home — `fill` below moves the state into
+    // it — so a caller's arena really does hold the `inflate_state` and gets it
+    // back through `zfree` at `inflateBackEnd` (AAP §0.6.3 has-hook clause,
+    // §0.6.5). Whether to charge at all is the allocator's decision
+    // (`Allocator::reserves_state_footprint`); the global default declines,
+    // because there the `Box` already is the allocation.
+    //
+    // It is taken before `lend_window` runs, so a refused request returns having
+    // touched nothing at all — precisely what C does: the `ZALLOC` at L51-L53
+    // fails and returns `Z_MEM_ERROR` before L60's `state->window = window;` ever
+    // runs. Reservation and construction are two steps because the charge has to
+    // happen before the state value exists.
+    let reservation = EngineReservation::<InflateState>::take(alloc).ok_or(ReturnCode::MemError)?;
 
-    let hook = alloc.hook();
-    // Raw stream: wrap = 0. `try_new_in` already sets dmax = 32768, sane = true,
-    // and records `hook` so any later window handling routes through it. Boxing is
-    // fallible so global-heap exhaustion becomes `Z_MEM_ERROR` — the code C returns
-    // when its state `ZALLOC` fails (`infback.c` L52-L53) — rather than an abort.
-    let mut state =
-        InflateState::try_new_in(hook, 0, window_bits as u32).ok_or(ReturnCode::MemError)?;
+    let state = build_back_state(alloc.hook(), window_bits, lend_window)?;
+
+    // Filling is fallible only on the no-hook path, where it boxes through a
+    // checked global allocation so heap exhaustion becomes `Z_MEM_ERROR` — the
+    // code C returns when its state `ZALLOC` fails (`infback.c` L52-L53) — rather
+    // than an abort. A reserved region was already secured above and cannot fail
+    // here.
+    reservation.fill(state).ok_or(ReturnCode::MemError)
+}
+
+/// Builds the back-inflate state **value**, with the window adopted but no
+/// placement decision made.
+///
+/// Split out of [`inflate_back_init_borrowed_window`] so the hook-backed FFI path
+/// and the owning Rust-native path
+/// ([`inflate_back_init_with`]) share one definition of what an
+/// `inflateBack` state *is*, while differing — as their signatures force them to —
+/// in where it ends up living.
+///
+/// `lend_window` is a closure rather than a value so a caller that must charge an
+/// allocator first can return without ever naming the window, which is what lets
+/// [`inflate_back_init_borrowed_window`] leave an ABI caller's buffer untouched on
+/// the path C leaves untouched.
+///
+/// # Errors
+///
+/// * [`ReturnCode::StreamError`] — `window_bits` is outside `8..=15`, or the lent
+///   buffer is shorter than `1 << window_bits`.
+/// * [`ReturnCode::MemError`] — `lend_window` reported failure.
+fn build_back_state<F>(
+    hook: AllocHook,
+    window_bits: i32,
+    lend_window: F,
+) -> Result<InflateState, ReturnCode>
+where
+    F: FnOnce() -> Option<AllocBuffer<u8>>,
+{
+    // C L33-L35, re-asserted here because this is also reached directly: reject
+    // windowBits outside the raw range 8..=15.
+    if !(MIN_WBITS..=MAX_WBITS).contains(&window_bits) {
+        return Err(ReturnCode::StreamError);
+    }
+    let wsize = 1usize << window_bits;
+
+    let window = lend_window().ok_or(ReturnCode::MemError)?;
+    if window.len() < wsize {
+        return Err(ReturnCode::StreamError);
+    }
+
+    // Raw stream: wrap = 0. `build_in` already sets dmax = 32768, sane = true, and
+    // records `hook` so any later window handling routes through it.
+    let mut state = InflateState::build_in(hook, 0, window_bits as u32);
 
     // C L56-L62: window geometry, then adopt the window.
     state.dmax = 32768;
@@ -479,7 +629,6 @@ pub(crate) fn inflate_back_init_borrowed_window<A: Allocator>(
     state.wnext = 0;
     state.sane = true;
     state.window = window;
-    state.state_alloc = state_alloc;
 
     Ok(state)
 }
@@ -524,7 +673,7 @@ fn do_type<I: InFunc, O: OutFunc>(
         }
         2 => state.mode = InflateMode::Table,
         // C L255-L257: reserved block type 3 -> "invalid block type".
-        _ => state.mode = InflateMode::Bad,
+        _ => ctx.bad(state, "invalid block type"),
     }
     // C L259: consume the type bits in all cases (including BAD).
     ctx.drop_bits(2);
@@ -553,7 +702,7 @@ fn do_stored<I: InFunc, O: OutFunc>(
     ctx.need_bits(32)?;
     if (ctx.hold & 0xffff) != ((ctx.hold >> 16) ^ 0xffff) {
         // C L266-L269: LEN and ~NLEN disagree.
-        state.mode = InflateMode::Bad;
+        ctx.bad(state, "invalid stored block lengths");
         return Ok(());
     }
     let mut length = ctx.hold & 0xffff;
@@ -564,14 +713,15 @@ fn do_stored<I: InFunc, O: OutFunc>(
         let mut copy = length as usize;
         ctx.pull()?;
         ctx.room(&mut state.window, &mut state.whave)?;
-        let have = ctx.inb.len() - ctx.next;
+        let have = ctx.have();
         if copy > have {
             copy = have;
         }
         if copy > ctx.left {
             copy = ctx.left;
         }
-        state.window[ctx.put..ctx.put + copy].copy_from_slice(&ctx.inb[ctx.next..ctx.next + copy]);
+        state.window[ctx.put..ctx.put + copy]
+            .copy_from_slice(&ctx.src.chunk()[ctx.next..ctx.next + copy]);
         ctx.next += copy;
         ctx.left -= copy;
         ctx.put += copy;
@@ -617,7 +767,7 @@ fn do_table<I: InFunc, O: OutFunc>(
 
     // C L303-L309: bound the symbol counts.
     if nlen > 286 || ndist > 30 {
-        state.mode = InflateMode::Bad;
+        ctx.bad(state, "too many length or distance symbols");
         return Ok(());
     }
 
@@ -646,7 +796,7 @@ fn do_table<I: InFunc, O: OutFunc>(
     )
     .is_err()
     {
-        state.mode = InflateMode::Bad;
+        ctx.bad(state, "invalid code lengths set");
         return Ok(());
     }
 
@@ -681,7 +831,7 @@ fn do_table<I: InFunc, O: OutFunc>(
                 ctx.drop_bits(u32::from(here.bits));
                 if n == 0 {
                     // C L350-L354: nothing to repeat.
-                    state.mode = InflateMode::Bad;
+                    ctx.bad(state, "invalid bit length repeat");
                     return Ok(());
                 }
                 repeat_val = state.lens[n - 1];
@@ -704,7 +854,7 @@ fn do_table<I: InFunc, O: OutFunc>(
             }
             // C L374-L379: a repeat must not overrun the declared code counts.
             if n + copy > total {
-                state.mode = InflateMode::Bad;
+                ctx.bad(state, "invalid bit length repeat");
                 return Ok(());
             }
             while copy != 0 {
@@ -717,7 +867,7 @@ fn do_table<I: InFunc, O: OutFunc>(
 
     // C L388-L394: a valid block must define an end-of-block code.
     if state.lens[256] == 0 {
-        state.mode = InflateMode::Bad;
+        ctx.bad(state, "invalid code -- missing end-of-block");
         return Ok(());
     }
 
@@ -738,7 +888,7 @@ fn do_table<I: InFunc, O: OutFunc>(
     )
     .is_err()
     {
-        state.mode = InflateMode::Bad;
+        ctx.bad(state, "invalid literal/lengths set");
         return Ok(());
     }
     state.lenbits = lenbits as u32;
@@ -760,7 +910,7 @@ fn do_table<I: InFunc, O: OutFunc>(
     )
     .is_err()
     {
-        state.mode = InflateMode::Bad;
+        ctx.bad(state, "invalid distances set");
         return Ok(());
     }
     state.distbits = distbits as u32;
@@ -816,7 +966,7 @@ fn do_len<I: InFunc, O: OutFunc>(
 
     // C L469-L473: invalid literal/length code.
     if here.op & 64 != 0 {
-        state.mode = InflateMode::Bad;
+        ctx.bad(state, "invalid literal/length code");
         return Ok(());
     }
 
@@ -840,7 +990,7 @@ fn do_len<I: InFunc, O: OutFunc>(
     };
     if dhere.op & 64 != 0 {
         // C L502-L505: invalid distance code.
-        state.mode = InflateMode::Bad;
+        ctx.bad(state, "invalid distance code");
         return Ok(());
     }
     let mut offset = dhere.val as usize;
@@ -862,7 +1012,7 @@ fn do_len<I: InFunc, O: OutFunc>(
         0
     };
     if offset > ctx.wsize - reach {
-        state.mode = InflateMode::Bad;
+        ctx.bad(state, "invalid distance too far back");
         return Ok(());
     }
 
@@ -942,26 +1092,48 @@ fn inf_leave<I: InFunc, O: OutFunc>(
 ///
 /// # Returns
 ///
-/// - [`ReturnCode::StreamEnd`] on a successfully decoded final block.
+/// A [`BackOutcome`] carrying both halves of what C leaves behind: the return
+/// code in [`code`](BackOutcome::code) and the fate of `strm->msg` in
+/// [`msg`](BackOutcome::msg). The codes are
+///
+/// - [`ReturnCode::StreamEnd`] on a successfully decoded final block
+///   ([`BackMsg::Cleared`]).
 /// - [`ReturnCode::DataError`] on a DEFLATE format error (an invalid block
 ///   type, bad stored-block lengths, a malformed dynamic header, an invalid
-///   code, or a distance that reaches too far back).
+///   code, or a distance that reaches too far back) — always
+///   [`BackMsg::Set`] with C's exact diagnostic.
 /// - [`ReturnCode::BufError`] if the input callback runs dry or the output
-///   callback aborts.
+///   callback aborts ([`BackMsg::Cleared`]: C assigns no diagnostic on this
+///   path).
 /// - [`ReturnCode::StreamError`] if `state` is not a valid, window-sized
-///   back-inflate state.
+///   back-inflate state ([`BackMsg::Untouched`], because C returns before it
+///   clears the field).
 ///
 /// # Examples
 ///
 /// ```
-/// # use zlib_rs::inflate::back::{inflate_back, inflate_back_init, InFunc, OutFunc};
+/// # use zlib_rs::inflate::back::{
+/// #     inflate_back, inflate_back_init, BackMsg, InFunc, OutFunc,
+/// # };
 /// # use zlib_rs::error::ReturnCode;
 /// // Raw DEFLATE for the empty stream: a final fixed block containing only the
 /// // end-of-block code.
-/// struct OneShot<'a>(Option<&'a [u8]>);
-/// impl InFunc for OneShot<'_> {
-///     fn next_input(&mut self) -> &[u8] {
-///         self.0.take().unwrap_or(&[])
+/// struct OneShot<'a> {
+///     pending: Option<&'a [u8]>,
+///     current: &'a [u8],
+/// }
+/// impl<'a> InFunc for OneShot<'a> {
+///     fn advance(&mut self) -> bool {
+///         match self.pending.take() {
+///             Some(chunk) => {
+///                 self.current = chunk;
+///                 true
+///             }
+///             None => false,
+///         }
+///     }
+///     fn chunk(&self) -> &[u8] {
+///         self.current
 ///     }
 /// }
 /// struct Collect(Vec<u8>);
@@ -973,31 +1145,40 @@ fn inf_leave<I: InFunc, O: OutFunc>(
 /// }
 /// let mut state = inflate_back_init(15).unwrap();
 /// let data = [0x03u8, 0x00];
-/// let mut src = OneShot(Some(&data));
+/// let mut src = OneShot { pending: Some(&data), current: &[] };
 /// let mut sink = Collect(Vec::new());
-/// assert_eq!(inflate_back(&mut state, &mut src, &mut sink), ReturnCode::StreamEnd);
+/// let outcome = inflate_back(&mut state, &mut src, &mut sink);
+/// assert_eq!(outcome.code, ReturnCode::StreamEnd);
+/// assert_eq!(outcome.msg, BackMsg::Cleared);
 /// assert!(sink.0.is_empty());
 /// ```
 pub fn inflate_back<I: InFunc, O: OutFunc>(
     state: &mut InflateState,
     in_func: &mut I,
     out_func: &mut O,
-) -> ReturnCode {
+) -> BackOutcome {
     // C L208-L211: the state must be initialized (via inflate_back_init), which
-    // means a valid mode and an allocated, correctly sized window.
+    // means a valid mode and an allocated, correctly sized window. This returns
+    // *before* C's `strm->msg = Z_NULL` at L214, so the caller's existing
+    // diagnostic is deliberately left alone.
     let wsize = state.wsize as usize;
     if !state.is_valid() || wsize == 0 || state.window.len() < wsize {
-        return ReturnCode::StreamError;
+        return BackOutcome {
+            code: ReturnCode::StreamError,
+            msg: BackMsg::Untouched,
+        };
     }
 
-    // C L213-L223: reset per-call state and load the registers.
+    // C L213-L223: reset per-call state and load the registers. C L214 clears
+    // `strm->msg` here, which `BackCtx::msg` starting at `None` reproduces: a
+    // decode that sets no diagnostic reports `BackMsg::Cleared` below.
     state.mode = InflateMode::Type;
     state.last = false;
     state.whave = 0;
 
     let mut ctx = BackCtx {
-        inb: Vec::new(),
         next: 0,
+        msg: None,
         hold: 0,
         bits: 0,
         put: 0,
@@ -1012,13 +1193,22 @@ pub fn inflate_back<I: InFunc, O: OutFunc>(
 
     // Report the unconsumed tail of the last provider chunk (C `have`) so an FFI
     // adapter can restore `next_in`/`avail_in` exactly like C `inf_leave`
-    // (infback.c L561-L569 sets `strm->avail_in = have`). `next <= inb.len()`, so
-    // this is the number of bytes pulled but not yet consumed from that chunk.
-    let unconsumed = ctx.inb.len() - ctx.next;
+    // (infback.c L561-L569 sets `strm->avail_in = have`). This is the number of
+    // bytes pulled but not yet consumed from that chunk.
+    let unconsumed = ctx.have();
     ctx.src.set_unconsumed(unconsumed);
 
     // C L561-L569: flush the tail of the window and return.
-    inf_leave(&mut ctx, state, ret)
+    let code = inf_leave(&mut ctx, state, ret);
+    BackOutcome {
+        code,
+        // C never re-clears `strm->msg` in `inf_leave`, so whatever an error site
+        // stored is what the caller observes; otherwise the L214 clear stands.
+        msg: match ctx.msg {
+            Some(m) => BackMsg::Set(m),
+            None => BackMsg::Cleared,
+        },
+    }
 }
 
 /// Runs the back-inflate block/symbol state machine to completion
@@ -1079,16 +1269,47 @@ fn drive<I: InFunc, O: OutFunc>(
 /// Callers using the idiomatic API may simply drop the [`Box<InflateState>`]
 /// instead of calling this function; the effect is identical.
 pub fn inflate_back_end(state: Box<InflateState>) -> ReturnCode {
-    if !state.is_valid() {
-        return ReturnCode::StreamError;
-    }
+    let code = back_end_validate(&state);
     // `state` and its owned window are freed here, subsuming the C `ZFREE`.
-    ReturnCode::Ok
+    code
+}
+
+/// [`inflate_back_end`] for a state that the FFI boundary placed through the
+/// caller's allocator.
+///
+/// The C `inflateBackEnd` shim owns its state as a placed engine rather than a
+/// plain [`Box`], because reference zlib's single `ZALLOC` at `infback.c` L51 is
+/// charged to the caller and the region it returned is where the state actually
+/// lives. Dropping the argument hands that region back through the caller's
+/// `zfree`, which is the one free `infback.c` L572-L577 performs; the lent window
+/// is deliberately left alone.
+pub(crate) fn inflate_back_end_engine(state: BoxedEngine<InflateState>) -> ReturnCode {
+    let code = back_end_validate(&state);
+    // Dropping `state` releases its storage — through the caller's `zfree` when
+    // the caller's `zalloc` supplied it.
+    code
+}
+
+/// The state check both `inflateBackEnd` spellings perform, factored out so the
+/// two cannot drift apart.
+///
+/// C `inflateBackEnd` refuses a stream with no state or no `zfree`
+/// (`infback.c` L572-L573); the missing-state half is discharged by holding the
+/// value at all, and the allocator half is enforced at the FFI boundary, which is
+/// the only place a `zfree` pointer exists. What is left to check here is that the
+/// state really is a usable inflate state.
+fn back_end_validate(state: &InflateState) -> ReturnCode {
+    if state.is_valid() {
+        ReturnCode::Ok
+    } else {
+        ReturnCode::StreamError
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     // Reference raw-DEFLATE (RFC 1951) test vectors, produced by Python's
     // `zlib` (the reference C implementation) with a negative `wbits` (raw
@@ -1128,15 +1349,21 @@ mod tests {
     struct SliceIn<'a> {
         data: &'a [u8],
         done: bool,
+        /// The chunk made current by the most recent successful `advance`.
+        cur: &'a [u8],
     }
     impl InFunc for SliceIn<'_> {
-        fn next_input(&mut self) -> &[u8] {
+        fn advance(&mut self) -> bool {
             if self.done {
-                &[]
+                false
             } else {
                 self.done = true;
-                self.data
+                self.cur = self.data;
+                true
             }
+        }
+        fn chunk(&self) -> &[u8] {
+            self.cur
         }
     }
 
@@ -1145,15 +1372,24 @@ mod tests {
     struct ChunkyIn<'a> {
         data: &'a [u8],
         pos: usize,
+        /// Window over the single byte made current by the last `advance`.
+        cur: &'a [u8],
+        /// Number of times `advance` has been invoked, so a test can assert the
+        /// engine pulls exactly as often as C's `in()` is called.
+        advances: usize,
     }
     impl InFunc for ChunkyIn<'_> {
-        fn next_input(&mut self) -> &[u8] {
+        fn advance(&mut self) -> bool {
+            self.advances += 1;
             if self.pos >= self.data.len() {
-                return &[];
+                return false;
             }
-            let one = &self.data[self.pos..self.pos + 1];
+            self.cur = &self.data[self.pos..self.pos + 1];
             self.pos += 1;
-            one
+            true
+        }
+        fn chunk(&self) -> &[u8] {
+            self.cur
         }
     }
 
@@ -1179,11 +1415,21 @@ mod tests {
     /// Decode `data` in one shot with the given window size, returning the
     /// return code and the collected output.
     fn run(window_bits: i32, data: &[u8]) -> (ReturnCode, Vec<u8>) {
+        run_full(window_bits, data).0
+    }
+
+    /// As [`run`], but also returns the diagnostic C would have left in
+    /// `strm->msg`, so a test can assert the exact `infback.c` string.
+    fn run_full(window_bits: i32, data: &[u8]) -> ((ReturnCode, Vec<u8>), BackMsg) {
         let mut state = inflate_back_init(window_bits).expect("valid windowBits");
-        let mut src = SliceIn { data, done: false };
+        let mut src = SliceIn {
+            data,
+            done: false,
+            cur: &[],
+        };
         let mut sink = VecOut { data: Vec::new() };
-        let rc = inflate_back(&mut state, &mut src, &mut sink);
-        (rc, sink.data)
+        let outcome = inflate_back(&mut state, &mut src, &mut sink);
+        ((outcome.code, sink.data), outcome.msg)
     }
 
     /// The 175-byte plaintext behind [`DYNAMIC_VEC`].
@@ -1289,11 +1535,26 @@ mod tests {
         let mut src = ChunkyIn {
             data: &DYNAMIC_VEC,
             pos: 0,
+            cur: &[],
+            advances: 0,
         };
         let mut sink = VecOut { data: Vec::new() };
-        let rc = inflate_back(&mut state, &mut src, &mut sink);
-        assert_eq!(rc, ReturnCode::StreamEnd);
+        let outcome = inflate_back(&mut state, &mut src, &mut sink);
+        assert_eq!(outcome.code, ReturnCode::StreamEnd);
+        assert_eq!(outcome.msg, BackMsg::Cleared);
         assert_eq!(sink.data, dynamic_plaintext());
+        // C invokes `in()` only when a byte is actually needed, so a stream whose
+        // final block ends on its last byte produces exactly one call per byte and
+        // never a trailing dry probe. Measured directly against reference C at the
+        // ABI (`calls == i` for every well-formed vector), this identity holds only
+        // because the engine consumes the provider's chunks in place: a buffering
+        // engine that read ahead would pull a different number of times.
+        assert_eq!(
+            src.advances,
+            DYNAMIC_VEC.len(),
+            "exactly one advance per byte, with no read-ahead and no dry probe",
+        );
+        assert_eq!(src.pos, DYNAMIC_VEC.len(), "every byte must be pulled once");
     }
 
     #[test]
@@ -1329,10 +1590,13 @@ mod tests {
         let mut src = SliceIn {
             data: &FIXED_VEC,
             done: false,
+            cur: &[],
         };
         let mut sink = AlwaysErrOut;
-        let rc = inflate_back(&mut state, &mut src, &mut sink);
-        assert_eq!(rc, ReturnCode::BufError);
+        let outcome = inflate_back(&mut state, &mut src, &mut sink);
+        assert_eq!(outcome.code, ReturnCode::BufError);
+        // C assigns no diagnostic on the failed-flush path; the L214 clear stands.
+        assert_eq!(outcome.msg, BackMsg::Cleared);
     }
 
     /// Port of `test/infcover.c`'s forced-mode assertion (`infcover.c` L459 and
@@ -1368,12 +1632,13 @@ mod tests {
             let mut src = SliceIn {
                 data: &data,
                 done: false,
+                cur: &[],
             };
             let mut sink = VecOut { data: Vec::new() };
             let wsize = state.wsize as usize;
             let mut ctx = BackCtx {
-                inb: Vec::new(),
                 next: 0,
+                msg: None,
                 hold: 0,
                 bits: 0,
                 put: 0,
@@ -1413,7 +1678,11 @@ mod tests {
     /// This is the property that makes the FFI `inflateBackInit_` shim match
     /// `infback.c` exactly: one `ZALLOC` for the state (L51), then
     /// `state->window = window;` (L60). A recording allocator therefore sees one
-    /// request whose `(items, size)` pair is `(1, sizeof(struct inflate_state))`.
+    /// request, shaped `(1, one state object)`. The size is this port's own
+    /// `size_of::<InflateState>()` rather than C's `sizeof(struct inflate_state)`,
+    /// because the region secured *is* where the state lives — a block of C's
+    /// smaller `sizeof` could not hold it — and AAP §0.6.5 pins the request count
+    /// and the failure timing, both of which this reproduces exactly.
     #[test]
     fn borrowed_window_init_makes_only_the_state_request() {
         use core::cell::RefCell;
@@ -1449,7 +1718,7 @@ mod tests {
         let window = AllocBuffer::<u8>::try_zeroed(1 << 15, AllocHook::none())
             .expect("global allocator serves a 32 KiB window");
 
-        let state = inflate_back_init_borrowed_window(&alloc, 15, window)
+        let state = inflate_back_init_borrowed_window(&alloc, 15, || Some(window))
             .expect("a healthy allocator initializes the state");
         assert_eq!(state.wsize, 1 << 15);
         assert_eq!(state.wbits, 15);
@@ -1461,8 +1730,8 @@ mod tests {
 
         assert_eq!(
             alloc.seen.into_inner(),
-            vec![(1, InflateState::C_LAYOUT_SIZE)],
-            "exactly C's single state request, with C's own sizeof pair"
+            vec![(1, size_of::<InflateState>())],
+            "exactly C's single state request, shaped as one state object"
         );
     }
 
@@ -1479,7 +1748,9 @@ mod tests {
         let short = AllocBuffer::<u8>::try_zeroed((1 << 15) - 1, AllocHook::none())
             .expect("global allocator serves the buffer");
         assert!(matches!(
-            inflate_back_init_borrowed_window(&HookAllocator::new(AllocHook::none()), 15, short),
+            inflate_back_init_borrowed_window(&HookAllocator::new(AllocHook::none()), 15, || {
+                Some(short)
+            }),
             Err(ReturnCode::StreamError)
         ));
 
@@ -1487,8 +1758,284 @@ mod tests {
         let ok = AllocBuffer::<u8>::try_zeroed(1 << 15, AllocHook::none())
             .expect("global allocator serves the buffer");
         assert!(matches!(
-            inflate_back_init_borrowed_window(&HookAllocator::new(AllocHook::none()), 16, ok),
+            inflate_back_init_borrowed_window(&HookAllocator::new(AllocHook::none()), 16, || {
+                Some(ok)
+            }),
             Err(ReturnCode::StreamError)
         ));
+    }
+    /// The engine must read input **through** the provider on every byte rather
+    /// than copying each chunk once into a buffer of its own (M4-02).
+    ///
+    /// The observable that separates the two strategies is how often
+    /// [`InFunc::chunk`] is consulted. A copying engine calls it exactly once per
+    /// successful `advance` — it needs the bytes only to memcpy them — so for a
+    /// single-chunk provider the count would be `1`. A lending engine consults it
+    /// on every `PULL`, `PULLBYTE` and stored-block copy, so the count scales with
+    /// the input. This is fully within the C callback contract: nothing mutates
+    /// the chunk, it is merely observed.
+    #[test]
+    fn the_decoder_reads_through_the_provider_instead_of_copying() {
+        use core::cell::Cell;
+
+        /// One-chunk provider that counts how often the engine looks at the chunk.
+        struct CountingIn<'a> {
+            data: &'a [u8],
+            done: bool,
+            cur: &'a [u8],
+            chunk_calls: Cell<usize>,
+        }
+        impl InFunc for CountingIn<'_> {
+            fn advance(&mut self) -> bool {
+                if self.done {
+                    return false;
+                }
+                self.done = true;
+                self.cur = self.data;
+                true
+            }
+            fn chunk(&self) -> &[u8] {
+                self.chunk_calls.set(self.chunk_calls.get() + 1);
+                self.cur
+            }
+        }
+
+        let mut state = inflate_back_init(15).unwrap();
+        let mut src = CountingIn {
+            data: &DYNAMIC_VEC,
+            done: false,
+            cur: &[],
+            chunk_calls: Cell::new(0),
+        };
+        let mut sink = VecOut { data: Vec::new() };
+        let outcome = inflate_back(&mut state, &mut src, &mut sink);
+        assert_eq!(outcome.code, ReturnCode::StreamEnd);
+        assert_eq!(sink.data, dynamic_plaintext());
+
+        let calls = src.chunk_calls.get();
+        assert!(
+            calls >= DYNAMIC_VEC.len(),
+            "a lending decoder consults the provider at least once per input byte; \
+             {calls} call(s) for {} byte(s) means the chunk was copied instead",
+            DYNAMIC_VEC.len()
+        );
+    }
+
+    /// A stored block must be copied straight out of the provider's memory, which
+    /// is the one place the old shape used `Vec` as a *source* slice rather than
+    /// just as a refill buffer.
+    #[test]
+    fn a_stored_block_is_copied_out_of_provider_memory() {
+        use core::cell::Cell;
+
+        struct CountingIn<'a> {
+            data: &'a [u8],
+            done: bool,
+            cur: &'a [u8],
+            chunk_calls: Cell<usize>,
+            advances: usize,
+        }
+        impl InFunc for CountingIn<'_> {
+            fn advance(&mut self) -> bool {
+                self.advances += 1;
+                if self.done {
+                    return false;
+                }
+                self.done = true;
+                self.cur = self.data;
+                true
+            }
+            fn chunk(&self) -> &[u8] {
+                self.chunk_calls.set(self.chunk_calls.get() + 1);
+                self.cur
+            }
+        }
+
+        let mut state = inflate_back_init(15).unwrap();
+        let mut src = CountingIn {
+            data: &STORED_VEC,
+            done: false,
+            cur: &[],
+            chunk_calls: Cell::new(0),
+            advances: 0,
+        };
+        let mut sink = VecOut { data: Vec::new() };
+        let outcome = inflate_back(&mut state, &mut src, &mut sink);
+        assert_eq!(outcome.code, ReturnCode::StreamEnd);
+        assert_eq!(outcome.msg, BackMsg::Cleared);
+        assert_eq!(&sink.data[..], b"Hello, stored DEFLATE world!");
+        // Measured: the lending decoder observes this 33-byte chunk 15 times (the
+        // header bit-pulls plus the bulk copy). A decoder that copied each chunk
+        // once would observe it a fixed handful of times regardless of length, so
+        // both a concrete floor and an advance-relative floor are asserted.
+        let calls = src.chunk_calls.get();
+        assert!(
+            calls >= 8,
+            "the stored-block copy must read the provider's slice directly; \
+             {calls} observation(s) indicates the chunk was buffered instead"
+        );
+        assert!(
+            calls > 3 * src.advances,
+            "observations must scale with the bytes consumed, not with the number \
+             of chunks ({calls} observation(s) across {} advance(s))",
+            src.advances
+        );
+    }
+
+    /// Every one of the twelve `infback.c` error sites must report C's exact
+    /// diagnostic string (M4-01), and a clean or short stream must report the
+    /// cleared field C leaves at `infback.c` L214.
+    ///
+    /// The vectors and their expected texts are `test/infcover.c` L584-L598, the
+    /// official table this crate treats as the decoder's conformance oracle.
+    #[test]
+    fn every_error_site_reports_cs_exact_diagnostic() {
+        // (raw DEFLATE bytes, the exact `strm->msg` C would publish)
+        let cases: [(&[u8], &str); 12] = [
+            (
+                &[0x00, 0x00, 0x00, 0x00, 0x00],
+                "invalid stored block lengths",
+            ),
+            (&[0x06], "invalid block type"),
+            (&[0xfc, 0x00, 0x00], "too many length or distance symbols"),
+            (&[0x04, 0x00, 0xfe, 0xff], "invalid code lengths set"),
+            (&[0x04, 0x00, 0x24, 0x49, 0x00], "invalid bit length repeat"),
+            (
+                &[0x04, 0x00, 0x24, 0xe9, 0xff, 0xff],
+                "invalid bit length repeat",
+            ),
+            (
+                &[0x04, 0x00, 0x24, 0xe9, 0xff, 0x6d],
+                "invalid code -- missing end-of-block",
+            ),
+            (
+                &[
+                    0x04, 0x80, 0x49, 0x92, 0x24, 0x49, 0x92, 0x24, 0x71, 0xff, 0xff, 0x93, 0x11,
+                    0x00,
+                ],
+                "invalid literal/lengths set",
+            ),
+            (
+                &[
+                    0x04, 0x80, 0x49, 0x92, 0x24, 0x49, 0x92, 0x24, 0x0f, 0xb4, 0xff, 0xff, 0xc3,
+                    0x84,
+                ],
+                "invalid distances set",
+            ),
+            (
+                &[
+                    0x04, 0xc0, 0x81, 0x08, 0x00, 0x00, 0x00, 0x00, 0x20, 0x7f, 0xeb, 0x0b, 0x00,
+                    0x00,
+                ],
+                "invalid literal/length code",
+            ),
+            (&[0x02, 0x7e, 0xff, 0xff], "invalid distance code"),
+            (
+                &[
+                    0x0c, 0xc0, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x90, 0xff, 0x6b, 0x04, 0x00,
+                ],
+                "invalid distance too far back",
+            ),
+        ];
+        for (bytes, expected) in cases {
+            let ((code, _out), msg) = run_full(15, bytes);
+            assert_eq!(
+                code,
+                ReturnCode::DataError,
+                "vector for {expected:?} must be a data error"
+            );
+            assert_eq!(
+                msg,
+                BackMsg::Set(expected),
+                "vector for {expected:?} reported the wrong diagnostic"
+            );
+        }
+
+        // The two well-formed vectors from the same table leave the field cleared.
+        for ok in [
+            &[0x03u8, 0x00][..],
+            &[0x01, 0x01, 0x00, 0xfe, 0xff, 0x00][..],
+        ] {
+            let ((code, _), msg) = run_full(15, ok);
+            assert_eq!(code, ReturnCode::StreamEnd);
+            assert_eq!(msg, BackMsg::Cleared);
+        }
+
+        // A truncated stream exits `Z_BUF_ERROR` without C assigning a diagnostic,
+        // so the L214 clear is what the caller observes — not a stale message.
+        let ((code, _), msg) = run_full(15, &[0x04]);
+        assert_eq!(code, ReturnCode::BufError);
+        assert_eq!(msg, BackMsg::Cleared);
+    }
+
+    /// A state `inflate_back` refuses must leave the diagnostic field alone,
+    /// because C returns at `infback.c` L209-L210 — *before* the
+    /// `strm->msg = Z_NULL` at L214 (M4-01).
+    #[test]
+    fn a_refused_call_leaves_the_diagnostic_untouched() {
+        let mut state = inflate_back_init(15).expect("15 is valid");
+        // Zero the window geometry so the entry check fails, standing in for C's
+        // `strm->state == Z_NULL`.
+        state.wsize = 0;
+        let mut src = SliceIn {
+            data: &FIXED_VEC,
+            done: false,
+            cur: &[],
+        };
+        let mut sink = VecOut { data: Vec::new() };
+        let outcome = inflate_back(&mut state, &mut src, &mut sink);
+        assert_eq!(outcome.code, ReturnCode::StreamError);
+        assert_eq!(
+            outcome.msg,
+            BackMsg::Untouched,
+            "a rejected call must not clear a diagnostic C preserves"
+        );
+        assert!(sink.data.is_empty(), "no output from a refused call");
+    }
+
+    /// `inflateBackInit_`'s allocation ordering: C's single state `ZALLOC`
+    /// (`infback.c` L51-L53) runs *before* `state->window = window;` (L60), so a
+    /// refused state request must return `Z_MEM_ERROR` without the caller's window
+    /// ever being named, let alone written (M6-09).
+    #[test]
+    fn a_refused_state_request_never_reaches_the_window() {
+        use crate::stream::AllocBuffer;
+        use core::cell::Cell;
+
+        /// Allocator that refuses everything, so the state request is the first
+        /// and only thing that happens.
+        struct Broke;
+        impl Allocator for Broke {
+            fn hook(&self) -> AllocHook {
+                AllocHook::none()
+            }
+            fn reserves_state_footprint(&self) -> bool {
+                true
+            }
+            fn allocate_zeroed_items<T: Copy + Default + crate::stream::ZeroValid>(
+                &self,
+                _items: usize,
+                _item_size: usize,
+            ) -> Option<AllocBuffer<T>> {
+                None
+            }
+        }
+
+        let lent = Cell::new(false);
+        let result = inflate_back_init_borrowed_window(&Broke, 15, || {
+            lent.set(true);
+            AllocBuffer::<u8>::try_zeroed(1 << 15, AllocHook::none())
+        });
+        // `InflateState` is deliberately not `Debug` (it holds caller memory), so
+        // match rather than unwrap.
+        match result {
+            Err(e) => assert_eq!(e, ReturnCode::MemError, "C returns Z_MEM_ERROR here"),
+            Ok(_) => panic!("a refusing allocator must not initialize the state"),
+        }
+        assert!(
+            !lent.get(),
+            "the caller's window must not be borrowed at all once the state \
+             request has failed -- C never reaches infback.c L60"
+        );
     }
 }
