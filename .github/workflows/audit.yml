@@ -276,21 +276,21 @@
 #     grinding through the remaining checks after `cancel-in-progress` killed it.
 #   * WHAT REMAINS FORBIDDEN: `continue-on-error`, `|| true`, `set +e`, a trailing
 #     `exit 0`, `2>/dev/null` on a tool invocation, and the weakening flags
-#     `--stale`, `-n` / `--no-fetch`, `--ignore` and `-A`. None appears in this
+#     `--stale`, `-n` / `--no-fetch` and `--ignore`. None of those appears in this
 #     file. Any `if:` other than the exact `${{ !cancelled() }}` form is a defect.
-#
-# ACTION PINNING - ACCEPTED RESIDUAL RISK
-# =======================================
-# Every `uses:` here names a TAG or BRANCH, not a commit SHA, and a tag can be
-# moved while a branch advances by design. In a workflow whose purpose is
-# supply-chain assurance that is worth stating plainly rather than leaving
-# implicit: this file trusts `actions/checkout` and `dtolnay/rust-toolchain` at
-# tag/branch granularity, and that is accepted residual risk.
-#
-# Two notes for whoever converts them, neither of which makes the conversion
-# all-or-nothing. Each `uses:` can be pinned INDEPENDENTLY - a SHA-pinned step
-# works alongside tag-referenced ones, so there is no atomicity requirement
-# across steps, jobs or workflows, and converting a few at a time is a valid path.
+#   * THE ONE QUALIFIED EXCEPTION, stated here so the list above is honest: the
+#     four root `cargo deny check` invocations DO carry `-A unused-wrapper -A
+#     license-exception-not-encountered`, and only those two codes. Both are
+#     shape artifacts of running ONE policy over TWO graphs - the `cc` ban's
+#     `wrappers = ["libfuzzer-sys"]` scope and the `libfuzzer-sys` NCSA exception
+#     are legitimately unused against the ROOT graph, where neither crate exists -
+#     and both stay at full severity on `cargo-deny-fuzz`, the graph where they
+#     mean something. Neither is a finding code: `rejected`, `denied`,
+#     `duplicate`, `vulnerability`, `unmaintained`, `unsound`, `yanked`,
+#     `unknown-registry` and `unknown-git` are all untouched, so nothing capable
+#     of hiding a real result is suppressed. The full argument sits inline above
+#     the `Check licenses` step; do NOT extend the pair, and do not read it as
+#     licence to add a third `-A`.
 #
 # ACTION PINNING - A DELIBERATE, REPOSITORY-WIDE CONVENTION
 # ========================================================
@@ -316,27 +316,32 @@
 # add or remove a job, update both the sentence and that job's expectation table
 # in the same reviewable diff - which is the point.
 #
-# It is a convention shared with `ci.yml` and `fuzz.yml`, and it was converted
-# across all three files in one change because a partial conversion does not work:
+# The conversion was made across all three files in one change because a partial
+# conversion does not work:
 #
 #   * `dtolnay/rust-toolchain` derives its DEFAULT toolchain from
 #     `github.action_ref` - that is precisely how `@stable`, `@nightly` and
 #     `@1.85.0` selected what they selected. Once the ref is a commit SHA the
-#     requested toolchain would be the SHA itself, so all 17 call sites across the
-#     three workflows pass an explicit `with: toolchain:` naming the channel, and
-#     every toolchain-sensitive job additionally ASSERTS the resolved channel via
-#     `rustup show active-toolchain` (the three jobs here pin `stable`).
+#     requested toolchain would be the SHA itself, so all 16 of its call sites
+#     across the three workflows pass an explicit `with: toolchain:` naming the
+#     channel, and every toolchain-sensitive job additionally ASSERTS the resolved
+#     channel via `rustup show active-toolchain` (the three jobs here pin
+#     `stable`).
 #   * Every SHA was verified against the upstream repository at the moment of
 #     pinning. A SHA copied from anywhere else is a worse trust root than the tag
 #     it replaces, because it looks authoritative and cannot be eyeballed.
 #
-# The pins in force across the three workflows, with their use counts:
+# The pins in force across the three workflows, with their use counts. These are
+# the same figures the sentence above quotes and the same ones `policy-integrity`
+# re-derives, so all three must be changed together or not at all:
 #
-#   actions/checkout         11d5960a326750d5838078e36cf38b85af677262  v4.4.0  18x
-#   dtolnay/rust-toolchain   2c7215f132e9ebf062739d9130488b56d53c060c  master  17x
+#   actions/checkout         11d5960a326750d5838078e36cf38b85af677262  v4.4.0  17x
+#   dtolnay/rust-toolchain   2c7215f132e9ebf062739d9130488b56d53c060c  master  16x
 #   actions/cache            0057852bfaa89a56745cba8c7296529d2fc39830  v4.3.0   5x
 #   actions/upload-artifact  ea165f8d65b6e75b540449e92b4886f43607fa02  v4.6.2   2x
 #   actions/setup-python     ece7cb06caefa5fff74198d8649806c4678c61a1  v6.3.0   1x
+#                                                                             ---
+#                                                                             41x
 #
 # UPGRADING: resolve the new SHA from the upstream repository, change every
 # occurrence in all three workflows in a single commit, and move the trailing
@@ -1092,7 +1097,7 @@ jobs:
                " The RUSTUP_TOOLCHAIN override was lost and rust-toolchain.toml won."; exit 1 ;;
           esac
 
-      # 4. Install cargo-deny, PINNED to the version both policy files were probed
+      # 4. Install cargo-deny, PINNED to the version the one policy file was probed
       #    against. This is the pin that matters most here: cargo-deny 0.20 removed
       #    and re-scoped whole families of `[advisories]` and `[licenses]` keys, and a
       #    future major could do the same - the dangerous outcome being not a parse
@@ -1263,13 +1268,27 @@ jobs:
           echo "Cargo.lock and fuzz/Cargo.lock are unchanged"
 
   # Policy evaluation over the DETACHED fuzz crate graph, against the SAME root
-  # `deny.toml` the job above uses. This is the job that closes the
-  # trigger-coverage gap: `fuzz.yml`'s `supply-chain` job runs the same command
-  # but only on pull_request, weekly cron and manual dispatch, so before this job
-  # existed a direct push touching `fuzz/Cargo.toml` or `fuzz/Cargo.lock` got
+  # `deny.toml` the job above uses. THIS IS NOW THE ONLY JOB IN THE REPOSITORY
+  # THAT EVALUATES THE FUZZ GRAPH AGAINST THE POLICY, and it exists because of a
+  # trigger-coverage gap it has since closed.
+  #
+  # `fuzz.yml` USED TO CARRY a `supply-chain` job running the same command, but it
+  # ran only on pull_request, the weekly cron and manual dispatch - never on a
+  # direct push - so a push touching `fuzz/Cargo.toml` or `fuzz/Cargo.lock` got
   # advisory coverage from the cargo-audit job above and NO licence, ban or source
-  # evaluation for up to seven days. Both jobs are kept: this one gives cadence,
-  # the one in `fuzz.yml` gates the fuzzing campaign. See "SCOPE" in the header.
+  # evaluation for up to seven days. That job was REMOVED rather than kept
+  # alongside this one: `fuzz.yml` today declares a single job, `cargo-fuzz`, and
+  # runs no cargo-deny and no cargo-audit at all. Two copies of one gate is not
+  # defence in depth - it is a second place for the tool pin, the `--locked`
+  # discipline and the lockfile assertion to drift.
+  #
+  # What that traded away, and what it bought, are both recorded in `fuzz.yml`'s
+  # "SUPPLY-CHAIN POLICY - OWNED BY `audit.yml`, NOT BY THIS FILE" header: the
+  # intra-run SEQUENCING is gone (a job in another workflow cannot be a `needs:`
+  # predecessor of `cargo-fuzz`), and in exchange this job runs on `push`,
+  # `pull_request`, a daily 05:00 cron and `workflow_dispatch` - a superset of the
+  # removed job's triggers - and is blocking on all of them. See "SCOPE" in the
+  # header. Do NOT re-add a policy job to `fuzz.yml` to "restore the sequencing".
   cargo-deny-fuzz:
     name: cargo-deny (fuzz graph, root policy)
     runs-on: ubuntu-latest

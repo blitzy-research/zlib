@@ -8,28 +8,42 @@
 # nightly toolchain (it injects `-Z` sanitizer / coverage instrumentation that
 # is unavailable on stable); see `.github/workflows/fuzz.yml`.
 #
-# EVERY RUN NEEDS AN EXPLICIT `+nightly` — LOCAL AND CI ALIKE. The repository
-# root carries a `rust-toolchain.toml` pinning the crate's MSRV — a STABLE
-# toolchain — and rustup resolves that file (precedence rank 4) by searching
-# UPWARD from the working directory, ahead of the default toolchain (rank 5). So
-# a shell sitting in `fuzz/` inherits the pin, and so does a CI job: installing a
-# nightly through `dtolnay/rust-toolchain` sets the DEFAULT toolchain and does NOT
-# export `RUSTUP_TOOLCHAIN`, and the toolchain file outranks it. Either way an
-# unprefixed `cargo fuzz build` or `cargo fuzz run` fails with "the option `Z` is
-# only accepted on the nightly compiler". Use
-# `cargo +nightly fuzz build|list|run <target>` and
-# `cargo +nightly fmt --all -- --check` here.
+# NIGHTLY MUST BE SELECTED EXPLICITLY, ONCE PER SHELL OR ONCE PER JOB. The
+# repository root carries a `rust-toolchain.toml` pinning the crate's MSRV — a
+# STABLE toolchain — and rustup resolves that file (precedence rank 4) by
+# searching UPWARD from the working directory, ahead of the default toolchain
+# (rank 5). A shell sitting in `fuzz/` therefore inherits the stable pin, and so
+# would a CI job left to itself: installing a nightly through
+# `dtolnay/rust-toolchain` sets the DEFAULT toolchain and does not export
+# `RUSTUP_TOOLCHAIN`, and the toolchain file outranks the default. Without an
+# override of rank 1 or 2, `cargo fuzz build` / `cargo fuzz run` fails with "the
+# option `Z` is only accepted on the nightly compiler".
 #
-# CI pins the exact nightly it uses, and names it on every invocation. Reproducing
-# a CI result locally means naming the same one - `.github/workflows/fuzz.yml`
-# carries the date on its install step and asserts it before building anything.
+# LOCALLY, prefer the environment form, because it is the one that also reaches
+# the nested `cargo build` calls `cargo-fuzz` spawns:
 #
-# The `cargo-fuzz` job in `.github/workflows/fuzz.yml` says it twice, for the same
-# reason every job in `ci.yml` does: a `+nightly` shorthand on every cargo
-# invocation (rank 1, the highest precedence rustup has, needing no cooperation
-# from the environment) plus a job-level `RUSTUP_TOOLCHAIN: nightly` (rank 2,
-# which additionally reaches the nested `cargo` calls `cargo-fuzz` itself makes).
-# The two name the same channel, so they cannot disagree; neither is redundant.
+#     RUSTUP_TOOLCHAIN=nightly-2026-08-01 cargo fuzz build
+#     RUSTUP_TOOLCHAIN=nightly-2026-08-01 cargo fuzz list
+#     RUSTUP_TOOLCHAIN=nightly-2026-08-01 cargo fuzz run <target>
+#     RUSTUP_TOOLCHAIN=nightly-2026-08-01 cargo fmt --all -- --check
+#
+# A `cargo +nightly-2026-08-01 ...` prefix (rank 1) works for the plain cargo
+# commands. NAME THE DATE either way: a bare `+nightly` resolves to whatever was
+# published this morning, which is precisely what the pin exists to prevent.
+#
+# IN CI THERE IS EXACTLY ONE SELECTOR, AND IT IS NOT A PREFIX. The `cargo-fuzz`
+# job in `.github/workflows/fuzz.yml` sets a job-level
+# `RUSTUP_TOOLCHAIN: nightly-2026-08-01` (rank 2) and every cargo invocation in
+# that job is deliberately UNPREFIXED. Adding a `+toolchain` prefix would make
+# the job's own "Verify the resolved toolchain is nightly" assertion vacuous for
+# the commands carrying it, while cargo-fuzz's child processes would still be
+# governed by the environment variable — two mechanisms to keep in step for no
+# gain. That job asserts both that the resolution is a nightly and that it is that
+# exact dated channel before building anything, and its install step requests
+# `components: clippy, rustfmt`, which a dated nightly does not ship by default.
+#
+# Reproducing a CI result locally means naming the same dated channel; the date
+# lives on that install step and in its assertion, and the two move together.
 
 [package]
 name = "zlib-rs-fuzz"
@@ -46,7 +60,9 @@ cargo-fuzz = true
 # boundary are hard errors here rather than warn-by-default suggestions.
 #
 # Declaring them in the manifest is what makes the DETACHED workspace's own
-# `cargo +nightly clippy --all-targets -- -D warnings` enforce the same
+# clippy gate — `cargo clippy --manifest-path fuzz/Cargo.toml --locked
+# --all-targets -- -D warnings`, run twice in `fuzz.yml` (default features and
+# `--no-default-features`) under that job's nightly — enforce the same
 # discipline the library enforces on itself with
 # `#![warn(clippy::undocumented_unsafe_blocks)]` at the crate root: the
 # repository-root `clippy` invocation cannot resolve this workspace, so without
@@ -55,7 +71,7 @@ cargo-fuzz = true
 # could not do without adding a second `#![...]` to each `#![no_main]` binary.
 #
 # `rustc` recognises `clippy` as a registered tool namespace and ignores lint
-# names inside it, so `cargo +nightly fuzz build` is unaffected.
+# names inside it, so `cargo fuzz build` under the pinned nightly is unaffected.
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
 multiple_unsafe_ops_per_block = "deny"
@@ -108,8 +124,9 @@ path = ".."
 # two entries overlap by design — `gzip` stays listed explicitly so the framing
 # capability remains guaranteed independently of how `gz-io` is defined.
 #
-# It is ON by default, so a plain `cargo +nightly fuzz build|run` keeps the full
-# gzip coverage. `--no-default-features` compiles the gzip-specific legs out
+# It is ON by default, so a plain `cargo fuzz build|run` under the pinned
+# nightly keeps the full gzip coverage. `--no-default-features` compiles the
+# gzip-specific legs out
 # while every `fuzz_target!` — and therefore every `main` — stays unconditional,
 # so all five `[[bin]]` targets still link.
 #

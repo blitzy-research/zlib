@@ -53,11 +53,20 @@ of the published crate through the `exclude` list in `Cargo.toml`.
 
 Two tiers, deliberately kept distinct:
 
-- **Tier 1 — strict byte-identity.** Roughly **300** vectors baked from the genuine C encoder, spanning every
-  level `-1..=9`, all five strategies, and the zlib, raw, gzip, and small-window framings. Because the reference
-  bytes are precomputed constants, this gate runs by default **with no C toolchain**. Its exhaustive closure is
-  the **50/50** and **3,750/3,750** live sweeps — 5 corpus shapes × 5 `windowBits` × 3 `memLevel`s × 10 levels ×
-  5 strategies — against a reference C zlib, reproducible in-repository through the opt-in `c-oracle` harness.
+- **Tier 1 — strict byte-identity.** **4,461** assertions baked from the genuine C encoder, spanning every
+  level `-1..=9`, all five strategies, the zlib, raw, gzip, and small-window framings, and `memLevel` 1 / 8 / 9.
+  They are baked in two encodings, because exact bytes and wide coverage pull against each other in source form:
+  - **336 full literal hex** rows — the exact-bytes core. `BI_VECTORS` (225) and `BI_VECTORS_GZIP` (75) cover the
+    five short corpora at `memLevel = 8`; `BI_EXTREMES` (24) and `BI_EXTREMES_GZIP` (12) add the `memLevel` 1 / 9
+    corners that the `memLevel = 8` family never reaches.
+  - **4,125 `(length, CRC-32)` digest** rows — `BI_GRID` (3,300) and `BI_GRID_GZIP` (825) over five 16 KiB
+    shapes. 16 KiB is not an arbitrary "big enough": it is exactly the `memLevel = 8` symbol budget
+    (`lit_bufsize == 1 << (memLevel + 6) == 16384`), which is what makes the `memLevel` axis observable at all.
+
+  Because every reference byte is a precomputed constant, this gate runs by default **with no C toolchain**. Its
+  exhaustive closure is the **50/50** and **3,750/3,750** live sweeps — 5 corpus shapes × 5 `windowBits` ×
+  3 `memLevel`s × 10 levels × 5 strategies — against a reference C zlib, reproducible in-repository through the
+  opt-in `c-oracle` harness.
 - **Tier 2 — decode compatibility.** Round-trips in both directions against `flate2`'s default pure-Rust
   `miniz_oxide` backend. That is a *different* encoder with different match-finding heuristics, so tier 2 proves
   RFC wire-format conformance and is **not** treated as satisfying byte-identity; that property is proven
@@ -71,7 +80,7 @@ here: they move with every test added, while that invariant does not.
 
 ## Documented divergences
 
-Five, each deliberate and none a defect:
+Five are **visible to a C caller**, each deliberate and none a defect:
 
 1. `gzprintf` / `gzvprintf` ship as ABI-compatible stubs returning `Z_STREAM_ERROR`, because rendering a C
    `va_list` needs the nightly-only `c_variadic` feature. This is advertised programmatically through
@@ -83,6 +92,16 @@ Five, each deliberate and none a defect:
    applying the version script is opt-in.
 5. A gzip handle's `Drop` is intentionally empty of finishing logic, so `gzclose` / `gzclose_w` remain mandatory
    — a destructor cannot surface a deferred compression or I/O error.
+
+A second class exists and is deliberately kept separate: internal departures from C that are **invisible at the
+C ABI**, because each is strictly stricter or strictly safer than C while leaving the return-code set, the struct
+layout, and the emitted bytes untouched. `deflateSetHeader` deep-copies the header instead of retaining the
+caller's pointer — a stricter lifetime contract, held to C's exact `{Z_OK, Z_STREAM_ERROR}` return set so an
+added allocation step cannot widen an inherited contract. Opaque state carries a kind tag, so handing a deflate
+stream to `inflateEnd` is a defined `Z_STREAM_ERROR` rather than C's undefined reinterpretation. Indexing is
+bounds-checked, so a path that would corrupt memory in C aborts instead. Allocation is fallible with no global
+fallback, which is C's `ZALLOC` contract stated precisely. Full reasoning lives in the repository's
+`CONTRIBUTING.md`, under *Internal divergences that are invisible at the C ABI*.
 
 ## Verified platforms
 

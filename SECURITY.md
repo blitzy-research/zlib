@@ -460,8 +460,8 @@ shipped artifacts (`lib`, `cdylib`, `staticlib` contain only `cfg-if` and option
 | `skip` entry | Why |
 |--------------|-----|
 | `rand@0.10.2` | Dev-only; transitive via `quickcheck 1.1.0`, while `rand 0.9.4` is the direct dev-dependency. Both are above the RUSTSEC-2026-0097 patched range |
-| `rand_core@0.10.1` | Dev-only; follows `rand 0.10.2` down the `quickcheck` path |
-| `getrandom@0.4.3` | Dev-only; follows `rand_core 0.10.1` down the same path |
+| `rand_core@0.10.1` | Dev-only; required by both `rand 0.10.2` and `getrandom 0.4.3`, each reached only through `quickcheck 1.1.0` |
+| `getrandom@0.4.3` | Dev-only; required by `rand 0.10.2` on the same path. Note the direction: in the 0.10 chain `getrandom` follows *`rand`*, and it is `getrandom` that depends on `rand_core` — not the reverse |
 | `r-efi@6.0.0` | Dev-only; the UEFI random backend of `getrandom 0.4.3`, while `r-efi 5.3.0` follows `getrandom 0.3.4`. Unreachable on every supported platform — `getrandom` gates it on the custom `cfg` `getrandom_backend = "efi_rng"` — and its LGPL term is an `OR`-disjunct already satisfied permissively |
 
 Each entry names the **transitive** copy rather than the version this project
@@ -510,15 +510,38 @@ freestanding `cdylib`/`staticlib` must supply. `deny` rather than `forbid` is
 deliberate — `forbid` cannot be relaxed by an inner `allow`, which would make
 those two boundary carve-outs inexpressible.
 
-Measured on this tree with a comment-excluded token scan:
+Measured on this tree with a comment-excluded token scan. Both carve-outs are
+listed, so the table accounts for every file in the crate that is permitted to
+contain `unsafe` at all:
 
 | Location | Unsafe-bearing code lines |
 |----------|---------------------------|
-| `src/ffi/` (the designated boundary) | **1,117** — `inflate.rs` 309, `deflate.rs` 230, `util.rs` 159, `gz.rs` 150, `types.rs` 113, `mod.rs` 101, `alloc.rs` 55 |
+| `src/ffi/` (carve-out 1 — the designated boundary) | **1,123** — `inflate.rs` 309, `deflate.rs` 236, `util.rs` 159, `gz.rs` 150, `types.rs` 113, `mod.rs` 101, `alloc.rs` 55 |
+| `src/lib.rs` (carve-out 2 — the freestanding runtime block, plus the boundary tests that police it) | **48**, split **22 / 26**. The **22** sit inside the private `mod no_std_support` (L207–L422): the libc-backed `#[global_allocator]`, the `#[panic_handler]`, and the personality symbol. The other **26** are all inside `#[cfg(test)] mod tests` — the boundary scanner's own parsing logic, its assertion messages, and the deliberately adversarial corpus it is fed. **No executable `unsafe` exists anywhere else in the file**, and an in-crate test asserts precisely that rather than trusting it |
 | `src/deflate/`, `src/inflate/`, `src/checksum/`, `src/gz/`, `src/util/`, `src/error.rs`, `src/constants.rs`, `src/gz_header.rs` | **0** |
 | `src/stream.rs` | **2**, and both are `type` aliases only — `ZallocFn` and `ZfreeFn` merely *name* the C hook signatures the crate interoperates with. `grep -c "unsafe {"` on that file returns **0**, and the module carries its own `#![deny(unsafe_code)]` |
 
-Every `unsafe` block that does exist is justified in place: **387** `// SAFETY:`
+Reproduce every figure above with the same scan that produced it — one line per
+file, whole-line comments discarded:
+
+```bash
+for f in src/ffi/*.rs src/lib.rs src/stream.rs; do
+  printf '%-22s %s\n' "$f" \
+    "$(grep -v -E '^[[:space:]]*(//|/\*|\*)' "$f" | grep -c '\bunsafe\b')"
+done
+```
+
+One reconciliation is worth stating explicitly, because a slightly different
+scan yields a slightly different number for `src/lib.rs` and neither is wrong.
+A stricter variant that *also* discards text following a trailing `//` reports
+**46** instead of 48. The two lines that drop out are the string literals
+`"// unsafe\n"` and `"//! unsafe\n"` inside the boundary test's corpus, which
+exist for the sole purpose of proving that the scanner ignores commented-out
+`unsafe`. The table quotes the whole-line-comment variant throughout so that
+`src/ffi/`, `src/lib.rs`, and `src/stream.rs` are all measured by one identical
+method; a mixed methodology would make the rows incomparable.
+
+Every `unsafe` block that does exist is justified in place: **388** `// SAFETY:`
 comments across `src/`, with `#![warn(clippy::undocumented_unsafe_blocks)]` and
 `#![warn(missing_docs)]` promoted to hard errors by the `-D warnings` lint gate.
 Containment is checked four independent ways — the `deny` attribute, that lint

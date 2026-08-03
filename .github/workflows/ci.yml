@@ -316,15 +316,21 @@ jobs:
         #
         # THE FLOORS ARE NOT ALL EXACT, ON PURPOSE. The five ubuntu rows carry
         # their exact measured totals, because they are reproducible on the
-        # development host. The two native rows carry a deliberately conservative
-        # 844 - fifteen below the Linux total, the same margin it has always carried:
-          #               their totals differ from the Linux total by platform-conditional
-        # tests (`#[cfg(unix)]` drops three, `#[cfg(windows)]` adds the
-        # `gzopen_w` round trip plus its guards) and CANNOT be measured from a
-        # Linux host, so an exact floor there would be a guess that breaks the
-        # build. 844 still catches the failure this gate exists for: a whole
-        # target or suite disappearing. Raise any floor when the suite grows;
-        # never lower one to make a red row green.
+        # development host: 860 for the three rows whose feature set includes
+        # `gz-io` (default, `gzip + gz-io`, and `simd` - `simd` changes which CRC
+        # backend runs, not how many tests exist), 873 with every feature on
+        # (`--all-features` adds the 13 `c-oracle` tests), and 0 for the
+        # build-only row that runs no test step.
+        #
+        # The two native rows carry a deliberately conservative 845 - fifteen
+        # below the Linux total, the same margin they have always carried,
+        # because their totals differ from the Linux total by
+        # platform-conditional tests (`#[cfg(unix)]` drops three,
+        # `#[cfg(windows)]` adds the `gzopen_w` round trip plus its guards) and
+        # CANNOT be measured from a Linux host, so an exact floor there would be
+        # a guess that breaks the build. 845 still catches the failure this gate
+        # exists for: a whole target or suite disappearing. Raise any floor when
+        # the suite grows; never lower one to make a red row green.
         include:
           # Default feature set: std + gzip + gz-io + simd.
           - name: Default features
@@ -333,7 +339,7 @@ jobs:
             arch: X64
             features: ''
             test: true
-            min_tests: 859
+            min_tests: 860
           # Every feature turned on at once.
           - name: All features
             os: ubuntu-latest
@@ -341,7 +347,7 @@ jobs:
             arch: X64
             features: '--all-features'
             test: true
-            min_tests: 872
+            min_tests: 873
           # gzip framing + gz file-I/O layer on top of std.
           - name: gzip + gz-io
             os: ubuntu-latest
@@ -349,7 +355,7 @@ jobs:
             arch: X64
             features: '--no-default-features --features std,gzip,gz-io'
             test: true
-            min_tests: 859
+            min_tests: 860
           # simd-enabled CRC-32 configuration (pulls in crc32fast). Whether
           # `crc32fast`'s accelerated code is actually selected is a target/CPU
           # question that `crc32_backend()` reports; this row exercises the
@@ -360,7 +366,7 @@ jobs:
             arch: X64
             features: '--no-default-features --features std,gzip,gz-io,simd'
             test: true
-            min_tests: 859
+            min_tests: 860
           # Core-only (no_std) LIBRARY build. `test: false` is what makes this row
           # distinct rather than redundant: `mod no_std_support` in `src/lib.rs` is
           # gated on `all(not(feature = "std"), not(test), panic = "abort")`, so a
@@ -422,7 +428,7 @@ jobs:
             arch: X64
             features: ''
             test: true
-            min_tests: 844
+            min_tests: 845
           # Native macOS: builds for the runner's own triple and, unlike a cross
           # row, EXECUTES the suite. This row PINS both that triple
           # (`aarch64-apple-darwin`) and the architecture GitHub reports
@@ -443,7 +449,7 @@ jobs:
             arch: ARM64
             features: ''
             test: true
-            min_tests: 844
+            min_tests: 845
     steps:
     - name: Checkout repository
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -667,9 +673,14 @@ jobs:
     # tests are silently lost, and AAP directive D-5 fixes the suite at
     # "preserved and only ever increased, zero ignored" (finding TEST-08).
     #
-    # The floor is 633 on all four, which is the measured std-off total. It is
-    # LOWER than the default-feature total by design: `gz-io` is off, so the
-    # `tests/gzip_compat.rs` target contributes nothing and several
+    # The floor is 634 on all four, which is the measured std-off total. ONE
+    # number governs every one of the four steps below - the value echoed in the
+    # summary line, the value compared against, and the value named in the error
+    # message are the same 634 in all four, so a reader can never be told one
+    # floor while a different one is enforced.
+    #
+    # It is LOWER than the default-feature total by design: `gz-io` is off, so
+    # the `tests/gzip_compat.rs` target contributes nothing and several
     # `cfg(feature = "gz-io")` unit tests do not exist. That gap is the reason
     # this job has its own floor instead of reusing `build-test`'s.
     - name: Test (no default features)
@@ -679,14 +690,14 @@ jobs:
         cargo +stable test --locked --no-default-features 2>&1 | tee "$log"
         set -- $(awk '/^test result:/ { b += 1; p += $4; f += $6; i += $8 }
                       END { printf "%d %d %d %d", b, p, f, i }' "$log")
-        echo "test summary: blocks=$1 passed=$2 failed=$3 ignored=$4 floor=633"
+        echo "test summary: blocks=$1 passed=$2 failed=$3 ignored=$4 floor=634"
         [ "$1" -ge 1 ] || { echo "::error::no 'test result:' line was produced -"\
           " the harness never ran, so nothing was verified"; exit 1; }
         [ "$3" -eq 0 ] || { echo "::error::$3 test(s) failed"; exit 1; }
         [ "$4" -eq 0 ] || { echo "::error::$4 test(s) were ignored; AAP directive D-5"\
           " requires zero ignored tests"; exit 1; }
-        [ "$2" -ge 629 ] || { echo "::error::only $2 std-off tests ran, below the floor"\
-          " of 629 - tests were lost, not merely skipped"; exit 1; }
+        [ "$2" -ge 634 ] || { echo "::error::only $2 std-off tests ran, below the floor"\
+          " of 634 - tests were lost, not merely skipped"; exit 1; }
     - name: Test (no-std feature)
       run: |
         set -euo pipefail
@@ -694,14 +705,14 @@ jobs:
         cargo +stable test --locked --no-default-features --features no-std 2>&1 | tee "$log"
         set -- $(awk '/^test result:/ { b += 1; p += $4; f += $6; i += $8 }
                       END { printf "%d %d %d %d", b, p, f, i }' "$log")
-        echo "test summary: blocks=$1 passed=$2 failed=$3 ignored=$4 floor=633"
+        echo "test summary: blocks=$1 passed=$2 failed=$3 ignored=$4 floor=634"
         [ "$1" -ge 1 ] || { echo "::error::no 'test result:' line was produced -"\
           " the harness never ran, so nothing was verified"; exit 1; }
         [ "$3" -eq 0 ] || { echo "::error::$3 test(s) failed"; exit 1; }
         [ "$4" -eq 0 ] || { echo "::error::$4 test(s) were ignored; AAP directive D-5"\
           " requires zero ignored tests"; exit 1; }
-        [ "$2" -ge 629 ] || { echo "::error::only $2 no-std tests ran, below the floor"\
-          " of 629 - tests were lost, not merely skipped"; exit 1; }
+        [ "$2" -ge 634 ] || { echo "::error::only $2 no-std tests ran, below the floor"\
+          " of 634 - tests were lost, not merely skipped"; exit 1; }
     # Both std-off rows again under the SHIPPED profile. See the rationale on the
     # `build-test` job's release step: `[profile.release]`'s `opt-level = 3` +
     # `codegen-units = 1` can decide whether an assertion holds, so the profile
@@ -713,14 +724,14 @@ jobs:
         cargo +stable test --locked --release --no-default-features 2>&1 | tee "$log"
         set -- $(awk '/^test result:/ { b += 1; p += $4; f += $6; i += $8 }
                       END { printf "%d %d %d %d", b, p, f, i }' "$log")
-        echo "test summary: blocks=$1 passed=$2 failed=$3 ignored=$4 floor=633"
+        echo "test summary: blocks=$1 passed=$2 failed=$3 ignored=$4 floor=634"
         [ "$1" -ge 1 ] || { echo "::error::no 'test result:' line was produced -"\
           " the harness never ran, so nothing was verified"; exit 1; }
         [ "$3" -eq 0 ] || { echo "::error::$3 test(s) failed"; exit 1; }
         [ "$4" -eq 0 ] || { echo "::error::$4 test(s) were ignored; AAP directive D-5"\
           " requires zero ignored tests"; exit 1; }
-        [ "$2" -ge 629 ] || { echo "::error::only $2 std-off release tests ran, below the"\
-          " floor of 633 - tests were lost, not merely skipped"; exit 1; }
+        [ "$2" -ge 634 ] || { echo "::error::only $2 std-off release tests ran, below the"\
+          " floor of 634 - tests were lost, not merely skipped"; exit 1; }
     - name: Test (no-std feature, release profile)
       run: |
         set -euo pipefail
@@ -729,14 +740,14 @@ jobs:
           | tee "$log"
         set -- $(awk '/^test result:/ { b += 1; p += $4; f += $6; i += $8 }
                       END { printf "%d %d %d %d", b, p, f, i }' "$log")
-        echo "test summary: blocks=$1 passed=$2 failed=$3 ignored=$4 floor=633"
+        echo "test summary: blocks=$1 passed=$2 failed=$3 ignored=$4 floor=634"
         [ "$1" -ge 1 ] || { echo "::error::no 'test result:' line was produced -"\
           " the harness never ran, so nothing was verified"; exit 1; }
         [ "$3" -eq 0 ] || { echo "::error::$3 test(s) failed"; exit 1; }
         [ "$4" -eq 0 ] || { echo "::error::$4 test(s) were ignored; AAP directive D-5"\
           " requires zero ignored tests"; exit 1; }
-        [ "$2" -ge 629 ] || { echo "::error::only $2 no-std release tests ran, below the"\
-          " floor of 633 - tests were lost, not merely skipped"; exit 1; }
+        [ "$2" -ge 634 ] || { echo "::error::only $2 no-std release tests ran, below the"\
+          " floor of 634 - tests were lost, not merely skipped"; exit 1; }
 
     - name: Assert Cargo.lock is unchanged
       if: ${{ !cancelled() }}
@@ -1668,11 +1679,21 @@ jobs:
   #     but builds only the library, so it type-checks none of the test surface.
   #   * s390x-unknown-linux-gnu - big-endian. `build-script-tests` already checks
   #     `--lib --profile test` here; this row widens the same triple to
-  #     `--all-targets`. NOTE for whoever maintains the target lists: s390x is
-  #     absent from both `.cargo/config.toml`'s `[target.<triple>]` tables and
-  #     `deny.toml`'s `[graph] targets`, so those two files and this matrix are not
-  #     aligned on it. Recorded here so the divergence is a decision, not an
-  #     accident.
+  #     `--all-targets`. NOTE for whoever maintains the target lists: s390x has no
+  #     `[target.s390x-unknown-linux-gnu]` table in `.cargo/config.toml`, so that
+  #     file and this matrix are not aligned on it. It needs none - the tables
+  #     there carry per-platform rustflags and linker settings, and this row only
+  #     type-checks - but the asymmetry is recorded so it reads as a decision
+  #     rather than an omission.
+  #
+  #     `deny.toml` is NOT part of that asymmetry and must not be added to it.
+  #     Its `[graph] targets` is deliberately EMPTY, which in cargo-deny means
+  #     "no target filter": every package in the graph is evaluated on every
+  #     platform, s390x included, with nothing pruned (`deny.toml` L253-L309
+  #     records the measurement - 89 of 89 packages governed with an empty list
+  #     versus 86 of 89 with the nine triples it used to carry). There is
+  #     therefore no s390x-shaped hole in the supply-chain policy to align, and
+  #     adding triples back to that key would REOPEN one.
   #
   # `--all-features` IS PART OF THAT CLAIM, not decoration (finding TEST-11).
   # `--all-targets` alone silently omits `tests/c_oracle.rs`, which declares
@@ -2174,24 +2195,27 @@ jobs:
         # count read rather than assumed - the packaged suite is exactly where a
         # lost target is hardest to notice, because an `exclude` entry can delete
         # a whole fixture and `cargo test` will still report `ok` over what
-        # remains (finding TEST-08). The floor is the measured default-feature
-        # total; `tests/c_oracle.rs` is absent from it by design, since `c-oracle`
-        # is not a default feature. Not `--no-fail-fast`; a single failure here is
-        # a broken published crate.
+        # remains (finding TEST-08). The floor is 860, the measured
+        # default-feature total, and the SAME 860 is echoed in the summary line,
+        # compared against, and named in the error message, so the number a
+        # reader is shown is always the number enforced. `tests/c_oracle.rs` is
+        # absent from that total by design, since `c-oracle` is not a default
+        # feature. Not `--no-fail-fast`; a single failure here is a broken
+        # published crate.
         log="$RUNNER_TEMP/packaged-full.log"
         cargo +stable test --locked --target-dir "$RUNNER_TEMP/packaged-target" \
           2>&1 | tee "$log"
         set -- $(awk '/^test result:/ { b += 1; p += $4; f += $6; i += $8 }
                       END { printf "%d %d %d %d", b, p, f, i }' "$log")
-        echo "packaged test summary: blocks=$1 passed=$2 failed=$3 ignored=$4 floor=859"
+        echo "packaged test summary: blocks=$1 passed=$2 failed=$3 ignored=$4 floor=860"
         [ "$1" -ge 1 ] || { echo "::error::the packaged crate produced no 'test result:'"\
           " line - its harness never ran"; exit 1; }
         [ "$3" -eq 0 ] || { echo "::error::$3 test(s) failed inside the packaged crate";
           exit 1; }
         [ "$4" -eq 0 ] || { echo "::error::$4 test(s) were ignored inside the packaged"\
           " crate; AAP directive D-5 requires zero ignored tests"; exit 1; }
-        [ "$2" -ge 845 ] || { echo "::error::only $2 tests ran inside the packaged crate,"\
-          " below the floor of 859 - the archive is missing part of the suite, so an"\
+        [ "$2" -ge 860 ] || { echo "::error::only $2 tests ran inside the packaged crate,"\
+          " below the floor of 860 - the archive is missing part of the suite, so an"\
           " exclude entry removed a test target or a fixture it needs"; exit 1; }
         # Belt and braces: prove the two suites PASSED BY DEGRADING rather than
         # by having been silently filtered out or renamed away. `--nocapture` is

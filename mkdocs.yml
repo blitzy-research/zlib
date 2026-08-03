@@ -105,6 +105,29 @@ nav:
 # one that GitHub and Backstage TechDocs render natively, and declaring the
 # custom fence here would mean overriding the `techdocs-core` extension set to
 # gain nothing on the published site.
+#
+# DO NOT READ THE BUILD LOG AS EVIDENCE THAT RENDERING IS ACTIVE. Every
+# `mkdocs build` prints, unconditionally and at CONFIGURATION time:
+#
+#     MERMAID2 - Using javascript library (10.4.0):
+#        https://unpkg.com/mermaid@10.4.0/dist/mermaid.esm.min.mjs
+#
+# That line describes the library the plugin WOULD use. The published page never
+# requests it. Verified in a real browser against a `--strict` build, on both
+# pages: `.mermaid` elements 0, `pre.mermaid` 0, `typeof window.mermaid`
+# "undefined", no `<script>` src matching mermaid, no `<svg>` inside the content
+# `<article>`, and zero network requests matching `mermaid` or `unpkg`. It is
+# not a connectivity failure - the same pages fetch Google Fonts over the same
+# connection with HTTP 200, and the logged URL returns HTTP 200 when fetched
+# directly. The runtime is simply never asked for, because the fence is lexed as
+# plain text, so no `<pre>` carries a class, so the theme's `pre.mermaid`
+# renderer binding matches nothing while `pre:not(.mermaid) > code` claims every
+# fence. Note also that the theme's own lazy fetch targets `mermaid@11` as UMD
+# while this plugin logs `mermaid@10.4.0` as ESM - different version and
+# different module format, neither of which is ever loaded.
+#
+# So: if you enable rendering here, do not judge success by the log line above.
+# Assert `document.querySelectorAll('pre.mermaid').length > 0` on a built page.
 plugins:
   - techdocs-core
   - mermaid2

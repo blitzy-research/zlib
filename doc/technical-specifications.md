@@ -219,17 +219,21 @@ current state was measured before planning any change:
 | Gate | Command | Observed |
 |------|---------|----------|
 | Release build | `cargo build --locked --release` | exit 0 |
-| Default test suite | `cargo test --locked` | **859 passed / 0 failed / 0 ignored** (704 unit, 128 integration, 27 doctests) |
-| no-`std` test suite | `cargo test --locked --no-default-features` | **633 passed / 0 failed / 0 ignored** (511 unit, 97 integration, 25 doctests) |
-| All-features test suite | `cargo test --locked --all-features` | **872 passed / 0 failed / 0 ignored** (adds the 13 live C-oracle tests) |
+| Default test suite | `cargo test --locked` | **860 passed / 0 failed / 0 ignored** (705 unit, 128 integration, 27 doctests) |
+| no-`std` test suite | `cargo test --locked --no-default-features` | **634 passed / 0 failed / 0 ignored** (512 unit, 97 integration, 25 doctests) |
+| All-features test suite | `cargo test --locked --all-features` | **873 passed / 0 failed / 0 ignored** (adds the 13 live C-oracle tests) |
 | Formatting | `cargo fmt --all -- --check` | exit 0 |
 | Lints | `cargo clippy --locked --all-targets --all-features -- -D warnings` | exit 0 |
 | Docs | `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features` | exit 0, 0 warnings |
 | Published docs | `mkdocs build --strict` | exit 0, 0 warnings |
-| Packaged crate | `cargo package --locked --list` | **75** files; the unpacked archive re-runs its own suite at 859 |
+| Packaged crate | `cargo package --locked --list` | **75** files; the unpacked archive re-runs its own suite at 860 |
 
-Release artifacts: `libzlib_rs.rlib` 2,460,224 B, `libzlib_rs.so` 634,712 B, `libzlib_rs.a`
-22,393,920 B. Linking a C program against the static archive yields
+Release artifacts, measured from a clean `cargo build --locked --release` under default features with
+`rustc 1.97.1 (8bab26f4f 2026-07-14)` on `x86_64-unknown-linux-gnu`: `libzlib_rs.rlib` 2,478,440 B,
+`libzlib_rs.so` 635,968 B, `libzlib_rs.a` 22,397,744 B. These byte counts are **provenance-bound** — they
+shift with the toolchain, the feature row, and any change to the crate's own source or documentation
+metadata, so a figure quoted without its toolchain and feature set says very little. Linking a C program
+against the static archive yields
 `ver=1.3.2.1-motley crc=cbf43926 adler=091e01de compress=0 uncompress=0 bound=22`, and against the shared
 object yields a byte-exact 50,000-byte round trip with correct `1f 8b` gzip framing at `windowBits = 31`.
 
@@ -308,7 +312,7 @@ documentation gap.
 | `src/deflate/**.rs` | `mod.rs` 2,517 · `state.rs` 3,680 · `trees.rs` 1,745 · `rle.rs` 578 · `strategy.rs` 475 · `slow.rs` 315 · `stored.rs` 313 · `fast.rs` 265 · `huff.rs` 196 |
 | `src/inflate/**.rs` | `mod.rs` 3,621 · `back.rs` 1,494 · `state.rs` 1,364 · `tables.rs` 1,229 · `fast.rs` 1,064 · `fixed.rs` 334 |
 | `src/gz/**.rs` | `write.rs` 2,940 · `open.rs` 2,035 · `state.rs` 1,479 · `read.rs` 1,371 · `close.rs` 671 · `mod.rs` 303 |
-| `src/ffi/**.rs` | `inflate.rs` 4,661 · `types.rs` 3,586 · `gz.rs` 2,949 · `deflate.rs` 2,834 · `alloc.rs` 2,282 · `mod.rs` 1,778 · `util.rs` 1,439 |
+| `src/ffi/**.rs` | `inflate.rs` 4,661 · `types.rs` 3,599 · `deflate.rs` 2,980 · `gz.rs` 2,949 · `alloc.rs` 2,282 · `mod.rs` 1,778 · `util.rs` 1,439 |
 
 An earlier recorded baseline of this plan reported 32,354 lines across the same 40 modules; that figure is
 a **historical datum** from before the hardening work described in
@@ -328,7 +332,7 @@ across all `*.rs` files returns zero matches.
 - `fuzz/fuzz_targets/**.rs` — five libFuzzer targets, **8,512** lines: `fuzz_ffi_roundtrip.rs` 3,537 ·
   `fuzz_inflate.rs` 1,837 · `fuzz_gzip.rs` 1,551 · `fuzz_deflate_roundtrip.rs` 1,044 ·
   `fuzz_checksum.rs` 543
-- `fuzz/Cargo.toml` (164 lines) and `fuzz/Cargo.lock` — the detached fuzz workspace manifest and its
+- `fuzz/Cargo.toml` (185 lines) and `fuzz/Cargo.lock` — the detached fuzz workspace manifest and its
   13-package lock
 - **No `fuzz/deny.toml`.** The detached workspace is governed by the *root* policy,
   invoked a second time against its manifest — `cargo deny --locked --manifest-path
@@ -342,18 +346,21 @@ across all `*.rs` files returns zero matches.
 
 #### 0.2.1.4 Configuration, build, and packaging updates
 
-- `Cargo.toml` (425 lines) — package metadata, feature matrix, `crate-type`, profiles, `exclude` list
+- `Cargo.toml` — package metadata, feature matrix, `crate-type`, profiles, `exclude` list
 - `Cargo.lock` — 89 pinned packages; tracked deliberately because the crate ships `cdylib`/`staticlib`
   distributables
-- `build.rs` (2,425 lines) — CRC table generation plus the opt-in `cdylib` version-script wiring; pure
-  `std`, no build-dependencies
-- `rust-toolchain.toml` (258 lines) · `deny.toml` (856) · `clippy.toml` (172) · `rustfmt.toml` (192) ·
-  `.cargo/config.toml` (273)
-- `.gitignore` (84 lines) — already Rust-aware, ignoring `/target` and
-  `/fuzz/{target,corpus,artifacts,coverage}`
-- `catalog-info.yaml` (32 lines) — Backstage component descriptor, already retargeted to Rust
-- `.github/workflows/ci.yml` (2,069 lines, 12 jobs) · `.github/workflows/audit.yml` (1,001 lines, 4 jobs) ·
-  `.github/workflows/fuzz.yml` (727 lines, 2 jobs)
+- `build.rs` — CRC table generation plus the opt-in `cdylib` version-script wiring; pure `std`, no
+  build-dependencies
+- `rust-toolchain.toml` · `deny.toml` · `clippy.toml` · `rustfmt.toml` · `.cargo/config.toml`
+- `.gitignore` — already Rust-aware, ignoring `/target` and `/fuzz/{target,corpus,artifacts,coverage}`
+- `catalog-info.yaml` — Backstage component descriptor, already retargeted to Rust
+- `.github/workflows/ci.yml` (12 jobs) · `.github/workflows/audit.yml` (4 jobs) ·
+  `.github/workflows/fuzz.yml` (1 job)
+
+Per-file line counts for everything named above are stated **once**, in the
+[§0.3.1](#031-refactored-structure-planning) tree layout, and are deliberately not repeated here. A figure
+maintained in two places drifts in one of them, and this document previously carried three such divergent
+copies of the same workflow line counts.
 
 The C-side integration descriptors remain in scope as REFERENCE, with selective UPDATE only where
 drop-in guidance is documented: `CMakeLists.txt`, `Makefile`, `Makefile.in`, `configure`, `zlib.pc.in`,
@@ -363,18 +370,22 @@ templates.
 
 #### 0.2.1.5 Documentation updates
 
-- `README.md` (1,128 lines) — Rust-focused, describing the crate as a memory-safe idiomatic Rust rewrite of
+- `README.md` — Rust-focused, describing the crate as a memory-safe idiomatic Rust rewrite of
   zlib 1.3.2.1 with byte-identical DEFLATE output and a C-compatible FFI drop-in layer
-- `mkdocs.yml` (110 lines) — `docs_dir: doc`, `site_name: blitzy-zlib`, `site_description`, a three-entry
-  `nav`, plugins `techdocs-core` + `mermaid2`. Ten of those lines are configuration; the remainder is the
-  rationale header recording why `doc/` is the canonical documentation root and `docs/` is not
-- [`index.md`](index.md) (116 lines) — the published documentation landing page
-- [`project-guide.md`](project-guide.md) (794 lines) — the engagement guide, whose own internal §1–§9
-  numbering is a frozen citation target and is deliberately *not* renumbered to this plan's scheme
+- `mkdocs.yml` — `docs_dir: doc`, `site_name: blitzy-zlib`, `site_description`, a three-entry `nav`,
+  plugins `techdocs-core` + `mermaid2`. Only a handful of its lines are configuration; the remainder is the
+  rationale header recording why `doc/` is the canonical documentation root, why `docs/` is not, and how the
+  `mermaid2` plugin's config-time log must **not** be read as evidence that diagrams render (§0.6.7)
+- [`index.md`](index.md) — the published documentation landing page
+- [`project-guide.md`](project-guide.md) — the engagement guide, whose own internal §1–§9 numbering is a
+  frozen citation target and is deliberately *not* renumbered to this plan's scheme
 - This document, `doc/technical-specifications.md`
-- `CHANGELOG.md` (578 lines), `SECURITY.md` (675 lines), and `CONTRIBUTING.md` (1,478 lines) — the
-  contributor-facing trio at the repository root, carrying the release history, the disclosure policy, and
-  the quality-gate and MSRV workflow respectively
+- `CHANGELOG.md`, `SECURITY.md`, and `CONTRIBUTING.md` — the contributor-facing trio at the repository
+  root, carrying the release history, the disclosure policy, and the quality-gate and MSRV workflow
+  respectively
+
+As in §0.2.1.4, line counts for these files live only in the
+[§0.3.1](#031-refactored-structure-planning) tree layout.
 
 The RFC and algorithm references under `doc/` — `rfc1950.txt`, `rfc1951.txt`, `rfc1952.txt`,
 `algorithm.txt`, `txtvsbin.txt`, `crc-doc.1.0.pdf` — are REFERENCE-only normative inputs and are never
@@ -382,9 +393,9 @@ edited.
 
 **Documentation-drift findings.** Two are tracked:
 
-- **E1 — an orphaned second landing page.** `mkdocs.yml` publishes from `doc/`, so `docs/index.md`
-  (37 lines) is outside the build root. It is retained as a redirect stub that points readers at the
-  published page rather than as a divergent duplicate.
+- **E1 — an orphaned second landing page.** `mkdocs.yml` publishes from `doc/`, so `docs/index.md` is
+  outside the build root. It is retained as a short redirect stub that points readers at the published
+  page rather than as a divergent duplicate.
 - **E2 — competing section-numbering baselines.** Rust sources cite this plan by section number. Three
   mutually inconsistent numbering baselines existed in the tree at one point: the numbering implied by the
   Rust sources; the numbering in the previously checked-in version of *this* document; and a third
@@ -594,8 +605,11 @@ glob-importing it cannot pull raw-pointer entry points into scope; it re-exports
 deliberate split: the **Cargo package version is `1.3.2`**, because SemVer forbids the four-component
 motley string, while the C API shim still reports the full upstream identity from `src/util/version.rs`.
 
-**Measured artifact geometry.** `cargo build --locked --release` emits `libzlib_rs.rlib` at 2,460,224 B,
-`libzlib_rs.so` at 634,712 B, and `libzlib_rs.a` at 22,393,920 B.
+**Measured artifact geometry.** `cargo build --locked --release` emits `libzlib_rs.rlib` at 2,478,440 B,
+`libzlib_rs.so` at 635,968 B, and `libzlib_rs.a` at 22,397,744 B — measured from a clean release build under
+default features with `rustc 1.97.1 (8bab26f4f 2026-07-14)` on `x86_64-unknown-linux-gnu`. Because all three
+share the single `target/release/` output path, the last feature row built is the one on disk (§0.6.2), so
+these numbers are only meaningful together with the toolchain and feature set that produced them.
 
 **Build-time table generation contract.** `build.rs` (2,425 lines) reimplements `crc32.c`'s
 `make_crc_table`, `multmodp`, `x2nmodp`, `byte_swap`, and `braid` in "Pure `std` only — no external
@@ -636,23 +650,25 @@ zlib-rs (same repository, additive to the retained C baseline)
 ├── build.rs                       2425  <- crc32.c make_crc_table/multmodp/x2nmodp/byte_swap/braid
 │                                        + opt-in cdylib version-script wiring
 ├── rust-toolchain.toml             285  pins channel 1.85.0 + rustfmt + clippy, profile minimal
-├── deny.toml                       900  cargo-deny licenses / advisories / bans / sources
+├── deny.toml                       930  cargo-deny licenses / advisories / bans / sources
+│                                        (the ONLY policy file; aimed at both graphs — §0.10.1 D1)
 ├── clippy.toml                     172  pinned lint configuration
 ├── rustfmt.toml                    192  pinned format configuration
-├── CHANGELOG.md                    585  Rust crate release history
-├── SECURITY.md                     686  vulnerability disclosure policy
-├── CONTRIBUTING.md                1491  contribution workflow, the seven blocking gates, MSRV policy
+├── CHANGELOG.md                    593  Rust crate release history
+├── SECURITY.md                     709  vulnerability disclosure policy
+├── CONTRIBUTING.md                1589  contribution workflow, the seven blocking gates, MSRV policy
 ├── README.md                      1134
 ├── LICENSE                          22  upstream zlib licence, retained verbatim
-├── mkdocs.yml                      110  docs_dir: doc — three-entry nav + canonical-root rationale
+├── mkdocs.yml                      133  docs_dir: doc — three-entry nav + canonical-root rationale
+│                                        + the mermaid rendering reconciliation (§0.6.7)
 ├── catalog-info.yaml                32  Backstage component descriptor
 ├── .gitignore                       84  /target and /fuzz/{target,corpus,artifacts,coverage}
 ├── .cargo/
 │   └── config.toml                 305  target rustflags / link args
 ├── .github/workflows/
-│   ├── ci.yml                     2244  12 jobs (see §0.10.1)
-│   ├── audit.yml                  1447  4 jobs — policy-integrity, cargo-audit, cargo-deny, deny-fuzz
-│   └── fuzz.yml                    795  2 jobs — supply-chain, cargo-fuzz (weekly cron)
+│   ├── ci.yml                     2268  12 jobs (see §0.10.1)
+│   ├── audit.yml                  1466  4 jobs — policy-integrity, cargo-audit, cargo-deny, deny-fuzz
+│   └── fuzz.yml                    823  1 job — cargo-fuzz (pull_request + weekly cron + dispatch)
 ├── src/
 │   ├── lib.rs                     2437  <- zlib.h  (crate root, API curator, #![deny(unsafe_code)],
 │   │                                       private no_std libc allocator + abort panic handler)
@@ -694,9 +710,10 @@ zlib-rs (same repository, additive to the retained C baseline)
 │   │   ├── write.rs               2940  <- gzwrite.c (700)
 │   │   └── close.rs                671  <- gzclose.c (23)
 │   └── ffi/                             [the SOLE unsafe module]
-│       ├── mod.rs                 1778  wiring + cfg(test) ABI-drift guard (96 coercions)
-│       ├── types.rs               3586  <- zlib.h + zconf.h ABI mirrors
-│       ├── deflate.rs             2834  <- deflate.c public API (17 entry points)
+│       ├── mod.rs                 1778  wiring + cfg(test) ABI-drift guard (96 coercions:
+│                                        94 unsafe extern "C" fn + 2 safe — see §0.6.2)
+│       ├── types.rs               3599  <- zlib.h + zconf.h ABI mirrors
+│       ├── deflate.rs             2980  <- deflate.c public API (17 entry points)
 │       ├── inflate.rs             4661  <- inflate.c + infback.c public API (22)
 │       ├── gz.rs                  2949  <- gz*.c public API (34)
 │       ├── util.rs                1439  <- compress.c / uncompr.c / zutil.c / adler32.c / crc32.c (25)
@@ -714,7 +731,7 @@ zlib-rs (same repository, additive to the retained C baseline)
 │   ├── inflate_bench.rs            229  uncompress throughput
 │   └── checksum_bench.rs           186  Adler-32 / CRC-32 throughput
 ├── fuzz/                                [DETACHED workspace, never in the root build graph]
-│   ├── Cargo.toml                  168
+│   ├── Cargo.toml                  185
 │   ├── Cargo.lock                   13 pinned packages
 │   └── fuzz_targets/
 │       ├── fuzz_checksum.rs        543
@@ -723,8 +740,8 @@ zlib-rs (same repository, additive to the retained C baseline)
 │       ├── fuzz_gzip.rs           1551
 │       └── fuzz_inflate.rs        1837
 ├── doc/                                 [the published docs_dir]
-│   ├── index.md                    116  published landing page
-│   ├── project-guide.md            835  frozen internal §1-§9 numbering
+│   ├── index.md                    135  published landing page
+│   ├── project-guide.md            849  frozen internal §1-§9 numbering
 │   ├── technical-specifications.md      this document
 │   └── rfc1950.txt, rfc1951.txt, rfc1952.txt, algorithm.txt, txtvsbin.txt, crc-doc.1.0.pdf
 │                                        REFERENCE ONLY — never edited (D-7)
@@ -1076,7 +1093,7 @@ documentation. `SECURITY.md` cites `src/ffi/types.rs` for these guards and is co
 | `build.rs` | UPDATE | `crc32.c` `make_crc_table` | Keep the pure-`std` table generation and the opt-in `cargo:rustc-cdylib-link-arg` version-script wiring |
 | `rust-toolchain.toml` | UPDATE | `Cargo.toml` `rust-version` | Keep the toolchain pinned so local builds match CI |
 | `deny.toml` | UPDATE | `Cargo.lock` | `cargo-deny` licenses / advisories / bans / sources policy over the 89-package root graph — the first half of the 102-package closure |
-| `fuzz/deny.toml` | **DELETE** | — | Removed. A second policy file governing a blocking gate is a second place for the standard to drift and a place a reviewer can miss. The root `deny.toml` now covers the other half of the closure directly, invoked a second time with `--manifest-path fuzz/Cargo.toml --config deny.toml`; what the fuzz graph legitimately needs is absorbed into the root policy as *scoped* entries rather than as a parallel standard (the `cc` `wrappers = ["libfuzzer-sys"]` scope, the crate-scoped `NCSA` exception, `allow-wildcard-paths`, and `[graph] targets = []`). `policy-integrity` in `.github/workflows/audit.yml` fails if the sibling reappears |
+| `fuzz/deny.toml` | **NOT CREATED** (deliberately absent) | — | This row records a path that does **not** exist and is not to be created. It is deliberately *not* marked `DELETE`: [§0.4.1](#041-file-by-file-transformation-plan) defines exactly three modes — `UPDATE`, `CREATE`, `REFERENCE` — and no deletion of this path was performed against the migration baseline, because **the baseline never contained it**. A second policy file governing a blocking gate would be a second place for the standard to drift and a place a reviewer can miss, so the authorized design is one policy file ([§0.10.1](#0101-authoritative-d1d12-register), artifact `D1`). The root `deny.toml` covers the fuzz half of the closure directly, invoked a second time with `--manifest-path fuzz/Cargo.toml --config deny.toml`; what the fuzz graph legitimately needs is absorbed into the root policy as *scoped* entries rather than as a parallel standard (the `cc` `wrappers = ["libfuzzer-sys"]` scope, the crate-scoped `NCSA` exception, `allow-wildcard-paths`, and `[graph] targets = []`). `policy-integrity` in `.github/workflows/audit.yml` asserts the sibling's non-existence and fails if it reappears |
 | `clippy.toml`, `rustfmt.toml` | UPDATE | — | Keep lint and format configuration pinned |
 | `.cargo/config.toml` | UPDATE | — | Provide the home for target-specific rustflags and link arguments. Delivered as an **inert placeholder**: five empty `[target.<triple>]` tables and no settings at all — see the D7 row in [§0.10.1](#0101-authoritative-d1d12-register). No rustflags or link arguments are actually in force today; adding any is a deliberate future change, and per-target link wiring for the `cdylib` version script lives in `build.rs` instead |
 
@@ -1303,22 +1320,35 @@ and are exempted by name; see "Two scopes" below.
 `cargo tree -i rand` fails with `specification 'rand' is ambiguous`, listing both — direct proof that both
 are in the graph. The consequence is that the RUSTSEC-2026-0097 mitigation is expressed **only** against
 the direct 0.9.4 requirement; the transitive 0.10.2 is not governed by any declared floor. This is exactly
-the class of drift a `cargo-deny` / `cargo-audit` gate exists to catch, and it is why the policy files must
-be authored against the measured graph — standard S6,
+the class of drift a `cargo-deny` / `cargo-audit` gate exists to catch, and it is why the single policy file
+must be authored against the measured graph — standard S6,
 [§0.7.2](#072-plan-adopted-engineering-standards).
 
-**Two scopes, and the difference is why `deny.toml` carries three `skip` entries and not four.** All four
-pairs above are present in `Cargo.lock`, which is target-agnostic. `cargo-deny` evaluates the graph
-*restricted to* the nine triples in `[graph].targets`, and under that restriction `r-efi` disappears —
-`getrandom` gates the UEFI backend on a custom `cfg` no listed triple can satisfy — so only the `rand` /
-`rand_core` / `getrandom` chain remains to justify. `[bans]` accordingly sets
-`multiple-versions = "deny"` with `multiple-versions-include-dev = true` (the second key is load-bearing:
-without it every duplication here is invisible, because all of them are dev-only) and exempts exactly
-`rand@0.10.2`, `rand_core@0.10.1`, and `getrandom@0.4.3` by exact version, with `skip-tree = []`. Adding a
-fourth entry for `r-efi` would be reported as `warning[unmatched-skip]`, which `[bans]` has no severity key
-to downgrade — a permanent warning the zero-warning gate forbids. Measured:
-`cargo deny check --show-stats bans` -> `bans ok: 0 errors, 0 warnings, 3 notes`, one note per skip; the
-detached fuzz graph carries `skip = []` and reports `bans ok` outright.
+**One scope, and it is why `deny.toml` carries four `skip` entries rather than three.** All four pairs above
+are present in `Cargo.lock`, which is target-agnostic, and `[graph] targets` is **empty** — in `cargo-deny`
+that means *no target filter*, so every package in the graph is evaluated on every platform with nothing
+pruned. `r-efi` is therefore in view and is correctly reported as a fourth duplicate major, so it must be
+waived by name like the other three. `[bans]` accordingly sets `multiple-versions = "deny"` with
+`multiple-versions-include-dev = true` (the second key is load-bearing: without it every duplication here is
+invisible, because all of them are dev-only) and exempts exactly `rand@0.10.2`, `rand_core@0.10.1`,
+`getrandom@0.4.3`, and `r-efi@6.0.0` by exact version, with `skip-tree = []`.
+
+The empty list replaced a nine-triple one, and that was a coverage fix rather than a refinement. Measured
+with `cargo deny list` over the root graph: `targets = []` governs 89 of 89 packages, the five supported
+triples govern 70 of 89, and the nine triples governed 86 of 89. The three that no triple could retain —
+`crunchy 0.2.4` and both `r-efi` versions — are gated on custom cfgs rather than target properties
+(`cfg(target_arch = "spirv")` via `half`, `cfg(all(target_os = "uefi", getrandom_backend = "efi_rng"))` via
+`getrandom`), and a `[graph].targets` entry accepts only `triple` and `features`, so under any non-empty
+list they were structurally unreviewable. An explicit `r-efi` waiver is what closing that hole costs, and it
+is the cheaper side of the trade: a package nobody evaluates is not a package nobody ships.
+
+Measured with the exact invocation CI runs,
+`cargo deny --locked --config deny.toml -L info check bans -A unused-wrapper -A license-exception-not-encountered`
+-> `bans ok: 0 errors, 0 warnings, 5 notes` (four acknowledged skips plus the `cc` ban's unmatched
+`libfuzzer-sys` wrapper scope). The same one policy aimed at the detached fuzz graph reports
+`bans ok: 0 errors, 0 warnings, 7 notes`; there, `rand` / `rand_core` are absent and `getrandom` / `r-efi`
+appear in one version only, which is the sole reason that invocation adds
+`-A license-not-encountered -A unmatched-skip -A unnecessary-skip`.
 
 **Reproducibility, measured.** `cargo build --offline` and `cargo metadata --offline --locked` both succeed
 once the registry index is warm, and `git status --porcelain Cargo.lock` remains empty afterwards,
@@ -1410,8 +1440,8 @@ consumer who knows how their C zlib was configured can reproduce it exactly. The
 
 The declared default set is `default = ["std", "gzip", "gz-io", "simd"]`.
 
-**Measured feature-matrix outcomes.** Default → 859 tests pass; `--no-default-features` → 633;
-`--all-features` → 872 (the delta is the 13 `c_oracle` tests, which complete in about 21 s). Every
+**Measured feature-matrix outcomes.** Default → 860 tests pass; `--no-default-features` → 634;
+`--all-features` → 873 (the delta is the 13 `c_oracle` tests, which complete in about 21 s). Every
 configuration reports **zero failed and zero ignored**. The CI `build-test` matrix exercises seven rows
 (default, `--all-features`, `std`+`gzip`+`gz-io`, that set plus `simd`, `--no-default-features`
 library-build-only, plus a native Windows x86_64 row and a native macOS aarch64 row), alongside a dedicated
@@ -1521,13 +1551,13 @@ only lines where the `unsafe` token appears in code:
 | Location | Unsafe-construct lines | Nature |
 |----------|------------------------|--------|
 | `src/ffi/inflate.rs` | 309 | `extern "C"` entry points and pointer validation |
-| `src/ffi/deflate.rs` | 230 | `extern "C"` entry points and pointer validation |
+| `src/ffi/deflate.rs` | 236 | `extern "C"` entry points and pointer validation |
 | `src/ffi/util.rs` | 159 | one-call wrappers, checksums, version, compile flags |
 | `src/ffi/gz.rs` | 150 | gzip file API, C strings, descriptors |
 | `src/ffi/types.rs` | 113 | ABI mirrors, hook aliases, handle tagging |
 | `src/ffi/mod.rs` | 101 | wiring plus the ABI-drift guard |
 | `src/ffi/alloc.rs` | 55 | `zcalloc` / `zcfree` bridge |
-| **`src/ffi/**` total** | **1,117** | the designated boundary |
+| **`src/ffi/**` total** | **1,123** | the designated boundary |
 | `src/lib.rs` | 46 | private libc-backed global allocator over `malloc` / `calloc` / `realloc` / `free` / `posix_memalign`, plus an abort panic handler and the `rust_eh_personality` shim, active only in true non-test no-`std` panic-abort builds |
 | `src/stream.rs` | 2 | **type aliases only** — `grep -c "unsafe {" src/stream.rs` returns **0**; there is no executable unsafe block |
 | Core module groups (`src/deflate`, `src/inflate`, `src/checksum`, `src/gz`, `src/util`, `src/error.rs`, `src/constants.rs`, `src/gz_header.rs`) | **0** | the word appears there only in documentation prose |
@@ -1545,7 +1575,7 @@ other core module. The correct response to a perceived need for `unsafe` in a co
 **restructure**, exactly as `src/deflate/strategy.rs` did when it replaced C's `compress_func` pointer table
 with a tag enum.
 
-**Documentation discipline.** There are **387** `// SAFETY:` comments in `src/`
+**Documentation discipline.** There are **388** `// SAFETY:` comments in `src/`
 (`grep -rn '// SAFETY:' src | wc -l`), required by `#![warn(clippy::undocumented_unsafe_blocks)]` at the
 crate root together with `#![warn(missing_docs)]`. Both lints are declared at `warn`, and CI's
 `-D warnings` gate promotes them to hard errors; `undocumented_unsafe_blocks` is relaxed to `allow` under
@@ -2045,10 +2075,13 @@ bifurcated:
   baked from the genuine C encoder (via `deflateInit2` plus `deflate(Z_FINISH)`), spanning every compression
   level `-1..=9`, all five strategies, and the zlib / raw / gzip / small-window framings. Because the
   reference bytes are precomputed constants, "this gate runs **by default in CI with no C toolchain**." Its
-  structure is roughly **300** full-hex vectors at `memLevel = 8`, plus a grid held as `(length, CRC-32)`
+  structure is **336** full-hex vectors — `BI_VECTORS` at 225 rows and `BI_VECTORS_GZIP` at 75 rows, both at
+  `memLevel = 8`, plus `BI_EXTREMES` at 24 rows and `BI_EXTREMES_GZIP` at 12 rows covering the `memLevel` 1 / 9
+  corners the `memLevel = 8` family never reaches — plus a grid held as `(length, CRC-32)`
   digests rather than full hex so the file stays reviewable: `BI_GRID` at 3,300 rows and `BI_GRID_GZIP` at
   825 rows, **4,125** grid rows in total, over five 16 KiB corpus shapes × levels `-1..=9` × 5 strategies ×
-  `windowBits` 15 / −15 / 9 / −9 / 31 × `memLevel` 1 / 8 / 9. The framing constants are named
+  `windowBits` 15 / −15 / 9 / −9 / 31 × `memLevel` 1 / 8 / 9. Six tables, **4,461** baked assertions in
+  total, every count reproducible by parsing the table literals in `tests/interop.rs`. The framing constants are named
   `WBITS_ZLIB 15`, `WBITS_RAW −15`, `WBITS_ZLIB_SMALL 9`, `WBITS_RAW_SMALL −9`, `WBITS_GZIP 31`, and
   `WBITS_AUTO 47`. The file documents its own regeneration procedure —
   `gcc -O2 -D_LARGEFILE64_SOURCE=1 -DHAVE_UNISTD_H -c …` then `ar rcs libz_ref.a *.o` — so the baked vectors
@@ -2086,9 +2119,9 @@ be lost.
 
 | Configuration | Total | Unit | Integration | Doctests | Failed | Ignored |
 |---------------|-------|------|-------------|----------|--------|---------|
-| default | **859** | 704 | 128 (checksum 23, gzip_compat 15, inflate_coverage 29, interop 30, regression 12, round_trip 19) | 27 | 0 | 0 |
-| `--no-default-features` | **633** | 511 | 97 (checksum 23, gzip_compat 0, inflate_coverage 28, interop 19, regression 10, round_trip 17) | 25 | 0 | 0 |
-| `--all-features` | **872** | 704 | 141 (the above plus c_oracle 13) | 27 | 0 | 0 |
+| default | **860** | 705 | 128 (checksum 23, gzip_compat 15, inflate_coverage 29, interop 30, regression 12, round_trip 19) | 27 | 0 | 0 |
+| `--no-default-features` | **634** | 512 | 97 (checksum 23, gzip_compat 0, inflate_coverage 28, interop 19, regression 10, round_trip 17) | 25 | 0 | 0 |
+| `--all-features` | **873** | 705 | 141 (the above plus c_oracle 13) | 27 | 0 | 0 |
 
 Five `cargo-fuzz` targets are declared, and the engagement's recorded baseline reports roughly 1.13 M
 accumulated executions with 0 crashes — a *cumulative* total that no single command reproduces and that was
@@ -2341,11 +2374,13 @@ the measured value is published and the earlier one is labelled a historical dat
 quietly dropped.
 
 **S2 — Unsafe containment by construction, not by convention.** `unsafe` is confined to `src/ffi/**`
-(1,117 construct lines) and the private no-`std` runtime block of `src/lib.rs` (46). The eight core module
+(1,123 construct lines) and the private no-`std` runtime block of `src/lib.rs` (46 lines file-wide under the
+canonical scan, of which the runtime block itself holds 22 and the boundary tests that police it hold the
+rest). The eight core module
 groups measure **zero**. Enforcement is a hard compile error: `#![deny(unsafe_code)]` at the crate root with
 exactly two `#[allow(unsafe_code)]` carve-outs, several core modules re-asserting the denial at module
 scope, a dedicated `unsafe-boundary` CI job, and `-D warnings` promoting
-`#![warn(clippy::undocumented_unsafe_blocks)]` and `#![warn(missing_docs)]` to errors. All 387
+`#![warn(clippy::undocumented_unsafe_blocks)]` and `#![warn(missing_docs)]` to errors. All 388
 `// SAFETY:` comments remain mandatory. Details in [§0.6.2](#062-unsafe-code-boundary).
 
 **S3 — Bit-exactness is a release gate, not an aspiration.** The tier-1 baked-oracle vectors in
@@ -2480,8 +2515,8 @@ versioned init entry points (`deflateInit_`, `deflateInit2_`, `inflateInit_`, `i
 to report `"1.3.2.1-motley"` with `ZLIB_VERNUM 0x1321`. The reconciliation that proves it is in
 [§0.6.2](#062-unsafe-code-boundary).
 
-**D-5 — Test coverage is preserved and only ever increased.** The measured totals are 859 by default, 633
-under `--no-default-features`, and 872 under `--all-features`, with **zero failed and zero ignored** in
+**D-5 — Test coverage is preserved and only ever increased.** The measured totals are 860 by default, 634
+under `--no-default-features`, and 873 under `--all-features`, with **zero failed and zero ignored** in
 every configuration. No test may be removed, weakened, or `#[ignore]`d to accommodate a change. The four
 official-driver ports (`tests/regression.rs`, `tests/round_trip.rs`, `tests/inflate_coverage.rs`,
 `tests/gzip_compat.rs`) are the operationalization of Constraint 4 and are load-bearing.
@@ -2559,6 +2594,8 @@ carries linker-portability risk best exercised through the platform matrix — g
 `gzclose_w` therefore remain **mandatory**. A destructor cannot surface a deferred compression or I/O error,
 and silently swallowing a write failure during unwinding would be worse than matching C's explicit-close
 contract. This must not be "improved" into an auto-finishing destructor.
+
+**The boundary of this list.** Divergences 1–5 are exactly those a **C caller can observe**. The port also departs from C internally in ways that are **invisible at the C ABI**, and those are deliberately kept out of this register because each is strictly stricter or strictly safer than C while leaving the return-code set, the `#[repr(C)]` layouts, and the emitted bytes untouched: `deflateSetHeader` deep-copies the caller's `gz_header` instead of retaining its pointer — a stricter lifetime contract whose added allocation step is still reported through C's exact `{Z_OK, Z_STREAM_ERROR}` return set, never as `Z_MEM_ERROR`, because a shim may not invent a return code its C original cannot produce; `HandleKind` / `HandleHeader` turn C's undefined cross-engine `End` call into a defined `Z_STREAM_ERROR`; indexing is bounds-checked, so a path that would corrupt memory in C aborts instead; and allocation is fallible with no global fallback, which states C's `ZALLOC` contract precisely. Moving any item from that class into this one is a breaking change to the drop-in contract and must be recorded as one.
 
 ### 0.8.3 Performance Expectations
 
@@ -2645,8 +2682,8 @@ limited to work that provably cannot change the token stream: bounds-check elisi
 inlining, and buffer-copy strategy.
 
 **Benchmark harness.** The Criterion targets are named `deflate_bench`, `inflate_bench`, and
-`checksum_bench` — all declared `harness = false` — backed by `benches/deflate_bench.rs` (482 lines),
-`benches/inflate_bench.rs` (265), and `benches/checksum_bench.rs` (246), **993** lines in total against
+`checksum_bench` — all declared `harness = false` — backed by `benches/deflate_bench.rs` (391 lines),
+`benches/inflate_bench.rs` (229), and `benches/checksum_bench.rs` (186), **806** lines in total against
 `criterion 0.5.1`. `deflate_bench` includes an explicit incompressible-input guard, bracketed at levels 1, 6 and 9, so that the slowest
 absolute Rust workload is measured rather than assumed, and so any future tuning has a regression guard —
 bearing in mind that this profile is the *closest* to C by ratio, not the C-relative worst case, and that the
@@ -2664,7 +2701,7 @@ single phase defined in [§0.4.4](#044-one-phase-execution).
 | Security and supply-chain audit (**D1** `deny.toml`, **D2** `audit.yml`) | High | 8 | **Artifacts in place**; the residual is keeping the policy authored against the measured graph, including the coexisting `rand` 0.9.4 / 0.10.2 majors |
 | Cross-platform CI coverage (**D3**) | Medium | 6 | **Largely satisfied** — native Windows and macOS rows plus `aarch64` / `i686` / big-endian `s390x` cross type-checks. Residual: *runtime* execution on a big-endian machine |
 | Broader byte-identity conformance matrix | Medium | 4 | **Empirically satisfied** by the 3,750-combination sweep; **D9** makes it reproducible in-repository as `tests/c_oracle.rs` |
-| Real-hardware `no_std` validation (**D10**) | Medium | 5 | **Partially satisfied** — a `thumbv7em-none-eabihf` build gate exists and asserts the freestanding runtime block is compiled in. Residual: execution on real hardware. 633 passing hosted tests do not prove an embedded target |
+| Real-hardware `no_std` validation (**D10**) | Medium | 5 | **Partially satisfied** — a `thumbv7em-none-eabihf` build gate exists and asserts the freestanding runtime block is compiled in. Residual: execution on real hardware. 634 passing hosted tests do not prove an embedded target |
 | Scheduled / CI-integrated fuzzing | Medium | 3 | **Satisfied** — weekly cron, a pull-request/scheduled budget split, and per-target corpus caching. Residual: duration tuning |
 | `crates.io` release governance (**D5**, **D12**) | Medium | 3 | **Partially satisfied** — `CHANGELOG.md` exists and the `package-verify` job enforces the `exclude` contract and packages the crate. Residual: an actual publish flow |
 | Incompressible-input deflate performance tuning | Low | 6 | **Outstanding** — gated behind the byte-identity rule above. The item keeps its AAP name, which identifies the slowest *absolute* profile; the C-relative headroom, however, sits on the **compressible** profiles (≈ 58% – 64%), while incompressible input is both the closest to C (≈ 82% – 86%) and the slowest in absolute terms — so `deflate_incompressible_guard` is the regression guard rather than the objective |
@@ -2727,12 +2764,14 @@ bullets, and the four Constraints. Reproduced verbatim where quoted — see
 | `gzlib.c`, `gzread.c`, `gzwrite.c`, `gzclose.c`, `gzguts.h` | The gzip file API |
 | `test/example.c`, `test/infcover.c`, `test/minigzip.c` | The official test vectors, ported to the drivers named in [§0.6.7](#067-official-test-vector-conformance) |
 
-**Rust migration artifacts**, inventoried and cited: the 40 files under `src/` totalling 56,876 lines; the
-7 integration drivers (17,156 lines); the 3 benches (993 lines); the 5 fuzz targets (8,512 lines);
-`Cargo.toml`, `Cargo.lock`, `fuzz/Cargo.toml`, `fuzz/Cargo.lock`, and `build.rs`.
+**Rust migration artifacts**, inventoried and cited: the 40 files under `src/` totalling 58,836 lines; the
+7 integration drivers (17,595 lines); the 3 benches (806 lines); the 5 fuzz targets (8,512 lines);
+`Cargo.toml`, `Cargo.lock`, `fuzz/Cargo.toml`, `fuzz/Cargo.lock`, and `build.rs`. The per-file breakdown
+behind the `src/` figure is in [§0.3.1](#031-refactored-structure-planning), which is the single
+authoritative place for it; this list quotes the totals only.
 
 **Build, CI, and documentation artifacts:** `.github/workflows/ci.yml` (12 jobs),
-`.github/workflows/audit.yml` (4 jobs), `.github/workflows/fuzz.yml` (2 jobs), `rust-toolchain.toml`,
+`.github/workflows/audit.yml` (4 jobs), `.github/workflows/fuzz.yml` (1 job), `rust-toolchain.toml`,
 `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.cargo/config.toml`, `mkdocs.yml`, `README.md`,
 `CHANGELOG.md`, `SECURITY.md`, `catalog-info.yaml`, and the C-side descriptors `CMakeLists.txt`,
 `Makefile.in`, `configure`, `BUILD.bazel`, `MODULE.bazel`, `zlib.pc.in`.
@@ -2803,7 +2842,7 @@ row below states explicitly rather than letting "CLOSED" imply working wiring.
 **The twelve CI jobs**, for reference, since several gap statuses above depend on them:
 `build-test` (7 matrix rows across three operating systems, each asserting its own `rustc -vV` host triple,
 `runner.arch`, and a per-row test-count floor with zero failed and zero ignored), `no-std-tests` (four
-invocations, each at a 633-test floor),
+invocations, each at a 634-test floor),
 `lint` (`cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`,
 and an anchored scan rejecting any real `#[ignore]` attribute),
 `docs` (`RUSTDOCFLAGS: -D warnings` over `cargo doc --locked --no-deps --all-features`, plus
@@ -2900,17 +2939,52 @@ sources are cited by frozen line number while Rust items are cited by module pat
 line numbering is stable and Rust line numbering is not — a convention chosen so that the citations in this
 document keep working as the Rust tree grows.
 
-**Diagrams are `mermaid` fenced blocks, and both were verified to render.** The two flowcharts in this
-document — the C-to-Rust correspondence in [§0.1.1](#011-core-refactoring-objective) and the layer graph in
+**Diagrams are `mermaid` fenced blocks: the sources are valid, and a local `mkdocs build` publishes them as
+source text rather than as drawn diagrams.** Those are two separate facts and the distinction is the whole
+point of this note, so they are stated separately rather than compressed into one claim.
+
+*The sources are valid.* The two flowcharts in this document — the C-to-Rust correspondence in
+[§0.1.1](#011-core-refactoring-objective) and the layer graph in
 [§0.3.1](#031-refactored-structure-planning) — are written as `mermaid` fences, the same form the sibling
 pages in this folder use. Each source was rendered with `mermaid-cli` 11.16.0, which produced a
 `flowchart-v2` SVG with exit 0 and no syntax diagnostic: twelve nodes and six edges for the correspondence
-diagram, nine nodes and eleven edges for the layer graph. One measured detail about the published output is
-worth stating so a reader does not misread it as a defect in these sources: the site configuration enables
-the `mermaid2` plugin but does not declare the `pymdownx.superfences` custom fence that routes a `mermaid`
-fence to it, and the `techdocs-core` preset does not add one either, so a local `mkdocs build` publishes both
-fences as highlighted source rather than as rendered diagrams. That behaviour is a property of the site
-configuration rather than of the diagram sources, it applies to every page in this folder identically, and it
-predates this revision — the superseded version of this page rendered the same way. It is recorded here
-rather than worked around, because the fenced form is the portable one that GitHub and Backstage TechDocs
-render natively, and the site configuration is outside the scope of this document.
+diagram, and nine nodes and **fifteen** edges for the layer graph — **eleven solid** arrows running down the
+tier order plus **four dashed** arrows for the upward references, matching the arrow census in
+[§0.3.1](#031-refactored-structure-planning) exactly. (The correspondence diagram's two `subgraph`
+containers are rendered as clusters, not as nodes, which is why its node count is twelve rather than
+fourteen.)
+
+*The published page does not draw them.* This was verified in a real browser against a `--strict` build, not
+assumed. Every one of the four `mermaid` fences in this folder — the two here and the two `pie` charts in
+[`project-guide.md`](project-guide.md) — is published as `<div class="language-text highlight">` wrapping a
+Pygments `table.highlighttable`, with a line-number gutter and a single unclassed `<code>` text node
+containing the fence body verbatim, HTML-escaped. Measured at runtime on both pages:
+`document.querySelectorAll('.mermaid').length` is `0`, `pre.mermaid` is `0`, `typeof window.mermaid` is
+`"undefined"`, no `<script>` src matches `mermaid`, `article svg` is `0`, and **no network request matches
+`mermaid` or `unpkg`**. On one page `/mermaid/i.test(document.documentElement.outerHTML)` is `false` — the
+fully loaded post-JavaScript DOM does not contain the string once.
+
+*Reconciling the build log, which is the part that misleads.* A `mkdocs build` prints
+`MERMAID2 - Using javascript library (10.4.0): https://unpkg.com/mermaid@10.4.0/dist/mermaid.esm.min.mjs`,
+and it prints it unconditionally at **configuration** time. It is natural to read that line as evidence that
+rendering is active. It is not: the published page never requests that URL. The absence is not a connectivity
+failure either — the same page loads Google Fonts and six `fonts.gstatic.com` files over the same connection
+with HTTP 200, and fetching the logged URL directly from the build host also returns HTTP 200. The runtime is
+simply never asked for.
+
+*Mechanism.* No `pymdownx.superfences` custom fence routes a `mermaid` fence to the plugin, and the
+`techdocs-core` preset declares none, so the fence is lexed as plain text and **no `<pre>` on the page
+carries a class at all**. The Material theme binds its own diagram renderer to the selector `pre.mermaid`
+and its ordinary code-block enhancer to `pre:not(.mermaid) > code`; with zero classed `<pre>` elements the
+first selector matches nothing, the second claims every fence, and the theme's lazy CDN fetch is therefore
+never triggered. Two independent signals confirm the fetch is genuinely unreachable rather than merely slow:
+the theme's only mermaid constant names `mermaid@11` as a UMD bundle while the plugin's log names
+`mermaid@10.4.0` as an ESM module — different version *and* different module format — and a screencast
+scrolling both fences into view in both directions shows the counters frozen across six checkpoints, which
+rules out lazy or `IntersectionObserver`-driven rendering.
+
+This behaviour is a property of the site configuration, not of the diagram sources; it applies to every page
+in this folder identically; and it predates this revision — the superseded version of this page rendered the
+same way. It is recorded rather than worked around, because the fenced form is the portable one that GitHub
+and Backstage TechDocs render natively, and declaring the custom fence would mean overriding the
+`techdocs-core` extension set to gain nothing on the published site.

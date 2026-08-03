@@ -1969,7 +1969,7 @@ pub(crate) fn inflate_tracked<A: Allocator>(
                 // gzip header-capture arms (`Extra`/`Name`/`Comment`) jump here
                 // when a caller-bounded `extra`/`name`/`comment` buffer cannot
                 // grow. Across calls, `MEM` is permanent: a window allocation
-                // that failed record it on the way out, so every later
+                // that fails records it on the way out, so every later
                 // `inflate` on that stream re-enters here and keeps returning
                 // `Z_MEM_ERROR` - exactly the C behavior, since C's
                 // `state->mode` is equally sticky. That window allocation is

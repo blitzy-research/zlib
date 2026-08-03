@@ -238,12 +238,29 @@ Every measured figure in this document was observed on this environment:
 | `rustc` / `cargo` (stable) | `1.97.1 (8bab26f4f 2026-07-14, LLVM 22.1.6)` / `1.97.1` |
 | `rustfmt` | `1.9.0-stable` |
 | `clippy` | `0.1.97` |
-| `rustc` (MSRV) | `1.85.0` |
-| `rustc` / `clippy` / `rustfmt` (nightly, detached fuzz gates only) | `1.99.0-nightly (73dc9167f 2026-08-01)` / `0.1.99` / `1.10.0-nightly` |
+| `rustc` (MSRV) | `1.85.0 (4d91de4e4 2025-02-17)` |
+| `rustc` (nightly, detached fuzz gates only) | `1.99.0-nightly (ad3d0bc14 2026-07-31, LLVM 22.1.8)` |
+| `clippy` / `rustfmt` (nightly) | *not installed on this environment* — see the note below |
 | `cargo-deny` / `cargo-audit` / `cargo-fuzz` | `0.20.2` / `0.22.2` / `0.13.2` |
-| `mkdocs` / `mkdocs-techdocs-core` / `mkdocs-mermaid2-plugin` | `1.6.1` / `1.7.0` / `1.2.3` |
+| `mkdocs` / `mkdocs-material` / `mkdocs-techdocs-core` / `mkdocs-mermaid2-plugin` / `pymdown-extensions` | `1.6.1` / `9.7.6` / `1.7.0` / `1.2.3` / `10.21.3` |
 | `gcc` (optional, C oracle only) | `15.2.0` |
 | Host | `x86_64-unknown-linux-gnu` |
+
+**No nightly `clippy` or `rustfmt` version is quoted, because none was observed.** A
+dated nightly channel installs `cargo`, `rustc` and `rust-std` and nothing else, so on
+this environment `cargo +nightly-2026-08-01 clippy --version` and `... fmt --version`
+both report the component is not installed. The detached-fuzz format and lint gates in
+[`fuzz.yml`](.github/workflows/fuzz.yml) are nevertheless real: its install step
+requests `components: clippy, rustfmt`, so CI has them and this environment does not.
+Reproduce those two gates locally with:
+
+```sh
+rustup component add --toolchain nightly-2026-08-01 clippy rustfmt
+```
+
+Every other row above was read back from the tool itself rather than transcribed, which
+is the whole point of the table — a version nobody can reproduce is worse than an
+absent one.
 
 A C compiler is needed for exactly one optional thing — the live byte-identity sweep
 described under [byte-identity](#tier-3--the-opt-in-live-c-oracle-sweep). Nothing
@@ -308,13 +325,36 @@ sites — so the correct response is to name the toolchain, never to relax the
 different reason. The date is pinned rather than floating so a local reproducer runs
 the toolchain CI ran.
 
-`+stable` is rank 1 in `rustup`'s precedence order and therefore beats the pin, which
-is exactly what [`.github/workflows/audit.yml`](.github/workflows/audit.yml) and
-[`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml) already do — every install
-step in both workflows names its toolchain explicitly. Nothing about the pin needs
+`+stable` is rank 1 in `rustup`'s precedence order and therefore beats the
+[`rust-toolchain.toml`](rust-toolchain.toml) pin (rank 4). Nothing about the pin needs
 changing to install a tool; name the toolchain on the command instead. `--locked` here
 pins the *tool's own* lockfile, and `--version` is what pins which release of the tool
 you get.
+
+**Two distinct mechanisms, and the workflows do not all use the same one.** Naming a
+channel on `dtolnay/rust-toolchain`'s `with: toolchain:` input decides what gets
+**installed**; a `+toolchain` prefix or a `RUSTUP_TOOLCHAIN` environment variable
+decides what gets **run**. Every install step in all three workflows names its channel
+explicitly — that part is uniform, and it has to be, because pinning the action to a
+commit SHA means the `@<ref>` no longer selects a toolchain. What differs is the
+selector, and the difference is deliberate:
+
+| Workflow | Selector for the commands it runs | Measured |
+|----------|-----------------------------------|----------|
+| [`ci.yml`](.github/workflows/ci.yml) | Both: a `+stable` / `+1.85.0` prefix **and** a job-level `RUSTUP_TOOLCHAIN` | 27 prefixed commands, 12 job-level `env:` keys |
+| [`audit.yml`](.github/workflows/audit.yml) | Both: a `+stable` prefix **and** a job-level `RUSTUP_TOOLCHAIN: stable` | 19 prefixed commands, 3 job-level `env:` keys |
+| [`fuzz.yml`](.github/workflows/fuzz.yml) | **Only** the job-level `RUSTUP_TOOLCHAIN: nightly-2026-08-01`; every command is deliberately **unprefixed** | 0 prefixed commands, 1 job-level `env:` key |
+
+`fuzz.yml` is the exception on purpose. The env var (rank 2) is inherited by the nested
+`cargo build` invocations `cargo-fuzz` spawns, which a per-command prefix is not; and
+because the job asserts the *ambient* resolution before building anything, a prefix on
+each command would make that assertion vacuous for exactly the commands carrying it.
+So when reading or reproducing a fuzz step, do not expect a `+nightly-2026-08-01` on
+the command line — set it once for the shell instead:
+
+```sh
+RUSTUP_TOOLCHAIN=nightly-2026-08-01 cargo fuzz build
+```
 
 These are CI tools, not consumers of this library, so their compiler requirements have
 no bearing on the crate's own MSRV contract. Build them with current stable (or the
@@ -800,7 +840,7 @@ for f in src/ffi/*.rs src/lib.rs src/stream.rs; do
       "$(grep -v '^[[:space:]]*//' "$f" | sed 's://.*::' | grep -cE '\bunsafe\b')" "$f"
 done
 cat src/ffi/*.rs | grep -v '^[[:space:]]*//' | sed 's://.*::' \
-    | grep -cE '\bunsafe\b'                                              # 1117
+    | grep -cE '\bunsafe\b'                                              # 1123
 cat src/{deflate,inflate,checksum,gz,util}/*.rs src/{error,constants,gz_header}.rs \
     | grep -v '^[[:space:]]*//' | sed 's://.*::' | grep -cE '\bunsafe\b'   # 0
 ```
@@ -815,14 +855,14 @@ reports, so the two documents report the same numbers.
 | Location | Constructs | Nature |
 |----------|-----------:|--------|
 | `src/ffi/inflate.rs` | 309 | `extern "C"` entry points, pointer validation |
-| `src/ffi/deflate.rs` | 230 | as above |
+| `src/ffi/deflate.rs` | 236 | as above |
 | `src/ffi/util.rs` | 159 | one-call wrappers, checksums, version, compile flags |
 | `src/ffi/gz.rs` | 150 | gzip file API, C strings, descriptors |
 | `src/ffi/types.rs` | 113 | ABI mirrors, hook aliases, handle tagging |
 | `src/ffi/mod.rs` | 101 | wiring plus the ABI-drift guard |
 | `src/ffi/alloc.rs` | 55 | the `zcalloc` / `zcfree` bridge |
-| **`src/ffi/**` total** | **1,117** | the designated boundary |
-| `src/lib.rs` | 46 | the freestanding runtime block described above |
+| **`src/ffi/**` total** | **1,123** | the designated boundary |
+| `src/lib.rs` | 46 | the freestanding runtime block described above (22 lines) plus the in-crate boundary tests that police it |
 | `src/stream.rs` | 2 | **type aliases only** |
 | All eight core module groups | **0** | — |
 
@@ -851,7 +891,7 @@ It is not trusted, and it is not a review convention:
    make the two boundary carve-outs inexpressible.
 2. **`#![warn(clippy::undocumented_unsafe_blocks)]`** alongside
    `#![warn(missing_docs)]`, both promoted to hard errors by the `-D warnings` lint
-   gate. There are **387** `// SAFETY:` comments in `src/`, and every `unsafe` block in
+   gate. There are **388** `// SAFETY:` comments in `src/`, and every `unsafe` block in
    shipped code must carry one, immediately adjacent, where a reader will meet it.
 3. **In-crate boundary tests** that re-derive the boundary from the source text —
    blanking comments and literals, classifying each `unsafe` token, and treating a
@@ -994,9 +1034,30 @@ actually gets decided:
   three `*Init*_` prologues substitute the library's own built-in for the missing half
   first, and the FFI layer reproduces that substitution before constructing anything.
 
+- **A shim may never invent a return code its C original cannot produce.** This is the
+  rule that decides the awkward cases, so it is worth stating as a rule rather than
+  leaving it to be re-derived. `deflateSetHeader` is the worked example: C's
+  implementation stores the caller's `gz_header` **pointer** and can therefore only
+  fail two ways — `Z_STREAM_ERROR` for a bad stream, wrong wrap mode, or bad state, or
+  `Z_OK`. Its return set is exactly `{Z_OK, Z_STREAM_ERROR}` and contains no
+  `Z_MEM_ERROR`. The Rust shim deep-copies the header's `extra` / `name` / `comment`
+  byte arrays into owned buffers instead of retaining a borrowed pointer, so it has an
+  allocation step that C does not have — and an allocation step can fail. That failure
+  must **still** surface as `Z_STREAM_ERROR`, because a C caller switching on the
+  documented return set would fall through an unexpected `Z_MEM_ERROR` into its
+  generic-error path. An implementation detail the port added must never widen the
+  contract the port inherited. A unit test pins the two-code set so the invariant is
+  checked rather than remembered.
+
 If a divergence is genuinely unavoidable, it is documented and — where the ABI can
-carry the signal — advertised through `zlibCompileFlags`, never left implicit. There
-are exactly five such divergences today, and they are all deliberate.
+carry the signal — advertised through `zlibCompileFlags`, never left implicit.
+
+Two distinct classes exist, and conflating them is what makes a register go stale.
+**Five divergences are visible to a C caller** and are enumerated in the next section;
+they are frozen. A second, separate class — **internal conveniences that are strictly
+invisible at the C ABI** — is enumerated in the section after it. A change that moves
+an item from the second class into the first is a breaking change to the drop-in
+contract and must be treated as one.
 
 ## Five divergences that must be preserved, not fixed
 
@@ -1038,6 +1099,43 @@ require a nightly compiler, break byte-identity, or bloat the published crate.
 [`CHANGELOG.md`](CHANGELOG.md#known-limitations-and-documented-divergences) carries
 the same list as release-facing text. If a divergence is ever added, removed, or
 altered in scope, it must be recorded there.
+
+## Internal divergences that are invisible at the C ABI
+
+The five above are the whole list of divergences a C caller can *observe*. The port
+also departs from C internally in the places below. None of them belongs in that list,
+and the reason is uniform: each is either strictly stricter than C or strictly safer
+than C, while leaving the return-code set, the struct layout, and the emitted bytes
+untouched. They are recorded here so nobody has to guess whether an omission was an
+oversight, and so that anyone who *changes* one can tell immediately whether they have
+just promoted it into the observable list.
+
+- **`deflateSetHeader` deep-copies rather than borrows.** C retains the caller's
+  `gz_header` pointer, which makes the caller responsible for keeping that structure
+  and its `extra` / `name` / `comment` buffers alive until the header has been emitted.
+  The Rust shim copies them into owned buffers at call time. That is a **stricter**
+  lifetime contract — every program correct against C stays correct, and a program that
+  freed its header early becomes correct rather than undefined. It is invisible at the
+  ABI because the return set is held to C's exact `{Z_OK, Z_STREAM_ERROR}` (see the
+  rule in the previous section) and the header bytes on the wire are identical.
+- **`HandleKind` / `HandleHeader` tag every opaque state allocation.** C's
+  `z_stream.state` is an untyped pointer, so passing a deflate stream to `inflateEnd`
+  reinterprets one struct as another — undefined behaviour that a C build cannot
+  detect. The port stores a discriminant beside the state and rejects the mismatch with
+  `Z_STREAM_ERROR`. C's own behaviour here is undefined rather than specified, so
+  turning it into a defined error narrows undefined behaviour instead of changing
+  defined behaviour.
+- **Indexing is bounds-checked.** Where a C defect would read or write out of bounds
+  and corrupt adjacent memory, the port panics. Since `panic = "abort"` is set in both
+  profiles, that is an immediate abort rather than an unwind across the FFI boundary.
+  This can only trigger on a path that is already a bug, so no correct program can
+  observe it.
+- **Allocation is fallible, with no global fallback.** Every working buffer is carved
+  from the active allocator hook, and an active `zalloc` reporting out-of-memory
+  propagates as an allocation failure rather than silently falling back to the global
+  allocator. This is C's `ZALLOC` contract stated precisely, not a divergence from it —
+  it is listed here only because a reader who knows the global allocator exists might
+  reasonably expect a fallback that deliberately does not exist.
 
 
 ## Performance policy

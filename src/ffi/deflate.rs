@@ -1001,13 +1001,25 @@ pub unsafe extern "C" fn deflateGetDictionary(
 /// calls. A `NULL` header clears any previously set header (restoring the
 /// default), exactly as passing `Z_NULL` does in C.
 ///
-/// Because that deep copy is an allocation C does not perform, it adds one return
-/// value C cannot produce here: `Z_MEM_ERROR`, when the caller's `extra`, `name`
-/// or `comment` cannot be copied. The alternative — allocating infallibly — would
-/// abort the process on a condition zlib reports as an ordinary error, so the
-/// extra code is the faithful choice (AAP §0.6.5). It is returned only on genuine
-/// allocator exhaustion, nothing is installed when it happens, and the stream
-/// keeps whatever header it already had.
+/// # Return values — exactly C's two, and no third
+///
+/// `zlib.h` L854-L855 documents precisely two outcomes for this entry point —
+/// `Z_OK` on success, `Z_STREAM_ERROR` when the stream state was inconsistent —
+/// and `deflate.c` L714-L719 produces only those two because it allocates
+/// nothing. **This shim produces exactly the same two and no others**, so a C
+/// caller's `switch` over the documented codes stays exhaustive.
+///
+/// That has one non-obvious consequence worth stating, because the deep copy is
+/// an allocation C does not perform: if the caller's `extra`, `name` or `comment`
+/// cannot be copied, the operation has failed and is reported with the one
+/// failure code C defines here, `Z_STREAM_ERROR`. It is **not** reported as
+/// `Z_MEM_ERROR`, which C cannot return from this function; inventing a third
+/// code would break exact C API equivalence, and allocating infallibly instead
+/// would abort the process on a condition C survives. Nothing is installed on
+/// that path — the stream keeps whatever header it already had — so the caller
+/// may retry. The copy itself is an internal implementation convenience with a
+/// stricter buffer-lifetime guarantee than C's, not an ABI divergence; it is
+/// registered as such alongside the five preserved divergences in `CONTRIBUTING.md`.
 ///
 /// # Safety
 ///
@@ -1037,14 +1049,17 @@ pub unsafe extern "C" fn deflateSetHeader(strm: z_streamp, head: gz_headerp) -> 
             // The deep copy is fallible because its three buffers are sized by
             // the caller (`extra_len`, and the `name`/`comment` NUL positions).
             // C stores the caller's pointers and allocates nothing here, so it
-            // has no corresponding failure; the copy is this shim's own doing and
-            // an exhausted allocator must therefore be reported the way zlib
-            // reports exhaustion everywhere else — `Z_MEM_ERROR` — rather than
-            // aborting the process. Nothing has been installed at this point, so
-            // the stream keeps whatever header it already had and the caller may
-            // retry.
+            // has no corresponding failure — and, decisively, `zlib.h` L854-L855
+            // gives this entry point exactly two return values. An exhausted
+            // allocator is therefore reported with the only failure code C
+            // defines here, `Z_STREAM_ERROR`, and never with `Z_MEM_ERROR`: a
+            // code C cannot produce from this function would break exact C API
+            // equivalence, and copying infallibly instead would abort the process
+            // on a condition C survives. Nothing has been installed at this
+            // point, so the stream keeps whatever header it already had and the
+            // caller may retry.
             let Ok(header) = (unsafe { gz_header_to_idiomatic(head) }) else {
-                return Z_MEM_ERROR;
+                return Z_STREAM_ERROR;
             };
             code_of(engine::deflate_set_header(zs, header))
         }
@@ -2273,15 +2288,146 @@ mod tests {
         assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
     }
 
+    /// `deflateSetHeader`'s observable return set is **exactly** `zlib.h`'s two
+    /// codes — `Z_OK` and `Z_STREAM_ERROR` — across every reachable stream shape.
+    ///
+    /// `zlib.h` L854-L855 documents only those two, and `deflate.c` L714-L719
+    /// produces only those two because it allocates nothing. This shim *does*
+    /// allocate (it deep-copies the caller's `extra`/`name`/`comment` so no
+    /// dangling pointer can be read during a later `deflate`), and the temptation
+    /// is to report an exhausted allocator as `Z_MEM_ERROR`. That would be a
+    /// return value C cannot produce here, so it is deliberately folded into
+    /// `Z_STREAM_ERROR` instead — see the entry point's own documentation. This
+    /// test is the standing guard on that decision: it sweeps the reachable
+    /// argument space and fails if any configuration ever answers a third code.
+    ///
+    /// The allocation-failure path itself is not driven here (forcing a *global*
+    /// allocator failure would need a process-wide allocator shim, and
+    /// `Vec::try_reserve_exact` does not consult the stream's `zalloc` pair), so
+    /// what is pinned is the contract every other caller can observe.
+    #[test]
+    fn set_header_return_set_is_exactly_ok_or_stream_error() {
+        // Assert a single observed code against the whole permitted set.
+        fn assert_permitted(rc: c_int, case: &str) {
+            assert!(
+                rc == Z_OK || rc == Z_STREAM_ERROR,
+                "deflateSetHeader({case}) returned {rc}, which is outside the \
+                 zlib.h L854-L855 contract {{Z_OK, Z_STREAM_ERROR}}"
+            );
+            assert_ne!(
+                rc, Z_MEM_ERROR,
+                "deflateSetHeader({case}) returned Z_MEM_ERROR, a code reference \
+                 zlib cannot produce from this function"
+            );
+        }
+
+        // 1. A null stream pointer.
+        assert_permitted(
+            unsafe { deflateSetHeader(ptr::null_mut(), ptr::null_mut()) },
+            "null strm",
+        );
+
+        // 2. A zeroed, never-initialized stream: no installed engine state.
+        let mut raw = zeroed_stream();
+        assert_permitted(
+            unsafe { deflateSetHeader(&mut raw, ptr::null_mut()) },
+            "uninitialized strm",
+        );
+
+        // 3. Every `windowBits` framing zlib offers, with and without a
+        //    populated header. Only the gzip framing (`wrap == 2`) may answer
+        //    `Z_OK`; the rest must answer `Z_STREAM_ERROR`. Either way the code
+        //    has to be one of the two.
+        for window_bits in [15, -15, 31, 9, -9] {
+            let mut strm = zeroed_stream();
+            let init_rc = unsafe {
+                deflateInit2_(
+                    &mut strm,
+                    6,
+                    Z_DEFLATED,
+                    window_bits,
+                    DEF_MEM_LEVEL,
+                    Z_DEFAULT_STRATEGY,
+                    ver(),
+                    size_of::<z_stream>() as c_int,
+                )
+            };
+            if init_rc != Z_OK {
+                // A framing this build cannot construct cannot be exercised
+                // further. The only such case is the gzip framing in a build
+                // without the `gzip` feature, where no stream can ever reach
+                // `wrap == 2` at all.
+                assert_eq!(
+                    window_bits, 31,
+                    "only the gzip framing may be unconstructible; windowBits=\
+                     {window_bits} returned {init_rc}"
+                );
+                continue;
+            }
+
+            let null_rc = unsafe { deflateSetHeader(&mut strm, ptr::null_mut()) };
+            assert_permitted(
+                null_rc,
+                &std::format!("windowBits={window_bits}, NULL head"),
+            );
+
+            let mut extra = std::vec![0x11u8, 0x22, 0x33];
+            let mut name = std::vec![b'n', b'a', b'm', b'e', 0];
+            let mut comment = std::vec![b'c', 0];
+            let mut head = crate::ffi::types::gz_header {
+                text: 0,
+                time: 0,
+                xflags: 0,
+                os: 3,
+                extra: extra.as_mut_ptr(),
+                extra_len: extra.len() as c_uint,
+                extra_max: 0,
+                name: name.as_mut_ptr(),
+                name_max: 0,
+                comment: comment.as_mut_ptr(),
+                comm_max: 0,
+                hcrc: 0,
+                done: 0,
+            };
+            // SAFETY: `strm` is a live deflate stream and every field-declared
+            // buffer above outlives this call.
+            let full_rc = unsafe { deflateSetHeader(&mut strm, &mut head) };
+            assert_permitted(
+                full_rc,
+                &std::format!("windowBits={window_bits}, populated head"),
+            );
+            // The gzip framing is the only one C accepts, and both header shapes
+            // must agree with each other on that verdict.
+            assert_eq!(
+                null_rc, full_rc,
+                "windowBits={window_bits}: a NULL and a populated header must \
+                 reach the same verdict"
+            );
+            assert_eq!(
+                full_rc,
+                if window_bits == 31 && cfg!(feature = "gzip") {
+                    Z_OK
+                } else {
+                    Z_STREAM_ERROR
+                },
+                "windowBits={window_bits}: only the gzip framing sets a header"
+            );
+
+            assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+        }
+    }
+
     /// `deflateSetHeader` with a **populated** header must deep-copy every
     /// caller-owned field and return `Z_OK`, and the fields must reach the wire.
     ///
     /// The deep copy is the shim's own allocation (C merely stores the caller's
-    /// pointers), which is why `gz_header_to_idiomatic` is fallible and why this
-    /// entry point can answer `Z_MEM_ERROR` where C cannot. That makes the
-    /// *success* path worth pinning explicitly: every other `deflateSetHeader`
-    /// test passes `NULL`, so without this one the copy could stop copying — or
-    /// start reporting failure spuriously — with nothing to catch it.
+    /// pointers), which is why `gz_header_to_idiomatic` is fallible — though the
+    /// failure is folded into C's own `Z_STREAM_ERROR` rather than surfacing a
+    /// third code, so the observable return set stays exactly `zlib.h`'s two.
+    /// That makes the *success* path worth pinning explicitly: every other
+    /// `deflateSetHeader` test passes `NULL`, so without this one the copy could
+    /// stop copying — or start reporting failure spuriously — with nothing to
+    /// catch it.
     ///
     /// Copying (rather than retaining the caller's pointers) is also load-bearing
     /// for memory safety: the source buffers are dropped before `deflate` runs,

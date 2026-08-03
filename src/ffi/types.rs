@@ -1154,7 +1154,14 @@ pub fn set_msg(strm: &mut z_stream, msg: *const c_char) {
 /// caller's `extra_len`, and `name`/`comment` by wherever the caller's NUL
 /// happens to be — so the size is not bounded by anything this crate controls.
 /// Reference zlib never aborts for such an input, and neither may this shim
-/// (AAP §0.6.5): the failure has to travel back as `Z_MEM_ERROR`.
+/// (AAP §0.6.5): the failure has to travel back as a return code.
+///
+/// **Which** return code is the caller's decision, and it is decided by the C
+/// contract of the entry point the caller implements — never by this helper.
+/// Reference zlib performs no allocation at `deflateSetHeader`, so it has no
+/// out-of-memory answer to copy there: `zlib.h` L854-L855 gives that function
+/// exactly `Z_OK` and `Z_STREAM_ERROR`, and its shim folds an exhausted
+/// allocator into the latter rather than inventing a third code.
 ///
 /// [`Vec::try_reserve_exact`] provides the fallible allocation; the subsequent
 /// `extend_from_slice` cannot fail because the exact capacity is already present.
@@ -1202,9 +1209,15 @@ unsafe fn cstr_bytes(ptr: *const c_uchar) -> Result<Vec<u8>, TryReserveError> {
 /// Returns [`TryReserveError`] if any of the three copies cannot be allocated.
 /// All three are sized entirely by the caller — `extra` by its `extra_len`, the
 /// two strings by their NUL positions — so an exhausted allocator here is a
-/// reachable outcome of a well-formed call, and one that reference zlib reports
-/// as `Z_MEM_ERROR` rather than dying on. Callers must map this to
-/// `Z_MEM_ERROR`; see `deflateSetHeader`.
+/// reachable outcome of a well-formed call, and one that must travel back as a
+/// return code rather than abort the process.
+///
+/// Callers must map it to whichever failure code the C contract of *their* entry
+/// point permits — **not** unconditionally to `Z_MEM_ERROR`. The sole production
+/// caller is `deflateSetHeader`, where reference zlib allocates nothing and
+/// `zlib.h` L854-L855 documents exactly two outcomes, so that shim reports the
+/// exhaustion as `Z_STREAM_ERROR`; returning `Z_MEM_ERROR` there would be a code
+/// C cannot produce. See `deflateSetHeader`.
 ///
 /// Nothing is retained on the error path: the partially built copies are dropped
 /// as this function returns, and the stream is left exactly as it was — matching

@@ -307,7 +307,7 @@ the security properties the initial release establishes.
   aliases only** — `ZallocFn` and `ZfreeFn`, which merely *name* the C hook
   signatures the crate must interoperate with. `grep -c "unsafe {"` on that file
   returns 0, and the module carries its own `#![deny(unsafe_code)]`.)
-- **Every `unsafe` block that does exist is justified in place.** **387
+- **Every `unsafe` block that does exist is justified in place.** **388
   `// SAFETY:` comments** across `src/`, with
   `#![warn(clippy::undocumented_unsafe_blocks)]` and `#![warn(missing_docs)]`
   promoted to hard errors by the `-D warnings` lint gate. Containment is checked
@@ -345,20 +345,23 @@ the security properties the initial release establishes.
   `[bans] deny` list keeps
   `cc`, `bindgen`, `pkg-config`, `libz-sys`, and the bzip2/lzma/zstd/brotli
   families out of the graph by name.
-  Both policies hold duplicate major versions to the same standard
-  (`[bans] multiple-versions = "deny"` with
+  That one policy holds duplicate major versions to the same standard on both
+  graphs (`[bans] multiple-versions = "deny"` with
   `multiple-versions-include-dev = true`), so an unreviewed duplicate fails the
   build instead of printing a warning that nothing acts on; the root graph's
-  three known dev-only duplications — `rand@0.10.2`, `rand_core@0.10.1`, and
-  `getrandom@0.4.3`, the chain reached through `quickcheck 1.1.0` — are
-  acknowledged individually with exact-version `skip` entries that expire on the
-  next bump, and `r-efi` needs no entry because the nine-triple
-  `[graph].targets` list prunes it.
+  **four** known dev-only duplications — `rand@0.10.2`, `rand_core@0.10.1`,
+  `getrandom@0.4.3`, and `r-efi@6.0.0`, the chain reached through
+  `quickcheck 1.1.0` — are acknowledged individually with exact-version `skip`
+  entries that expire on the next bump. `r-efi@6.0.0` is the fourth precisely
+  *because* `[graph] targets` is empty: the nine-triple list `deny.toml` used to
+  carry pruned it out of view, which was a coverage hole rather than a
+  refinement, and acknowledging it explicitly is what closing that hole costs.
   [`.github/workflows/audit.yml`](.github/workflows/audit.yml) runs the gate on
   push, pull request, a daily schedule, and manual dispatch as four independent
-  blocking jobs — `policy-integrity` (both policy files still declare every
-  governed table and hold every load-bearing key at its reviewed value, so
-  section-level erosion cannot pass vacuously), `cargo-audit` (both lockfiles),
+  blocking jobs — `policy-integrity` (the one policy file still declares every
+  governed table and holds every load-bearing key at its reviewed value, and no
+  second policy file has appeared, so section-level erosion cannot pass
+  vacuously), `cargo-audit` (both lockfiles),
   `cargo-deny` (all four root categories), and `cargo-deny-fuzz` (the detached
   fuzz graph). None declares `needs:`, so one failing category cannot mask
   another's verdict, and those four jobs are the only place either tool runs:
@@ -460,15 +463,20 @@ the security properties the initial release establishes.
   `#[ignore]`.
 - **Release artifacts** from `cargo build --locked --release` on the measuring
   host, in exact bytes so no rounding convention has to be inferred:
-  `libzlib_rs.rlib` 2,460,224 · `libzlib_rs.so` 634,712 · `libzlib_rs.a`
-  22,393,920. All three share one output path, so the last feature row built
-  wins — rebuild with the intended features immediately before linking a C
-  consumer.
+  `libzlib_rs.rlib` 2,478,440 · `libzlib_rs.so` 635,968 · `libzlib_rs.a`
+  22,397,744 — from a clean build under **default** features with
+  `rustc 1.97.1 (8bab26f4f 2026-07-14)` on `x86_64-unknown-linux-gnu`. Quote
+  these only together with that toolchain and feature set: they move with both,
+  and with any change to the crate's own sources or doc metadata. All three
+  share one output path, so the last feature row built wins — rebuild with the
+  intended features immediately before linking a C consumer.
 
 ### Known limitations and documented divergences
 
 All of the following are **deliberate and preserved**, not pending fixes
 (AAP §0.8.2). Each is listed with the reason it must stay.
+
+The list above is exactly the set of divergences a **C caller can observe**. Internal departures that are invisible at the C ABI are tracked separately in `CONTRIBUTING.md` rather than here, because each is strictly stricter or strictly safer than C while leaving the return-code set, the struct layout, and the emitted bytes untouched: `deflateSetHeader` deep-copies the header instead of retaining the caller's pointer and still reports through C's exact `{Z_OK, Z_STREAM_ERROR}` return set; opaque state is kind-tagged so a cross-engine `End` is a defined error rather than C's undefined reinterpretation; indexing is bounds-checked; and allocation is fallible with no global fallback.
 
 - **`gzprintf` / `gzvprintf` return `Z_STREAM_ERROR`.** Consuming a C `va_list`
   requires the nightly-only `c_variadic` language feature, which would break the

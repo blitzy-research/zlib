@@ -63,9 +63,12 @@
 #   would have to be kept in step for no gain.
 #
 #   LOCALLY there is no job-level env, so a contributor does need to say it
-#   once: either `RUSTUP_TOOLCHAIN=nightly-2026-08-01 cargo fuzz build` or the `cargo
-#   +nightly fuzz ...` shorthand. See the header of `fuzz/Cargo.toml` and the
-#   "VERSION RESOLUTION" section of `rust-toolchain.toml`.
+#   once: either `RUSTUP_TOOLCHAIN=nightly-2026-08-01 cargo fuzz build` or the
+#   `cargo +nightly-2026-08-01 fuzz ...` shorthand. Name the DATE either way - a
+#   bare `+nightly` resolves to whatever was published this morning, which is the
+#   one thing the pin below exists to prevent. See the header of
+#   `fuzz/Cargo.toml` and the "VERSION RESOLUTION" section of
+#   `rust-toolchain.toml`.
 #
 #   THE NIGHTLY IS DATE-PINNED to `nightly-2026-08-01`, not the floating `nightly`
 #   channel: a floating channel changes the sanitizer flags and the `-Z` surface
@@ -101,11 +104,13 @@
 #   on the nightly compiler".
 #
 #   Two mechanisms therefore state nightly, and the job-level one is what actually
-#   selects it: the `cargo-fuzz` job sets `RUSTUP_TOOLCHAIN: nightly` (rank 2, which
-#   also reaches the nested `cargo build` invocations cargo-fuzz spawns), and the job
-#   then ASSERTS what it resolved before building anything. Local runs need the same
-#   selection, via `RUSTUP_TOOLCHAIN=nightly` or a `+nightly` shorthand. Do NOT "fix"
-#   this by deleting the pin or pointing `channel` at nightly: the first reopens the
+#   selects it: the `cargo-fuzz` job sets `RUSTUP_TOOLCHAIN: nightly-2026-08-01`
+#   (rank 2), and the job then ASSERTS what it resolved - both that it is *a*
+#   nightly and that it is that exact dated channel - before building anything.
+#   The steps below are consequently UNPREFIXED; "THE OVERRIDE IS THE JOB-LEVEL
+#   ..." above is the single authority on why, and on how to make the same
+#   selection locally. Do NOT "fix" this by deleting the repository pin or by
+#   pointing `rust-toolchain.toml`'s `channel` at nightly: the first reopens the
 #   local/CI MSRV asymmetry, the second puts every contributor's library build on
 #   an unstable compiler.
 #
@@ -119,16 +124,23 @@
 #   ever acquire. Those 13 are governed by the repository's single root policy
 #   `deny.toml`, aimed at this graph with `--manifest-path fuzz/Cargo.toml --config deny.toml`.
 #
-#   THAT POLICY IS ENFORCED IN `audit.yml`, AND NOWHERE ELSE. The supply-chain
-#   gate is a single deliverable with a single home: `deny.toml` and
-#   `deny.toml` is the single policy, and `.github/workflows/audit.yml` is the
-#   workflow that evaluates them - `cargo-deny` for the root graph,
-#   `cargo-deny-fuzz` for this one, `cargo-audit` for advisories over both
-#   lockfiles, and `policy-integrity` for the structural integrity of that policy
-#   files. THIS workflow builds and fuzzes; it runs no `cargo-deny` and no
-#   `cargo-audit` job, and it must not grow one. A second copy of the gate is not
-#   defence in depth: it is a second place for the tool pin, the `--locked`
-#   discipline and the lockfile assertion to drift out of step with the first.
+#   THAT POLICY IS ENFORCED IN `audit.yml`, AND NOWHERE ELSE. There is exactly
+#   ONE policy file in this repository - the root `deny.toml`. `fuzz/deny.toml`
+#   deliberately does not exist, and `audit.yml`'s `policy-integrity` job fails if
+#   one ever appears, because two files would be two places for the same allow
+#   list, the same skip set and the same advisory ignores to drift apart. The one
+#   file is aimed at BOTH graphs instead: `--config deny.toml` is passed
+#   explicitly on the fuzz side, which is the whole reason a sibling copy is
+#   unnecessary.
+#
+#   `.github/workflows/audit.yml` is the workflow that evaluates it, across four
+#   jobs - `cargo-deny` for the root graph, `cargo-deny-fuzz` for this one,
+#   `cargo-audit` for advisories over both lockfiles, and `policy-integrity` for
+#   the structural integrity of that single policy file. THIS workflow builds and
+#   fuzzes; it runs no `cargo-deny` and no `cargo-audit` job, and it must not grow
+#   one. A second copy of the gate is not defence in depth: it is a second place
+#   for the tool pin, the `--locked` discipline and the lockfile assertion to
+#   drift out of step with the first.
 #
 #   WHAT THAT COSTS, STATED HONESTLY. An earlier revision of this file carried a
 #   `supply-chain` job that `cargo-fuzz` declared `needs:` on, so a policy
@@ -148,8 +160,8 @@
 #   minute.
 #
 #   THE TOOL PIN AND THE `--locked` DISCIPLINE LIVE WITH THE GATE. `cargo-deny`
-#   is pinned to 0.20.2 in `audit.yml` because that is the release both policy
-#   files were authored and validated against, and every invocation there passes
+#   is pinned to 0.20.2 in `audit.yml` because that is the release the one policy
+#   file was authored and validated against, and every invocation there passes
 #   `--locked` and then asserts that neither lockfile moved. That matters: without
 #   `--locked`, cargo-deny re-resolves the graph, may REWRITE `fuzz/Cargo.lock` on
 #   the runner, and still reports `ok` - measured on this repository, a single
@@ -340,6 +352,22 @@ jobs:
           # so relying on the default would silently install stable wherever
           # another channel was intended.
           toolchain: nightly-2026-08-01
+          # `components:` IS REQUIRED HERE, not defensive. A dated nightly channel
+          # installs `cargo`, `rustc` and `rust-std` and nothing else - neither
+          # `clippy` nor `rustfmt` is part of that set. Step 4 below runs
+          # `cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check` and two
+          # `cargo clippy ... -- -D warnings` invocations, and the job-level
+          # `RUSTUP_TOOLCHAIN: nightly-2026-08-01` means they resolve against THIS
+          # toolchain, not the stable one another workflow installs. Without this
+          # line all three die on `no such command` before they can gate anything,
+          # leaving the detached fuzz workspace formatted and linted by nothing -
+          # exactly the hole finding TEST-09 was raised to close.
+          #
+          # Both components ship for nightly channels, so requesting them cannot
+          # make the install fail; if a future dated nightly ever drops one, this
+          # step fails loudly at install time instead of the quality gate silently
+          # ceasing to exist.
+          components: clippy, rustfmt
 
       # 2a. Fail loudly if the nightly override is ever lost, instead of meeting it
       #     as an opaque `-Z` parse error part-way through the build.

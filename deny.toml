@@ -639,7 +639,7 @@ multiple-versions-include-dev = true
 # job still exits 0 and still reports GREEN, and nothing in `audit.yml` escalates
 # warnings by deliberate design (the policy lives here, and a CLI `-D` override
 # there would silently diverge from what a reviewer reads). `deny` costs nothing
-# today, because the three acknowledged `skip` entries below cover the real graph
+# today, because the four acknowledged `skip` entries below cover the real graph
 # exactly -- one per duplicate major, each pinned to an exact version.
 #
 # What that means in practice when a duplicate DOES appear:
@@ -647,7 +647,7 @@ multiple-versions-include-dev = true
 #   * `bans` fails with `error[duplicate]`, naming the crate and printing both
 #     inclusion paths (`highlight = "all"` below makes that output actionable).
 #   * The response is either fixing the graph or adding ONE exact-version `skip`
-#     entry with a reason, in the form the three existing entries use. It is never
+#     entry with a reason, in the form the four existing entries use. It is never
 #     a downgrade of this key back to `warn`.
 #   * Because a `skip` matches an exact version, the acknowledgement expires by
 #     construction: the next bump of the crate carrying the duplicate makes the
@@ -816,24 +816,54 @@ deny = [
 # why -- and the ONLY reason why -- the fuzz invocation passes
 # `-A unmatched-skip -A unnecessary-skip`. The re-review prompt above therefore
 # still fires, on the root invocation, where it means something.
+# EVERY LEADING COMMENT BELOW NAMES THE VERSION ITS OWN ENTRY SKIPS, FIRST. That
+# is not a style preference. Each of these four crates appears twice in the graph,
+# so a comment that opens by describing the OTHER copy reads as though the entry
+# beneath it governs that other copy -- and the predictable consequence is a
+# maintainer deleting a waiver that is load-bearing, then finding
+# `error[duplicate]` with no record of why the entry existed. The measured
+# reverse-dependency paths (`cargo tree --locked -i <crate>@<version>
+# --all-features -e normal,build,dev`) are quoted so each claim is checkable
+# rather than remembered.
+#
+# The two chains, for orientation:
+#   0.9  chain (0.9.4 is DIRECTLY declared, so it is the copy under normal
+#        scrutiny and is deliberately NOT skipped):
+#          zlib-rs [dev] -> rand 0.9.4 -> rand_core 0.9.5 -> getrandom 0.3.4
+#                                      -> rand_chacha 0.9.0 -> rand_core 0.9.5
+#   0.10 chain (entirely transitive, which is why every entry here is a 0.10-line
+#        version):
+#          zlib-rs [dev] -> quickcheck 1.1.0 -> rand 0.10.2 -> getrandom 0.4.3
+#                                                           -> rand_core 0.10.1
+#                                            getrandom 0.4.3 -> rand_core 0.10.1
 skip = [
-    # rand 0.9.4 is the direct dev-dependency (pinned >= 0.9.4 for
-    # RUSTSEC-2026-0097); 0.10.2 arrives transitively through quickcheck 1.1.0.
+    # SKIPS rand 0.10.2 -- the TRANSITIVE copy, reached only through
+    # quickcheck 1.1.0. rand 0.9.4 is the direct dev-dependency (pinned
+    # >= 0.9.4 for RUSTSEC-2026-0097) and is intentionally not skipped.
     { crate = "rand@0.10.2", reason = "dev-only; transitive via quickcheck 1.1.0, while rand 0.9.4 is our direct dev-dependency. Both are above the RUSTSEC-2026-0097 patched range." },
-    # rand_core 0.9.5 follows rand 0.9.4 (and rand_chacha 0.9.0).
-    { crate = "rand_core@0.10.1", reason = "dev-only; follows rand 0.10.2 down the quickcheck path" },
-    # getrandom 0.3.4 follows rand_core 0.9.5.
-    { crate = "getrandom@0.4.3", reason = "dev-only; follows rand_core 0.10.1 down the quickcheck path" },
-    # r-efi 5.3.0 follows getrandom 0.3.4 as its UEFI random backend; 6.0.0
-    # follows getrandom 0.4.3 down the same path. Neither is reachable on any
+    # SKIPS rand_core 0.10.1, which rand 0.10.2 and getrandom 0.4.3 both depend
+    # on. Its sibling rand_core 0.9.5 sits under the direct rand 0.9.4 (via
+    # rand 0.9.4 and rand_chacha 0.9.0) and is not skipped.
+    { crate = "rand_core@0.10.1", reason = "dev-only; required by rand 0.10.2 and by getrandom 0.4.3, both reached only through quickcheck 1.1.0" },
+    # SKIPS getrandom 0.4.3, which rand 0.10.2 depends on directly. Its sibling
+    # getrandom 0.3.4 hangs off rand_core 0.9.5 in the 0.9 chain and is not
+    # skipped. NOTE THE DIRECTION: in the 0.10 chain getrandom follows *rand*,
+    # and it is getrandom that depends on rand_core -- not the reverse.
+    { crate = "getrandom@0.4.3", reason = "dev-only; required by rand 0.10.2, reached only through quickcheck 1.1.0" },
+    # SKIPS r-efi 6.0.0, the UEFI random backend of getrandom 0.4.3. Its sibling
+    # r-efi 5.3.0 follows getrandom 0.3.4 in the 0.9 chain and is not skipped.
+    #
+    # DO NOT DELETE THIS ENTRY on the reasoning that r-efi cannot be built here.
+    # That is true and is not the point. Neither version is reachable on any
     # platform this project supports: `getrandom` gates them on
     # `cfg(all(target_os = "uefi", getrandom_backend = "efi_rng"))`, and that
     # second conjunct is a CUSTOM cfg rather than a target property, so no build
-    # of this crate or its test suite ever compiles them. They are in view here
-    # only because `[graph].targets` is empty -- which is the point: a package
-    # that is in the lockfile is a package that gets reviewed, and the honest way
-    # to review this one is an exact-version acknowledgement rather than a target
-    # filter that hides it.
+    # of this crate or its test suite ever compiles them -- which is also why
+    # `cargo tree -i` prints "nothing to print" for either version without
+    # `--target all`. They are nevertheless in view here because `[graph].targets`
+    # is empty, and that is deliberate: a package that is in the lockfile is a
+    # package that gets reviewed. Removing this entry does not remove r-efi from
+    # the graph; it turns the acknowledgement into `error[duplicate]`.
     #
     # The licence question, since `r-efi` is the one crate in the closure whose
     # expression mentions a copyleft term: it is
