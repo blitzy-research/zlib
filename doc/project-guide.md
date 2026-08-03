@@ -47,6 +47,7 @@ Every figure in this subsection was produced by the command beside it, on stable
 **Provenance.** Every figure above was measured against this repository's working tree with `rustc 1.97.1 (8bab26f4f 2026-07-14)` on `x86_64-unknown-linux-gnu`, default features unless a row says otherwise. Each command in the right-hand column is exact and self-contained: running it reproduces the value in the same row. That property is the point of the column, and it is worth stating why the job-count command is shaped the way it is — the obvious shorter form `grep -cE '^  [a-z0-9-]+:'` returns 15 rather than 12, because at two-space indentation it also matches the children of the top-level `permissions:` and `concurrency:` blocks (`contents:`, `group:`, `cancel-in-progress:`). The `awk` form brackets the `jobs:` mapping specifically and therefore agrees with the `EXPECTED_JOBS` table that the `policy-integrity` job in `audit.yml` asserts on every run.
 
 **Key achievements:**
+
 - 58,836 lines of Rust across 40 `.rs` files, standing alongside — not replacing in-tree — the 23,107 lines of retained C
 - Complete DEFLATE compression engine with all five block producers (stored, fast, slow, huff, rle)
 - Complete DEFLATE decompression engine with a 32-mode state machine
@@ -57,6 +58,7 @@ Every figure in this subsection was produced by the command beside it, on stable
 - Three Rust CI workflows in place of the six C-specific workflows that were removed (the migration's **only** deletions — Section 8.3)
 
 **Previously-tracked open items, now resolved:**
+
 - **`--no-default-features` test compilation.** The suite compiles and passes under both `--no-default-features` and `--no-default-features --features no-std` — **634** passed, 0 failed, 0 ignored in each.
 - **`cargo-fuzz` targets.** Five targets exist under `fuzz/fuzz_targets/` (`fuzz_deflate_roundtrip`, `fuzz_inflate`, `fuzz_checksum`, `fuzz_gzip`, `fuzz_ffi_roundtrip`) with their own detached `fuzz/Cargo.toml` and `fuzz/Cargo.lock`, governed by the root `deny.toml` and driven by `fuzz.yml` — which already carries a **weekly** `cron: '0 3 * * 1'` schedule.
 - **Byte-identity against C.** Proven by two independent mechanisms, and *not* by `flate2`: tier 1 of `tests/interop.rs` compares against deterministic vectors baked from the genuine C encoder and therefore needs **no C toolchain**, while `tests/c_oracle.rs` (opt-in, `--features c-oracle`) builds a reference library from the retained in-tree C sources and diffs live output, returning 3,750/3,750 and 50/50 byte-identical. `flate2`'s `miniz_oxide` backend is a *different* encoder, so tier 2 proves RFC wire-format interoperability only — the file says so explicitly.
@@ -72,6 +74,7 @@ compression ≈ 85% and decompression 107–127% of C throughput, and the per-pr
 intuitive reading — see Section 7.1 and `technical-specifications.md` §0.8.3.
 
 **Recommended next steps:**
+
 1. Human code review and sign-off across the Rust surface — the one item no gate can supply.
 2. Runtime (not merely compile-time) validation on a big-endian host and on bare-metal hardware; the s390x and `thumbv7em-none-eabihf` CI rows are compile-verified only.
 3. Deflate throughput work on the *compressible* profiles, which are the ones furthest from C — gated behind the byte-identity suite, since the heuristics that cost throughput are the heuristics that determine output bytes.
@@ -133,7 +136,7 @@ group.
 
 | Test suite | Tests passed | Description |
 |-----------|-------------:|-------------|
-| Unit tests (lib) | 704 | Inline module tests across all 40 source files |
+| Unit tests (lib) | 705 | Inline module tests across all 40 source files |
 | `tests/interop.rs` | 30 | Two-tier gate: tier 1 baked C-encoder vectors (byte-identity, no C toolchain needed), tier 2 `flate2` cross-decode (wire-format only) |
 | `tests/inflate_coverage.rs` | 29 | Port of C `test/infcover.c` inflate coverage |
 | `tests/checksum.rs` | 23 | Adler-32 and CRC-32 known-answer and combine tests |
@@ -236,10 +239,10 @@ pie title Completed Work Distribution (240 hours)
 | **Subtotal (`src/` only)** | **40 `.rs`** | **58,836** | — | The **seven** rows above, which sum exactly: 10,084 + 9,106 + 8,799 + 19,688 + 6,813 + 2,359 + 1,987. This is the figure Section 9.1's tree reproduces |
 | Test Suite | 7 files (`tests/`) | 17,595 | 28h | Ports of C `test/example.c`, `infcover.c`, `minigzip.c`, plus property tests, the two-tier interop gate, and the opt-in `c_oracle` sweep |
 | Quality & Debugging | — | — | 16h | Blitzy Agent commits: formatting, Clippy compliance, `// SAFETY:` documentation, bug fixes |
-| Architecture/Config | `Cargo.toml`, `build.rs`, `rust-toolchain.toml`, `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.cargo/config.toml`, `.gitignore` | 4,794 | 8h | Manifest, CRC table generation, feature flags, profiles, lint/format/supply-chain policy |
+| Architecture/Config | `Cargo.toml`, `build.rs`, `rust-toolchain.toml`, `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.cargo/config.toml`, `.gitignore` | 4,813 | 8h | Manifest, CRC table generation, feature flags, profiles, lint/format/supply-chain policy |
 | Benchmarks | 3 files (`benches/`) | 806 | 6h | Criterion deflate/inflate/checksum throughput, including the incompressible profile |
-| Documentation | `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, `doc/index.md`, `docs/index.md` | 4,197 | 6h | Crate docs, release history, contribution workflow, disclosure policy, published landing pages. This row deliberately **excludes** `doc/technical-specifications.md` and this file: a page cannot stably state its own length, so quoting one guarantees a stale number |
-| CI/CD | `ci.yml`, `audit.yml`, `fuzz.yml` | 4,557 | 1h | 12-job Rust CI pipeline, 4-job supply-chain audit, 1-job `cargo-fuzz` workflow. `mkdocs.yml` (133 lines) is documentation tooling rather than CI and is counted in neither row |
+| Documentation | `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, `doc/index.md`, `docs/index.md` | 4,207 | 6h | Crate docs, release history, contribution workflow, disclosure policy, published landing pages. This row deliberately **excludes** `doc/technical-specifications.md` and this file: a page cannot stably state its own length, so quoting one guarantees a stale number |
+| CI/CD | `ci.yml`, `audit.yml`, `fuzz.yml` | 4,562 | 1h | 12-job Rust CI pipeline, 4-job supply-chain audit, 1-job `cargo-fuzz` workflow. `mkdocs.yml` (176 lines) is documentation tooling rather than CI and is counted in neither row |
 | Fuzzing | 5 targets (`fuzz/fuzz_targets/`) + `fuzz/Cargo.toml` | 8,697 | — | Detached libFuzzer workspace (effort folded into the Quality row). There is no `fuzz/deny.toml`: a single root `deny.toml` governs both dependency graphs, invoked twice — see Section 9.2 |
 | **Historical hours total** | — | — | **240h** | Spans every component; see Section 3 |
 
@@ -397,8 +400,8 @@ RUSTUP_TOOLCHAIN=stable cargo test --locked --no-default-features --features no-
 # 634 passed, 0 failed, 0 ignored in each
 
 # Slices of the default row.
-RUSTUP_TOOLCHAIN=stable cargo test --locked --lib     # 704 unit tests
-RUSTUP_TOOLCHAIN=stable cargo test --locked --tests   # 704 lib + 128 integration = 832
+RUSTUP_TOOLCHAIN=stable cargo test --locked --lib     # 705 unit tests
+RUSTUP_TOOLCHAIN=stable cargo test --locked --tests   # 705 lib + 128 integration = 833
 RUSTUP_TOOLCHAIN=stable cargo test --locked --doc     # 27 (26 runnable + 1 compile_fail)
 
 # One suite at a time.
@@ -688,7 +691,7 @@ from the package.
 | Root C headers (`crc32.h` … `zutil.h`) | **11** | **0** |
 | Root C lines total | **23,107** | — |
 | `zlib.map` symbol-version script | yes | **0** |
-| Official C test drivers (`test/`) | 9 files | **0** |
+| C test directory (`test/`) | **9** files — the **3** official C drivers (`example.c`, `infcover.c`, `minigzip.c`) plus `CMakeLists.txt` and five `*.cmake.in` harness templates | **0** |
 | C build & integration descriptors | `CMakeLists.txt`, `Makefile`, `Makefile.in`, `configure`, `zconf.h.in`, `zlib.pc.in`, `zlib.pc.cmakein`, `zlibConfig.cmake.in`, `BUILD.bazel`, `MODULE.bazel`, `make_vms.com`, `treebuild.xml`, `.cmake-format.yaml`, `zlib.3`, `ChangeLog` — all present | **0** |
 | Out-of-scope trees | `contrib/` 155, `examples/` 13, `win32/` 8, `msdos/` 5, `os400/` 5, `amiga/` 2, `watcom/` 2, `qnx/` 1 — all present | **0** |
 
@@ -715,7 +718,7 @@ cargo package --locked --list | grep -cE '\.(c|h|in|map|pc)$|^(contrib|examples|
 | Metric | Value | Reproduce with |
 |--------|-------|----------------|
 | Rust files | **51** = 40 `src/` + 7 `tests/` + 3 `benches/` + 1 `build.rs` | `git ls-files src tests benches \| grep -c '\.rs$'` (plus `build.rs`) |
-| Source lines (`src/`) | **58,677** | `git ls-files src \| grep '\.rs$' \| xargs wc -l \| tail -1` |
+| Source lines (`src/`) | **58,836** | `git ls-files src \| grep '\.rs$' \| xargs wc -l \| tail -1` |
 | Test lines (`tests/`) | **17,595** (7 files) | same form over `tests` |
 | Benchmark lines (`benches/`) | **806** (3 files) | same form over `benches` |
 | Build script (`build.rs`) | **2,425** | `wc -l build.rs` |
@@ -724,7 +727,7 @@ cargo package --locked --list | grep -cE '\.(c|h|in|map|pc)$|^(contrib|examples|
 | `unsafe fn` declarations | **42** | `sed 's://.*::' \| grep -cE 'unsafe fn'` over `src/**` |
 | `extern "C"` sites | **252** | same form for `extern "C"` |
 | `// SAFETY:` comments | **388**, with zero undocumented unsafe blocks | `grep -rc '// SAFETY:' src \| …`, enforced by `clippy::undocumented_unsafe_blocks` under `-D warnings` |
-| Unit tests | **704** | `cargo test --locked --lib` |
+| Unit tests | **705** | `cargo test --locked --lib` |
 | Integration tests | **128** default (+13 `c_oracle` under `--features c-oracle`) | `cargo test --locked --tests` |
 | Doc tests | **27** (26 runnable + 1 `compile_fail`) | `cargo test --locked --doc` |
 | Ignored tests | **0** | any of the above |
@@ -743,7 +746,7 @@ Line counts below are current and every subtotal sums exactly to its children; t
 to the seven groups. Regenerate the whole block with:
 
 ```sh
-git ls-files src | grep '\.rs$' | xargs wc -l | tail -1          # 56876 total
+git ls-files src | grep '\.rs$' | xargs wc -l | tail -1          # 58836 total
 for d in deflate inflate checksum gz util ffi; do
   printf '%-10s %s\n' "$d" "$(git ls-files "src/$d" | grep '\.rs$' | xargs wc -l | tail -1)"
 done

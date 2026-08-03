@@ -581,9 +581,9 @@ derivation: [Exported symbol reconciliation](README.md#exported-symbol-reconcili
 
 | Command | Result |
 |---------|--------|
-| `cargo test --locked` | **859 passed / 0 failed / 0 ignored** (704 unit, 128 integration, 27 doctests) |
-| `cargo test --locked --all-features` | **872 passed / 0 failed / 0 ignored** (adds the 13 live C-oracle tests) |
-| `cargo test --locked --no-default-features` | **633 passed / 0 failed / 0 ignored** |
+| `cargo test --locked` | **860 passed / 0 failed / 0 ignored** (705 unit, 128 integration, 27 doctests) |
+| `cargo test --locked --all-features` | **873 passed / 0 failed / 0 ignored** (adds the 13 live C-oracle tests) |
+| `cargo test --locked --no-default-features` | **634 passed / 0 failed / 0 ignored** |
 
 The **ignored-test count is zero in every configuration and stays zero**. A
 capability that cannot be exercised in a given build is expressed by a feature

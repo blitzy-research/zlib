@@ -51,6 +51,49 @@
 #      changes belong in `doc/`, next to the page they affect.
 #
 # ---------------------------------------------------------------------------
+# `site_url` IS DELIBERATELY UNSET -- AND THAT IS A DECISION, NOT AN OMISSION
+# ---------------------------------------------------------------------------
+# There is no `site_url` key below. The consequences were measured, not assumed,
+# by building this exact configuration three times with `--strict` (all three
+# exit 0 with zero warnings) and diffing the output:
+#
+#   unset (shipped)              sitemap.xml 109 B, 0 <url> entries; the three
+#                                content pages carry 0 absolute references and
+#                                use correct relative paths; no <link canonical>.
+#   site_url: <host>/zlib-rs/    sitemap.xml 487 B, 3 <url> entries; each content
+#                                page gains EXACTLY ONE line, a <link canonical>
+#                                (+78/+92/+89 bytes); still 0 absolute refs and
+#                                not one relative path rewritten; `404.html`'s
+#                                root-absolute refs gain the `/zlib-rs` prefix.
+#   site_url: <host>/            same, with the prefix at the root.
+#
+# So setting it would NOT break relative linking or sub-path hosting -- the usual
+# worry -- and the only blocker is the one that matters: THIS PROJECT HAS NO
+# PUBLISHED DOCUMENTATION URL. Nothing in the repository names one; there is no
+# GitHub Pages job in `.github/workflows/`, no `gh-pages` branch reference, and
+# no such address in `README.md`, `catalog-info.yaml`, or any page under `doc/`.
+# The site is published through Backstage TechDocs (`catalog-info.yaml` sets
+# `backstage.io/techdocs-ref: dir:.`), which serves it under a route derived from
+# the component identity at request time, not a URL knowable at build time.
+#
+# Writing a concrete value here would therefore invent a fact, and it would do so
+# in the worst available form: a `<link rel="canonical">` on all three content
+# pages pointing at an address that does not resolve. A canonical link to a
+# nonexistent URL is strictly worse than no canonical link -- it tells crawlers to
+# attribute the content to a dead address, and it would be actively wrong once
+# TechDocs serves the same pages at their real route. The empty `<urlset>` is
+# stock upstream MkDocs behaviour, is benign, and is the honest output for a site
+# whose address is unknown.
+#
+# IF a canonical URL ever exists, this becomes a one-line change: add
+# `site_url: https://<host>/<path>/` beside `docs_dir` below (it must be a real
+# top-level key -- note that the literal text `docs_dir: doc` also appears inside
+# the comment block above, so an unanchored search-and-replace will silently bury
+# the new key in a comment and it will have no effect), rebuild with `--strict`,
+# and assert `sitemap.xml` contains 3 `<url>` entries and each content page one
+# `<link rel="canonical">`. Do not add it speculatively.
+#
+# ---------------------------------------------------------------------------
 # THE KEYS BELOW ARE INTENTIONALLY UNCHANGED
 # ---------------------------------------------------------------------------
 # `docs_dir`, `nav`, and `plugins` are already correct and are deliberately left

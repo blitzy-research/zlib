@@ -16,7 +16,7 @@
 //! "Performance Expectations"). Compression is measured separately in
 //! `benches/deflate_bench.rs`; nothing timed here is a compression figure. A
 //! per-profile comparison against a reference C build put these decode cases at
-//! 104%-125%, which brackets the quoted range.
+//! 104%-125%, which overlaps the quoted range without containing it.
 //!
 //! This file links no C library and runs no reference implementation, and the
 //! repository has no automated in-tree performance oracle that could re-check the

@@ -67,6 +67,7 @@ Two tiers, deliberately kept distinct:
   exhaustive closure is the **50/50** and **3,750/3,750** live sweeps — 5 corpus shapes × 5 `windowBits` ×
   3 `memLevel`s × 10 levels × 5 strategies — against a reference C zlib, reproducible in-repository through the
   opt-in `c-oracle` harness.
+
 - **Tier 2 — decode compatibility.** Round-trips in both directions against `flate2`'s default pure-Rust
   `miniz_oxide` backend. That is a *different* encoder with different match-finding heuristics, so tier 2 proves
   RFC wire-format conformance and is **not** treated as satisfying byte-identity; that property is proven

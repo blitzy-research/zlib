@@ -56,11 +56,11 @@ Know the scale of what you are touching:
 
 | Quantity | Measured value | How it was measured |
 |----------|----------------|---------------------|
-| Rust modules under `src/` | **40 files**, **57,210 lines** | `find src -name '*.rs' \| wc -l`, then `cat` piped to `wc -l` |
+| Rust modules under `src/` | **40 files**, **58,836 lines** | `find src -name '*.rs' \| wc -l`, then `cat` piped to `wc -l` |
 | Retained C baseline | **23,107 lines** across 26 root translation units and headers | `cat` of the 26 files piped to `wc -l` |
 | Public C entry points the baseline declares | **119** `ZEXTERN` declarations in `zlib.h` | the retained header |
 | Exported C symbols this crate emits | **95**, all type `T` | `nm -D --defined-only target/release/libzlib_rs.so` |
-| Tests, default features | **859 passed / 0 failed / 0 ignored** | `cargo test --locked` |
+| Tests, default features | **860 passed / 0 failed / 0 ignored** | `cargo test --locked` |
 
 Three companion documents carry things this one deliberately does not repeat:
 
@@ -425,7 +425,7 @@ RUSTUP_TOOLCHAIN=stable cargo test  --locked
 RUSTUP_TOOLCHAIN=stable cargo test  --locked --no-default-features
 RUSTUP_TOOLCHAIN=stable RUSTDOCFLAGS='-D warnings' \
   cargo doc --locked --no-deps --all-features
-mkdocs build --strict
+mkdocs build --strict --site-dir "$(mktemp -d)/site"
 ```
 
 The last two are CI's `docs` job. Rustdoc warnings are **denied**, so a broken
@@ -463,15 +463,15 @@ different total is information, not noise — find out why before you push.
 
 | Command | Expected result |
 |---------|-----------------|
-| `cargo test --locked` | **859 passed / 0 failed / 0 ignored** |
-| `cargo test --locked --all-features` | **872 passed / 0 failed / 0 ignored** |
-| `cargo test --locked --no-default-features` | **633 passed / 0 failed / 0 ignored** |
-| `cargo test --locked --no-default-features --features no-std` | **633 passed / 0 failed / 0 ignored** |
+| `cargo test --locked` | **860 passed / 0 failed / 0 ignored** |
+| `cargo test --locked --all-features` | **873 passed / 0 failed / 0 ignored** |
+| `cargo test --locked --no-default-features` | **634 passed / 0 failed / 0 ignored** |
+| `cargo test --locked --no-default-features --features no-std` | **634 passed / 0 failed / 0 ignored** |
 
-The 859 decompose as **704** in-crate unit tests, **128** integration tests
+The 860 decompose as **705** in-crate unit tests, **128** integration tests
 (`checksum` 23, `gzip_compat` 15, `inflate_coverage` 29, `interop` 30, `regression`
 12, `round_trip` 19), and **27** doctests. `--all-features` adds the **13** tests of
-the opt-in live C-oracle harness. Under `--no-default-features` the total is **511**
+the opt-in live C-oracle harness. Under `--no-default-features` the total is **512**
 unit + **97** integration + **25** doctests, and the `gzip_compat` suite correctly
 reports 0 because the whole `gz*` file API is feature-gated off.
 
@@ -1164,7 +1164,7 @@ of the compression gap**, and it is worth knowing before you go hunting:
 - **Compressible profiles are the furthest**, at roughly **58–64%**. That is where hash
   chains are genuinely walked, lazy matching is evaluated, and Huffman trees are built
   and emitted.
-- **Decompression measured 104–125%** per profile, which brackets the quoted 107–127%.
+- **Decompression measured 104–125%** per profile, which *overlaps* the quoted 107–127% aggregate on 107–125% without containing it — parity holds throughout.
 
 ### The hard rule on optimisation
 
@@ -1239,7 +1239,7 @@ by a command that was actually run. Hold your pull request to the same bar:
 Concretely, paste **the observed output of the gates you ran** into the pull request
 description — the test totals, the exit codes, and, if you touched any of the seven
 byte-identity-risk files, the byte-identity result. "Tests pass" is an assertion;
-`859 passed / 0 failed / 0 ignored` is evidence.
+`860 passed / 0 failed / 0 ignored` is evidence.
 
 ### Import conventions
 
@@ -1492,10 +1492,10 @@ Tick every line before you open the pull request.
 - [ ] `RUSTUP_TOOLCHAIN=stable cargo fmt --all -- --check` — exit 0
 - [ ] `RUSTUP_TOOLCHAIN=stable cargo clippy --locked --all-targets --all-features -- -D warnings` — exit 0
 - [ ] `RUSTUP_TOOLCHAIN=stable cargo build --locked` — exit 0
-- [ ] `RUSTUP_TOOLCHAIN=stable cargo test --locked` — **859 passed / 0 failed / 0
+- [ ] `RUSTUP_TOOLCHAIN=stable cargo test --locked` — **860 passed / 0 failed / 0
       ignored**, or higher with **zero** ignored
 - [ ] `RUSTUP_TOOLCHAIN=stable cargo test --locked --no-default-features` —
-      **633 passed**, same rule
+      **634 passed**, same rule
 - [ ] `RUSTUP_TOOLCHAIN=stable RUSTDOCFLAGS='-D warnings' cargo doc --locked
       --no-deps --all-features` — exit 0 with zero warnings
 - [ ] `mkdocs build --strict` — exit 0 with zero warnings (CI's `docs` job runs both)

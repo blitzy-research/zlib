@@ -987,10 +987,15 @@ jobs:
           'mkdocs-mermaid2-plugin==1.2.3'
         mkdocs --version
     # `--site-dir` points OUTSIDE the checkout on purpose. A default `mkdocs
-    # build` writes `site/`, which is not in `.gitignore`, so it would leave the
-    # working tree dirty - harmless in this job, and exactly the kind of stray
-    # artifact that makes a `git status --porcelain` assertion elsewhere fail for
-    # an unrelated reason.
+    # build` writes 60 generated files into `<repo>/site`. `/site/` IS in
+    # `.gitignore`, so that alone no longer shows up in `git status --porcelain` -
+    # but an ignore rule only hides the artifact, it does not avoid creating it.
+    # Building outside the checkout leaves the tree untouched rather than merely
+    # unstaged, which is what keeps the `git status --porcelain` assertions in
+    # this workflow (Cargo.lock immutability below, and the packaging job) honest:
+    # they must fail only for a real regression, never for a stray build artifact.
+    # The documented reproduce commands in `README.md`, `CONTRIBUTING.md`, and
+    # `doc/technical-specifications.md` pass `--site-dir` for the same reason.
     - name: Build the documentation site in strict mode
       run: |
         set -euo pipefail

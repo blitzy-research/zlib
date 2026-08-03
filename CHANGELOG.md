@@ -164,11 +164,11 @@ every entry in one would have to be invented.
   [`tests/gzip_compat.rs`](tests/gzip_compat.rs); checksum known-answer vectors
   in [`tests/checksum.rs`](tests/checksum.rs); and the two-tier byte-identity and
   wire-format gate in [`tests/interop.rs`](tests/interop.rs).
-  **859 tests pass** by default — 704 in-crate unit tests, 128 integration tests
+  **860 tests pass** by default — 705 in-crate unit tests, 128 integration tests
   (`checksum` 23, `gzip_compat` 15, `inflate_coverage` 29, `interop` 30,
   `regression` 12, `round_trip` 19), and 27 doctests — with **0 failed and 0
-  ignored**. `--no-default-features` passes **633** (511 unit + 97 integration +
-  25 doctests) and `--all-features` passes **872**. CI parses every
+  ignored**. `--no-default-features` passes **634** (512 unit + 97 integration +
+  25 doctests) and `--all-features` passes **873**. CI parses every
   `test result:` line and fails on any failure, on any *ignored* test, or on a
   count below a per-row lower bound, because `cargo test` exits 0 when tests are
   skipped.
@@ -452,8 +452,8 @@ the security properties the initial release establishes.
   | `cargo fmt --all -- --check` | exit 0 |
   | `cargo clippy --locked --all-targets --all-features -- -D warnings` | exit 0 |
   | `cargo build --locked` | exit 0 |
-  | `cargo test --locked` | **859 passed / 0 failed / 0 ignored** |
-  | `cargo test --locked --no-default-features` | **633 passed / 0 failed / 0 ignored** |
+  | `cargo test --locked` | **860 passed / 0 failed / 0 ignored** |
+  | `cargo test --locked --no-default-features` | **634 passed / 0 failed / 0 ignored** |
   | `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features` | exit 0, 0 warnings |
   | `mkdocs build --strict` | exit 0, 0 warnings |
 
@@ -547,8 +547,8 @@ The list above is exactly the set of divergences a **C caller can observe**. Int
   cannot pay for itself), while compressible profiles are the *furthest* at
   roughly 58–64% (hash chains genuinely walked, lazy matching evaluated, Huffman
   trees built and emitted). Per-profile decompression measured 104–125%, which
-  brackets the quoted aggregate, so that figure survives contact with
-  measurement. **The hard rule:** any candidate compression speed-up
+  *overlaps* the quoted 107–127% aggregate on 107–125% without containing it,
+  so parity holds throughout. **The hard rule:** any candidate compression speed-up
   must clear the byte-identity gate before it is viable, because the very
   heuristics that cost throughput are the ones that determine the output bytes —
   the chain-length **quartering** at `good_match` (`chain_length >>= 2`, which

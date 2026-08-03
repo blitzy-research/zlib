@@ -83,25 +83,25 @@ except the two MSRV rows.
 
 | Gate | Command | Result |
 |------|---------|--------|
-| Test suite (default features) | `cargo test --locked` | **859 passed / 0 failed / 0 ignored** |
-| Test suite (all features) | `cargo test --locked --all-features` | **872 passed / 0 failed / 0 ignored** |
-| Test suite (`no_std`) | `cargo test --locked --no-default-features` | **633 passed / 0 failed / 0 ignored** |
-| Test suite (`no-std` feature) | `cargo test --locked --no-default-features --features no-std` | **633 passed / 0 failed / 0 ignored** |
+| Test suite (default features) | `cargo test --locked` | **860 passed / 0 failed / 0 ignored** |
+| Test suite (all features) | `cargo test --locked --all-features` | **873 passed / 0 failed / 0 ignored** |
+| Test suite (`no_std`) | `cargo test --locked --no-default-features` | **634 passed / 0 failed / 0 ignored** |
+| Test suite (`no-std` feature) | `cargo test --locked --no-default-features --features no-std` | **634 passed / 0 failed / 0 ignored** |
 | Formatting | `cargo fmt --all -- --check` | exit 0 |
 | Lints | `cargo clippy --locked --all-targets --all-features -- -D warnings` | exit 0 |
 | API docs | `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features` | exit 0, 0 warnings |
-| Published docs | `mkdocs build --strict` | exit 0, 0 warnings |
+| Published docs | `mkdocs build --strict --site-dir "$(mktemp -d)/site"` | exit 0, 0 warnings |
 | MSRV build | `cargo +1.85.0 build --locked` | exit 0 |
 | MSRV type-check | `cargo +1.85.0 check --locked --all-targets` | exit 0 |
 | Exported C symbols | `nm -D --defined-only target/release/libzlib_rs.so` | **95**, all type `T` |
-| Packaged crate | `cargo package --locked --list` | **75** files; the unpacked archive re-runs its own suite at 859 |
+| Packaged crate | `cargo package --locked --list` | **75** files; the unpacked archive re-runs its own suite at 860 |
 | Live byte-identity sweep | `cargo test --locked --features c-oracle --test c_oracle` | **3750/3750** and **50/50** byte-identical |
 
-The 859 default-feature tests decompose as **704** in-crate unit tests, **128**
+The 860 default-feature tests decompose as **705** in-crate unit tests, **128**
 integration tests (`checksum` 23, `gzip_compat` 15, `inflate_coverage` 29,
 `interop` 30, `regression` 12, `round_trip` 19), and **27** doctests.
 `--all-features` adds the 13 tests of the opt-in live C-oracle harness. Under
-`--no-default-features` the total is **511** unit + **97** integration + **25**
+`--no-default-features` the total is **512** unit + **97** integration + **25**
 doctests; the `gzip_compat` suite correctly reports 0 because the whole `gz*`
 file API is feature-gated off.
 
@@ -607,13 +607,18 @@ RUSTUP_TOOLCHAIN=stable cargo test  --locked
 RUSTUP_TOOLCHAIN=stable cargo test  --locked --no-default-features
 RUSTUP_TOOLCHAIN=stable RUSTDOCFLAGS='-D warnings' \
   cargo doc --locked --no-deps --all-features
-mkdocs build --strict
+mkdocs build --strict --site-dir "$(mktemp -d)/site"
 ```
 
 The last two are what CI's `docs` job runs. Rustdoc warnings are **denied**, not
 merely printed, so a broken intra-doc link or a malformed doc attribute fails the
 build; and the published MkDocs site is built with `--strict`, which promotes a
-missing nav page or a dangling internal link to an error. The MkDocs environment
+missing nav page or a dangling internal link to an error. `--site-dir` sends the
+output outside the checkout, exactly as CI does (`--site-dir "$RUNNER_TEMP/site"`):
+MkDocs otherwise defaults `site_dir` to `<repo>/site`, so a bare build drops 60
+generated files into the working tree and dirties `git status`. `/site/` is in
+`.gitignore` as a backstop, but the flag is the primary fix because it leaves the
+checkout untouched rather than merely unstaged. The MkDocs environment
 is version-pinned in CI (Python 3.12, `mkdocs 1.6.1`, `mkdocs-techdocs-core
 1.7.0`, `mkdocs-mermaid2-plugin 1.2.3`) so the gate cannot change verdict because
 an upstream release shifted underneath it.
@@ -985,7 +990,7 @@ that were previously tracked as open items are now closed:
   [Compatibility and RFCs](#compatibility-and-rfcs) for the full grid.
 - **`no_std` test coverage (done).** The full test suite compiles and passes
   under `cargo test --locked --no-default-features` (and `--features no-std`) —
-  **633 tests, 0 failed, 0 ignored** in both rows — and CI runs both as blocking
+  **634 tests, 0 failed, 0 ignored** in both rows — and CI runs both as blocking
   gates, plus a bare-metal `thumbv7em-none-eabihf` build job.
 - **Cross-platform CI (done).** Native Windows and macOS rows run the real suite;
   aarch64, 32-bit x86, and big-endian s390x are cross type-checked. The residual
@@ -1033,8 +1038,12 @@ Remaining, workload-dependent work:
   - Compressible profiles are the **furthest**, at roughly **58–64%**. That is where
     hash chains are genuinely walked, lazy matching is evaluated, and Huffman trees
     are built and emitted.
-  - Decompression measured **104–125%** per profile, which brackets the quoted
-    107–127%, so that figure survives contact with measurement.
+  - Decompression measured **104–125%** per profile, which *overlaps* the quoted
+    107–127% aggregate on 107–125% without containing it: the per-profile floor
+    sits three points below the aggregate's and the ceiling two points below, so
+    neither range brackets the other. What survives contact with measurement is
+    the load-bearing half of the claim — decompression is at or above parity on
+    every profile.
 
   No CRC-32 multiplier is quoted here. The difference between the `crc32fast` hot
   path and the scalar braid is CPU- and build-dependent, and — as
