@@ -665,10 +665,10 @@ pub fn inflate_init2<A: Allocator>(strm: &mut ZStream<A>, window_bits: i32) -> I
     strm.msg = None;
     // Charge the state to the caller's allocator *first*, exactly where C does
     // (`inflate.c` L198-L200: `state = ZALLOC(strm, 1, sizeof(struct
-    // inflate_state)); if (state == Z_NULL) return Z_MEM_ERROR;`). The region this
-    // secures becomes the finished state's actual home — `fill` below moves the
-    // state into it — so a caller's arena really does hold the `inflate_state`
-    // and gets it back through `zfree` (AAP §0.6.3 has-hook clause, §0.6.5).
+    // inflate_state)); if (state == Z_NULL) return Z_MEM_ERROR;`), with C's own
+    // argument pair `(1, InflateState::C_LAYOUT_SIZE)`, so an arena sized from C's
+    // header serves this request exactly as it serves reference zlib's; the region
+    // is handed back through their `zfree` after the window (AAP §0.6.5).
     //
     // Whether to charge at all is the allocator's decision
     // (`Allocator::reserves_state_footprint`): the global default declines,
@@ -685,9 +685,9 @@ pub fn inflate_init2<A: Allocator>(strm: &mut ZStream<A>, window_bits: i32) -> I
     // a no-op under the global allocator) is threaded in so the lazily-allocated
     // window is later routed through it (AAP §0.6.3).
     let hook = strm.allocator().hook();
-    // Filling is fallible only on the global path, where it boxes through a
-    // checked allocation so heap exhaustion becomes `Z_MEM_ERROR` rather than an
-    // abort; a reserved region was already secured above and cannot fail here.
+    // Filling boxes the state through a checked allocation, so heap exhaustion
+    // becomes `Z_MEM_ERROR` rather than an abort; the caller's charge was already
+    // secured above and is never re-requested here, so C's request count holds.
     let state = reservation
         .fill(InflateState::build_in(hook, 0, 0))
         .ok_or(ZlibError::MemError)?;

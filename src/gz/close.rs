@@ -44,7 +44,7 @@
 //! *overrides* whatever status the finalize flush accumulated, and `gzclose_r`
 //! does so with `return ret ? Z_ERRNO : err;` (`gzread.c` L665-L667) — two
 //! spellings of the same rule: a failing close yields `Z_ERRNO`, a succeeding one
-//! yields the accumulated status. [`File`]'s [`Drop`] discards the `close(2)`
+//! yields the accumulated status. [`File`](std::fs::File)'s [`Drop`] discards the `close(2)`
 //! result outright, and this module cannot call `close(2)` itself because it
 //! contains no `unsafe`.
 //!
@@ -52,12 +52,12 @@
 //!
 //! * [`gzclose_r`] / [`gzclose_w`] / [`gzclose`] — the public idiomatic API. They
 //!   perform every step C performs *except* the fallible close, then drop the
-//!   released [`File`] so RAII closes it, discarding the result. An idiomatic
+//!   released [`File`](std::fs::File) so RAII closes it, discarding the result. An idiomatic
 //!   Rust caller who wants to observe a close failure closes the descriptor
 //!   itself; these functions keep the infallible, ergonomic contract.
 //! * [`gzclose_r_release`] / [`gzclose_w_release`] / [`gzclose_release`] — the
 //!   crate-internal forms that perform the identical work but hand the still-open
-//!   [`File`] back to the caller alongside the accumulated status, so the C-ABI
+//!   [`File`](std::fs::File) back to the caller alongside the accumulated status, so the C-ABI
 //!   shim in `src/ffi/gz.rs` can close it explicitly and apply C's precedence.
 //!
 //! Splitting the finalizers this way is what keeps the fallible close — and its
@@ -91,12 +91,10 @@
 
 #![deny(unsafe_code)]
 
-use std::fs::File;
-
 use crate::constants::FlushMode;
 use crate::error::ReturnCode;
 use crate::gz::read::finish_read;
-use crate::gz::state::{GzMode, GzState};
+use crate::gz::state::{GzMode, GzState, ReleasedFile};
 use crate::gz::write::{gz_comp, gz_zero};
 
 /// Finalizes and closes a gzip file opened for **writing** — port of C
@@ -124,11 +122,11 @@ use crate::gz::write::{gz_comp, gz_zero};
 ///
 /// Reference zlib additionally reports [`Z_ERRNO`](ReturnCode::ErrNo) when
 /// `close(fd)` itself fails (C L695-L696), overriding the accumulated status.
-/// This function closes the descriptor through [`File`]'s [`Drop`], which
+/// This function closes the descriptor through [`File`](std::fs::File)'s [`Drop`], which
 /// discards the `close(2)` result, so it never returns `Z_ERRNO` — the value is
 /// always the accumulated stream status, which equals the C result whenever the
 /// close succeeds. Callers that must observe a close failure use
-/// `gzclose_w_release`, which returns the still-open [`File`] instead; that is
+/// `gzclose_w_release`, which returns the still-open [`File`](std::fs::File) instead; that is
 /// what the `gzclose`/`gzclose_w` C-ABI shims do, so the C ABI *does* report
 /// `Z_ERRNO`. See the module documentation for why the split exists.
 pub fn gzclose_w(file: Box<GzState>) -> i32 {
@@ -147,7 +145,7 @@ pub fn gzclose_w(file: Box<GzState>) -> i32 {
 ///
 /// Performs every step of [`gzclose_w`] except the final close: the direction
 /// check, the pending-seek zero fill, the mandatory `Z_FINISH` flush, and the
-/// buffer/stream teardown. The still-open [`File`] is handed back so the caller
+/// buffer/stream teardown. The still-open [`File`](std::fs::File) is handed back so the caller
 /// can close it explicitly and apply C's precedence — a failing close yields
 /// [`Z_ERRNO`](ReturnCode::ErrNo), a succeeding one yields the returned status.
 ///
@@ -164,7 +162,7 @@ pub fn gzclose_w(file: Box<GzState>) -> i32 {
 /// * `(status, Some(file))` otherwise, where `status` is `Z_OK` or the stream's
 ///   recorded error if the zero fill or the `Z_FINISH` flush failed (a later
 ///   error overrides an earlier one, matching C).
-pub(crate) fn gzclose_w_release(mut file: Box<GzState>) -> (i32, Option<File>) {
+pub(crate) fn gzclose_w_release(mut file: Box<GzState>) -> (i32, Option<ReleasedFile>) {
     // C L676-L677: reject a handle that is not open for writing. C performs this
     // test before any `free` or `close`, so the caller's handle survives intact;
     // the C-ABI shim reproduces that by validating the direction through a borrow
@@ -225,11 +223,11 @@ pub(crate) fn gzclose_w_release(mut file: Box<GzState>) -> (i32, Option<File>) {
 ///
 /// Reference zlib additionally reports [`Z_ERRNO`](ReturnCode::ErrNo) when
 /// `close(fd)` fails (C `return ret ? Z_ERRNO : err;`). This function closes the
-/// descriptor through [`File`]'s [`Drop`], which discards the `close(2)` result,
+/// descriptor through [`File`](std::fs::File)'s [`Drop`], which discards the `close(2)` result,
 /// so it never returns `Z_ERRNO` — the value is always the accumulated read
 /// status, which equals the C result whenever the close succeeds. Callers that
 /// must observe a close failure use `gzclose_r_release`, which returns the
-/// still-open [`File`] instead; that is what the `gzclose`/`gzclose_r` C-ABI
+/// still-open [`File`](std::fs::File) instead; that is what the `gzclose`/`gzclose_r` C-ABI
 /// shims do, so the C ABI *does* report `Z_ERRNO`. See the module documentation
 /// for why the split exists.
 pub fn gzclose_r(file: Box<GzState>) -> i32 {
@@ -248,7 +246,7 @@ pub fn gzclose_r(file: Box<GzState>) -> i32 {
 ///
 /// Performs every step of [`gzclose_r`] except the final close: the direction
 /// check, the `Z_BUF_ERROR`-preserving status computation, and the buffer/stream
-/// teardown. The still-open [`File`] is handed back so the caller can close it
+/// teardown. The still-open [`File`](std::fs::File) is handed back so the caller can close it
 /// explicitly and apply C's `return ret ? Z_ERRNO : err;` precedence.
 ///
 /// # Return value
@@ -264,7 +262,7 @@ pub fn gzclose_r(file: Box<GzState>) -> i32 {
 /// * `(status, Some(file))` otherwise, where `status` is
 ///   [`Z_BUF_ERROR`](ReturnCode::BufError) if that was the stream's last recorded
 ///   error and [`Z_OK`](ReturnCode::Ok) in every other case.
-pub(crate) fn gzclose_r_release(mut file: Box<GzState>) -> (i32, Option<File>) {
+pub(crate) fn gzclose_r_release(mut file: Box<GzState>) -> (i32, Option<ReleasedFile>) {
     // C L650-L651: reject a handle that is not open for reading. C performs this
     // test before any `free` or `close`, so the caller's handle survives intact;
     // the C-ABI shim reproduces that by validating the direction through a borrow
@@ -311,7 +309,7 @@ pub(crate) fn gzclose_r_release(mut file: Box<GzState>) -> (i32, Option<File>) {
 /// # Return value
 ///
 /// The raw zlib integer return code produced by the selected finalizer. As with
-/// [`gzclose_r`] and [`gzclose_w`], the descriptor is closed through [`File`]'s
+/// [`gzclose_r`] and [`gzclose_w`], the descriptor is closed through [`File`](std::fs::File)'s
 /// [`Drop`] and a close failure is therefore not reported; `gzclose_release` is
 /// the variant that makes it observable, and it is what the C-ABI shim uses.
 pub fn gzclose(file: Box<GzState>) -> i32 {
@@ -331,7 +329,7 @@ pub fn gzclose(file: Box<GzState>) -> i32 {
 /// `state->mode == GZ_READ ? gzclose_r(file) : gzclose_w(file)` ternary C uses,
 /// and forwards their `(status, descriptor)` pair unchanged so the caller can
 /// perform the fallible close and apply C's precedence.
-pub(crate) fn gzclose_release(file: Box<GzState>) -> (i32, Option<File>) {
+pub(crate) fn gzclose_release(file: Box<GzState>) -> (i32, Option<ReleasedFile>) {
     match file.mode {
         GzMode::Read => gzclose_r_release(file),
         _ => gzclose_w_release(file),
@@ -578,7 +576,15 @@ mod tests {
     /// Confirms a released handle is genuinely **still open**: an `fstat` through
     /// it must succeed. This is what lets the FFI layer call `close(2)` itself and
     /// report a failure as `Z_ERRNO`.
-    fn assert_still_open(file: &File) {
+    ///
+    /// Every state built by this module opens its file through the standard
+    /// library, so the release is always the `Owned` arm; a raw-descriptor owner
+    /// reaches this path only from `gzdopen`, whose lifecycle is covered in
+    /// `src/ffi/gz.rs`.
+    fn assert_still_open(released: &ReleasedFile) {
+        let ReleasedFile::Owned(file) = released else {
+            panic!("a state opened through std releases an Owned handle");
+        };
         assert!(
             file.metadata().is_ok(),
             "the released descriptor must still be open"

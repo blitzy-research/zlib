@@ -56,11 +56,11 @@ Know the scale of what you are touching:
 
 | Quantity | Measured value | How it was measured |
 |----------|----------------|---------------------|
-| Rust modules under `src/` | **40 files**, **72,082 lines** (2026-08-04) | `find src -name '*.rs' -print0 \| xargs -0 wc -l` — the `total` row, with the file count from the same listing |
+| Rust modules under `src/` | **40 files**, **78,386 lines** (2026-08-04) | `find src -name '*.rs' -print0 \| xargs -0 wc -l` — the `total` row, with the file count from the same listing |
 | Retained C baseline | **23,107 lines** across 26 root translation units and headers | `cat` of the 26 files piped to `wc -l` |
 | Public C entry points the baseline declares | **119** `ZEXTERN` declarations in `zlib.h` | the retained header |
 | Exported C symbols this crate emits | **95**, all type `T` | `nm -D --defined-only target/release/libzlib_rs.so` |
-| Tests, default features | **959 passed / 0 failed / 0 ignored** | `cargo test --locked` |
+| Tests, default features | **1015 passed / 0 failed / 0 ignored** | `cargo test --locked` |
 
 Three companion documents carry things this one deliberately does not repeat:
 
@@ -475,16 +475,16 @@ different total is information, not noise — find out why before you push.
 
 | Command | Expected result |
 |---------|-----------------|
-| `cargo test --locked` | **959 passed / 0 failed / 0 ignored** |
-| `cargo test --locked --all-features` | **972 passed / 0 failed / 0 ignored** |
-| `cargo test --locked --no-default-features` | **696 passed / 0 failed / 0 ignored** |
-| `cargo test --locked --no-default-features --features no-std` | **696 passed / 0 failed / 0 ignored** |
+| `cargo test --locked` | **1015 passed / 0 failed / 0 ignored** |
+| `cargo test --locked --all-features` | **1028 passed / 0 failed / 0 ignored** |
+| `cargo test --locked --no-default-features` | **713 passed / 0 failed / 0 ignored** |
+| `cargo test --locked --no-default-features --features no-std` | **713 passed / 0 failed / 0 ignored** |
 
-The 959 decompose as **799** in-crate unit tests, **131** integration tests
-(`checksum` 23, `gzip_compat` 17, `inflate_coverage` 29, `interop` 30, `regression`
+The 1015 decompose as **854** in-crate unit tests, **132** integration tests
+(`checksum` 23, `gzip_compat` 17, `inflate_coverage` 30, `interop` 30, `regression`
 13, `round_trip` 19), and **29** doctests — 28 runnable plus one `compile_fail`.
 `--all-features` adds the **13** tests of the opt-in live C-oracle harness. Under
-`--no-default-features` the total is **571** unit + **98** integration + **27**
+`--no-default-features` the total is **587** unit + **99** integration + **27**
 doctests, and the `gzip_compat` suite correctly
 reports 0 because the whole `gz*` file API is feature-gated off.
 
@@ -870,15 +870,15 @@ reports, so the two documents report the same numbers.
 
 | Location | Constructs | Nature |
 |----------|-----------:|--------|
-| `src/ffi/inflate.rs` | 478 | `extern "C"` entry points, pointer validation |
-| `src/ffi/deflate.rs` | 333 | as above |
-| `src/ffi/gz.rs` | 186 | gzip file API, C strings, descriptors |
+| `src/ffi/inflate.rs` | 538 | `extern "C"` entry points, pointer validation |
+| `src/ffi/deflate.rs` | 373 | as above |
+| `src/ffi/gz.rs` | 212 | gzip file API, C strings, descriptors, the raw-descriptor owners |
+| `src/ffi/types.rs` | 188 | ABI mirrors, hook aliases, handle tagging, raw header descriptors |
 | `src/ffi/util.rs` | 184 | one-call wrappers, checksums, version, compile flags |
-| `src/ffi/types.rs` | 148 | ABI mirrors, hook aliases, handle tagging |
-| `src/ffi/mod.rs` | 106 | wiring plus the ABI-drift guard |
-| `src/ffi/alloc.rs` | 62 | the `zcalloc` / `zcfree` bridge |
-| **`src/ffi/**` total** | **1,497** | the designated boundary |
-| `src/lib.rs` | 47 | the freestanding runtime block described above (**22** of the 47, `mod no_std_support` at L207-L422) plus the **25** in the in-crate boundary tests that police it |
+| `src/ffi/mod.rs` | 113 | wiring plus the ABI-drift guard |
+| `src/ffi/alloc.rs` | 54 | the `zcalloc` / `zcfree` bridge |
+| **`src/ffi/**` total** | **1,662** | the designated boundary |
+| `src/lib.rs` | 51 | the freestanding runtime block described above (**22** of the 51, `mod no_std_support` at L207-L422) plus the **29** in the in-crate boundary tests that police it |
 | `src/stream.rs` | 2 | **type aliases only** |
 | All eight core module groups | **0** | — |
 
@@ -907,7 +907,7 @@ It is not trusted, and it is not a review convention:
    make the two boundary carve-outs inexpressible.
 2. **`#![warn(clippy::undocumented_unsafe_blocks)]`** alongside
    `#![warn(missing_docs)]`, both promoted to hard errors by the `-D warnings` lint
-   gate. There are **513** `// SAFETY:` comments in `src/`, and every `unsafe` block in
+   gate. There are **592** `// SAFETY:` comments in `src/`, and every `unsafe` block in
    shipped code must carry one, immediately adjacent, where a reader will meet it.
 3. **In-crate boundary tests** that re-derive the boundary from the source text —
    blanking comments and literals, classifying each `unsafe` token, and treating a
@@ -1279,7 +1279,7 @@ by a command that was actually run. Hold your pull request to the same bar:
 Concretely, paste **the observed output of the gates you ran** into the pull request
 description — the test totals, the exit codes, and, if you touched any of the seven
 byte-identity-risk files, the byte-identity result. "Tests pass" is an assertion;
-`959 passed / 0 failed / 0 ignored` is evidence.
+`1015 passed / 0 failed / 0 ignored` is evidence.
 
 ### Import conventions
 
@@ -1480,6 +1480,31 @@ since there is no unwinding to catch. Relatedly, `[profile.release]` deliberatel
 declared optimisation that does nothing is worse than an honest absence. A test fails the
 build if an `lto` key reappears.
 
+**`[lints.rust.unexpected_cfgs]` is a lint *narrowing*, not a lint suppression — do not
+"simplify" it.** The crate matches on one `target_os` value that current stable rustc knows
+but the pinned MSRV compiler (1.85.0) does not: `cygwin`, which [`src/gz/open.rs`](src/gz/open.rs)
+places in the newlib `O_NONBLOCK` family and the POSIX `FD_CLOEXEC` family, and
+[`src/ffi/gz.rs`](src/ffi/gz.rs) places in the POSIX `fcntl`-command family. Without the
+table those three arms warn on MSRV only. The table therefore teaches the lint that **one**
+value:
+
+```toml
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ['cfg(target_os, values("cygwin"))']
+```
+
+Two edits to it are forbidden, and a test rejects each. Changing `level` to `allow` would
+switch the lint off wholesale, and widening `check-cfg` to `values(any())` would permit every
+spelling — including misspellings. That matters concretely: this same lint is what caught
+`target_arch = "hppa"` and `target_arch = "alpha"`, neither of which exists, while the
+platform-constant cascades were being written. A misspelled predicate does not fail to
+compile; it compiles into an arm that can never be taken, which on this code path means
+silently abandoning a requested flag. Note also that `level = "warn"` is what makes it
+*gate*: the `lint` job's `-D warnings` promotes it to a hard error in CI. Deleting a
+`cygwin` arm instead of keeping the table would regress the platform-constant work, so
+prefer the table.
+
 ### Fuzzing
 
 Five `cargo-fuzz` / libFuzzer targets live in the **detached** [`fuzz/`](fuzz) workspace,
@@ -1568,10 +1593,10 @@ Tick every line before you open the pull request.
 - [ ] `RUSTUP_TOOLCHAIN=stable cargo fmt --all -- --check` — exit 0
 - [ ] `RUSTUP_TOOLCHAIN=stable cargo clippy --locked --all-targets --all-features -- -D warnings` — exit 0
 - [ ] `RUSTUP_TOOLCHAIN=stable cargo build --locked` — exit 0
-- [ ] `RUSTUP_TOOLCHAIN=stable cargo test --locked` — **959 passed / 0 failed / 0
+- [ ] `RUSTUP_TOOLCHAIN=stable cargo test --locked` — **1015 passed / 0 failed / 0
       ignored**, or higher with **zero** ignored
 - [ ] `RUSTUP_TOOLCHAIN=stable cargo test --locked --no-default-features` —
-      **696 passed**, same rule
+      **713 passed**, same rule
 - [ ] `RUSTUP_TOOLCHAIN=stable RUSTDOCFLAGS='-D warnings' cargo doc --locked
       --no-deps --all-features` — exit 0 with zero warnings
 - [ ] `mkdocs build --strict --site-dir "$(mktemp -d)/site"` — exit 0 with **zero

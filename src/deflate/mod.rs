@@ -960,6 +960,12 @@ pub(crate) fn deflate_bound_lending<A: Allocator>(
 /// [`Some`] means "return this code from `deflate` immediately", reproducing C's
 /// early exits when the pending buffer could not be fully flushed. [`None`] means
 /// the header is complete and compression may proceed.
+///
+/// The code is [`ReturnCode::Ok`] for every flush-stall exit. The one other
+/// possibility is [`ReturnCode::StreamError`], returned when a caller shrinks a
+/// *live* foreign `extra_len` below the progress this phase has already made —
+/// the state C reaches through an unsigned underflow and an unbounded over-read.
+/// See the re-entry guard in the `Extra` phase.
 #[cfg(feature = "gzip")]
 fn emit_gzip_header(
     s: &mut DeflateState,
@@ -1045,6 +1051,33 @@ fn emit_gzip_header(
         if let Some(extra) = head.and_then(|h| h.extra) {
             let gz_hcrc = head.is_some_and(|h| h.hcrc);
             let extra_len = extra.len() & 0xffff;
+            // Re-entry guard on the caller's *live* header length.
+            //
+            // `s.gzindex` records how many `extra` bytes this phase has already
+            // copied; it survives across `deflate` calls because a full pending
+            // buffer makes the phase return early (below) and resume here on the
+            // next call. `extra_len`, by contrast, is re-derived from the caller's
+            // struct on every call — that freshness is the whole point of
+            // borrowing the header rather than copying it (see this function's
+            // "Why the header arrives borrowed"). A caller is therefore free to
+            // *shrink* `head->extra_len` between two calls and leave
+            // `gzindex > extra_len`.
+            //
+            // C computes `ulg left = (s->gzhead->extra_len & 0xffff) - s->gzindex`
+            // (`deflate.c` L1120) with no such guard: on an unsigned type the
+            // subtraction wraps to a near-`ULONG_MAX` count, and the copy loop
+            // then reads far past the end of the caller's buffer — an unbounded
+            // over-read, so C has no defined behavior here to preserve. The
+            // arithmetic is unreachable in every legitimate flow (`gzindex` is
+            // zeroed in the `Gzip` phase before this one is entered, and is only
+            // ever advanced by amounts summing to at most `extra_len`), so
+            // rejecting it costs nothing and cannot perturb byte-identical output
+            // (AAP §0.8.1 D-1). `Z_STREAM_ERROR` is the documented `deflate`
+            // return for an inconsistent stream state, and the phase state is left
+            // untouched so a caller that restores `extra_len` resumes correctly.
+            if s.gzindex > extra_len {
+                return Some(ReturnCode::StreamError);
+            }
             let mut beg = s.pending;
             let mut left = extra_len - s.gzindex;
             while s.pending + left > s.pending_buf_size {
@@ -1088,6 +1121,18 @@ fn emit_gzip_header(
                 // C reads bytes (including the C-string NUL) until it hits
                 // 0. The borrowed view excludes the NUL, so emit a 0 past
                 // its end (`deflate.c` L1158: `val = s->gzhead->name[...]`).
+                //
+                // This form is also what makes the phase immune to the
+                // shrinking-live-header hazard the `Extra` phase has to reject
+                // explicitly: `name` is re-scanned to the caller's NUL on every
+                // call, so a caller that moves its terminator earlier — even to
+                // before the `gzindex` this loop already reached — simply falls
+                // into the `else` arm, emits the terminating 0 and ends the
+                // field. There is no subtraction to underflow and no index to
+                // run out of range. C in the same situation reads
+                // `name[gzindex]` from beyond the new NUL and keeps going until
+                // it happens upon a zero byte, which is an unbounded over-read
+                // with no defined behavior to preserve.
                 let val = if s.gzindex < name.len() {
                     name[s.gzindex]
                 } else {
@@ -1119,6 +1164,9 @@ fn emit_gzip_header(
                     }
                     beg = 0;
                 }
+                // Byte-at-a-time to the caller's NUL, exactly as in the `Name`
+                // phase above (`deflate.c` L1180), and immune to a shrinking
+                // live header for the same reason: see the note there.
                 let val = if s.gzindex < comment.len() {
                     comment[s.gzindex]
                 } else {

@@ -553,11 +553,10 @@ where
     }
 
     // C L51-L53: the state is charged to the caller's allocator and checked
-    // immediately. This reservation *is* that request, and the region it secures
-    // becomes the finished state's actual home — `fill` below moves the state into
-    // it — so a caller's arena really does hold the `inflate_state` and gets it
-    // back through `zfree` at `inflateBackEnd` (AAP §0.6.3 has-hook clause,
-    // §0.6.5). Whether to charge at all is the allocator's decision
+    // immediately. This reservation *is* that request, carrying C's own
+    // `(1, sizeof(struct inflate_state))` pair, and the region is handed back
+    // through their `zfree` at `inflateBackEnd` (AAP §0.6.5). Whether to charge at
+    // all is the allocator's decision
     // (`Allocator::reserves_state_footprint`); the global default declines,
     // because there the `Box` already is the allocation.
     //
@@ -570,11 +569,10 @@ where
 
     let state = build_back_state(alloc.hook(), window_bits, lend_window)?;
 
-    // Filling is fallible only on the no-hook path, where it boxes through a
-    // checked global allocation so heap exhaustion becomes `Z_MEM_ERROR` — the
-    // code C returns when its state `ZALLOC` fails (`infback.c` L52-L53) — rather
-    // than an abort. A reserved region was already secured above and cannot fail
-    // here.
+    // Filling boxes the state through a checked global allocation, so heap
+    // exhaustion becomes `Z_MEM_ERROR` — the code C returns when its state
+    // `ZALLOC` fails (`infback.c` L52-L53) — rather than an abort. The caller's
+    // charge was already secured above and is never re-requested here.
     reservation.fill(state).ok_or(ReturnCode::MemError)
 }
 
@@ -1678,11 +1676,9 @@ mod tests {
     /// This is the property that makes the FFI `inflateBackInit_` shim match
     /// `infback.c` exactly: one `ZALLOC` for the state (L51), then
     /// `state->window = window;` (L60). A recording allocator therefore sees one
-    /// request, shaped `(1, one state object)`. The size is this port's own
-    /// `size_of::<InflateState>()` rather than C's `sizeof(struct inflate_state)`,
-    /// because the region secured *is* where the state lives — a block of C's
-    /// smaller `sizeof` could not hold it — and AAP §0.6.5 pins the request count
-    /// and the failure timing, both of which this reproduces exactly.
+    /// request, shaped `(1, sizeof(struct inflate_state))` — C's own pair, taken
+    /// from the `#[repr(C)]` layout mirror — so an arena sized from C's header
+    /// serves it exactly as it serves reference zlib (AAP §0.6.5).
     #[test]
     fn borrowed_window_init_makes_only_the_state_request() {
         use core::cell::RefCell;
@@ -1730,8 +1726,8 @@ mod tests {
 
         assert_eq!(
             alloc.seen.into_inner(),
-            vec![(1, size_of::<InflateState>())],
-            "exactly C's single state request, shaped as one state object"
+            vec![(1, InflateState::C_LAYOUT_SIZE)],
+            "exactly C's single state request, with C's own `sizeof(struct inflate_state)`"
         );
     }
 

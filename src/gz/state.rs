@@ -106,10 +106,80 @@ pub(crate) enum How {
     Gzip = 2,
 }
 
+/// A descriptor whose byte I/O is performed by raw platform calls rather than by
+/// a [`File`], because it cannot be represented as one *soundly*.
+///
+/// # Why this capability exists
+///
+/// [`File`] is the natural owner for anything the standard library opened, and
+/// [`GzFile::Owned`] uses it for exactly that. But `gzdopen` receives a bare C
+/// `int` from a caller, and two cases make [`File`] the wrong owner for it:
+///
+/// * **An unproven descriptor.** `File::from_raw_fd` requires the descriptor to
+///   be *open*; `zlib.h` L1422-L1426 requires `gzdopen` to *accept* a descriptor
+///   that is not (anything except `-1`) and to surface the failure later as
+///   [`Z_ERRNO`](ReturnCode::ErrNo). Wrapping an unproven descriptor to satisfy
+///   the second requirement would violate the first.
+/// * **A borrowed OS handle.** On Windows the CRT owns the `HANDLE` behind an
+///   `int` descriptor and `_get_osfhandle` only *lends* it, so wrapping that
+///   handle in a `File` creates a second owner and a later double close.
+///
+/// Both are resolved by owning the raw descriptor directly and doing the I/O
+/// through the same platform entry points reference zlib uses. The trait is
+/// declared here, in the safe core, and implemented in `src/ffi/gz.rs`, which is
+/// the crate's only `unsafe` module (AAP §0.6.2): the core calls these methods
+/// without ever naming a raw descriptor.
+///
+/// # Contract
+///
+/// * The implementor owns the descriptor for its whole life and closes it in
+///   [`Drop`], so the idiomatic `gzclose_*` path (which simply drops the state)
+///   leaks nothing.
+/// * [`close`](Self::close) performs that close *explicitly* and reports the
+///   platform result, which is what makes C's `Z_ERRNO` observable; it must
+///   suppress the [`Drop`] close so the descriptor is closed exactly once.
+/// * [`relinquish`](Self::relinquish) gives the descriptor back to the caller
+///   **without** closing it, for the `gzdopen` failure paths on which C leaves
+///   the caller's descriptor open.
+/// * Every method must *fail* rather than panic when the descriptor is not
+///   usable, so an invalid descriptor produces C's deferred error.
+pub(crate) trait RawFileIo {
+    /// Reads into `buf`, with [`std::io::Read::read`] semantics.
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
+
+    /// Writes from `buf`, with [`std::io::Write::write`] semantics.
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize>;
+
+    /// Flushes buffered state. Raw descriptors buffer nothing, so this matches
+    /// `File::flush` (a no-op) rather than issuing an `fsync`, which reference
+    /// zlib never does either.
+    fn flush(&mut self) -> std::io::Result<()>;
+
+    /// Repositions the descriptor, with [`std::io::Seek::seek`] semantics.
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64>;
+
+    /// The raw descriptor number, for the `fcntl` reconciliation C applies to an
+    /// adopted descriptor (`gzlib.c` L253-L263).
+    ///
+    /// Unix-only, because that reconciliation is: C's two `fcntl` calls are POSIX
+    /// descriptor operations with no Windows counterpart, so on Windows nothing
+    /// ever needs the number and requiring it would be dead weight in the contract.
+    #[cfg(unix)]
+    fn raw_descriptor(&self) -> core::ffi::c_int;
+
+    /// Closes the descriptor and reports whether the platform close succeeded,
+    /// consuming the owner so no [`Drop`] close can follow.
+    fn close(self: Box<Self>) -> bool;
+
+    /// Ends ownership **without** closing, handing the descriptor back exactly as
+    /// it was received.
+    fn relinquish(self: Box<Self>);
+}
+
 /// The owned OS file handle, with an explicit **release** path so a close can be
 /// made *fallible* — the safe-Rust stand-in for the C `int fd` member.
 ///
-/// # Why a newtype rather than a plain [`File`]
+/// # Why a wrapper rather than a plain [`File`]
 ///
 /// RAII closes a descriptor from [`Drop`], which cannot report failure: the
 /// standard library's `File::drop` discards the `close(2)` result. Reference zlib
@@ -120,39 +190,120 @@ pub(crate) enum How {
 /// handing the descriptor *out* of the state so the C-ABI boundary can close it
 /// itself and inspect the result.
 ///
-/// This wrapper makes that hand-off explicit while keeping every existing call
-/// site unchanged: it [`Deref`](core::ops::Deref)s to [`File`], so
-/// `state.file.read(..)`, `.write(..)`, and `.seek(..)` all still work, and only
-/// [`release`](Self::release) can take the handle away.
+/// The wrapper also decides *how* the descriptor is owned. Anything the standard
+/// library opened is an [`Owned`](Self::Owned) [`File`]; a descriptor handed in
+/// through `gzdopen` that cannot be soundly represented as a [`File`] is an
+/// [`Adopted`](Self::Adopted) [`RawFileIo`] owner instead. Both answer
+/// [`Read`](std::io::Read), [`Write`](std::io::Write) and [`Seek`](std::io::Seek),
+/// so `state.file.read(..)`, `.write(..)` and `.seek(..)` read identically at
+/// every call site regardless of which one is in play.
 ///
 /// # Invariant
 ///
 /// The handle is present for the whole useful life of a [`GzState`].
 /// [`release`](Self::release) is called exactly once, by the close finalizers in
 /// `src/gz/close.rs`, as the last act before the state is dropped — so no code
-/// can observe a released handle. The [`Deref`](core::ops::Deref) impls document
-/// that as their panic condition; it is unreachable by construction and covered
-/// by tests.
+/// can observe a released handle. The I/O impls document that as their panic
+/// condition; it is unreachable by construction and covered by tests.
 ///
 /// The one other moment at which the handle is absent is *before* the useful
 /// life begins: [`pending`](Self::pending) exists so `gz_open` can allocate the
 /// state in C's order — struct first, then the path name, then the `open(2)` —
 /// and install the handle only once the file is actually open. That window is
-/// confined to `gz_open`'s own body and no [`Deref`](core::ops::Deref) occurs
-/// inside it.
-pub(crate) struct GzFile {
-    /// The owned handle, or [`None`] once [`release`](Self::release) has taken it
-    /// for an explicit close.
-    handle: Option<File>,
+/// confined to `gz_open`'s own body and no I/O occurs inside it.
+pub(crate) enum GzFile {
+    /// No handle yet: the window inside `gz_open` between allocating the state
+    /// and opening the file. See [`pending`](Self::pending).
+    Pending,
+    /// A handle the standard library owns — `gzopen`'s own `open(2)`, or a
+    /// descriptor whose openness was *proven* before it was adopted.
+    Owned(File),
+    /// A descriptor owned through raw platform calls; see [`RawFileIo`].
+    Adopted(Box<dyn RawFileIo>),
+    /// The handle has been handed out by [`release`](Self::release) for an
+    /// explicit, fallible close. Terminal: the state is dropped immediately
+    /// afterwards.
+    Released,
 }
+
+/// A handle taken out of a [`GzFile`] by [`GzFile::release`], preserving which
+/// kind of owner it came from so the C-ABI boundary can close it the matching
+/// way.
+pub(crate) enum ReleasedFile {
+    /// Came from [`GzFile::Owned`]; closed through the platform close applied to
+    /// a [`File`].
+    Owned(File),
+    /// Came from [`GzFile::Adopted`]; closed through
+    /// [`RawFileIo::close`](RawFileIo::close).
+    Adopted(Box<dyn RawFileIo>),
+}
+
+impl ReleasedFile {
+    /// Ends ownership without closing, leaving the descriptor exactly as it was
+    /// received — the `gzdopen`-failure contract, on which C never closes the
+    /// caller's descriptor.
+    ///
+    /// For an [`Owned`](Self::Owned) handle the caller must dissolve the [`File`]
+    /// itself (that step needs a platform primitive and therefore lives in
+    /// `src/ffi/gz.rs`), so this returns it; an
+    /// [`Adopted`](Self::Adopted) owner relinquishes itself and [`None`] comes
+    /// back.
+    #[inline]
+    pub(crate) fn relinquish(self) -> Option<File> {
+        match self {
+            Self::Owned(file) => Some(file),
+            Self::Adopted(raw) => {
+                raw.relinquish();
+                None
+            }
+        }
+    }
+
+    /// Closes the handle and reports whether the platform close succeeded — C's
+    /// `close(state->fd)` step, whose result becomes
+    /// [`Z_ERRNO`](ReturnCode::ErrNo).
+    ///
+    /// An [`Adopted`](Self::Adopted) owner closes itself; an
+    /// [`Owned`](Self::Owned) [`File`] is passed to `close_file`, because closing
+    /// one *and observing the result* needs a platform primitive that lives in
+    /// `src/ffi/gz.rs`. Taking it as a callback keeps this layer free of `unsafe`
+    /// while leaving the close decision in one place.
+    #[inline]
+    pub(crate) fn close_with(self, close_file: impl FnOnce(File) -> bool) -> bool {
+        match self {
+            Self::Owned(file) => close_file(file),
+            Self::Adopted(raw) => raw.close(),
+        }
+    }
+}
+
+/// Panic message for using the handle before `gz_open` installed it. Unreachable
+/// by construction — the window is confined to `gz_open`'s own body.
+const HANDLE_PENDING: &str = "gz file handle used before it was opened";
+
+/// Panic message for using the handle after [`GzFile::release`] took it.
+/// Unreachable by construction — release is the last act of a close finalizer.
+const HANDLE_RELEASED: &str = "gz file handle used after release";
 
 impl GzFile {
     /// Wraps an owned [`File`] (the descriptor C stores in `state->fd`).
     #[inline]
     pub(crate) const fn new(handle: File) -> Self {
-        Self {
-            handle: Some(handle),
-        }
+        Self::Owned(handle)
+    }
+
+    /// Wraps a raw-descriptor owner, for a `gzdopen` descriptor that cannot be
+    /// soundly represented as a [`File`]. See [`RawFileIo`].
+    ///
+    /// Platform-gated to state a contract rather than to silence a diagnostic:
+    /// owning a raw C `int` descriptor needs `close(2)` on unix and the CRT
+    /// `_read`/`_write`/`_lseeki64`/`_close` family on Windows, and no portable
+    /// `std` equivalent exists anywhere else — so on any other target the C-ABI
+    /// `gzdopen` returns null unconditionally and nothing constructs this variant.
+    #[cfg(any(unix, windows))]
+    #[inline]
+    pub(crate) const fn adopted(owner: Box<dyn RawFileIo>) -> Self {
+        Self::Adopted(owner)
     }
 
     /// Creates a wrapper with **no** handle yet, for the brief window inside
@@ -166,52 +317,131 @@ impl GzFile {
     /// uninitialised until the `open` succeeds, and this is the safe equivalent.
     ///
     /// The resulting value must have a real handle installed (by assigning
-    /// [`GzFile::new`]) before anything dereferences it; `gz_open` does so on the
-    /// only path that returns the state to a caller, so no live [`GzState`] is
-    /// ever observable in this condition.
+    /// [`GzFile::new`] or [`GzFile::adopted`]) before anything performs I/O on it;
+    /// `gz_open` does so on the only path that returns the state to a caller, so
+    /// no live [`GzState`] is ever observable in this condition.
     #[inline]
     pub(crate) const fn pending() -> Self {
-        Self { handle: None }
+        Self::Pending
+    }
+
+    /// Reinstalls a handle previously taken by [`release`](Self::release),
+    /// preserving its ownership kind.
+    ///
+    /// Platform-gated for the same reason as [`adopted`](Self::adopted): its only
+    /// caller is the `gzdopen` shim's fallible boxing step, which exists only where
+    /// a raw descriptor can be adopted at all.
+    #[cfg(any(unix, windows))]
+    #[inline]
+    pub(crate) fn restore(released: ReleasedFile) -> Self {
+        match released {
+            ReleasedFile::Owned(file) => Self::Owned(file),
+            ReleasedFile::Adopted(raw) => Self::Adopted(raw),
+        }
     }
 
     /// Hands the owned handle to the caller so it can perform an explicit,
-    /// *fallible* close, returning [`None`] if it was already released.
+    /// *fallible* close, returning [`None`] if it was already released (or never
+    /// installed).
     ///
     /// After this the wrapper closes nothing: the descriptor's lifetime belongs
-    /// entirely to the returned [`File`] (or to whatever raw descriptor the
-    /// caller extracts from it). The state must not be used afterwards.
+    /// entirely to the returned [`ReleasedFile`]. The state must not be used
+    /// afterwards.
     #[inline]
-    pub(crate) fn release(&mut self) -> Option<File> {
-        self.handle.take()
+    pub(crate) fn release(&mut self) -> Option<ReleasedFile> {
+        match core::mem::replace(self, Self::Released) {
+            Self::Owned(file) => Some(ReleasedFile::Owned(file)),
+            Self::Adopted(raw) => Some(ReleasedFile::Adopted(raw)),
+            Self::Pending | Self::Released => None,
+        }
+    }
+
+    /// The raw descriptor number backing this handle, for the `fcntl`
+    /// reconciliation C applies at open time (`gzlib.c` L246-L263).
+    ///
+    /// [`None`] while the handle is absent, which no caller can observe.
+    #[cfg(unix)]
+    #[inline]
+    pub(crate) fn raw_descriptor(&self) -> Option<core::ffi::c_int> {
+        use std::os::fd::AsRawFd;
+
+        match self {
+            Self::Owned(file) => Some(file.as_raw_fd()),
+            Self::Adopted(raw) => Some(raw.raw_descriptor()),
+            Self::Pending | Self::Released => None,
+        }
+    }
+
+    /// The underlying [`File`], when this handle is one. Used by tests that
+    /// inspect the descriptor directly.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn as_file(&self) -> Option<&File> {
+        match self {
+            Self::Owned(file) => Some(file),
+            Self::Adopted(_) | Self::Pending | Self::Released => None,
+        }
     }
 }
 
-impl core::ops::Deref for GzFile {
-    type Target = File;
-
+impl std::io::Read for GzFile {
     /// # Panics
     ///
-    /// If the handle has already been [`release`](Self::release)d. Unreachable by
-    /// construction: release happens only in the close finalizers, immediately
-    /// before the owning [`GzState`] is dropped.
+    /// If the handle is absent — before `gz_open` installs it, or after
+    /// [`release`](GzFile::release) takes it. Unreachable by construction: release
+    /// happens only in the close finalizers, immediately before the owning
+    /// [`GzState`] is dropped.
     #[inline]
-    fn deref(&self) -> &File {
-        self.handle
-            .as_ref()
-            .expect("gz file handle used after release")
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Owned(file) => std::io::Read::read(file, buf),
+            Self::Adopted(raw) => raw.read(buf),
+            Self::Pending => panic!("{HANDLE_PENDING}"),
+            Self::Released => panic!("{HANDLE_RELEASED}"),
+        }
     }
 }
 
-impl core::ops::DerefMut for GzFile {
+impl std::io::Write for GzFile {
     /// # Panics
     ///
-    /// If the handle has already been [`release`](Self::release)d; see
-    /// [`Deref::deref`](core::ops::Deref::deref).
+    /// If the handle is absent; see [`Read::read`](std::io::Read::read).
     #[inline]
-    fn deref_mut(&mut self) -> &mut File {
-        self.handle
-            .as_mut()
-            .expect("gz file handle used after release")
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Owned(file) => std::io::Write::write(file, buf),
+            Self::Adopted(raw) => raw.write(buf),
+            Self::Pending => panic!("{HANDLE_PENDING}"),
+            Self::Released => panic!("{HANDLE_RELEASED}"),
+        }
+    }
+
+    /// # Panics
+    ///
+    /// If the handle is absent; see [`Read::read`](std::io::Read::read).
+    #[inline]
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Owned(file) => std::io::Write::flush(file),
+            Self::Adopted(raw) => raw.flush(),
+            Self::Pending => panic!("{HANDLE_PENDING}"),
+            Self::Released => panic!("{HANDLE_RELEASED}"),
+        }
+    }
+}
+
+impl std::io::Seek for GzFile {
+    /// # Panics
+    ///
+    /// If the handle is absent; see [`Read::read`](std::io::Read::read).
+    #[inline]
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        match self {
+            Self::Owned(file) => std::io::Seek::seek(file, pos),
+            Self::Adopted(raw) => raw.seek(pos),
+            Self::Pending => panic!("{HANDLE_PENDING}"),
+            Self::Released => panic!("{HANDLE_RELEASED}"),
+        }
     }
 }
 
@@ -906,16 +1136,23 @@ mod tests {
     fn gz_file_releases_its_handle_exactly_once() {
         let mut s = test_state("archive.gz");
 
-        // Before release the wrapper is transparent: `Deref` reaches the `File`.
+        // Before release the wrapper reaches a live `File`.
         assert!(
-            s.file.metadata().is_ok(),
-            "Deref must reach a live File before release"
+            s.file
+                .as_file()
+                .expect("an opened state holds an Owned handle")
+                .metadata()
+                .is_ok(),
+            "the wrapper must reach a live File before release"
         );
 
         let released = s
             .file
             .release()
             .expect("the first release yields the handle");
+        let ReleasedFile::Owned(released) = released else {
+            panic!("an opened state releases an Owned handle");
+        };
         assert!(
             released.metadata().is_ok(),
             "the released descriptor must still be open"
@@ -937,7 +1174,7 @@ mod tests {
         );
     }
 
-    /// Deref-after-release panics with the documented message. Unreachable in
+    /// Use-after-release panics with the documented message. Unreachable in
     /// production (release happens only as the last act of a close finalizer), but
     /// pinned so the invariant fails loudly rather than silently if that changes.
     #[test]
@@ -945,7 +1182,35 @@ mod tests {
     fn deref_after_release_panics() {
         let mut s = test_state("archive.gz");
         let _released = s.file.release().expect("handle present");
-        let _ = s.file.metadata();
+        let _ = std::io::Seek::stream_position(&mut s.file);
+    }
+
+    /// The same invariant on the other side of the useful life: touching the
+    /// handle inside `gz_open`'s pre-open window names its own distinct message,
+    /// so a regression there cannot be mistaken for a release-ordering bug.
+    #[test]
+    #[should_panic(expected = "gz file handle used before it was opened")]
+    fn use_before_open_panics_with_its_own_message() {
+        let mut pending = GzFile::pending();
+        let _ = std::io::Seek::stream_position(&mut pending);
+    }
+
+    /// [`GzFile::restore`] must put a released handle back with its ownership kind
+    /// intact — the step `gzdopen`'s boxing performs once the handle exists.
+    #[test]
+    fn restore_reinstalls_the_released_handle() {
+        let mut s = test_state("archive.gz");
+        let released = s.file.release().expect("handle present");
+
+        s.file = GzFile::restore(released);
+        assert!(
+            s.file
+                .as_file()
+                .expect("an Owned handle must come back as Owned")
+                .metadata()
+                .is_ok(),
+            "the restored descriptor must still be open"
+        );
     }
 
     // -----------------------------------------------------------------------

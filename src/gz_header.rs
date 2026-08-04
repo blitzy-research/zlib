@@ -567,6 +567,63 @@ impl HeaderPublication {
             comment_terminated: true,
         }
     }
+
+    /// Folds a **later** record into this one, yielding the record for the two
+    /// consecutive engine calls taken together.
+    ///
+    /// # Why a merge is needed
+    ///
+    /// A record describes one engine call, while a C caller sees one `inflate`
+    /// call. The two coincide everywhere except on the FFI boundary's
+    /// header/output overlap path, which splits a single C call into a header phase
+    /// and a data phase (and chunks the former) so that no Rust reference over the
+    /// caller's window is live while a header byte is stored. The caller must still
+    /// observe exactly the assignments C's single call would have made, so the
+    /// per-call records are folded back into one.
+    ///
+    /// The fold matches how each field is produced:
+    ///
+    /// * Scalar flags are *idempotent* assignments — C writes the field once, from
+    ///   whichever state reached it — so they are OR-ed.
+    /// * `done` is the tri-state; the later call wins, because a call that reaches
+    ///   `HCRC` after an earlier one saw the `HEAD` non-gzip branch is reporting the
+    ///   newer truth.
+    /// * `extra_len` is the declared `XLEN`, assigned once in `EXLEN`; the later
+    ///   `Some` wins for the same reason.
+    /// * The byte counters are *counts of bytes appended during the call*, which is
+    ///   additive by construction: the publisher derives each destination offset as
+    ///   `len - stored` from the owned vector's final length, and that identity
+    ///   holds for the summed count exactly as it does for either part.
+    ///
+    /// The production caller — `inflate_split_over_header` in `src/ffi/inflate.rs` —
+    /// is `#[cfg(feature = "gzip")]`, so in a `gzip`-off **non-test** build this
+    /// method has no caller and `dead_code` fires. It is deliberately *not* given
+    /// the same `cfg` as that caller: its two unit tests below are ungated, so
+    /// gating the method would have to gate them too, dropping two tests from the
+    /// `--no-default-features`, `no-std` and `std,simd` rows. AAP directive D-5
+    /// fixes this suite at "preserved and only ever increased", so the fold stays
+    /// compiled and stays covered in every configuration, and the lint is waived
+    /// only in the one configuration that legitimately has no production caller.
+    #[cfg_attr(not(feature = "gzip"), allow(dead_code))]
+    #[must_use]
+    pub(crate) fn merged_with(self, later: Self) -> Self {
+        Self {
+            done: later.done.or(self.done),
+            text: self.text || later.text,
+            time: self.time || later.time,
+            os: self.os || later.os,
+            hcrc: self.hcrc || later.hcrc,
+            extra_len: later.extra_len.or(self.extra_len),
+            extra_null: self.extra_null || later.extra_null,
+            extra_stored: self.extra_stored + later.extra_stored,
+            name_null: self.name_null || later.name_null,
+            name_stored: self.name_stored + later.name_stored,
+            name_terminated: self.name_terminated || later.name_terminated,
+            comment_null: self.comment_null || later.comment_null,
+            comment_stored: self.comment_stored + later.comment_stored,
+            comment_terminated: self.comment_terminated || later.comment_terminated,
+        }
+    }
 }
 
 // ===========================================================================
@@ -791,15 +848,29 @@ impl<'a> HeaderFields<'a> {
 /// # Shape
 ///
 /// Each field is `Some` exactly when the corresponding C pointer is non-null,
-/// and the slice length is that field's live capacity, so the decoder's store
-/// predicate is the ordinary `Option`-plus-bounds test rather than a raw pointer
-/// comparison. Holding the borrow for the duration of one engine call is
-/// equivalent to C's per-byte re-read, because the synchronous single-threaded C
-/// API gives a caller no opportunity to mutate its header *during* a call.
+/// and the sink's [`capacity`](ForeignByteSink::capacity) is that field's live
+/// capacity, so the decoder's store predicate is the ordinary
+/// `Option`-plus-bounds test rather than a raw pointer comparison. Holding the
+/// borrow for the duration of one engine call is equivalent to C's per-byte
+/// re-read, because the synchronous single-threaded C API gives a caller no
+/// opportunity to mutate its header *during* a call.
+///
+/// # Why the buffers are [`ForeignByteSink`]s and not `&mut [u8]`
+///
+/// C imposes **no disjointness requirement** on `head->extra`, `head->name`,
+/// `head->comment` and `strm->next_out`: they are four independent caller
+/// pointers, and a program that overlaps them merely gets whatever the
+/// interleaved stores leave behind. Three simultaneous `&mut [u8]` over those
+/// ranges, by contrast, are instant undefined behaviour the moment they overlap
+/// — the aliasing is committed when the references are *created*, before any
+/// bounds-checked write runs — so no such reference is ever formed. Each buffer
+/// is instead reached through a [`ForeignByteSink`] the FFI boundary backs with a
+/// bare pointer and a capacity, and every store is one independent, bounds-tested
+/// access. Overlap then behaves exactly as it does in C.
 ///
 /// The type carries no `unsafe`; materializing it from a raw `gz_header` is the
 /// FFI boundary's job.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ForeignGzHeaderSink<'a> {
     /// The stream's declared `XLEN`, as currently visible in the caller's
     /// `extra_len` field.
@@ -811,13 +882,135 @@ pub struct ForeignGzHeaderSink<'a> {
     pub extra_len: u32,
     /// The caller's `extra` buffer, bounded by its live `extra_max`
     /// (`inflate.c` L614-L621).
-    pub extra: Option<&'a mut [u8]>,
+    pub extra: Option<&'a mut dyn ForeignByteSink>,
     /// The caller's `name` buffer, bounded by its live `name_max`
     /// (`inflate.c` L632-L637).
-    pub name: Option<&'a mut [u8]>,
+    pub name: Option<&'a mut dyn ForeignByteSink>,
     /// The caller's `comment` buffer, bounded by its live `comm_max`
     /// (`inflate.c` L654-L659).
-    pub comment: Option<&'a mut [u8]>,
+    pub comment: Option<&'a mut dyn ForeignByteSink>,
+}
+
+impl core::fmt::Debug for ForeignGzHeaderSink<'_> {
+    /// Reports each field's presence and live capacity rather than its contents.
+    ///
+    /// A [`ForeignByteSink`] may be backed by a bare caller pointer whose bytes
+    /// are not known to be initialized, so formatting them would be unsound; the
+    /// capacity is the whole of what the decoder's store predicate consults
+    /// anyway.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        fn cap(sink: Option<&&mut dyn ForeignByteSink>) -> Option<usize> {
+            sink.map(|s| s.capacity())
+        }
+        f.debug_struct("ForeignGzHeaderSink")
+            .field("extra_len", &self.extra_len)
+            .field("extra_capacity", &cap(self.extra.as_ref()))
+            .field("name_capacity", &cap(self.name.as_ref()))
+            .field("comment_capacity", &cap(self.comment.as_ref()))
+            .finish()
+    }
+}
+
+/// A bounded byte sink the decoder can write single bytes and runs of bytes into
+/// without ever holding a Rust reference over the destination.
+///
+/// # Why this trait exists
+///
+/// The gzip header's three variable-length payloads live in **caller** memory
+/// reached through the raw `extra`/`name`/`comment` pointers of a C `gz_header`.
+/// The C API places no disjointness requirement on them, nor between them and
+/// `strm->next_out`, so the decoder must tolerate arbitrary overlap. Materializing
+/// them as `&mut [u8]` cannot: overlapping mutable references are undefined
+/// behaviour at the moment of creation, independently of whether any write ever
+/// lands in the shared bytes.
+///
+/// This trait is the narrow capability the decoder actually needs — "store this
+/// byte at this index if the index is inside the live capacity" — expressed so
+/// that the implementation may perform one isolated, bounds-tested access per
+/// store. The FFI boundary implements it over a bare pointer and a length
+/// (`crate::ffi::types`), which is precisely what C does, so overlap is as
+/// well-defined here as it is there.
+///
+/// Declaring it in this module rather than at the boundary is what keeps
+/// `src/inflate/**` free of `unsafe` (AAP §0.8.1 D-6, standard S2): the decoder
+/// programs against this safe interface, and the single `unsafe` implementation
+/// lives inside the boundary module that is allowed to have one.
+///
+/// # Contract
+///
+/// Implementations must be **total**: a store whose target lies at or beyond
+/// [`capacity`](Self::capacity) must be refused rather than clamped into a
+/// neighbouring byte, because C's guards (`length < head->name_max`,
+/// `len < head->extra_max`) drop such bytes outright.
+pub trait ForeignByteSink {
+    /// The number of bytes that may be stored, counted from index `0`.
+    ///
+    /// This is the caller's live `extra_max`/`name_max`/`comm_max`; C re-reads it
+    /// on every stored byte, so an implementation must report the current value
+    /// rather than one captured at registration time.
+    fn capacity(&self) -> usize;
+
+    /// Stores `byte` at `index`, reporting whether it was stored.
+    ///
+    /// Returns `false` — writing nothing — when `index >= self.capacity()`.
+    fn store_byte(&mut self, index: usize, byte: u8) -> bool;
+
+    /// Copies as much of `src` as fits starting at `offset`, returning how many
+    /// bytes were stored.
+    ///
+    /// Returns `0` — writing nothing — when `offset >= self.capacity()`;
+    /// otherwise stores `min(src.len(), capacity - offset)` bytes.
+    fn store_bytes(&mut self, offset: usize, src: &[u8]) -> usize;
+}
+
+/// The obvious [`ForeignByteSink`] over a byte buffer the *Rust* side owns: the
+/// capacity is the slice length and each store is an ordinary bounds-checked index.
+///
+/// This is the implementation idiomatic Rust callers and this crate's own tests
+/// use, and — because [`ForeignGzHeaderSink`]'s fields are trait objects — the one
+/// that makes that type constructible outside the FFI boundary at all. It is *not*
+/// the implementation the C ABI uses: a slice over caller memory is exactly the
+/// aliasing hazard [`ForeignByteSink`] exists to avoid. For a buffer whose
+/// exclusive ownership Rust can see, the borrow is unique by construction and the
+/// bounds test is free.
+///
+/// A newtype rather than `impl ForeignByteSink for [u8]` because a trait object is
+/// a thin pointer plus a vtable: `[u8]` is itself unsized, so `&mut [u8]` could
+/// never be coerced to `&mut dyn ForeignByteSink` without discarding its length.
+#[derive(Debug)]
+pub struct SliceSink<'a>(
+    /// The borrowed destination; its length is the sink's capacity.
+    pub &'a mut [u8],
+);
+
+impl ForeignByteSink for SliceSink<'_> {
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    fn store_byte(&mut self, index: usize, byte: u8) -> bool {
+        match self.0.get_mut(index) {
+            Some(slot) => {
+                *slot = byte;
+                true
+            }
+            None => false,
+        }
+    }
+
+    #[inline]
+    fn store_bytes(&mut self, offset: usize, src: &[u8]) -> usize {
+        let cap = self.0.len();
+        if offset >= cap {
+            return 0;
+        }
+        let room = cap - offset;
+        let n = if src.len() > room { room } else { src.len() };
+        self.0[offset..offset + n].copy_from_slice(&src[..n]);
+        n
+    }
 }
 
 impl<'a> ForeignGzHeaderSink<'a> {
@@ -849,27 +1042,23 @@ impl<'a> ForeignGzHeaderSink<'a> {
     /// offset already at or beyond the live capacity stores nothing.
     #[inline]
     pub fn store_extra(&mut self, offset: usize, src: &[u8]) -> usize {
-        let Some(buf) = self.extra.as_deref_mut() else {
-            return 0;
-        };
-        if offset >= buf.len() {
-            return 0;
+        match self.extra.as_deref_mut() {
+            Some(sink) => sink.store_bytes(offset, src),
+            None => 0,
         }
-        let room = buf.len() - offset;
-        let n = if src.len() > room { room } else { src.len() };
-        buf[offset..offset + n].copy_from_slice(&src[..n]);
-        n
     }
 
     /// Shared bounds-checked single-byte store for `name`/`comment`.
+    ///
+    /// The trait object's lifetime is elided *separately* from the reborrow's
+    /// (`+ '_` rather than the object-lifetime default): `&mut` is invariant in its
+    /// pointee, so tying the two together would force the caller's short reborrow
+    /// and the view's own `'a` to be equal instead of merely compatible.
     #[inline]
-    fn store(buf: Option<&mut [u8]>, index: usize, byte: u8) -> bool {
-        match buf {
-            Some(b) if index < b.len() => {
-                b[index] = byte;
-                true
-            }
-            _ => false,
+    fn store(sink: Option<&mut (dyn ForeignByteSink + '_)>, index: usize, byte: u8) -> bool {
+        match sink {
+            Some(sink) => sink.store_byte(index, byte),
+            None => false,
         }
     }
 }
@@ -1108,5 +1297,189 @@ mod tests {
         let p = HeaderPublication::for_completed_header(&done);
         assert_eq!(p.done, Some(HeaderDone::Complete));
         assert_eq!(p.extra_len, None);
+    }
+
+    // -- ForeignByteSink / ForeignGzHeaderSink ------------------------------
+
+    /// The slice-backed sink refuses every out-of-range target instead of
+    /// clamping it into a neighbouring byte, which is what C's
+    /// `length < head->name_max` and `len < head->extra_max` guards do.
+    #[test]
+    fn a_slice_sink_refuses_out_of_range_targets() {
+        let mut buf = [0xAAu8; 4];
+        let mut backing = SliceSink(&mut buf[..]);
+        let sink: &mut dyn ForeignByteSink = &mut backing;
+
+        assert_eq!(sink.capacity(), 4);
+        assert!(sink.store_byte(0, 1), "index 0 is inside the capacity");
+        assert!(
+            sink.store_byte(3, 2),
+            "the last index is inside the capacity"
+        );
+        assert!(
+            !sink.store_byte(4, 3),
+            "the first out-of-range index is refused"
+        );
+        assert!(!sink.store_byte(usize::MAX, 4), "and so is a wild one");
+
+        assert_eq!(sink.store_bytes(2, &[9, 9, 9, 9]), 2, "the copy is clamped");
+        assert_eq!(
+            sink.store_bytes(4, &[9]),
+            0,
+            "an offset at the capacity stores nothing"
+        );
+        assert_eq!(
+            sink.store_bytes(usize::MAX, &[9]),
+            0,
+            "and neither does a wild one"
+        );
+        assert_eq!(buf, [1, 0xAA, 9, 9]);
+    }
+
+    /// An absent field stores nothing and reports it, so the decoder's
+    /// `Option`-plus-bounds predicate matches C's `head->name != Z_NULL` test.
+    #[test]
+    fn an_absent_sink_field_stores_nothing() {
+        let mut sink = ForeignGzHeaderSink::default();
+        assert!(!sink.store_name(0, b'x'));
+        assert!(!sink.store_comment(0, b'x'));
+        assert_eq!(sink.store_extra(0, b"xy"), 0);
+        assert_eq!(sink.extra_len, 0);
+    }
+
+    /// The three payload views are independent: a store to one must not disturb
+    /// another, and each is bounded by its own capacity.
+    #[test]
+    fn each_sink_field_is_bounded_by_its_own_capacity() {
+        let mut extra = [0xAAu8; 2];
+        let mut name = [0xAAu8; 4];
+        let mut comment = [0xAAu8; 1];
+        let mut extra_sink = SliceSink(&mut extra[..]);
+        let mut name_sink = SliceSink(&mut name[..]);
+        let mut comment_sink = SliceSink(&mut comment[..]);
+        let mut sink = ForeignGzHeaderSink {
+            extra_len: 5,
+            extra: Some(&mut extra_sink),
+            name: Some(&mut name_sink),
+            comment: Some(&mut comment_sink),
+        };
+
+        assert_eq!(
+            sink.store_extra(0, b"ABCDE"),
+            2,
+            "clamped to extra's capacity"
+        );
+        assert!(sink.store_name(3, b'd'));
+        assert!(!sink.store_name(4, b'e'), "clamped to name's capacity");
+        assert!(sink.store_comment(0, b'!'));
+        assert!(
+            !sink.store_comment(1, b'?'),
+            "clamped to comment's capacity"
+        );
+
+        assert_eq!(extra, [b'A', b'B']);
+        assert_eq!(name, [0xAA, 0xAA, 0xAA, b'd']);
+        assert_eq!(comment, [b'!']);
+    }
+
+    /// `Debug` reports capacities, never contents: a sink may be backed by a bare
+    /// caller pointer whose bytes are not known to be initialized.
+    #[test]
+    fn sink_debug_reports_capacities_only() {
+        let mut name = [0u8; 7];
+        let mut name_sink = SliceSink(&mut name[..]);
+        let sink = ForeignGzHeaderSink {
+            extra_len: 3,
+            extra: None,
+            name: Some(&mut name_sink),
+            comment: None,
+        };
+        let rendered = alloc::format!("{sink:?}");
+        assert!(rendered.contains("extra_len: 3"), "{rendered}");
+        assert!(rendered.contains("name_capacity: Some(7)"), "{rendered}");
+        assert!(rendered.contains("extra_capacity: None"), "{rendered}");
+        assert!(rendered.contains("comment_capacity: None"), "{rendered}");
+    }
+
+    // -- HeaderPublication::merged_with -------------------------------------
+
+    /// Folding two sub-pass records must yield the record for the single C call
+    /// they jointly implement: flags OR, counters add, later `Some` wins.
+    #[test]
+    fn merging_publications_ors_flags_and_sums_counters() {
+        let first = HeaderPublication {
+            // `Pending` rather than the gzip-only `NotGzip`: what is under test is
+            // that the *later* record's `Some` wins, and `Pending` is available in
+            // every feature configuration.
+            done: Some(HeaderDone::Pending),
+            text: true,
+            time: false,
+            os: false,
+            hcrc: false,
+            extra_len: Some(4),
+            extra_null: false,
+            extra_stored: 2,
+            name_null: true,
+            name_stored: 3,
+            name_terminated: false,
+            comment_null: false,
+            comment_stored: 0,
+            comment_terminated: false,
+        };
+        let second = HeaderPublication {
+            done: Some(HeaderDone::Complete),
+            text: false,
+            time: true,
+            os: true,
+            hcrc: true,
+            extra_len: Some(9),
+            extra_null: true,
+            extra_stored: 5,
+            name_null: false,
+            name_stored: 1,
+            name_terminated: true,
+            comment_null: true,
+            comment_stored: 7,
+            comment_terminated: true,
+        };
+
+        let merged = first.merged_with(second);
+        assert_eq!(
+            merged.done,
+            Some(HeaderDone::Complete),
+            "the later call wins"
+        );
+        assert!(merged.text && merged.time && merged.os && merged.hcrc);
+        assert_eq!(merged.extra_len, Some(9), "the later declared XLEN wins");
+        assert!(merged.extra_null && merged.name_null && merged.comment_null);
+        assert_eq!(merged.extra_stored, 7);
+        assert_eq!(merged.name_stored, 4);
+        assert_eq!(merged.comment_stored, 7);
+        assert!(merged.name_terminated && merged.comment_terminated);
+    }
+
+    /// Merging with an empty record is the identity, in both directions — the
+    /// common case, since only the pass that reaches a field reports it.
+    #[test]
+    fn merging_an_empty_publication_changes_nothing() {
+        let only = HeaderPublication {
+            done: Some(HeaderDone::Complete),
+            text: true,
+            time: true,
+            os: true,
+            hcrc: true,
+            extra_len: Some(6),
+            extra_null: false,
+            extra_stored: 6,
+            name_null: false,
+            name_stored: 9,
+            name_terminated: true,
+            comment_null: false,
+            comment_stored: 4,
+            comment_terminated: true,
+        };
+        let empty = HeaderPublication::default();
+        assert_eq!(only.merged_with(empty), only);
+        assert_eq!(empty.merged_with(only), only);
     }
 }

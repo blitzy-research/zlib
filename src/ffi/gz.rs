@@ -182,9 +182,6 @@ use alloc::boxed::Box;
 #[cfg(all(unix, feature = "gz-io"))]
 use std::os::fd::FromRawFd;
 
-#[cfg(all(windows, feature = "gz-io"))]
-use std::os::windows::io::FromRawHandle;
-
 #[cfg(all(any(unix, windows), feature = "gz-io"))]
 use crate::gz::GzFile;
 #[cfg(feature = "gz-io")]
@@ -560,6 +557,23 @@ fn with_forced_close_failure<R>(body: impl FnOnce() -> R) -> R {
 unsafe extern "C" {
     /// Closes a file descriptor, returning `0` on success and `-1` on failure.
     fn close(fd: c_int) -> c_int;
+
+    /// Duplicates a descriptor, returning the new one or `-1` when `fd` is not
+    /// open. Used only as a descriptor-validity probe, and only on a platform
+    /// whose `fcntl` command numbers this crate does not enumerate — its
+    /// signature needs no platform-specific constant or type, which is exactly
+    /// why it is the safe fallback.
+    fn dup(fd: c_int) -> c_int;
+
+    /// Duplicates `src` onto the specific descriptor number `dst`, returning
+    /// `dst` on success and `-1` on failure. Declared for the test suite alone:
+    /// the descriptor-lifecycle tests need a *closed* descriptor number that no
+    /// concurrently running test can be handed, and POSIX allocates the LOWEST
+    /// free number, so only a deliberately HIGH one is safe to close and reuse.
+    /// `int dup2(int, int)` is uniform on every POSIX platform, so it needs no
+    /// platform-specific constant or type, exactly like `dup` above.
+    #[cfg(test)]
+    fn dup2(src: c_int, dst: c_int) -> c_int;
 }
 
 // Win32 `CloseHandle`. A Rust `File` owns a `HANDLE` (not a CRT `int fd`) on
@@ -584,14 +598,6 @@ unsafe extern "system" {
 #[cfg(feature = "gz-io")]
 #[cfg(unix)]
 fn platform_close(file: std::fs::File) -> bool {
-    #[cfg(test)]
-    if FORCE_CLOSE_FAILURE.get() {
-        // Still release the descriptor — a leaked fd would destabilise the rest
-        // of the suite — then report the failure C would have reported.
-        drop(file);
-        return false;
-    }
-
     use std::os::fd::IntoRawFd;
 
     // Take the raw descriptor so `File`'s `Drop` does not also close it: a double
@@ -610,12 +616,6 @@ fn platform_close(file: std::fs::File) -> bool {
 #[cfg(feature = "gz-io")]
 #[cfg(windows)]
 fn platform_close(file: std::fs::File) -> bool {
-    #[cfg(test)]
-    if FORCE_CLOSE_FAILURE.get() {
-        drop(file);
-        return false;
-    }
-
     use std::os::windows::io::IntoRawHandle;
 
     // Take the raw handle so `File`'s `Drop` does not also close it.
@@ -635,12 +635,6 @@ fn platform_close(file: std::fs::File) -> bool {
 #[cfg(feature = "gz-io")]
 #[cfg(not(any(unix, windows)))]
 fn platform_close(file: std::fs::File) -> bool {
-    #[cfg(test)]
-    if FORCE_CLOSE_FAILURE.get() {
-        drop(file);
-        return false;
-    }
-
     drop(file);
     true
 }
@@ -658,20 +652,38 @@ fn platform_close(file: std::fs::File) -> bool {
 ///
 /// `None` means the finalizer refused the handle (wrong direction) and released
 /// no descriptor, so `status` — `Z_STREAM_ERROR` — passes through unchanged.
+///
+/// Both ownership kinds are closed here through
+/// [`ReleasedFile::close_with`](crate::gz::ReleasedFile::close_with): a
+/// standard-library [`std::fs::File`] through [`platform_close`], and a
+/// raw-descriptor owner through its own close. The `Z_ERRNO` precedence is applied
+/// once, to whichever kind it was.
 #[cfg(feature = "gz-io")]
 #[inline]
-fn finish_close(status: c_int, released: Option<std::fs::File>) -> c_int {
-    match released {
-        // C `close(state->fd)`: a failure becomes `Z_ERRNO`, a success leaves the
-        // accumulated status in place.
-        Some(file) => {
-            if platform_close(file) {
-                status
-            } else {
-                ReturnCode::ErrNo.as_c_int()
-            }
-        }
-        None => status,
+fn finish_close(status: c_int, released: Option<crate::gz::ReleasedFile>) -> c_int {
+    // C `close(state->fd)`: a failure becomes `Z_ERRNO`, a success leaves the
+    // accumulated status in place.
+    let Some(released) = released else {
+        return status;
+    };
+
+    // The failure seam lives here rather than inside `platform_close` so it covers
+    // *both* ownership kinds with one switch: the descriptor is still released for
+    // real (a leaked fd would destabilise the rest of the suite) and the failure C
+    // would have reported is returned.
+    #[cfg(test)]
+    if FORCE_CLOSE_FAILURE.get() {
+        let _ = released.close_with(|file| {
+            drop(file);
+            true
+        });
+        return ReturnCode::ErrNo.as_c_int();
+    }
+
+    if released.close_with(platform_close) {
+        status
+    } else {
+        ReturnCode::ErrNo.as_c_int()
     }
 }
 
@@ -708,8 +720,9 @@ fn box_state(result: Result<Box<GzState>, ReturnCode>) -> gzFile {
 
 // POSIX `fcntl`, the one way to reconcile an already-open descriptor's
 // close-on-exec and non-blocking state with what a gzip mode string asked for.
-// Declared here for the same reason `close`, `CloseHandle` and `_get_osfhandle`
-// are: it resolves against the platform C runtime, never against a C zlib, so the
+// Declared here for the same reason `close`, `CloseHandle`, `dup` and the CRT
+// `_read`/`_write`/`_lseeki64`/`_close` family are: it resolves against the
+// platform C runtime, never against a C zlib, so the
 // zero-C-dependency rule is preserved, and the raw call is confined to this
 // boundary module — `src/gz/**` stays `unsafe`-free (AAP §0.8.1 D-6).
 #[cfg(feature = "gz-io")]
@@ -723,22 +736,197 @@ unsafe extern "C" {
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
 }
 
-/// `fcntl` command: get the descriptor flags (`FD_CLOEXEC`).
+/// The four `fcntl` command numbers this layer issues, as they are spelled on one
+/// platform class.
+///
+/// Every field is optional because a command a platform does not define must
+/// **not** be substituted with another platform's number. `fcntl`'s second
+/// parameter selects the operation *and* its variadic signature, so a wrong
+/// command is not a failed call — it is a different, successful one. The
+/// motivating case is Haiku, where the POSIX `F_GETFD` value `1` is `F_DUPFD`: a
+/// bare `fcntl(fd, 1)` there is a variadic call missing its required `int`
+/// argument that, if it succeeds, *duplicates the descriptor* and leaks it.
+/// NuttX is the second case; it renumbers `F_GETFL`/`F_SETFL` and does not define
+/// `F_SETFD` at all.
 #[cfg(feature = "gz-io")]
 #[cfg(unix)]
-const F_GETFD: c_int = 1;
-/// `fcntl` command: set the descriptor flags.
+struct FcntlCmds {
+    /// `F_GETFD` — get the descriptor flags (`FD_CLOEXEC`). Takes no third
+    /// argument.
+    get_fd: Option<c_int>,
+    /// `F_SETFD` — set the descriptor flags. Takes exactly one `int`.
+    set_fd: Option<c_int>,
+    /// `F_GETFL` — get the file status flags (`O_NONBLOCK`, …). Takes no third
+    /// argument.
+    get_fl: Option<c_int>,
+    /// `F_SETFL` — set the file status flags. Takes exactly one `int`.
+    set_fl: Option<c_int>,
+}
+
+/// The POSIX command numbers, used by every platform this table enumerates apart
+/// from Haiku and NuttX.
+///
+/// libc declares them once for all Linux-likes in `unix/linux_like/mod.rs` and
+/// repeats the same four values for Apple, the BSDs, AIX, Cygwin, GNU/Hurd,
+/// newlib, QNX, Redox, Solaris/illumos, VxWorks and Fuchsia.
 #[cfg(feature = "gz-io")]
 #[cfg(unix)]
-const F_SETFD: c_int = 2;
-/// `fcntl` command: get the file status flags (`O_NONBLOCK`, …).
+const FCNTL_POSIX: FcntlCmds = FcntlCmds {
+    get_fd: Some(1),
+    set_fd: Some(2),
+    get_fl: Some(3),
+    set_fl: Some(4),
+};
+
+/// Haiku's command numbers, which are a disjoint bitfield-style set.
+///
+/// libc `unix/haiku/mod.rs`: `F_DUPFD` is `0x0001`, `F_GETFD` `0x0002`, `F_SETFD`
+/// `0x0004`, `F_GETFL` `0x0008`, `F_SETFL` `0x0010`. Note that all four POSIX
+/// numbers (`1`..`4`) are *valid but different* commands here, which is why a
+/// POSIX-numbered call cannot be expected to fail cleanly.
 #[cfg(feature = "gz-io")]
 #[cfg(unix)]
-const F_GETFL: c_int = 3;
-/// `fcntl` command: set the file status flags.
+const FCNTL_HAIKU: FcntlCmds = FcntlCmds {
+    get_fd: Some(0x0002),
+    set_fd: Some(0x0004),
+    get_fl: Some(0x0008),
+    set_fl: Some(0x0010),
+};
+
+/// NuttX's command numbers.
+///
+/// libc `unix/nuttx/mod.rs` declares `F_GETFD` `0x1`, `F_GETFL` `0x2` and
+/// `F_SETFL` `0x9`, and declares **no** `F_SETFD` — so `set_fd` is `None` and the
+/// close-on-exec reconciliation is skipped there rather than issued with a
+/// borrowed number.
 #[cfg(feature = "gz-io")]
 #[cfg(unix)]
-const F_SETFL: c_int = 4;
+const FCNTL_NUTTX: FcntlCmds = FcntlCmds {
+    get_fd: Some(0x1),
+    set_fd: None,
+    get_fl: Some(0x2),
+    set_fl: Some(0x9),
+};
+
+/// The table for a platform whose `fcntl` numbering this crate does not
+/// enumerate: no command is known, so no `fcntl` is issued at all.
+#[cfg(feature = "gz-io")]
+#[cfg(unix)]
+const FCNTL_UNKNOWN: FcntlCmds = FcntlCmds {
+    get_fd: None,
+    set_fd: None,
+    get_fl: None,
+    set_fl: None,
+};
+
+/// The `fcntl` command numbers for the target being compiled.
+///
+/// Ordered most-specific-first. The two platforms that renumber the commands are
+/// matched *before* the broad POSIX arm, so neither can reach it; and the final
+/// arm is `FCNTL_UNKNOWN` rather than `FCNTL_POSIX`, so a future unix target with
+/// a third numbering gets no `fcntl` instead of a wrong one.
+#[cfg(feature = "gz-io")]
+#[cfg(unix)]
+const FCNTL: FcntlCmds = if cfg!(target_os = "haiku") {
+    FCNTL_HAIKU
+} else if cfg!(target_os = "nuttx") {
+    FCNTL_NUTTX
+} else if cfg!(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "emscripten",
+    target_os = "l4re",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "aix",
+    target_os = "solaris",
+    target_os = "illumos",
+    target_os = "nto",
+    target_os = "cygwin",
+    target_os = "vxworks",
+    target_os = "espidf",
+    target_os = "horizon",
+    target_os = "vita",
+    target_os = "rtems",
+    target_os = "hurd",
+    target_os = "redox",
+    target_os = "fuchsia"
+)) {
+    FCNTL_POSIX
+} else {
+    FCNTL_UNKNOWN
+};
+
+// A compile-time cross-check of the command table, evaluated by `const` folding
+// on every build, so the Haiku and NuttX numbers are provable from an x86_64
+// Linux host that cannot compile either. Referencing all four named tables also
+// keeps the unselected ones from tripping `dead_code`.
+#[cfg(feature = "gz-io")]
+#[cfg(unix)]
+const _: () = {
+    assert!(
+        matches!(FCNTL_POSIX.get_fd, Some(1))
+            && matches!(FCNTL_POSIX.set_fd, Some(2))
+            && matches!(FCNTL_POSIX.get_fl, Some(3))
+            && matches!(FCNTL_POSIX.set_fl, Some(4)),
+        "the POSIX fcntl commands are F_GETFD 1, F_SETFD 2, F_GETFL 3, F_SETFL 4"
+    );
+    assert!(
+        matches!(FCNTL_HAIKU.get_fd, Some(2))
+            && matches!(FCNTL_HAIKU.set_fd, Some(4))
+            && matches!(FCNTL_HAIKU.get_fl, Some(8))
+            && matches!(FCNTL_HAIKU.set_fl, Some(16)),
+        "Haiku renumbers every fcntl command; its F_DUPFD is the POSIX F_GETFD"
+    );
+    assert!(
+        matches!(FCNTL_NUTTX.get_fd, Some(1))
+            && FCNTL_NUTTX.set_fd.is_none()
+            && matches!(FCNTL_NUTTX.get_fl, Some(2))
+            && matches!(FCNTL_NUTTX.set_fl, Some(9)),
+        "NuttX renumbers F_GETFL/F_SETFL and defines no F_SETFD"
+    );
+    assert!(
+        FCNTL_UNKNOWN.get_fd.is_none()
+            && FCNTL_UNKNOWN.set_fd.is_none()
+            && FCNTL_UNKNOWN.get_fl.is_none()
+            && FCNTL_UNKNOWN.set_fl.is_none(),
+        "the unenumerated-platform table must name no command at all"
+    );
+
+    // No two enumerated platforms may agree on a command number by accident: if
+    // Haiku's numbering ever coincided with POSIX's the distinction above would
+    // be silently pointless.
+    assert!(
+        !matches!(
+            (FCNTL_HAIKU.get_fd, FCNTL_POSIX.get_fd),
+            (Some(a), Some(b)) if a == b
+        ),
+        "Haiku's F_GETFD must differ from POSIX's, which is the whole finding"
+    );
+
+    // The platforms this project claims support for must have a fully populated
+    // table. Stated as an implication so an unenumerated target still builds.
+    assert!(
+        !cfg!(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+            target_os = "illumos",
+            target_os = "solaris"
+        )) || (FCNTL.get_fd.is_some()
+            && FCNTL.set_fd.is_some()
+            && FCNTL.get_fl.is_some()
+            && FCNTL.set_fl.is_some()),
+        "a supported platform must have all four fcntl commands enumerated"
+    );
+};
 
 /// Reconciles a descriptor **opened by path** with the close-on-exec state C
 /// would have given it.
@@ -763,26 +951,43 @@ const F_SETFL: c_int = 4;
 #[cfg(feature = "gz-io")]
 #[cfg(unix)]
 fn reconcile_opened_descriptor(state: &GzState, mode: &[u8]) {
-    use std::os::fd::AsRawFd;
-
     if gz::descriptor_request(mode).cloexec {
         // C asked for `O_CLOEXEC`, which is what `File::open` already produced.
         return;
     }
 
-    let fd = state.file.as_raw_fd();
+    // Every ingredient must be known for this platform before any `fcntl` is
+    // issued: both command numbers *and* the flag bit to clear. A platform this
+    // crate does not enumerate is left exactly as the standard library opened it
+    // — close-on-exec, i.e. the pre-existing behaviour — rather than being sent a
+    // command borrowed from another platform's numbering.
+    let (Some(get_fd), Some(set_fd), Some(cloexec)) = (
+        FCNTL.get_fd,
+        FCNTL.set_fd,
+        crate::gz::DescriptorRequest::FD_CLOEXEC,
+    ) else {
+        return;
+    };
+
+    // A handle with no descriptor cannot occur on this path, and a `None` here
+    // simply issues nothing rather than guessing a descriptor number.
+    let Some(fd) = state.file.raw_descriptor() else {
+        return;
+    };
     // SAFETY: `fd` is owned by `state.file`, which is alive for this call, so it
-    // is a valid open descriptor. `F_GETFD` reads flags and takes no third
-    // argument.
-    let flags = unsafe { fcntl(fd, F_GETFD) };
+    // is a valid open descriptor. `get_fd` is this platform's `F_GETFD`, which
+    // reads flags and takes no third argument, so the variadic call is complete
+    // as written.
+    let flags = unsafe { fcntl(fd, get_fd) };
     if flags < 0 {
         return;
     }
-    let cleared = flags & !crate::gz::DescriptorRequest::FD_CLOEXEC;
+    let cleared = flags & !cloexec;
     if cleared != flags {
-        // SAFETY: as above; `F_SETFD` takes exactly one `int` argument, supplied
-        // here, and the descriptor is still owned by `state.file`.
-        let _ = unsafe { fcntl(fd, F_SETFD, cleared) };
+        // SAFETY: as above; `set_fd` is this platform's `F_SETFD`, which takes
+        // exactly one `int` argument, supplied here, and the descriptor is still
+        // owned by `state.file`.
+        let _ = unsafe { fcntl(fd, set_fd, cleared) };
     }
 }
 
@@ -801,7 +1006,8 @@ fn reconcile_opened_descriptor(state: &GzState, mode: &[u8]) {
 ///
 /// (`gzlib.c` L253-L263.) Only the first is reproduced, and that is deliberate:
 /// **C's second `fcntl` is a no-op on every POSIX platform.** `F_SETFD`'s only
-/// defined flag is `FD_CLOEXEC`, which is `1`, whereas `O_CLOEXEC` is a
+/// defined flag is `FD_CLOEXEC` (`1` on every platform this crate enumerates
+/// except Redox, which uses `0x0100_0000`), whereas `O_CLOEXEC` is a
 /// completely different bit (`0o2000000` on Linux); Linux implements `F_SETFD` as
 /// `set_close_on_exec(fd, arg & FD_CLOEXEC)`, so OR-ing `O_CLOEXEC` contributes
 /// nothing at all. Measured against reference zlib: an adopted descriptor that
@@ -813,27 +1019,39 @@ fn reconcile_opened_descriptor(state: &GzState, mode: &[u8]) {
 #[cfg(feature = "gz-io")]
 #[cfg(unix)]
 fn reconcile_adopted_descriptor(state: &GzState, mode: &[u8]) {
-    use std::os::fd::AsRawFd;
-
     if !gz::descriptor_request(mode).nonblock {
         return;
     }
 
-    let fd = state.file.as_raw_fd();
+    // As in `reconcile_opened_descriptor`: both command numbers and the flag bit
+    // must be known for this platform, or nothing is issued. Leaving an adopted
+    // descriptor blocking is the same outcome a C zlib compiled without
+    // `O_NONBLOCK` produces; sending a command number borrowed from a different
+    // platform is not.
+    let (Some(get_fl), Some(set_fl), Some(nonblock)) = (
+        FCNTL.get_fl,
+        FCNTL.set_fl,
+        crate::gz::DescriptorRequest::O_NONBLOCK,
+    ) else {
+        return;
+    };
+
+    // An adopted descriptor that turned out not to be open still reports its
+    // number, so C's `fcntl` is still issued and still fails harmlessly, exactly as
+    // in C. A handle with no descriptor at all issues nothing.
+    let Some(fd) = state.file.raw_descriptor() else {
+        return;
+    };
     // SAFETY: `fd` is owned by `state.file`, which is alive for this call.
-    // `F_GETFL` reads the status flags and takes no third argument.
-    let flags = unsafe { fcntl(fd, F_GETFL) };
+    // `get_fl` is this platform's `F_GETFL`, which reads the status flags and
+    // takes no third argument, so the variadic call is complete as written.
+    let flags = unsafe { fcntl(fd, get_fl) };
     if flags < 0 {
         return;
     }
-    // SAFETY: as above; `F_SETFL` takes exactly one `int` argument.
-    let _ = unsafe {
-        fcntl(
-            fd,
-            F_SETFL,
-            flags | crate::gz::DescriptorRequest::O_NONBLOCK,
-        )
-    };
+    // SAFETY: as above; `set_fl` is this platform's `F_SETFL`, which takes
+    // exactly one `int` argument, supplied here.
+    let _ = unsafe { fcntl(fd, set_fl, flags | nonblock) };
 }
 
 // ===========================================================================
@@ -925,20 +1143,351 @@ pub unsafe extern "C" fn gzopen64(path: *const c_char, mode: *const c_char) -> g
     }
 }
 
-// Windows CRT `_get_osfhandle`: maps a CRT `int` file descriptor onto the OS
-// `HANDLE` backing it, which is what a Rust `std::fs::File` owns on Windows.
-// Declaring the CRT entry point directly is the approach this module already
-// takes for `close` and `CloseHandle`; it resolves against the platform C
-// runtime, never against a C zlib, so the zero-C-dependency rule is preserved.
+/// Reports whether `fd` names an open descriptor in this process, returning the
+/// platform's own `errno` when it does not.
+///
+/// # Why the boundary must ask
+///
+/// [`std::fs::File::from_raw_fd`] requires the descriptor to be **open**: the
+/// I/O-safety contract behind `OwnedFd` is what makes a `File` sound to read,
+/// write and close. `gzdopen`, meanwhile, is required to *accept* a descriptor
+/// that is not — `zlib.h` L1422-L1426 promises that only `fd == -1` is rejected
+/// and that "the file descriptor is not used until the next gz\* read, write,
+/// seek, or close operation, so gzdopen will not detect if fd is invalid". Wrapping
+/// an unproven descriptor to satisfy the second obligation would break the first,
+/// so the descriptor is proven here and only a proven one becomes a `File`; an
+/// unproven one is owned raw instead (see [`DeadDescriptor`]).
+///
+/// # The probe
+///
+/// `fcntl(fd, F_GETFD)` is the canonical POSIX existence test: it reads the
+/// descriptor flags, changes nothing, and fails with `EBADF` for a descriptor that
+/// is not open. It needs this platform's `F_GETFD` number, which the [`FCNTL`]
+/// table supplies for every platform this crate enumerates; where it does not,
+/// `dup(2)` stands in — its signature and semantics need no platform constant at
+/// all — and the duplicate is closed immediately.
+///
+/// A failure carries the errno the probe itself produced rather than a fabricated
+/// `EBADF`, so the message `gzerror` later reports is the platform's own — the
+/// same string C's `zstrerror()` would produce from its first failing `read`.
+#[cfg(feature = "gz-io")]
+#[cfg(unix)]
+fn descriptor_is_open(fd: c_int) -> Result<(), i32> {
+    /// The errno the probe just set. `EBADF` is the only outcome a descriptor
+    /// probe can report and its value is `9` on every platform this crate
+    /// enumerates, so it stands in for the unreachable "no code" case.
+    fn probe_errno() -> i32 {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(9)
+    }
+
+    if let Some(get_fd) = FCNTL.get_fd {
+        // SAFETY: `get_fd` is this platform's `F_GETFD`, which reads the
+        // descriptor flags and takes no third argument, so the variadic call is
+        // complete as written. Probing an arbitrary `int` is defined for every
+        // value: a descriptor that is not open yields `-1` with `errno == EBADF`
+        // and nothing is read from or written to caller memory.
+        if unsafe { fcntl(fd, get_fd) } >= 0 {
+            return Ok(());
+        }
+        return Err(probe_errno());
+    }
+
+    // SAFETY: `dup` accepts any `int`, reports `-1` for a descriptor that is not
+    // open, and touches no caller memory.
+    let copy = unsafe { dup(fd) };
+    if copy < 0 {
+        return Err(probe_errno());
+    }
+    // SAFETY: `copy` is a descriptor this call just created, so nothing else owns
+    // it and closing it exactly once is correct. `fd` itself is untouched.
+    let _ = unsafe { close(copy) };
+    Ok(())
+}
+
+/// Owner for a `gzdopen` descriptor that is **not open** — the case C adopts and
+/// whose failure it defers (`zlib.h` L1422-L1426, `gzlib.c` L300).
+///
+/// Nothing here can be represented as a [`std::fs::File`], so nothing tries: the
+/// raw descriptor is held as an `int`, every byte operation fails with the errno
+/// the adoption probe observed, and the close performs the real `close(2)` C
+/// performs — which fails, yielding the `Z_ERRNO` C yields.
+///
+/// This is the whole reason the ownership decision lives at the boundary. A
+/// descriptor that is not open needs no I/O primitives at all, so the unix side of
+/// this module declares none: `close(2)` (already needed for the observable
+/// `gzclose` result) and the `fcntl`/`dup` probe are the complete surface.
+#[cfg(feature = "gz-io")]
+#[cfg(unix)]
+struct DeadDescriptor {
+    /// The caller's descriptor while this owner still holds it; [`None`] once it
+    /// has been closed or relinquished, so neither can happen twice.
+    fd: Option<c_int>,
+    /// The `errno` the adoption probe produced, replayed by every operation so the
+    /// message `gzerror` reports is the platform's own.
+    errno: i32,
+}
+
+#[cfg(feature = "gz-io")]
+#[cfg(unix)]
+impl DeadDescriptor {
+    /// The stored failure, rebuilt for each operation ([`std::io::Error`] is not
+    /// [`Clone`]). C reports the same errno on every attempt, so replaying one
+    /// value is exact rather than approximate.
+    #[inline]
+    fn failure(&self) -> std::io::Error {
+        std::io::Error::from_raw_os_error(self.errno)
+    }
+}
+
+#[cfg(feature = "gz-io")]
+#[cfg(unix)]
+impl crate::gz::RawFileIo for DeadDescriptor {
+    #[inline]
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(self.failure())
+    }
+
+    #[inline]
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(self.failure())
+    }
+
+    /// Succeeds, because C never flushes a descriptor and `File::flush` is
+    /// likewise a no-op. A failure here would invent an error C cannot produce.
+    #[inline]
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    #[inline]
+    fn seek(&mut self, _pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        Err(self.failure())
+    }
+
+    #[inline]
+    fn raw_descriptor(&self) -> c_int {
+        // `-1` cannot collide with a live descriptor, so a caller that reads this
+        // after the close simply issues no `fcntl`.
+        self.fd.unwrap_or(-1)
+    }
+
+    fn close(mut self: Box<Self>) -> bool {
+        let Some(fd) = self.fd.take() else {
+            return false;
+        };
+        // SAFETY: ownership of `fd` was transferred to this owner by `gzdopen`'s
+        // contract and `take` above guarantees this is the only close, so
+        // `close(2)` is called at most once on it. It is expected to fail — that
+        // is precisely C's `close(state->fd) == -1` producing `Z_ERRNO`.
+        unsafe { close(fd) == 0 }
+    }
+
+    fn relinquish(mut self: Box<Self>) {
+        // Forget the descriptor without closing it, so the caller keeps exactly
+        // what it passed in. `Drop` below then does nothing.
+        let _ = self.fd.take();
+    }
+}
+
+#[cfg(feature = "gz-io")]
+#[cfg(unix)]
+impl Drop for DeadDescriptor {
+    /// Closes the descriptor if it is still held, so the idiomatic `gzclose_*`
+    /// path — which simply drops the state — leaks nothing. The result is
+    /// discarded, exactly as `File`'s own [`Drop`] discards it.
+    fn drop(&mut self) {
+        if let Some(fd) = self.fd.take() {
+            // SAFETY: as in `close` above — ownership was transferred to this
+            // owner and `take` makes this the only close of `fd`.
+            let _ = unsafe { close(fd) };
+        }
+    }
+}
+
+// Windows CRT byte I/O on an `int` descriptor: the exact family reference zlib
+// compiles to on this platform (`read`/`write` resolve to `_read`/`_write`, and
+// `gzlib.c` L11 defines `LSEEK` as `_lseeki64`). Declared directly for the same
+// reason `close` and `CloseHandle` are — a link-time reference to the platform C
+// runtime that `std` already links, never to a C zlib, so the zero-C-dependency
+// rule holds (AAP §0.5.2).
 #[cfg(feature = "gz-io")]
 #[cfg(windows)]
 unsafe extern "C" {
-    /// Returns the OS handle backing CRT descriptor `fd`, or `-1`/`-2` when that
-    /// descriptor is not open.
-    fn _get_osfhandle(fd: c_int) -> isize;
+    /// `int _read(int fd, void *buffer, unsigned int count)` — bytes read, or `-1`.
+    #[link_name = "_read"]
+    fn crt_read(fd: c_int, buffer: *mut core::ffi::c_void, count: c_uint) -> c_int;
+
+    /// `int _write(int fd, const void *buffer, unsigned int count)` — bytes
+    /// written, or `-1`.
+    #[link_name = "_write"]
+    fn crt_write(fd: c_int, buffer: *const core::ffi::c_void, count: c_uint) -> c_int;
+
+    /// `__int64 _lseeki64(int fd, __int64 offset, int origin)` — the new offset,
+    /// or `-1`.
+    #[link_name = "_lseeki64"]
+    fn crt_lseeki64(fd: c_int, offset: i64, origin: c_int) -> i64;
+
+    /// `int _close(int fd)` — `0` on success, `-1` on failure. Releases both the
+    /// OS handle and the CRT descriptor-table slot.
+    #[link_name = "_close"]
+    fn crt_close(fd: c_int) -> c_int;
 }
 
-/// Adopts the caller's raw descriptor into a [`std::fs::File`] that owns it.
+/// `SEEK_SET` — universal across every platform this crate targets.
+#[cfg(feature = "gz-io")]
+#[cfg(windows)]
+const SEEK_SET: c_int = 0;
+/// `SEEK_CUR` — universal across every platform this crate targets.
+#[cfg(feature = "gz-io")]
+#[cfg(windows)]
+const SEEK_CUR: c_int = 1;
+/// `SEEK_END` — universal across every platform this crate targets.
+#[cfg(feature = "gz-io")]
+#[cfg(windows)]
+const SEEK_END: c_int = 2;
+
+/// Owner for a `gzdopen` descriptor on Windows, doing its I/O through the CRT
+/// exactly as reference zlib does.
+///
+/// # Why a `File` is wrong here even for a *valid* descriptor
+///
+/// A Rust [`std::fs::File`] owns a Win32 `HANDLE`, not a CRT `int`. The only way
+/// to obtain the handle behind a CRT descriptor is `_get_osfhandle`, which
+/// **lends** it: the CRT descriptor-table slot keeps ownership. Wrapping that
+/// handle in a `File` therefore creates a *second* owner, and the first close —
+/// whichever it is — leaves the other holding a stale handle; a subsequent
+/// `_close` by the CRT (or by a caller that still believes it owns the
+/// descriptor) is a double close.
+///
+/// Owning the CRT descriptor itself removes the second owner entirely, and has the
+/// side benefit of erasing a previously documented divergence: `_close` releases
+/// the CRT table slot as well as the handle, which is exactly what C's
+/// `close(state->fd)` does on this platform.
+///
+/// # Validity
+///
+/// Unlike the unix path, no probe is performed. C stores whatever `int` it was
+/// handed and lets the CRT decide, so an out-of-range descriptor reaches the CRT's
+/// invalid-parameter handler here just as it does in reference zlib. Matching C
+/// means inheriting that behaviour rather than pre-empting it.
+#[cfg(feature = "gz-io")]
+#[cfg(windows)]
+struct CrtDescriptor {
+    /// The caller's CRT descriptor while this owner still holds it; [`None`] once
+    /// it has been closed or relinquished, so neither can happen twice.
+    fd: Option<c_int>,
+}
+
+#[cfg(feature = "gz-io")]
+#[cfg(windows)]
+impl CrtDescriptor {
+    /// The descriptor, or a [`std::io::Error`] if this owner has already given it
+    /// up — unreachable while the handle is live.
+    #[inline]
+    fn descriptor(&self) -> std::io::Result<c_int> {
+        self.fd
+            .ok_or_else(|| std::io::Error::other("gz file descriptor used after close"))
+    }
+
+    /// Clamps a buffer length to what the CRT's `unsigned int` count and `int`
+    /// return can express. Short reads and writes are ordinary
+    /// [`Read`](std::io::Read)/[`Write`](std::io::Write) outcomes, so clamping
+    /// loses nothing.
+    #[inline]
+    fn clamp(len: usize) -> c_uint {
+        core::cmp::min(len, c_int::MAX as usize) as c_uint
+    }
+}
+
+#[cfg(feature = "gz-io")]
+#[cfg(windows)]
+impl crate::gz::RawFileIo for CrtDescriptor {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let fd = self.descriptor()?;
+        let want = Self::clamp(buf.len());
+        // SAFETY: `buf` is a live Rust slice, so `buf.as_mut_ptr()` is valid for
+        // `buf.len()` bytes and `want <= buf.len()`; the CRT writes at most `want`
+        // bytes there and nothing else. `fd` is owned by this value.
+        let read = unsafe { crt_read(fd, buf.as_mut_ptr().cast(), want) };
+        if read < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(read as usize)
+    }
+
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let fd = self.descriptor()?;
+        let want = Self::clamp(buf.len());
+        // SAFETY: `buf` is a live Rust slice, so `buf.as_ptr()` is valid for
+        // `buf.len()` bytes and `want <= buf.len()`; the CRT only reads from it.
+        // `fd` is owned by this value.
+        let written = unsafe { crt_write(fd, buf.as_ptr().cast(), want) };
+        if written < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(written as usize)
+    }
+
+    /// Succeeds without issuing `_commit`: reference zlib never flushes the
+    /// descriptor to disk, and `File::flush` is likewise a no-op, so forcing a
+    /// commit here would change observable behaviour.
+    #[inline]
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let fd = self.descriptor()?;
+        let (offset, origin) = match pos {
+            std::io::SeekFrom::Start(from_start) => (
+                i64::try_from(from_start).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "seek offset exceeds the platform range",
+                    )
+                })?,
+                SEEK_SET,
+            ),
+            std::io::SeekFrom::Current(delta) => (delta, SEEK_CUR),
+            std::io::SeekFrom::End(delta) => (delta, SEEK_END),
+        };
+        // SAFETY: `fd` is owned by this value and `_lseeki64` touches no caller
+        // memory; `origin` is one of the three defined whence values.
+        let at = unsafe { crt_lseeki64(fd, offset, origin) };
+        u64::try_from(at).map_err(|_| std::io::Error::last_os_error())
+    }
+
+    fn close(mut self: Box<Self>) -> bool {
+        let Some(fd) = self.fd.take() else {
+            return false;
+        };
+        // SAFETY: ownership of `fd` was transferred to this owner by `gzdopen`'s
+        // contract and `take` above guarantees this is the only close, so `_close`
+        // runs at most once on it.
+        unsafe { crt_close(fd) == 0 }
+    }
+
+    fn relinquish(mut self: Box<Self>) {
+        let _ = self.fd.take();
+    }
+}
+
+#[cfg(feature = "gz-io")]
+#[cfg(windows)]
+impl Drop for CrtDescriptor {
+    /// Closes the descriptor if it is still held, so the idiomatic `gzclose_*`
+    /// path leaks nothing. The result is discarded, as `File`'s own [`Drop`]
+    /// discards it.
+    fn drop(&mut self) {
+        if let Some(fd) = self.fd.take() {
+            // SAFETY: as in `close` above.
+            let _ = unsafe { crt_close(fd) };
+        }
+    }
+}
+
+/// Takes ownership of the caller's raw descriptor, in whichever form is sound for
+/// it, returning [`None`] if the owner cannot be allocated.
 ///
 /// # Why an invalid descriptor is adopted rather than rejected
 ///
@@ -951,81 +1500,104 @@ unsafe extern "C" {
 ///
 /// So a descriptor that is negative-but-not-`-1`, or merely closed, must open
 /// successfully and fail at the *first* read, write, seek or close. Rejecting it
-/// here would turn C's **deferred** [`Z_ERRNO`](crate::error::ReturnCode::ErrNo) into an **immediate** `NULL`,
-/// denying the caller the very handle it needs to read that error from. This
-/// helper therefore adopts unconditionally; `fd == -1` is screened by the caller,
-/// before adoption, because that is the one case C screens too.
+/// here would turn C's **deferred**
+/// [`Z_ERRNO`](crate::error::ReturnCode::ErrNo) into an **immediate** `NULL`,
+/// denying the caller the very handle it needs to read that error from.
+///
+/// # How ownership is chosen
+///
+/// The descriptor is probed with [`descriptor_is_open`]. A descriptor proven open
+/// becomes a [`std::fs::File`], whose safety contract is then satisfied in full,
+/// and every later read/write/seek is ordinary safe `std` I/O. One that is not
+/// becomes a [`DeadDescriptor`], which fails every operation with the errno the
+/// probe observed and performs C's failing `close(2)` at the end. In neither case
+/// is a `File` built from a descriptor that has not been shown to be open.
+///
+/// `fd == -1` is screened by the caller, before adoption, because that is the one
+/// case C screens too.
 ///
 /// # Safety
 ///
 /// The caller transfers ownership of `fd`: nothing else may own or close it. The
-/// descriptor need *not* be open — the raw-conversion contract of
-/// [`std::fs::File`] is about sole ownership, and every operation on a closed
-/// descriptor simply fails, which is precisely the deferred error C exhibits.
+/// descriptor need *not* be open.
 #[cfg(feature = "gz-io")]
 #[cfg(unix)]
-unsafe fn adopt_descriptor(fd: c_int) -> std::fs::File {
-    // SAFETY: forwarded verbatim from this function's own contract — the caller
-    // transferred sole ownership of `fd`, so wrapping it here creates exactly one
-    // owner and no other Rust value can close it.
-    unsafe { std::fs::File::from_raw_fd(fd) }
+unsafe fn adopt_descriptor(fd: c_int) -> Option<GzFile> {
+    match descriptor_is_open(fd) {
+        Ok(()) => {
+            // SAFETY: the probe has just shown `fd` to be an open descriptor, and
+            // this function's own contract transfers sole ownership of it, so
+            // wrapping it creates exactly one owner of an open resource — the full
+            // `from_raw_fd` precondition. A descriptor needs no cleanup beyond
+            // `close`, which is what `File`'s `Drop` performs.
+            Some(GzFile::new(unsafe { std::fs::File::from_raw_fd(fd) }))
+        }
+        Err(errno) => {
+            // Not open: own it raw. A failed allocation leaves `fd` completely
+            // untouched — no owner was created — so returning `None` hands it back
+            // to the caller exactly as C's `malloc` failure does.
+            let owner = crate::ffi::alloc::try_box(DeadDescriptor {
+                fd: Some(fd),
+                errno,
+            })?;
+            Some(GzFile::adopted(owner))
+        }
+    }
 }
 
-/// Windows counterpart of `adopt_descriptor`, resolving the CRT descriptor to
-/// the OS handle a [`std::fs::File`] owns on this platform.
+/// Windows counterpart of [`adopt_descriptor`], owning the CRT descriptor itself.
 ///
-/// The rejection policy, and the reason an invalid descriptor is adopted rather
-/// than refused, are identical to the Unix twin — see its documentation.
+/// The rejection policy is identical to the unix twin — only `fd == -1` is
+/// screened, by the caller — but the ownership form is not: see
+/// [`CrtDescriptor`] for why a [`std::fs::File`] is the wrong owner on this
+/// platform even for a perfectly valid descriptor, and why no validity probe is
+/// performed.
 ///
-/// One Windows-only residual difference is deliberate and documented rather than
-/// silent: C's Windows build keeps the CRT `int` descriptor and closes it with
-/// `_close`, releasing both the OS handle *and* the CRT table slot, whereas a
-/// [`std::fs::File`] owns the `HANDLE` and closes it with `CloseHandle`, leaving
-/// the CRT slot allocated. The observable close result — the value
-/// [`gzclose`]/[`gzclose_w`] reports — comes from closing the handle either way,
-/// so the ABI-visible behaviour matches; only the CRT-internal slot differs, and
-/// a caller must not `_close` a descriptor whose ownership it has handed away.
+/// # Safety
+///
+/// The caller transfers ownership of `fd`: nothing else may own or close it.
 #[cfg(feature = "gz-io")]
 #[cfg(windows)]
-unsafe fn adopt_descriptor(fd: c_int) -> std::fs::File {
-    // SAFETY: `_get_osfhandle` only reads the CRT's own descriptor table and
-    // reports `-1`/`-2` for a descriptor that is not open, so it is safe to call
-    // for any `int`, valid or not.
-    let raw = unsafe { _get_osfhandle(fd) };
-
-    // SAFETY: the caller transferred sole ownership of `fd`, so the handle the CRT
-    // reports for it has exactly one owner, which now becomes this `File`. A
-    // `-1`/`-2` result (`INVALID_HANDLE_VALUE`) is adopted deliberately rather
-    // than rejected — see the Unix twin for why C's deferred-failure contract
-    // requires it. Every `ReadFile`/`WriteFile` on such a handle fails, raising
-    // the same `Z_ERRNO` C raises on its first `_read`.
-    unsafe { std::fs::File::from_raw_handle(raw as *mut core::ffi::c_void) }
+unsafe fn adopt_descriptor(fd: c_int) -> Option<GzFile> {
+    // A failed allocation leaves `fd` untouched, so the caller keeps it — C's
+    // `malloc`-failure contract.
+    let owner = crate::ffi::alloc::try_box(CrtDescriptor { fd: Some(fd) })?;
+    Some(GzFile::adopted(owner))
 }
 
-/// Ends Rust ownership of `file`'s descriptor **without closing it**, handing it
-/// back to the caller exactly as it was passed in.
+/// Ends Rust ownership of a released handle's descriptor **without closing it**,
+/// handing it back to the caller exactly as it was passed in.
 ///
 /// This is the release half of the `gzdopen` ownership contract: C never reaches
 /// its allocation failures with the descriptor stored (`gzlib.c` assigns
 /// `state->fd` only at the open/adopt step), so no `gzdopen` failure may close
 /// what the caller still owns.
+///
+/// A raw-descriptor owner abdicates by itself; a [`std::fs::File`] comes back from
+/// [`relinquish`](crate::gz::ReleasedFile::relinquish) to be dissolved with the
+/// platform's own raw-extraction call, which is why this step lives here.
 #[cfg(feature = "gz-io")]
 #[cfg(unix)]
-fn release_descriptor(file: std::fs::File) {
+fn release_descriptor(released: crate::gz::ReleasedFile) {
     use std::os::fd::IntoRawFd;
 
-    let _ = file.into_raw_fd();
+    if let Some(file) = released.relinquish() {
+        let _ = file.into_raw_fd();
+    }
 }
 
-/// Windows counterpart of `release_descriptor`: dissolves the [`std::fs::File`]
-/// without `CloseHandle`, leaving both the OS handle and the CRT descriptor the
-/// caller passed in open and usable.
+/// Windows counterpart of [`release_descriptor`]: dissolves a [`std::fs::File`]
+/// without `CloseHandle`, and lets a [`CrtDescriptor`] abdicate without `_close`,
+/// leaving both the OS handle and the CRT descriptor the caller passed in open and
+/// usable.
 #[cfg(feature = "gz-io")]
 #[cfg(windows)]
-fn release_descriptor(file: std::fs::File) {
+fn release_descriptor(released: crate::gz::ReleasedFile) {
     use std::os::windows::io::IntoRawHandle;
 
-    let _ = file.into_raw_handle();
+    if let Some(file) = released.relinquish() {
+        let _ = file.into_raw_handle();
+    }
 }
 
 /// `gzFile gzdopen(int fd, const char *mode)`
@@ -1046,6 +1618,8 @@ fn release_descriptor(file: std::fs::File) {
 /// * an **invalid mode string** (`"r+"`, `"rT"`, `"wG"`, a string with no
 ///   `r`/`w`/`a`, …) is rejected by `crate::gz::validate_mode`, also before
 ///   adoption — this is the check C performs at `gzlib.c` L150-L197; and
+/// * an **unallocatable descriptor owner** (unix, unproven descriptor only) is
+///   reported before the descriptor is owned at all; and
 /// * if the handle allocation fails after adoption, the descriptor is released
 ///   back to the OS-owned world with `release_descriptor` rather than closed —
 ///   the analogue of C's `malloc` failure at `gzlib.c` L206-L210, which likewise
@@ -1104,12 +1678,16 @@ pub unsafe extern "C" fn gzdopen(fd: c_int, mode: *const c_char) -> gzFile {
             // SAFETY: the caller transfers ownership of `fd` (the `-1` sentinel is
             // screened above), so nothing else owns or will close it. Adoption
             // happens only now, with the mode already proven acceptable, so the
-            // remaining failure mode is an exhausted heap — handled by releasing the
-            // descriptor below rather than closing it. The descriptor need not be
-            // open: `adopt_descriptor` documents why C's contract requires adopting
-            // an invalid one and deferring the error.
-            let file = unsafe { adopt_descriptor(fd) };
-            let opened = gz::gzdopen_bytes(file, mode_bytes);
+            // remaining failure mode is an exhausted heap — reported as `None` here
+            // (with `fd` never owned, hence never closed) or handled by releasing
+            // the descriptor below. The descriptor need not be open:
+            // `adopt_descriptor` documents why C's contract requires adopting an
+            // invalid one and deferring the error, and how it chooses an ownership
+            // form that stays sound for one.
+            let Some(file) = (unsafe { adopt_descriptor(fd) }) else {
+                return ptr::null_mut();
+            };
+            let opened = gz::gzdopen_adopted(file, mode_bytes);
             // C applies `O_NONBLOCK` to an adopted descriptor with `fcntl`,
             // because it never calls `open` here. See
             // `reconcile_adopted_descriptor` for why its companion `O_CLOEXEC`
@@ -1171,16 +1749,17 @@ fn dopen_state(result: Result<Box<GzState>, ReturnCode>) -> gzFile {
     match crate::ffi::alloc::try_box(handle) {
         Some(mut boxed) => {
             // The handle exists; ownership of the descriptor now transfers to it,
-            // to be closed by `gzclose`/`gzclose_r`/`gzclose_w`.
+            // to be closed by `gzclose`/`gzclose_r`/`gzclose_w`. `restore` puts it
+            // back in the same ownership form it was released in.
             if let Some(file) = released {
-                boxed.state.file = GzFile::new(file);
+                boxed.state.file = GzFile::restore(file);
             }
             Box::into_raw(boxed) as gzFile
         }
         None => {
             // Allocation failed. C never got this far with the descriptor, so
             // give it back to the caller unclosed: `release_descriptor` dissolves
-            // the `File` without closing, leaving `fd` exactly as the caller
+            // the owner without closing, leaving `fd` exactly as the caller
             // passed it. `handle` (and with it the buffers) drops here — C's
             // `free(state)`.
             if let Some(file) = released {
@@ -1193,11 +1772,12 @@ fn dopen_state(result: Result<Box<GzState>, ReturnCode>) -> gzFile {
 
 /// `gzFile gzdopen(int fd, const char *mode)`  *(neither Unix nor Windows)*
 ///
-/// Adopting a raw C `int` file descriptor requires a platform primitive that maps
-/// it onto whatever `std` owns — `from_raw_fd` on Unix, `_get_osfhandle` plus
-/// `from_raw_handle` on Windows (both implemented above). Targets that are
-/// neither expose no such primitive, so the symbol is retained for ABI
-/// completeness but always fails here; use [`gzopen`]/`gzopen_w` instead.
+/// Owning a raw C `int` file descriptor requires platform primitives: `close(2)`
+/// plus the `fcntl`/`dup` validity probe on Unix, and the CRT
+/// `_read`/`_write`/`_lseeki64`/`_close` family on Windows (both implemented
+/// above). Targets that are neither expose no such primitives, so the symbol is
+/// retained for ABI completeness but always fails here; use
+/// [`gzopen`]/`gzopen_w` instead.
 #[cfg(not(any(unix, windows)))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzdopen(_fd: c_int, _mode: *const c_char) -> gzFile {
@@ -2297,6 +2877,56 @@ mod tests {
         (temp, c)
     }
 
+    /// Claims a deliberately HIGH descriptor number, duplicated from standard
+    /// input, and returns it still open. The caller closes it and is then free to
+    /// hand the *number* to `gzdopen` as a genuinely closed descriptor.
+    ///
+    /// # Why the number has to be high
+    ///
+    /// POSIX allocates the LOWEST free descriptor. A freshly closed low number is
+    /// therefore the very next one a concurrently running test's `open` will be
+    /// handed, which makes "close it, check it is closed, then use it" a
+    /// time-of-check/time-of-use race no retry loop can close: the probe reports
+    /// closed, another thread opens a file into that slot, and the test then
+    /// adopts — and on `gzclose_r` CLOSES — a descriptor belonging to another
+    /// test. That is not hypothetical. An earlier revision of
+    /// `gzdopen_adopts_a_closed_descriptor_and_defers` did exactly that and broke
+    /// two unrelated `gz` tests in the `std,gzip,gz-io` feature row while passing
+    /// on every other row, because the interleaving differs per feature set.
+    ///
+    /// A high number is race-free by construction instead: nothing in the process
+    /// can be handed it while the harness's own descriptor use stays orders of
+    /// magnitude below, so no retry is needed and the outcome is deterministic.
+    ///
+    /// # Why each candidate is probed before it is claimed
+    ///
+    /// `dup2` silently CLOSES `dst` when `dst` is already open. Probing first
+    /// means this helper never evicts an inherited descriptor that happens to sit
+    /// at a candidate number. The candidates descend so that a host with a low
+    /// `RLIMIT_NOFILE` still finds one — `dup2` fails with `EBADF` when `dst` is
+    /// at or above the soft limit.
+    ///
+    /// # Panics
+    ///
+    /// If no candidate can be claimed, which would mean the process cannot hold a
+    /// descriptor at any of them.
+    #[cfg(unix)]
+    fn reserve_high_descriptor() -> c_int {
+        for candidate in [8192 as c_int, 4096, 1024, 512, 256] {
+            if descriptor_is_open(candidate).is_ok() {
+                // Occupied — `dup2` would close it. Leave it alone.
+                continue;
+            }
+            // SAFETY: `dup2` accepts any two `int`s, touches no caller memory,
+            // and `0` is the process's standard input, always open under the test
+            // harness. `candidate` was just proven closed, so nothing is evicted.
+            if unsafe { dup2(0, candidate) } == candidate {
+                return candidate;
+            }
+        }
+        panic!("no high descriptor number could be reserved");
+    }
+
     #[test]
     fn write_then_read_round_trip() {
         let (_path, cpath) = unique_path("rt");
@@ -2928,16 +3558,15 @@ mod tests {
     }
 
     /// Probes whether `fd` is still an open descriptor, without taking ownership
-    /// of it — the `fstat`-based analogue of the C harness's
-    /// `fcntl(fd, F_GETFD) != -1`.
+    /// of it — exactly the C harness's `fcntl(fd, F_GETFD) != -1`.
+    ///
+    /// Delegates to the production probe rather than wrapping the descriptor in a
+    /// `ManuallyDrop<File>`: `File::from_raw_fd` requires an *open* descriptor, and
+    /// the whole point of this helper is to be called on descriptors that may not
+    /// be — the same soundness trap the shipped `gzdopen` path avoids.
     #[cfg(unix)]
     fn fd_is_alive(fd: c_int) -> bool {
-        // SAFETY: wrapping the descriptor in a `ManuallyDrop<File>` gives a
-        // borrow-only view: `metadata()` issues an `fstat` and the `File` is never
-        // dropped, so the descriptor is neither closed nor otherwise disturbed. A
-        // closed or never-valid descriptor answers `EBADF`.
-        let probe = core::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
-        probe.metadata().is_ok()
+        descriptor_is_open(fd).is_ok()
     }
 
     /// A failed `gzdopen` must leave the caller's descriptor **open**.
@@ -3030,11 +3659,12 @@ mod tests {
         // faithful on both — `adopt_descriptor` adopts whatever the platform
         // reports, exactly as C stores whatever `int` it was handed — but on
         // Windows what an out-of-range CRT descriptor *does* is decided by the
-        // CRT's invalid-parameter handler, which `_get_osfhandle` invokes and
-        // whose default action is CRT-version-specific. Reference zlib has the
-        // identical exposure there (its `_read` validates the descriptor through
-        // the same handler), so matching C means inheriting it; what would be
-        // wrong is to pin a specific outcome to it in an assertion.
+        // CRT's invalid-parameter handler, which `_read` invokes and whose default
+        // action is CRT-version-specific. Reference zlib has the identical exposure
+        // there (its own `_read` validates the descriptor through the same
+        // handler), and owning the CRT descriptor means this port reaches the
+        // handler through the very same call — so matching C means inheriting it;
+        // what would be wrong is to pin a specific outcome to it in an assertion.
         #[cfg(unix)]
         for fd in [-5 as c_int, 9999 as c_int] {
             // SAFETY: `fd` is not the `-1` sentinel and `mode` is a NUL-terminated
@@ -3490,7 +4120,8 @@ mod tests {
         // creation cannot re-truncate one path four times, which is precisely the
         // property that makes it safe. All four are siblings inside the guard's
         // private directory and are removed with it.
-        let fresh = |name: &str| create_new_file(&path.sibling(name));
+        let fresh =
+            |name: &str| crate::gz::ReleasedFile::Owned(create_new_file(&path.sibling(name)));
 
         // Descriptor released and the close succeeds: status passes through, for
         // both a success and a preserved error status.
@@ -3667,33 +4298,44 @@ mod tests {
     /// `gzopen*`/`gzdopen`.
     #[cfg(unix)]
     unsafe fn handle_fd(file: gzFile) -> c_int {
-        use std::os::fd::AsRawFd;
         // SAFETY: per the contract `file` is a live handle, so `gz_handle`'s
         // requirements are met; the borrow ends with this expression and only a
         // `Copy` descriptor number is read out of it.
-        unsafe { gz_handle(file).state.file.as_raw_fd() }
+        unsafe { gz_handle(file).state.file.raw_descriptor() }
+            .expect("a live gz handle always holds a descriptor")
     }
 
     /// `fcntl(fd, F_GETFD) & FD_CLOEXEC`, as a bool — the exact quantity the C
     /// acceptance probe prints as `cloexec=`.
     #[cfg(unix)]
     fn fd_cloexec(fd: c_int) -> bool {
+        let get_fd = FCNTL
+            .get_fd
+            .expect("a platform running this test must have an enumerated F_GETFD");
+        let cloexec = crate::gz::DescriptorRequest::FD_CLOEXEC
+            .expect("a platform running this test must have an enumerated FD_CLOEXEC");
         // SAFETY: `fd` is a live descriptor owned by the caller's handle;
-        // `F_GETFD` reads the descriptor flags and takes no third argument.
-        let flags = unsafe { fcntl(fd, F_GETFD) };
+        // `get_fd` is this platform's `F_GETFD`, which reads the descriptor flags
+        // and takes no third argument.
+        let flags = unsafe { fcntl(fd, get_fd) };
         assert!(flags >= 0, "F_GETFD must succeed on a live descriptor");
-        flags & crate::gz::DescriptorRequest::FD_CLOEXEC != 0
+        flags & cloexec != 0
     }
 
     /// `fcntl(fd, F_GETFL) & O_NONBLOCK`, as a bool — the exact quantity the C
     /// acceptance probe prints as `nonblock=`.
     #[cfg(unix)]
     fn fd_nonblock(fd: c_int) -> bool {
-        // SAFETY: as above; `F_GETFL` reads the file status flags and takes no
-        // third argument.
-        let flags = unsafe { fcntl(fd, F_GETFL) };
+        let get_fl = FCNTL
+            .get_fl
+            .expect("a platform running this test must have an enumerated F_GETFL");
+        let nonblock = crate::gz::DescriptorRequest::O_NONBLOCK
+            .expect("a platform running this test must have an enumerated O_NONBLOCK");
+        // SAFETY: as above; `get_fl` is this platform's `F_GETFL`, which reads the
+        // file status flags and takes no third argument.
+        let flags = unsafe { fcntl(fd, get_fl) };
         assert!(flags >= 0, "F_GETFL must succeed on a live descriptor");
-        flags & crate::gz::DescriptorRequest::O_NONBLOCK != 0
+        flags & nonblock != 0
     }
 
     /// A descriptor `gzopen`ed **without** mode `e` must not be close-on-exec, and
@@ -3806,17 +4448,22 @@ mod tests {
 
         // A fresh descriptor on `path` with FD_CLOEXEC forced to `want` and
         // O_NONBLOCK clear — the two starting states the C probe measures.
+        let set_fd = FCNTL
+            .set_fd
+            .expect("a platform running this test must have an enumerated F_SETFD");
         let fresh = |want: bool| -> c_int {
             let fd = std::fs::File::open(&path).unwrap().into_raw_fd();
             let target = if want {
                 crate::gz::DescriptorRequest::FD_CLOEXEC
+                    .expect("a platform running this test must have an enumerated FD_CLOEXEC")
             } else {
                 0
             };
             // SAFETY: `fd` was just produced by `File::open` and is owned by this
-            // closure's caller; `F_SETFD` takes exactly one `int`, supplied here.
+            // closure's caller; `set_fd` is this platform's `F_SETFD`, which takes
+            // exactly one `int`, supplied here.
             assert!(
-                unsafe { fcntl(fd, F_SETFD, target) } >= 0,
+                unsafe { fcntl(fd, set_fd, target) } >= 0,
                 "F_SETFD must succeed on a freshly opened descriptor"
             );
             assert_eq!(fd_cloexec(fd), want, "the starting state must be exact");
@@ -3884,5 +4531,497 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---------------------------------------------------------------------
+    // fcntl command table (finding SEC-GZ-09)
+    // ---------------------------------------------------------------------
+
+    /// Every entry of the `fcntl` command table matches its platform's headers,
+    /// and the two platforms that renumber the commands are genuinely distinct
+    /// from POSIX.
+    ///
+    /// This repeats what the module's `const _: () = { .. }` block proves at
+    /// compile time, for the same reason the flag-table test does: the compile
+    /// time block is what makes the Haiku and NuttX numbers checkable from an
+    /// x86_64 Linux host, and a `#[test]` is what names the offending platform
+    /// when one of them drifts.
+    #[cfg(unix)]
+    #[test]
+    fn the_fcntl_command_table_matches_every_platforms_headers() {
+        assert_eq!(
+            (
+                FCNTL_POSIX.get_fd,
+                FCNTL_POSIX.set_fd,
+                FCNTL_POSIX.get_fl,
+                FCNTL_POSIX.set_fl
+            ),
+            (Some(1), Some(2), Some(3), Some(4)),
+            "POSIX: F_GETFD 1, F_SETFD 2, F_GETFL 3, F_SETFL 4"
+        );
+        assert_eq!(
+            (
+                FCNTL_HAIKU.get_fd,
+                FCNTL_HAIKU.set_fd,
+                FCNTL_HAIKU.get_fl,
+                FCNTL_HAIKU.set_fl
+            ),
+            (Some(0x0002), Some(0x0004), Some(0x0008), Some(0x0010)),
+            "Haiku uses a disjoint, bitfield-style command set"
+        );
+        assert_eq!(
+            (
+                FCNTL_NUTTX.get_fd,
+                FCNTL_NUTTX.set_fd,
+                FCNTL_NUTTX.get_fl,
+                FCNTL_NUTTX.set_fl
+            ),
+            (Some(0x1), None, Some(0x2), Some(0x9)),
+            "NuttX renumbers F_GETFL/F_SETFL and defines no F_SETFD at all"
+        );
+        assert_eq!(
+            (
+                FCNTL_UNKNOWN.get_fd,
+                FCNTL_UNKNOWN.set_fd,
+                FCNTL_UNKNOWN.get_fl,
+                FCNTL_UNKNOWN.set_fl
+            ),
+            (None, None, None, None),
+            "an unenumerated platform must be sent no fcntl command whatsoever"
+        );
+    }
+
+    /// The precise hazard SEC-GZ-09 describes: on Haiku the POSIX `F_GETFD` value
+    /// `1` is `F_DUPFD`, a **variadic** command that would duplicate and leak the
+    /// descriptor instead of reading its flags.
+    ///
+    /// Asserted as a property of the table rather than as prose, so that a future
+    /// change which reintroduced POSIX numbering for Haiku fails here.
+    #[cfg(unix)]
+    #[test]
+    fn haiku_command_numbers_collide_with_posix_meanings() {
+        /// Haiku's `F_DUPFD`, from libc `unix/haiku/mod.rs` — the command a
+        /// POSIX-numbered `F_GETFD` would actually have selected there.
+        const HAIKU_F_DUPFD: c_int = 0x0001;
+
+        assert_eq!(
+            FCNTL_POSIX.get_fd,
+            Some(HAIKU_F_DUPFD),
+            "the POSIX F_GETFD number is exactly Haiku's F_DUPFD, which is why \
+             issuing it there is a variadic call missing its argument rather than \
+             a harmless failure"
+        );
+        for (name, posix, haiku) in [
+            ("F_GETFD", FCNTL_POSIX.get_fd, FCNTL_HAIKU.get_fd),
+            ("F_SETFD", FCNTL_POSIX.set_fd, FCNTL_HAIKU.set_fd),
+            ("F_GETFL", FCNTL_POSIX.get_fl, FCNTL_HAIKU.get_fl),
+            ("F_SETFL", FCNTL_POSIX.set_fl, FCNTL_HAIKU.set_fl),
+        ] {
+            assert_ne!(
+                posix, haiku,
+                "{name} must differ between POSIX and Haiku; if it ever agreed, \
+                 the separate Haiku arm would be silently pointless"
+            );
+        }
+
+        // Haiku's numbering is internally disjoint, so no Haiku command can be
+        // confused with another Haiku command either.
+        let haiku = [
+            FCNTL_HAIKU.get_fd,
+            FCNTL_HAIKU.set_fd,
+            FCNTL_HAIKU.get_fl,
+            FCNTL_HAIKU.set_fl,
+        ];
+        for (i, a) in haiku.iter().enumerate() {
+            for b in haiku.iter().skip(i + 1) {
+                assert_ne!(a, b, "Haiku's four commands must be pairwise distinct");
+            }
+        }
+    }
+
+    /// A platform missing even one required command is skipped rather than sent a
+    /// borrowed number — the property that makes NuttX (no `F_SETFD`) safe.
+    ///
+    /// `reconcile_opened_descriptor` needs `get_fd` **and** `set_fd` **and**
+    /// `FD_CLOEXEC`; `reconcile_adopted_descriptor` needs `get_fl` **and**
+    /// `set_fl` **and** `O_NONBLOCK`. This test states those conjunctions over the
+    /// table so a future edit that dropped one of the three checks is visible.
+    #[cfg(unix)]
+    #[test]
+    fn a_partially_known_platform_issues_no_fcntl() {
+        // NuttX is the live instance: three commands known, `F_SETFD` absent, so
+        // the close-on-exec reconciliation must be skipped while the non-blocking
+        // one remains available.
+        let cloexec_ready = FCNTL_NUTTX.get_fd.is_some() && FCNTL_NUTTX.set_fd.is_some();
+        let nonblock_ready = FCNTL_NUTTX.get_fl.is_some() && FCNTL_NUTTX.set_fl.is_some();
+        assert!(
+            !cloexec_ready,
+            "NuttX defines no F_SETFD, so close-on-exec reconciliation must be \
+             unavailable there"
+        );
+        assert!(
+            nonblock_ready,
+            "NuttX does define F_GETFL/F_SETFL, so skipping must be per-operation \
+             and not all-or-nothing for the platform"
+        );
+
+        // And a wholly unenumerated platform is unavailable for both.
+        assert!(!(FCNTL_UNKNOWN.get_fd.is_some() && FCNTL_UNKNOWN.set_fd.is_some()));
+        assert!(!(FCNTL_UNKNOWN.get_fl.is_some() && FCNTL_UNKNOWN.set_fl.is_some()));
+
+        // This host must be fully known, or every descriptor-flag test in this
+        // module would be silently exercising the skip path instead of its
+        // subject.
+        assert!(
+            FCNTL.get_fd.is_some()
+                && FCNTL.set_fd.is_some()
+                && FCNTL.get_fl.is_some()
+                && FCNTL.set_fl.is_some(),
+            "the host running these tests must be a fully enumerated platform"
+        );
+        assert!(
+            crate::gz::DescriptorRequest::FD_CLOEXEC.is_some()
+                && crate::gz::DescriptorRequest::O_NONBLOCK.is_some(),
+            "and must have both descriptor flags enumerated"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SEC-GZ-10 — `gzdopen` descriptor ownership
+    //
+    // The defect this covers: a caller-supplied `int` was wrapped straight into a
+    // `std::fs::File` with `from_raw_fd` / `_get_osfhandle` + `from_raw_handle`.
+    // Both are unsound for the descriptors `gzdopen` is *required* to accept —
+    // `from_raw_fd` demands an open descriptor and `zlib.h` L1422-L1426 demands
+    // that anything except `-1` be accepted, while `_get_osfhandle` only *lends*
+    // the Windows handle the CRT still owns, so a `File` built from it becomes a
+    // second owner and a later double close.
+    //
+    // The fix moves the ownership decision to the boundary: a descriptor proven
+    // open becomes a `File`, anything else is owned raw. These tests pin the
+    // decision, the probe that drives it, and the lifecycle either way.
+    // -----------------------------------------------------------------------
+
+    /// The probe must answer correctly for a live descriptor, for a
+    /// negative-but-not-`-1` one, and for one that really has been closed — and it
+    /// must leave a live descriptor completely undisturbed.
+    #[cfg(unix)]
+    #[test]
+    fn the_descriptor_probe_answers_open_closed_and_never_opened() {
+        use std::io::Read as _;
+        use std::os::fd::IntoRawFd;
+
+        let (path, _cpath) = unique_path("probe");
+        {
+            use std::io::Write as _;
+            let mut seed = path.create();
+            seed.write_all(b"probe payload").expect("seed the fixture");
+        }
+
+        // A live descriptor: open, and still fully usable afterwards. A probe that
+        // consumed or perturbed the descriptor would break `gzdopen` outright.
+        let fd = std::fs::File::open(&path)
+            .expect("open the fixture")
+            .into_raw_fd();
+        assert!(
+            descriptor_is_open(fd).is_ok(),
+            "a live descriptor must probe as open"
+        );
+        assert!(
+            descriptor_is_open(fd).is_ok(),
+            "the probe must be repeatable, so it cannot consume anything"
+        );
+        // SAFETY: `fd` was just proven open and nothing else owns it, so this is
+        // exactly the precondition `from_raw_fd` asks for.
+        let mut adopted = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut seen = std::vec::Vec::new();
+        adopted
+            .read_to_end(&mut seen)
+            .expect("the probe left the descriptor usable");
+        assert_eq!(
+            seen, b"probe payload",
+            "the probe must not consume any bytes"
+        );
+        drop(adopted);
+
+        // Descriptors that were never open. `-1` never reaches the probe (the shim
+        // screens it), but `-2` and a high unallocated number do.
+        for never in [-2 as c_int, 9998 as c_int] {
+            assert!(
+                descriptor_is_open(never).is_err(),
+                "fd {never} was never open, so the probe must say so"
+            );
+        }
+
+        // A genuinely closed descriptor, taken at a deliberately high number so
+        // that closing it cannot hand the slot to a concurrently running test —
+        // see [`reserve_high_descriptor`] for why a low number would be a race
+        // rather than a test.
+        let copy = reserve_high_descriptor();
+        assert!(
+            descriptor_is_open(copy).is_ok(),
+            "a fresh duplicate must probe as open"
+        );
+        // SAFETY: `copy` is a descriptor this test created and solely owns, so
+        // closing it exactly once is correct.
+        assert_eq!(unsafe { close(copy) }, 0, "closing our own duplicate");
+        assert!(
+            descriptor_is_open(copy).is_err(),
+            "a closed descriptor must probe as closed"
+        );
+    }
+
+    /// The ownership decision itself: a descriptor **proven** open becomes an
+    /// `Owned(File)`, and one that is not becomes an `Adopted` raw owner. No
+    /// `File` may ever be built from an unproven descriptor — that is the entire
+    /// finding.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_proven_descriptor_is_owned_as_a_file() {
+        use std::os::fd::IntoRawFd;
+
+        let (path, _cpath) = unique_path("ownform");
+        let fd = path.create().into_raw_fd();
+
+        // SAFETY: the test transfers sole ownership of `fd`, which is what
+        // `adopt_descriptor` requires; the returned owner closes it below.
+        let owned = unsafe { adopt_descriptor(fd) }.expect("adoption must succeed");
+        assert!(
+            matches!(owned, crate::gz::GzFile::Owned(_)),
+            "a descriptor proven open must be owned as a std File"
+        );
+        assert_eq!(
+            owned.raw_descriptor(),
+            Some(fd),
+            "the owner must report the descriptor it was handed"
+        );
+        drop(owned);
+
+        // Anything the probe refuses is owned raw instead, so `from_raw_fd`'s
+        // precondition is never asserted about a descriptor that does not meet it.
+        for unproven in [-2 as c_int, 9998 as c_int] {
+            // SAFETY: `unproven` is not the `-1` sentinel and nothing else owns
+            // that number; adopting an invalid descriptor is the documented C
+            // contract.
+            let raw = unsafe { adopt_descriptor(unproven) }.expect("adoption must succeed");
+            assert!(
+                matches!(raw, crate::gz::GzFile::Adopted(_)),
+                "fd {unproven} is not open, so it must NOT become a std File"
+            );
+            assert_eq!(
+                raw.raw_descriptor(),
+                Some(unproven),
+                "the raw owner must report the descriptor it was handed"
+            );
+            drop(raw);
+        }
+    }
+
+    /// The raw owner for an unproven descriptor must fail every byte operation
+    /// with the platform's own errno, succeed at `flush` (C never flushes), report
+    /// a failing close, and — when relinquished — close nothing at all.
+    #[cfg(unix)]
+    #[test]
+    fn the_raw_owner_defers_the_platform_error_and_can_abdicate() {
+        use crate::gz::RawFileIo as _;
+        use std::os::fd::IntoRawFd;
+
+        let errno = descriptor_is_open(-2).expect_err("fd -2 is not open");
+        let mut dead = DeadDescriptor {
+            fd: Some(-2),
+            errno,
+        };
+        assert_eq!(
+            dead.read(&mut [0u8; 4])
+                .expect_err("a read must fail")
+                .raw_os_error(),
+            Some(errno),
+            "the deferred read reports the errno the probe observed"
+        );
+        assert_eq!(
+            dead.write(b"x")
+                .expect_err("a write must fail")
+                .raw_os_error(),
+            Some(errno),
+            "the deferred write reports the same errno"
+        );
+        assert_eq!(
+            dead.seek(std::io::SeekFrom::Start(0))
+                .expect_err("a seek must fail")
+                .raw_os_error(),
+            Some(errno),
+            "the deferred seek reports the same errno"
+        );
+        assert!(
+            dead.flush().is_ok(),
+            "C never flushes a descriptor and File::flush is a no-op, so neither may this"
+        );
+        assert_eq!(dead.raw_descriptor(), -2);
+        assert!(
+            !std::boxed::Box::new(dead).close(),
+            "closing a descriptor that is not open must report failure, as C's does"
+        );
+
+        // Relinquishing must leave a real descriptor untouched — the `gzdopen`
+        // allocation-failure contract, on which C never closes the caller's fd.
+        let (path, _cpath) = unique_path("abdicate");
+        let live = path.create().into_raw_fd();
+        std::boxed::Box::new(DeadDescriptor {
+            fd: Some(live),
+            errno,
+        })
+        .relinquish();
+        assert!(
+            fd_is_alive(live),
+            "relinquish must NOT close the descriptor it was holding"
+        );
+        // SAFETY: `live` is still open and no Rust value owns it.
+        drop(unsafe { std::fs::File::from_raw_fd(live) });
+    }
+
+    /// End-to-end lifecycle for the exact descriptor the finding names: `-2`.
+    /// `gzdopen` must accept it, report nothing at first, then surface `Z_ERRNO`
+    /// from the first read *and* from the close — C's deferred-failure contract.
+    #[cfg(unix)]
+    #[test]
+    fn gzdopen_minus_two_is_adopted_and_defers_z_errno() {
+        // SAFETY: `-2` is not the `-1` sentinel and the mode is a NUL-terminated
+        // literal; the handle returned is consumed by the `gzclose_r` below.
+        let gz = unsafe { gzdopen(-2, c"rb".as_ptr()) };
+        assert!(
+            !gz.is_null(),
+            "zlib.h L1422-L1426: only fd == -1 is rejected, so -2 must be adopted"
+        );
+
+        let mut errnum: c_int = 4242;
+        // SAFETY: `gz` is a live handle and `errnum` is a valid out-parameter.
+        let msg = unsafe { gzerror(gz, &raw mut errnum) };
+        assert_eq!(errnum, Z_OK, "adoption itself must report no error");
+        // SAFETY: `msg` is a non-null NUL-terminated string owned by the handle.
+        assert!(unsafe { CStr::from_ptr(msg) }.to_bytes().is_empty());
+
+        let mut buf = [0u8; 4];
+        // SAFETY: `gz` is live and `buf` is valid for its own length.
+        assert_eq!(
+            unsafe { gzread(gz, buf.as_mut_ptr() as voidp, buf.len() as c_uint) },
+            -1,
+            "the first read is where an invalid descriptor shows up"
+        );
+        // SAFETY: as above.
+        let msg = unsafe { gzerror(gz, &raw mut errnum) };
+        assert_eq!(errnum, Z_ERRNO, "the deferred failure is an OS error");
+        // SAFETY: as above.
+        assert!(
+            !unsafe { CStr::from_ptr(msg) }.to_bytes().is_empty(),
+            "the OS error message must be reported, not swallowed"
+        );
+
+        // SAFETY: `gz` is live and is consumed here.
+        assert_eq!(
+            unsafe { gzclose_r(gz) },
+            Z_ERRNO,
+            "gzread.c L665-L667: a failing close(state->fd) reports Z_ERRNO"
+        );
+    }
+
+    /// End-to-end lifecycle for a descriptor that was open and has since been
+    /// closed — the second case the finding names. Adopted, then deferred, exactly
+    /// as for `-2`.
+    ///
+    /// Reuse-tolerant for the same reason as the probe test: the number is free
+    /// once closed, so a concurrent test may legitimately be handed it.
+    #[cfg(unix)]
+    #[test]
+    fn gzdopen_adopts_a_closed_descriptor_and_defers() {
+        // The number is taken at a deliberately HIGH value, because this test
+        // does not merely probe the descriptor — `gzdopen` ADOPTS it and
+        // `gzclose_r` CLOSES it. Over a recycled low number that makes the test
+        // actively destructive to whichever concurrently running test was handed
+        // the slot. See [`reserve_high_descriptor`].
+        let copy = reserve_high_descriptor();
+        // SAFETY: `copy` is solely owned by this test.
+        assert_eq!(unsafe { close(copy) }, 0);
+        assert!(
+            descriptor_is_open(copy).is_err(),
+            "the reserved number must be closed before it is handed to gzdopen"
+        );
+
+        // SAFETY: `copy` is not the `-1` sentinel and no live Rust value owns it;
+        // the handle is consumed by `gzclose_r` below.
+        let gz = unsafe { gzdopen(copy, c"rb".as_ptr()) };
+        assert!(
+            !gz.is_null(),
+            "a closed descriptor must be adopted, not rejected"
+        );
+
+        let mut buf = [0u8; 4];
+        // SAFETY: `gz` is live and `buf` is valid for its own length.
+        assert_eq!(
+            unsafe { gzread(gz, buf.as_mut_ptr() as voidp, buf.len() as c_uint) },
+            -1,
+            "reading a closed descriptor must fail"
+        );
+        let mut errnum: c_int = 0;
+        // SAFETY: `gz` is live and `errnum` is a valid out-parameter.
+        let _ = unsafe { gzerror(gz, &raw mut errnum) };
+        assert_eq!(errnum, Z_ERRNO);
+        // SAFETY: `gz` is live and is consumed here.
+        assert_eq!(unsafe { gzclose_r(gz) }, Z_ERRNO);
+    }
+
+    /// A *valid* adopted descriptor must support the whole operation set the
+    /// resolution names — read, write, seek and close — through the handle, with
+    /// no observable difference from a `gzopen`ed one.
+    #[cfg(unix)]
+    #[test]
+    fn an_adopted_valid_descriptor_reads_writes_seeks_and_closes() {
+        use std::os::fd::IntoRawFd;
+
+        let (path, _cpath) = unique_path("dopenseek");
+        let payload = b"0123456789abcdef";
+
+        unsafe {
+            // Write through an adopted descriptor.
+            let fd = path.create().into_raw_fd();
+            let wf = gzdopen(fd, c"wb".as_ptr());
+            assert!(!wf.is_null(), "a valid descriptor must open for writing");
+            assert_eq!(
+                gzwrite(wf, payload.as_ptr() as voidpc, payload.len() as c_uint),
+                payload.len() as c_int
+            );
+            assert_eq!(gzclose_w(wf), Z_OK, "an adopted descriptor closes cleanly");
+
+            // Read + seek through another adopted descriptor.
+            let fd = std::fs::File::open(&path).expect("reopen").into_raw_fd();
+            let rf = gzdopen(fd, c"rb".as_ptr());
+            assert!(!rf.is_null(), "a valid descriptor must open for reading");
+
+            // `gzseek` drives the underlying descriptor's seek, which is the
+            // operation a borrowed or unproven owner would get wrong. `0` is
+            // `SEEK_SET`, universal on every platform this crate targets.
+            assert_eq!(
+                gzseek(rf, 10, 0),
+                10,
+                "seeking forward inside an adopted stream"
+            );
+            let mut buf = [0u8; 6];
+            assert_eq!(
+                gzread(rf, buf.as_mut_ptr() as voidp, buf.len() as c_uint),
+                6,
+                "reading after the seek"
+            );
+            assert_eq!(&buf, b"abcdef", "the seek must land on the right byte");
+
+            // Rewinding proves the descriptor is genuinely seekable through the
+            // owner, not merely forward-skippable in the buffer.
+            assert_eq!(gzrewind(rf), 0, "an adopted read handle must rewind");
+            let mut head = [0u8; 4];
+            assert_eq!(
+                gzread(rf, head.as_mut_ptr() as voidp, head.len() as c_uint),
+                4
+            );
+            assert_eq!(&head, b"0123");
+            assert_eq!(gzclose_r(rf), Z_OK);
+        }
     }
 }

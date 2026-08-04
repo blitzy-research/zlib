@@ -83,10 +83,10 @@ except the two MSRV rows.
 
 | Gate | Command | Result |
 |------|---------|--------|
-| Test suite (default features) | `cargo test --locked` | **959 passed / 0 failed / 0 ignored** |
-| Test suite (all features) | `cargo test --locked --all-features` | **972 passed / 0 failed / 0 ignored** |
-| Test suite (`no_std`) | `cargo test --locked --no-default-features` | **696 passed / 0 failed / 0 ignored** |
-| Test suite (`no-std` feature) | `cargo test --locked --no-default-features --features no-std` | **696 passed / 0 failed / 0 ignored** |
+| Test suite (default features) | `cargo test --locked` | **1015 passed / 0 failed / 0 ignored** |
+| Test suite (all features) | `cargo test --locked --all-features` | **1028 passed / 0 failed / 0 ignored** |
+| Test suite (`no_std`) | `cargo test --locked --no-default-features` | **713 passed / 0 failed / 0 ignored** |
+| Test suite (`no-std` feature) | `cargo test --locked --no-default-features --features no-std` | **713 passed / 0 failed / 0 ignored** |
 | Formatting | `cargo fmt --all -- --check` | exit 0 |
 | Lints | `cargo clippy --locked --all-targets --all-features -- -D warnings` | exit 0 |
 | API docs | `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features` | exit 0, 0 warnings |
@@ -94,15 +94,15 @@ except the two MSRV rows.
 | MSRV build | `cargo +1.85.0 build --locked` | exit 0 |
 | MSRV type-check | `cargo +1.85.0 check --locked --all-targets` | exit 0 |
 | Exported C symbols | `nm -D --defined-only target/release/libzlib_rs.so` | **95**, all type `T` |
-| Packaged crate | `cargo package --locked --list` | **75** files; the unpacked archive re-runs its own suite at 959 |
+| Packaged crate | `cargo package --locked --list` | **75** files; the unpacked archive re-runs its own suite at 1015 |
 | Live byte-identity sweep | `cargo test --locked --features c-oracle --test c_oracle` | **3750/3750** and **50/50** byte-identical |
 
-The 959 default-feature tests decompose as **799** in-crate unit tests, **131**
-integration tests (`checksum` 23, `gzip_compat` 17, `inflate_coverage` 29,
+The 1015 default-feature tests decompose as **854** in-crate unit tests, **132**
+integration tests (`checksum` 23, `gzip_compat` 17, `inflate_coverage` 30,
 `interop` 30, `regression` 13, `round_trip` 19), and **29** doctests (28
 runnable plus one `compile_fail`).
 `--all-features` adds the 13 tests of the opt-in live C-oracle harness. Under
-`--no-default-features` the total is **571** unit + **98** integration + **27**
+`--no-default-features` the total is **587** unit + **99** integration + **27**
 doctests; the `gzip_compat` suite correctly reports 0 because the whole `gz*`
 file API is feature-gated off.
 
@@ -472,11 +472,11 @@ nothing else. CI's `c-abi-linkage`
 job runs the equivalent check on four feature rows and additionally asserts that
 the dynamic export set matches the `zlib.map` contract on every one of them.
 
-Release artifact sizes, observed on **2026-08-03** with **stable 1.97.1**, the
+Release artifact sizes, observed on **2026-08-04** with **stable 1.97.1**, the
 **default** feature set, `cargo build --locked --release`, into this repository's
 default `target/release/` (no `CARGO_TARGET_DIR` override): `libzlib_rs.rlib`
-≈ 2.7 MiB (2,791,948 B), `libzlib_rs.so` ≈ 646 KiB (660,944 B), `libzlib_rs.a`
-≈ 21.4 MiB (22,441,620 B).
+≈ 2.8 MiB (2,930,500 B), `libzlib_rs.so` ≈ 652 KiB (667,552 B), `libzlib_rs.a`
+≈ 21.4 MiB (22,464,508 B).
 
 Read those as a dated, environment-specific observation rather than a budget or an
 invariant. No gate asserts them; they move with the compiler, the feature row, and
@@ -1084,7 +1084,7 @@ that were previously tracked as open items are now closed:
   [Compatibility and RFCs](#compatibility-and-rfcs) for the full grid.
 - **`no_std` test coverage (done).** The full test suite compiles and passes
   under `cargo test --locked --no-default-features` (and `--features no-std`) —
-  **696 tests, 0 failed, 0 ignored** in both rows — and CI runs both as blocking
+  **713 tests, 0 failed, 0 ignored** in both rows — and CI runs both as blocking
   gates, plus a bare-metal `thumbv7em-none-eabihf` build job.
 - **Cross-platform CI (done).** Native Windows and macOS rows run the real suite;
   four further triples — aarch64, 32-bit x86, big-endian s390x, and

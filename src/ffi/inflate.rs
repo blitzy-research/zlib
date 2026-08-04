@@ -125,11 +125,16 @@ use crate::inflate::back::{InFunc, OutFunc};
 use crate::inflate::state::{InflateState, InflateStream};
 use crate::stream::{BoxedEngine, ZStream};
 
-// `gz_header` (the `#[repr(C)]` mirror) and the header write-back helper are
-// only referenced by the gzip-only `inflateGetHeader` path and the header
-// write-back inside `inflate`, so gate their imports to avoid unused warnings.
+// `gz_header` (the `#[repr(C)]` mirror), the raw header sink descriptors and the
+// header write-back helper are only referenced by the gzip-only
+// `inflateGetHeader` path and the header handling inside `inflate`, so gate their
+// imports to avoid unused warnings.
 #[cfg(feature = "gzip")]
-use crate::ffi::types::{borrow_gz_header_sink, gz_header, publish_gz_header};
+use crate::ffi::types::{CGzHeaderSinks, borrow_gz_header_sink, gz_header, publish_gz_header};
+#[cfg(feature = "gzip")]
+use crate::gz_header::{ForeignGzHeaderSink, HeaderPublication};
+#[cfg(feature = "gzip")]
+use crate::inflate::{InflateOutcome, TrackedInflateOutcome};
 
 // ---------------------------------------------------------------------------
 // Return-code constants
@@ -465,20 +470,44 @@ struct InflateBackHandle {
     /// same, so for a caller with an active hook these bytes live in the caller's
     /// own region and go back through their `zfree` when the handle drops.
     inner: BoxedEngine<InflateState>,
+    /// Base of the caller-supplied window the engine adopted (`infback.c` L60),
+    /// retained as a raw pointer alongside [`window_len`](Self::window_len).
+    ///
+    /// The engine owns the region through an `AllocBuffer::Foreign`, so this is a
+    /// *descriptor*, not a second owner: nothing here ever frees it, and it is
+    /// used only for the two boundary duties the engine cannot perform itself.
+    /// Recording it costs two words per handle and removes the need to reach back
+    /// into the engine's private buffer representation from the shim.
+    window: *mut c_uchar,
+    /// Byte length of that window — always `1 << windowBits`, derived by this
+    /// shim exactly as C derives `state->wsize` and never taken from the caller.
+    window_len: usize,
 }
 
 impl InflateBackHandle {
     /// Wraps a freshly built back-inflate state, tagging it as an `inflateBack`
-    /// handle.
+    /// handle and recording the adopted window's raw extent.
     ///
     /// The owner is left null until [`install_handle`] binds it.
     #[inline]
-    fn new(inner: BoxedEngine<InflateState>) -> Self {
+    fn new(inner: BoxedEngine<InflateState>, window: *mut c_uchar, window_len: usize) -> Self {
         Self {
             kind: HandleKind::INFLATE_BACK,
             owner: ptr::null(),
             inner,
+            window,
+            window_len,
         }
+    }
+
+    /// The half-open address range `[start, end)` the adopted window occupies.
+    ///
+    /// Used by [`CInFunc`] to decide whether a provider buffer overlaps the
+    /// window and must therefore be staged rather than published as a slice.
+    #[inline]
+    fn window_range(&self) -> (usize, usize) {
+        let start = self.window as usize;
+        (start, start.wrapping_add(self.window_len))
     }
 }
 
@@ -627,99 +656,276 @@ unsafe fn inflate_back_take(strm: &mut z_stream) -> Option<Box<InflateBackHandle
 // C callback adapters for `inflateBack`
 // ---------------------------------------------------------------------------
 
+/// Largest number of provider bytes `CInFunc` will publish in one segment.
+///
+/// A Rust slice length may not exceed `isize::MAX`, but the zlib `in_func`
+/// contract returns a `c_uint`. On a 32-bit target those ranges differ: a
+/// conforming callback may legitimately answer `0x8000_0000`, which is a valid
+/// `unsigned` and a valid readable extent for C but an invalid slice length. The
+/// buffer is therefore handed to the engine in segments no longer than this, which
+/// on a 64-bit target is unreachable (`c_uint::MAX < isize::MAX`) and so leaves
+/// behavior there completely unchanged.
+const IN_SEGMENT_MAX: usize = isize::MAX as usize;
+
+/// Bytes of private staging storage `CInFunc` uses for provider buffers that
+/// overlap the adopted `inflateBack` window.
+///
+/// Only that pathological-but-legal placement uses it, so the size trades a
+/// slightly larger stack frame for how often the engine has to come back for more
+/// input. 512 bytes is well above the largest single run the decoder copies out of
+/// one chunk in `STORED`/`LEN` handling, and the whole array lives in the
+/// `inflateBack` shim's frame.
+const IN_STAGE_CAP: usize = 512;
+
 /// Adapts zlib's C `in_func` to the engine's [`InFunc`] trait.
 ///
 /// On the first advance it yields whatever input was already buffered in the
 /// stream (`next_in[..avail_in]`); thereafter it invokes the C callback, which
 /// returns a byte count and points `*buf` at that many readable input bytes.
 ///
-/// The chunk is never copied. `advance` only records the provenance of the region
-/// the callback published, and `chunk` re-forms a slice over it on demand, so the
-/// engine decodes straight out of the caller's memory — the zero-allocation
-/// property `infback.c` has and a growing owned buffer would not.
+/// # Raw ranges, never whole-buffer slices
 ///
-/// It also records the provenance of the most recent chunk it hands to the
-/// engine (`last_ptr`/`last_len`), whether it has handed out any real input
-/// (`handed_out`), whether the most recent pull ran dry (`dry`), and the
-/// engine-reported unconsumed tail (`unconsumed`). After [`inflate_back`]
-/// returns, the shim uses these to restore the C `z_stream`'s `next_in`/
-/// `avail_in` exactly like C `infback.c`'s `inf_leave`.
-struct CInFunc<'a> {
+/// Both the pre-buffered input and every callback buffer are held as a raw
+/// pointer plus a count, and a slice is formed over at most one *segment* at a
+/// time. Two independent hazards make that necessary, and neither is a malformed
+/// input — both are placements zlib permits:
+///
+/// * **Length.** A `c_uint` count can exceed `isize::MAX` on a 32-bit target, so
+///   forming a slice over the whole buffer would violate
+///   [`slice::from_raw_parts`]'s length precondition. Segments are capped at
+///   [`IN_SEGMENT_MAX`].
+/// * **Aliasing.** The input may live *inside* the caller-supplied window — the
+///   same allocation the safe decoder writes through a `&mut [u8]`. A shared slice
+///   over it would alias that unique slice, so when the buffer's address range
+///   intersects the window's, up to [`IN_STAGE_CAP`] bytes are copied into this
+///   adapter's own `staged` array and the segment is published from there. No
+///   reference into the window is ever handed to the engine as input.
+///
+/// Neither path copies in the ordinary case: a disjoint buffer is published in
+/// place, preserving `infback.c`'s zero-allocation, zero-copy property.
+///
+/// # Cursor reconstruction
+///
+/// The adapter tracks the buffer currently in play (`cur_ptr`/`cur_len`), which
+/// segment of it is published (`seg_start`/`seg_len`), whether any real input has
+/// been handed out (`handed_out`), whether the most recent pull ran dry (`dry`),
+/// and the engine-reported unconsumed tail (`unconsumed`). After
+/// [`inflate_back`](crate::inflate::back::inflate_back) returns, the shim combines
+/// them to restore the C `z_stream`'s `next_in`/`avail_in` exactly like
+/// `infback.c`'s `inf_leave`: `next` at the first unconsumed byte of that buffer
+/// and `have` as everything after it — the un-decoded remainder of the published
+/// segment *plus* any segments not yet published.
+struct CInFunc {
     in_fn: unsafe extern "C" fn(*mut c_void, *mut *const c_uchar) -> c_uint,
     in_desc: *mut c_void,
-    initial: &'a [u8],
+    /// Base of the stream's pre-buffered input (C `strm->next_in`), held raw.
+    initial_ptr: *const c_uchar,
+    /// Its length (C `have` at `infback.c` L226-L231, already `0` when
+    /// `next_in` is null).
+    initial_len: usize,
+    /// Whether the pre-buffered input has been taken into play.
     initial_done: bool,
-    /// Base pointer of the most recent NON-EMPTY chunk handed to the engine
-    /// (the initial buffer first, then successive callback buffers). Defaults to
-    /// the initial buffer's base so a decode consuming only buffered input still
-    /// reconstructs a correct `next_in`.
-    last_ptr: *const c_uchar,
-    /// Length of that most-recent non-empty chunk.
-    last_len: usize,
-    /// Set once any non-empty chunk has been handed to the engine.
+    /// Half-open address range `[start, end)` of the adopted window, from
+    /// [`InflateBackHandle::window_range`]. A provider buffer intersecting it is
+    /// staged rather than published in place. `(0, 0)` disables the check.
+    window: (usize, usize),
+    /// Base pointer of the provider buffer currently in play — the pre-buffered
+    /// input first, then successive callback buffers.
+    cur_ptr: *const c_uchar,
+    /// Full length of that buffer, as the provider reported it.
+    cur_len: usize,
+    /// Offset within it at which the published segment starts.
+    seg_start: usize,
+    /// Length of the published segment. `seg_start + seg_len <= cur_len`.
+    seg_len: usize,
+    /// Largest in-place segment this adapter will publish.
+    ///
+    /// Always [`IN_SEGMENT_MAX`] in production. It is a field rather than a bare
+    /// constant so the multi-segment path is reachable from a test on any host:
+    /// the case it exists for needs a buffer larger than `isize::MAX`, which is
+    /// unallocatable on a 64-bit machine, so a test shrinks this to a handful of
+    /// bytes and exercises the identical code with an identical set of transitions.
+    segment_max: usize,
+    /// Whether the published segment lives in [`staged`](Self::staged) rather
+    /// than in the provider buffer itself.
+    staged_active: bool,
+    /// Private storage for segments copied out of a window-overlapping buffer.
+    staged: [u8; IN_STAGE_CAP],
+    /// Set once any non-empty segment has been handed to the engine.
     handed_out: bool,
-    /// Set when the MOST RECENT pull yielded an empty slice (the callback ran
-    /// dry). Mirrors C `PULL` returning 0, which sets `next = Z_NULL`/`have = 0`.
+    /// Set when the MOST RECENT pull yielded nothing (the callback ran dry).
+    /// Mirrors C `PULL` returning 0, which sets `next = Z_NULL`/`have = 0`.
     dry: bool,
-    /// Bytes of the last chunk left unconsumed at exit, reported by the engine
-    /// via [`InFunc::set_unconsumed`]. Combined with `last_ptr`/`last_len` to
-    /// reconstruct C's `next`/`have`.
+    /// Bytes of the published segment left unconsumed at exit, reported by the
+    /// engine via [`InFunc::set_unconsumed`].
     unconsumed: usize,
 }
 
-impl InFunc for CInFunc<'_> {
+impl CInFunc {
+    /// Builds an adapter over the stream's pre-buffered input and the callback,
+    /// with the window range that decides whether staging is required.
+    fn new(
+        in_fn: unsafe extern "C" fn(*mut c_void, *mut *const c_uchar) -> c_uint,
+        in_desc: *mut c_void,
+        initial_ptr: *const c_uchar,
+        initial_len: usize,
+        window: (usize, usize),
+    ) -> Self {
+        Self {
+            in_fn,
+            in_desc,
+            initial_ptr,
+            initial_len,
+            initial_done: false,
+            window,
+            cur_ptr: ptr::null(),
+            cur_len: 0,
+            seg_start: 0,
+            seg_len: 0,
+            segment_max: IN_SEGMENT_MAX,
+            staged_active: false,
+            staged: [0u8; IN_STAGE_CAP],
+            handed_out: false,
+            dry: false,
+            unconsumed: 0,
+        }
+    }
+
+    /// Whether the buffer currently in play shares any address with the adopted
+    /// window, in which case every segment taken from it must be staged.
+    ///
+    /// The test is deliberately made over the *whole* buffer rather than the
+    /// current segment: a partial overlap would otherwise flip staging on and off
+    /// mid-buffer for no benefit, and answering "overlapping" for a buffer that
+    /// merely touches the window is always safe.
+    fn overlaps_window(&self) -> bool {
+        let (ws, we) = self.window;
+        if ws == we || self.cur_len == 0 {
+            return false;
+        }
+        let bs = self.cur_ptr as usize;
+        let be = bs.wrapping_add(self.cur_len);
+        // Comparing addresses from distinct allocations is well defined in Rust
+        // (the ordering is merely unspecified), and a wrapped end can only come
+        // from a range no real live allocation can occupy — for which "treat it as
+        // overlapping" is the conservative answer.
+        if be < bs || we < ws {
+            return true;
+        }
+        bs < we && ws < be
+    }
+
+    /// Publishes the segment beginning at `offset` in the buffer in play.
+    ///
+    /// `offset` must be strictly less than `cur_len`. The segment is capped at
+    /// [`IN_SEGMENT_MAX`] in place, or copied into `staged` (capped at
+    /// [`IN_STAGE_CAP`]) when the buffer overlaps the window.
+    fn publish_from(&mut self, offset: usize) {
+        let remaining = self.cur_len - offset;
+        self.seg_start = offset;
+        if self.overlaps_window() {
+            // `segment_max` also bounds the staged path so a test that shrinks it
+            // drives both kinds of segmentation through the same transitions.
+            let n = remaining.min(IN_STAGE_CAP).min(self.segment_max);
+            // SAFETY: `offset + n <= cur_len` and the provider guarantees
+            // `cur_len` readable bytes at `cur_ptr` until it is next invoked, so
+            // the source range is readable. The destination is this adapter's own
+            // array, at least `n` bytes long and — being a distinct local
+            // allocation — necessarily disjoint from the provider's region, which
+            // is what `copy_nonoverlapping` requires. The read is performed
+            // through a raw pointer and no reference into the provider region is
+            // created, so it cannot alias the engine's unique window slice even
+            // when the two regions are the same memory.
+            unsafe {
+                ptr::copy_nonoverlapping(self.cur_ptr.add(offset), self.staged.as_mut_ptr(), n);
+            }
+            self.seg_len = n;
+            self.staged_active = true;
+        } else {
+            self.seg_len = remaining.min(self.segment_max);
+            self.staged_active = false;
+        }
+        self.handed_out = true;
+        self.dry = false;
+    }
+
+    /// Publishes the next segment of the buffer already in play, or returns
+    /// `false` when it is exhausted and the callback must be invoked.
+    ///
+    /// Serving the remainder of a buffer without re-entering the callback is
+    /// exactly C's `PULL`, which calls `in()` only while `have == 0`.
+    fn publish_next_segment(&mut self) -> bool {
+        let end = self.seg_start + self.seg_len;
+        if end >= self.cur_len {
+            return false;
+        }
+        self.publish_from(end);
+        true
+    }
+
+    /// Offset within the buffer in play of the first byte the engine has not
+    /// consumed — C's `next - <buffer base>` at `inf_leave`.
+    fn consumed(&self) -> usize {
+        self.seg_start + (self.seg_len - self.unconsumed)
+    }
+}
+
+impl InFunc for CInFunc {
     fn advance(&mut self) -> bool {
         if !self.initial_done {
             self.initial_done = true;
-            if !self.initial.is_empty() {
-                // Record the initial stream buffer as the current chunk.
-                self.last_ptr = self.initial.as_ptr();
-                self.last_len = self.initial.len();
-                self.handed_out = true;
-                self.dry = false;
+            if self.initial_len != 0 {
+                self.cur_ptr = self.initial_ptr;
+                self.cur_len = self.initial_len;
+                self.publish_from(0);
                 return true;
             }
+        } else if self.publish_next_segment() {
+            return true;
         }
         let mut buf: *const c_uchar = ptr::null();
         // SAFETY: `in_fn` is a valid zlib `in_func` (checked non-null by the
         // `inflateBack` shim before this adapter is constructed). Per the zlib
         // callback contract it returns a count `n` and stores in `*buf` a pointer
         // to `n` readable bytes that remain valid at least until the next call —
-        // which is exactly the window over which `chunk` re-forms the slice.
+        // which is exactly the window over which `chunk` re-forms each segment.
         let n = unsafe { (self.in_fn)(self.in_desc, &mut buf) };
         if n == 0 || buf.is_null() {
             // Callback ran dry: mirror C `PULL` returning 0 (next = Z_NULL). The
             // recorded provenance is left in place so `chunk` keeps reporting the
-            // previous, fully consumed region and C's `have` stays `0`.
+            // previous, fully consumed segment and C's `have` stays `0`.
             self.dry = true;
             false
         } else {
-            // Record this callback buffer as the current chunk.
-            self.last_ptr = buf;
-            self.last_len = n as usize;
-            self.handed_out = true;
-            self.dry = false;
+            self.cur_ptr = buf;
+            self.cur_len = n as usize;
+            self.publish_from(0);
             true
         }
     }
 
     fn chunk(&self) -> &[u8] {
         if !self.handed_out {
-            // Nothing has been published yet. `last_ptr`/`last_len` are
-            // pre-seeded with the initial buffer so the exit-cursor arithmetic
-            // works even for a decode that pulls nothing, but that region has not
-            // been handed to the engine, so reporting it here would let the
-            // decoder consume the same bytes twice.
+            // Nothing has been published yet, so there is no current segment. A
+            // decode that pulls nothing leaves the caller's cursors untouched,
+            // which the shim handles from `handed_out` directly.
             return &[];
         }
-        // SAFETY: `handed_out` means the most recent successful `advance` recorded
-        // `last_len` readable bytes at `last_ptr` — either the caller's
-        // `next_in[..avail_in]` window or a region the C `in_func` published.
-        // Either stays valid until the next callback invocation, and `advance` is
-        // the only thing that invokes it, so no slice formed here outlives its
-        // region. `last_len` came from a `c_uint`, so it cannot exceed
-        // `isize::MAX`.
-        unsafe { slice::from_raw_parts(self.last_ptr, self.last_len) }
+        if self.staged_active {
+            // The window-overlapping case: the segment lives in this adapter's own
+            // storage, so the slice cannot alias the engine's window.
+            return &self.staged[..self.seg_len];
+        }
+        // SAFETY: `handed_out` with `staged_active == false` means the most recent
+        // `publish_from` found the provider buffer disjoint from the window and
+        // recorded a segment `[seg_start, seg_start + seg_len)` inside `cur_len`
+        // readable bytes at `cur_ptr` — either the caller's `next_in[..avail_in]`
+        // region or one the C `in_func` published, both valid until the callback
+        // is next invoked, and `advance` is the only thing that invokes it.
+        // `seg_len <= IN_SEGMENT_MAX == isize::MAX`, so the length precondition
+        // holds on every target width, and the region is disjoint from the window
+        // so the shared slice cannot alias the engine's unique window slice.
+        unsafe { slice::from_raw_parts(self.cur_ptr.add(self.seg_start), self.seg_len) }
     }
 
     fn set_unconsumed(&mut self, unconsumed: usize) {
@@ -772,6 +978,213 @@ unsafe fn version_check(version: *const c_char, stream_size: c_int) -> bool {
         return false;
     }
     stream_size == size_of::<z_stream>() as c_int
+}
+
+/// Bytes of caller input copied into a stack buffer per header sub-pass on the
+/// overlapping-header path.
+///
+/// The header pass must never hand the engine a `&[u8]` over the caller's own
+/// input window, because a `head->extra` buffer that overlaps that window would be
+/// written through an independent pointer while the reference is live. Copying
+/// into local storage first removes the aliasing entirely; the copy is bounded so
+/// the stack cost is fixed no matter how large `extra_max`/`name_max`/`comm_max`
+/// are, and the header parser resumes across sub-passes exactly as it resumes
+/// across ordinary `inflate` calls.
+#[cfg(feature = "gzip")]
+const HEADER_PASS_STAGE: usize = 512;
+
+/// Counts entries into [`inflate_split_over_header`], for the tests' anti-vacuity
+/// assertions only.
+///
+/// The split path is taken only when a registered header buffer shares bytes with
+/// the caller's input or output window, which no ordinary caller does. A test that
+/// *believes* it constructed that layout but got the byte arithmetic wrong would
+/// silently assert about the single-pass path instead and pass for the wrong
+/// reason, so the tests read this counter to confirm the path they mean to cover
+/// actually ran.
+#[cfg(all(test, feature = "gzip"))]
+static HEADER_SPLIT_PASSES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Runs one C `inflate` call as a header phase followed by a data phase, for the
+/// case where a registered `gz_header` buffer shares bytes with the caller's input
+/// or output window.
+///
+/// # Why the call must be split
+///
+/// C stores each decoded header byte straight through `head->extra`,
+/// `head->name` or `head->comment` — three caller pointers the API places under
+/// **no** disjointness obligation, either with each other or with `strm->next_in`
+/// and `strm->next_out`. Raw descriptors (`CRawHeaderSink`) already make
+/// overlap *between the three payloads* sound, because no reference over them is
+/// ever formed. Overlap with a *window* is different in kind: the engine
+/// necessarily holds `&[u8]`/`&mut [u8]` over the windows for the whole call, and a
+/// write through an unrelated pointer into those same bytes invalidates that
+/// reference — the engine's next window access is then undefined behaviour even
+/// though every individual write was in bounds. No amount of bounds checking fixes
+/// that; only not having both live at once does.
+///
+/// So the call is separated in time:
+///
+/// * **Header phase.** While the state is still in one of C's `HEAD`..`HCRC` modes
+///   (see [`InflateMode::is_header_phase`]), the engine runs against a *staged copy*
+///   of the caller's input and an **empty** output window. Header bytes are stored,
+///   nothing is produced, and no reference over either caller window exists while
+///   they are. The pass uses `Z_BLOCK`, which is C's own "stop at the first block
+///   boundary" flush (`inflate.c` `case TYPE`), so it halts exactly where the
+///   header ends rather than running on into the first block.
+/// * **Data phase.** Once the header is complete, the windows are re-materialized
+///   from the caller's `next_in`/`next_out` and the engine runs the caller's real
+///   flush with **no** sink attached — by then C stores no further header byte, so
+///   there is nothing to alias.
+///
+/// The ordering is C's ordering: header bytes land before decompressed bytes, so a
+/// caller that overlaps a header buffer with its output window sees the output
+/// overwrite the header bytes, exactly as reference zlib leaves it.
+///
+/// # Composition
+///
+/// The caller must observe one call's worth of results, so the sub-passes are
+/// folded: consumption sums, production comes from the data phase (the header phase
+/// has no output window), the publication records merge
+/// ([`HeaderPublication::merged_with`]), and C's single no-progress clause
+/// `if (((in == 0 && out == 0) || flush == Z_FINISH) && ret == Z_OK) ret =
+/// Z_BUF_ERROR;` (`inflate.c` L1143-L1145) is applied once over the totals — in
+/// both directions, since a sub-pass may report `Z_BUF_ERROR` from its own
+/// zero-progress view while the call as a whole progressed.
+///
+/// # Safety
+///
+/// `in_ptr` must be valid for reads of `in_len` bytes and `out_ptr` valid for
+/// writes of `out_len` bytes for the duration of the call, or the corresponding
+/// length must be `0`. These are the caller's `next_in`/`avail_in` and
+/// `next_out`/`avail_out` as already validated by `stream_buffers_valid`.
+#[cfg(feature = "gzip")]
+unsafe fn inflate_split_over_header(
+    zs: &mut ZStream<CAllocator>,
+    in_ptr: *const Bytef,
+    in_len: usize,
+    out_ptr: *mut Bytef,
+    out_len: usize,
+    flush: c_int,
+    mut view: Option<&mut ForeignGzHeaderSink<'_>>,
+) -> TrackedInflateOutcome {
+    /// C `Z_FINISH` (4).
+    const Z_FINISH: c_int = crate::constants::Z_FINISH as c_int;
+    /// C `Z_BLOCK` (5) — the header pass's flush.
+    const Z_BLOCK: c_int = crate::constants::Z_BLOCK as c_int;
+    /// C `Z_TREES` (6).
+    const Z_TREES: c_int = crate::constants::Z_TREES as c_int;
+
+    #[cfg(test)]
+    HEADER_SPLIT_PASSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+    let mut consumed = 0usize;
+    let mut produced = 0usize;
+    let mut header = HeaderPublication::default();
+    let mut code = ReturnCode::Ok;
+    let mut commit_totals = true;
+    let mut ran_header_pass = false;
+
+    // ---- header phase --------------------------------------------------------
+    let mut stage = [0u8; HEADER_PASS_STAGE];
+    while consumed < in_len
+        && zs
+            .inflate_state()
+            .is_some_and(|state| state.mode.is_header_phase())
+    {
+        let n = core::cmp::min(in_len - consumed, HEADER_PASS_STAGE);
+        // SAFETY: `consumed < in_len` and `n <= in_len - consumed`, so
+        // `in_ptr.add(consumed)` starts inside the caller's input window and the
+        // `n`-byte read stays within it; `stage` is a live local of
+        // `HEADER_PASS_STAGE >= n` bytes. The two cannot overlap: `stage` is this
+        // frame's own storage. Reading here — before the engine call that may write
+        // through an overlapping header pointer — is what keeps the read valid.
+        unsafe { ptr::copy_nonoverlapping(in_ptr.add(consumed), stage.as_mut_ptr(), n) };
+        let pass = crate::inflate::inflate_tracked_lending(
+            zs,
+            &stage[..n],
+            &mut [],
+            Z_BLOCK,
+            view.as_deref_mut(),
+        );
+        ran_header_pass = true;
+        consumed += pass.outcome.consumed;
+        header = header.merged_with(pass.header);
+        code = pass.outcome.code;
+        commit_totals = pass.commit_totals;
+        // Stop on anything other than ordinary progress: a `Bad`/`Mem` state, a
+        // `Z_NEED_DICT` handshake, or a sub-pass that consumed nothing (which would
+        // otherwise spin, since the next iteration would stage the same bytes).
+        if code != ReturnCode::Ok || pass.outcome.consumed == 0 {
+            break;
+        }
+    }
+
+    // ---- data phase ----------------------------------------------------------
+    //
+    // Skipped when the header is not yet complete (C cannot have produced output
+    // either), when a sub-pass reported anything but `Z_OK`, and when the caller
+    // asked to stop at a block boundary and the header pass already delivered it —
+    // `Z_BLOCK`/`Z_TREES` return at C's `case TYPE`, which is precisely where the
+    // header pass halted.
+    let header_complete = zs
+        .inflate_state()
+        .is_some_and(|state| !state.mode.is_header_phase());
+    let stopped_at_block_boundary = ran_header_pass && (flush == Z_BLOCK || flush == Z_TREES);
+    if code == ReturnCode::Ok && header_complete && !stopped_at_block_boundary {
+        // Both windows are re-derived from the caller's own `next_in`/`next_out`, so
+        // neither inherits a reference tag the header pass may have invalidated by
+        // writing through an overlapping header pointer, and no sink is attached to
+        // this pass — nothing writes through a header pointer while these are live.
+        let out: &mut [u8] = if out_len == 0 {
+            &mut []
+        } else {
+            // SAFETY: `out_len` bytes from `out_ptr` are the caller's output window,
+            // valid for writes for the duration of this call per this function's
+            // contract, and `out_len != 0` here so the pointer is non-null. This is
+            // the only live reference over that region.
+            unsafe { slice::from_raw_parts_mut(out_ptr, out_len) }
+        };
+        let remaining = in_len - consumed;
+        let inp: &[u8] = if remaining == 0 {
+            &[]
+        } else {
+            // SAFETY: `consumed <= in_len` and `remaining == in_len - consumed != 0`,
+            // so `in_ptr.add(consumed)` starts inside the caller's input window and
+            // the `remaining`-byte read stays within it; the window is valid for
+            // reads for the duration of this call per this function's contract.
+            unsafe { slice::from_raw_parts(in_ptr.add(consumed), remaining) }
+        };
+        let pass = crate::inflate::inflate_tracked_lending(zs, inp, out, flush, None);
+        consumed += pass.outcome.consumed;
+        produced = pass.outcome.produced;
+        header = header.merged_with(pass.header);
+        code = pass.outcome.code;
+        commit_totals = pass.commit_totals;
+    }
+
+    // ---- C's no-progress clause, applied once over the whole call -------------
+    let progressed = consumed != 0 || produced != 0;
+    if code == ReturnCode::Ok && (!progressed || flush == Z_FINISH) {
+        // `inflate.c` L1143-L1145 verbatim.
+        code = ReturnCode::BufError;
+    } else if code == ReturnCode::BufError && progressed && flush != Z_FINISH {
+        // The converse: a sub-pass saw no progress of its own and applied the clause,
+        // but the call it belongs to did progress. `Z_BUF_ERROR` has no other source
+        // in C's `inflate`, so undoing it here cannot mask a different condition.
+        code = ReturnCode::Ok;
+    }
+
+    TrackedInflateOutcome {
+        outcome: InflateOutcome {
+            code,
+            consumed,
+            produced,
+        },
+        commit_totals,
+        header,
+    }
 }
 
 // ===========================================================================
@@ -924,11 +1337,36 @@ pub unsafe extern "C" fn inflateInit_(
 /// Only a call that will be *accepted* must actually supply `1 << windowBits`
 /// live, un-aliased bytes that outlive the state.
 ///
-/// The region is adopted, never written — see `crate::ffi::alloc`'s
-/// `borrow_caller_window`. A caller that pre-fills its window and then makes a
-/// call this function refuses (a rejected argument, or an allocator that turns
-/// the state request down) finds the buffer byte-for-byte unchanged, exactly as a
-/// C build leaves it.
+/// # Documented divergence: an accepted init zero-fills the window
+///
+/// C's adoption is a bare `state->window = window;` that writes nothing. This shim
+/// zero-fills the whole `1 << windowBits` region as the **last act of the
+/// accepting path**, after every fallible step has succeeded. That is a deliberate
+/// divergence, and it is mandated by Rust's validity rules rather than chosen: the
+/// decoder addresses the window through slices, and a `&[u8]`/`&mut [u8]` over
+/// abstract-uninitialized bytes is undefined behavior even when nothing reads it,
+/// so a buffer that arrives fresh from `malloc` must be initialized before its
+/// first reference exists.
+///
+/// Three properties bound the divergence as tightly as it can be bounded:
+///
+/// * **Every refusing path still leaves the buffer byte-for-byte unchanged** — a
+///   rejected argument, an allocator that turns C's single state request down, or
+///   an exhausted Rust heap. So does [`inflateBackEnd`], which frees only the state
+///   (`infback.c` L572-L577). A caller can therefore still distinguish "refused"
+///   from "accepted" by its own bytes, exactly as against a C build.
+/// * **No conforming caller can observe it on the accepting path.**
+///   `inflateBack` treats the window purely as its output buffer — it assigns
+///   `put = state->window; left = state->wsize;` (`infback.c` L222-L223) and resets
+///   `state->whave = 0`, so pre-existing content is never consulted, and zlib
+///   offers no way to seed `inflateBack` history (there is no
+///   `inflateBackSetDictionary`). The fill erases only bytes the decode was about
+///   to overwrite or would never have read.
+/// * **It happens at init, not at decode time, on purpose.** A caller may legally
+///   stage its compressed input *inside* the window and point `next_in` at it;
+///   filling on the first `inflateBack` would erase that input and turn a decode C
+///   completes into `Z_DATA_ERROR`. Filling here means anything the caller writes
+///   after a successful init survives untouched.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn inflateBackInit_(
     strm: z_streamp,
@@ -1001,9 +1439,39 @@ pub unsafe extern "C" fn inflateBackInit_(
                 // (`infback.c` L52-L53), not as an abort (AAP §0.6.5). The
                 // dropped `state` releases the state reservation through the
                 // caller's `zfree` and leaves the lent window untouched.
-                let Some(handle) = try_box(InflateBackHandle::new(state)) else {
+                let window_len = 1usize << window_bits;
+                let Some(handle) = try_box(InflateBackHandle::new(state, window, window_len))
+                else {
                     return Z_MEM_ERROR;
                 };
+                // Initialize the adopted region, once, now that every fallible step
+                // has succeeded and before anything can form a slice over it.
+                //
+                // C's L60 adoption is a bare pointer store, so the bytes arrive
+                // abstract-uninitialized, and a `&[u8]`/`&mut [u8]` over such bytes
+                // is validity UB whether or not it is read — which the decoder,
+                // addressing the window through slices, would otherwise commit on
+                // its first access. `ForeignBuffer::len` keeps the length queries
+                // above from being that first access, so this is genuinely the
+                // earliest reference and the fill precedes it.
+                //
+                // Placed here, not in `inflateBack`: a caller may legally stage its
+                // compressed input *inside* the window (see `CInFunc`), and filling
+                // at decode time would erase input the caller had already written.
+                // Filling at the end of init instead means every refusing path —
+                // rejected argument, refused state request, exhausted Rust heap —
+                // still leaves the caller's buffer byte-for-byte untouched, exactly
+                // as C leaves it, and so does `inflateBackEnd`.
+                //
+                // SAFETY: `window` is non-null (checked above) and the caller's
+                // documented contract guarantees it is valid for writes of
+                // `1 << window_bits` bytes and stays valid, un-aliased, until
+                // `inflateBackEnd`. `window_len` is that same count, derived here
+                // rather than taken from the caller. The engine holds an equivalent
+                // raw pointer inside its `AllocBuffer::Foreign` but no reference
+                // into the region exists at this moment, so the write conflicts
+                // with nothing.
+                unsafe { ptr::write_bytes(window, 0u8, window_len) };
                 // SAFETY: transfers ownership of the `Box<InflateBackHandle>`
                 // into the opaque `state` slot; reclaimed and dropped by
                 // `inflateBackEnd` after tag validation. The owner is recorded
@@ -1145,6 +1613,36 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
         // for the duration of the call.
         let output: &mut [u8] = unsafe { output_slice(sref) };
 
+        // Raw geometry of the caller's two windows, taken from the `z_stream`
+        // itself rather than from the slices above.
+        //
+        // A C caller's `head->extra`/`name`/`comment` buffers are three further
+        // independent pointers under no disjointness obligation, so any of them may
+        // land inside these windows. Recording the ranges lets the header path below
+        // detect that and separate the header stores from the decoder's window
+        // accesses in *time* — the only way a store through the caller's header
+        // pointer cannot invalidate a live reference over the same bytes.
+        //
+        // Taking the pointers from `next_in`/`next_out` is deliberate: they are the
+        // caller's own, and a window re-materialized from them carries provenance
+        // independent of the `input`/`output` references above, which is exactly
+        // what a second engine pass needs once the first has written through an
+        // overlapping header pointer.
+        #[cfg(feature = "gzip")]
+        let (in_ptr, in_len) = (sref.next_in, input.len());
+        #[cfg(feature = "gzip")]
+        let (out_ptr, out_len) = (sref.next_out, output.len());
+        #[cfg(feature = "gzip")]
+        let in_range = {
+            let start = in_ptr as usize;
+            (start, start.saturating_add(in_len))
+        };
+        #[cfg(feature = "gzip")]
+        let out_range = {
+            let start = out_ptr as usize;
+            (start, start.saturating_add(out_len))
+        };
+
         // Snapshot the caller's `adler` before `handle` takes a mutable borrow
         // of `sref` (see `seed_adler_mirror`).
         let caller_adler = sref.adler;
@@ -1180,25 +1678,60 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
         // `&mut handle.zs` borrow below.
         #[cfg(feature = "gzip")]
         let head_ptr = handle.head;
-        // The sink is scoped to the engine call alone: the mutable slices it holds
-        // alias the caller's header buffers, and the write-back below reaches the
-        // same struct through `head_ptr`, so the borrow must be provably finished
-        // before that happens.
+        // The sink is scoped to the engine call alone: it holds raw descriptors
+        // addressing the caller's header buffers, and the write-back below reaches
+        // the same struct through `head_ptr`, so the descriptors must be provably
+        // out of scope before that happens.
+        #[cfg(feature = "gzip")]
         let tracked = {
             // SAFETY: `head_ptr` is either null or the `gz_header` the caller
             // registered through `inflateGetHeader` and undertook to keep valid,
             // with `extra`/`name`/`comment` writable for their declared `*_max`.
-            #[cfg(feature = "gzip")]
-            let mut sink = unsafe { borrow_gz_header_sink(head_ptr) };
-            crate::inflate::inflate_tracked_lending(
-                &mut handle.zs,
-                input,
-                output,
-                flush,
-                #[cfg(feature = "gzip")]
-                sink.as_mut(),
-            )
+            let mut sinks = unsafe { borrow_gz_header_sink(head_ptr) };
+            // Does any registered header buffer share bytes with the caller's input
+            // or output window? C tolerates that — its stores are plain indexed
+            // writes through independent pointers — but a Rust reference over one
+            // window cannot survive a write through a pointer into the other, so the
+            // two must be separated in time. This is the *only* condition under which
+            // the split path runs; the universal disjoint case keeps the single call.
+            let split = sinks.as_ref().is_some_and(|sinks| {
+                sinks.intersects(out_range.0, out_range.1)
+                    || sinks.intersects(in_range.0, in_range.1)
+            });
+            // One set of descriptors serves every pass, so the declared `XLEN` the
+            // engine assigns in `EXLEN` is still visible to the `EXTRA` pass that
+            // derives its write offset from it — even when they fall in different
+            // passes.
+            let mut view = sinks.as_mut().map(CGzHeaderSinks::view);
+            if split {
+                // SAFETY: `in_ptr`/`out_ptr` are the caller's own `next_in`/`next_out`
+                // as validated by `stream_buffers_valid`, and `in_len`/`out_len` are
+                // the `avail_in`/`avail_out` byte counts `input_slice`/`output_slice`
+                // measured from the same fields, so each window is valid for that
+                // many bytes for the duration of this call.
+                unsafe {
+                    inflate_split_over_header(
+                        &mut handle.zs,
+                        in_ptr,
+                        in_len,
+                        out_ptr,
+                        out_len,
+                        flush,
+                        view.as_mut(),
+                    )
+                }
+            } else {
+                crate::inflate::inflate_tracked_lending(
+                    &mut handle.zs,
+                    input,
+                    output,
+                    flush,
+                    view.as_mut(),
+                )
+            }
         };
+        #[cfg(not(feature = "gzip"))]
+        let tracked = crate::inflate::inflate_tracked_lending(&mut handle.zs, input, output, flush);
         let outcome = tracked.outcome;
 
         // C's `inflate_fast` gives back `bits >> 3` whole input bytes by rewinding a
@@ -2098,10 +2631,23 @@ pub unsafe extern "C" fn inflateBack(
             return Z_STREAM_ERROR;
         }
 
-        // SAFETY: detached-lifetime input window (see `inflate`); it points at the
-        // caller's external buffer, so it stays valid across the later `&mut`
-        // re-borrow of the stream for cursor restoration.
-        let initial: &[u8] = unsafe { input_slice(sref) };
+        // The pre-buffered input is captured as a RAW range, never a slice. It may
+        // legally live inside the caller's window — the same allocation the safe
+        // decoder writes through a `&mut [u8]` — so a shared slice over it could
+        // alias that unique borrow; and on a 32-bit target `avail_in` can exceed
+        // `isize::MAX`, which is not a valid slice length. `CInFunc` resolves both
+        // by publishing bounded segments, staged into private storage when the
+        // ranges intersect.
+        //
+        // The null-`next_in` clause is C's own: `infback.c` L226-L231 loads
+        // `have = next != Z_NULL ? strm->avail_in : 0`, so a null pointer with a
+        // nonzero count contributes no input rather than being dereferenced.
+        let initial_ptr = sref.next_in;
+        let initial_len = if initial_ptr.is_null() {
+            0
+        } else {
+            sref.avail_in as usize
+        };
 
         // Fetch the tagged `inflateBack` handle, validating the kind before
         // touching the engine state. A missing handle, or one owned by the
@@ -2111,24 +2657,19 @@ pub unsafe extern "C" fn inflateBack(
             Some(h) => h,
             None => return Z_STREAM_ERROR,
         };
+
+        // Captured before the engine borrow below, since both come from `handle`.
+        // `CInFunc` needs it to recognise input that lives inside the window and
+        // stage it rather than publish a slice aliasing the engine's output.
+        let window_range = handle.window_range();
         let state = &mut **handle.inner;
 
-        let mut src = CInFunc {
-            in_fn,
-            in_desc,
-            initial,
-            initial_done: false,
-            last_ptr: initial.as_ptr(),
-            last_len: initial.len(),
-            handed_out: false,
-            dry: false,
-            unconsumed: 0,
-        };
+        let mut src = CInFunc::new(in_fn, in_desc, initial_ptr, initial_len, window_range);
         let mut sink = COutFunc { out_fn, out_desc };
 
         let outcome = crate::inflate::back::inflate_back(state, &mut src, &mut sink);
-        // `state`/`handle` borrows of `sref` end here; `src` is a local that only
-        // borrows the detached-lifetime `initial`, so it stays readable below.
+        // `state`/`handle` borrows of `sref` end here; `src` is a local holding only
+        // raw ranges, so it stays readable below.
 
         // Publish `strm->msg`. C clears it at `infback.c` L214 — after the
         // valid-state check at L209-L210, which is why a rejected call (handled
@@ -2152,15 +2693,25 @@ pub unsafe extern "C" fn inflateBack(
             sref.next_in = ptr::null();
             sref.avail_in = 0;
         } else if src.handed_out {
-            // `unconsumed <= last_len` by construction; `consumed` is the offset
-            // of the unconsumed tail within the last chunk.
-            let consumed = src.last_len - src.unconsumed;
-            // SAFETY: `last_ptr` is the base of the last chunk of `last_len`
-            // readable bytes; `consumed <= last_len`, so the offset is in-bounds
-            // (one-past-the-end is permitted when fully consumed, matching C's
-            // `next` pointer).
-            sref.next_in = unsafe { src.last_ptr.add(consumed) };
-            sref.avail_in = src.unconsumed as c_uint;
+            // `consumed` is the offset of the first byte the engine did not take,
+            // measured in the buffer that was in play — the published segment's
+            // start plus the part of it that was decoded. C's `have` is everything
+            // after that point in the buffer, which for a segmented or staged
+            // buffer includes the bytes never published as well as the tail of the
+            // segment that was. When neither segmentation nor staging applies —
+            // every 64-bit case, and every 32-bit case under 2 GiB — `seg_start`
+            // is `0` and `seg_len` is `cur_len`, so this reduces to the previous
+            // `avail_in = unconsumed` exactly.
+            let consumed = src.consumed();
+            // SAFETY: `cur_ptr` is the base of `cur_len` readable bytes and
+            // `consumed <= cur_len` by the segment invariants, so the offset is
+            // in-bounds (one-past-the-end is permitted when fully consumed,
+            // matching C's `next` pointer). The result is published to the caller
+            // and never dereferenced here.
+            sref.next_in = unsafe { src.cur_ptr.add(consumed) };
+            // `cur_len` came from a `c_uint` (`avail_in` or the callback's return),
+            // so the remainder is representable in `c_uint` without truncation.
+            sref.avail_in = (src.cur_len - consumed) as c_uint;
         }
         // else: the engine never pulled any input (e.g. it rejected an invalid
         // state before reading). C returns without loading `next`/`have`, so the
@@ -7064,21 +7615,52 @@ mod tests {
         assert_eq!(unsafe { inflateEnd(&mut other) }, Z_OK);
     }
 
-    /// `inflateBackInit_` must leave the caller's window byte-for-byte unchanged,
-    /// on both the accepting and the refusing path (M6-09).
+    /// Every path `inflateBackInit_` **refuses** must leave the caller's window
+    /// byte-for-byte unchanged, and so must `inflateBackEnd` (M6-09, SEC-FFI-01).
     ///
     /// C's `infback.c` L60 is a bare `state->window = window;`: it stores the
     /// pointer and writes nothing. And because the single state `ZALLOC` at
     /// L51-L53 runs *first*, a refused allocation returns `Z_MEM_ERROR` having
     /// never reached the window at all — so a caller that pre-fills the buffer and
     /// then hits an exhausted allocator finds its own bytes intact.
+    ///
+    /// The accepting path is the one documented divergence: it zero-fills the
+    /// region once, as its last act, because the decoder addresses the window
+    /// through slices and a reference over abstract-uninitialized bytes is validity
+    /// UB. That half is pinned by
+    /// `an_accepted_back_init_initializes_the_window_once`; this test pins
+    /// everything around it, which is what keeps the divergence bounded to exactly
+    /// the committed path.
     #[test]
     fn back_init_never_writes_the_callers_window() {
         use crate::ffi::alloc::test_hook::HookStats;
 
         const FILL: u8 = 0xC3;
 
-        // --- accepting path -------------------------------------------------
+        // --- refusing path: a rejected argument, before adoption -------------
+        let mut rejected = vec![FILL; 1 << 15];
+        let mut bad = zeroed_stream();
+        // `windowBits` outside 8..=15 is refused before the window is named.
+        // SAFETY: `bad` and the buffer are live; the call is refused on arguments.
+        assert_eq!(
+            unsafe {
+                inflateBackInit_(
+                    &mut bad,
+                    16,
+                    rejected.as_mut_ptr(),
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_STREAM_ERROR
+        );
+        assert!(
+            rejected.iter().all(|&b| b == FILL),
+            "an argument-rejected init must not touch the buffer"
+        );
+        assert!(bad.state.is_null());
+
+        // --- accepting path, then teardown -----------------------------------
         let mut window = vec![FILL; 1 << 15];
         let mut strm = zeroed_stream();
         // SAFETY: `strm` and the window are live and correctly sized.
@@ -7094,10 +7676,9 @@ mod tests {
             },
             Z_OK
         );
-        assert!(
-            window.iter().all(|&b| b == FILL),
-            "a successful inflateBackInit_ adopts the window without writing it"
-        );
+        // Re-fill so the teardown assertion below measures `inflateBackEnd` alone
+        // rather than the accepting path's documented one-time initialization.
+        window.fill(FILL);
         // SAFETY: single reclaim of the handle just installed.
         assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
         assert!(
@@ -7145,6 +7726,1131 @@ mod tests {
         assert!(
             strm2.state.is_null(),
             "no handle may be installed on the failing path"
+        );
+    }
+    /// A caller `zalloc` sized from reference zlib's own headers must satisfy both
+    /// `inflateInit2_` and `inflateBackInit_`.
+    ///
+    /// This is the C-ABI reproduction of the drop-in allocator requirement. The
+    /// hook below serves only the request shapes reference zlib is known to make —
+    /// `(1, sizeof(struct inflate_state))` for the state (`inflate.c` L198,
+    /// `infback.c` L51) and `(1U << wbits, sizeof(unsigned char))` for the lazily
+    /// grown window (`inflate.c` L261) — and refuses everything else, exactly as a
+    /// validating or tightly bounded allocator written against reference zlib does.
+    /// Charging this port's own, legitimately larger `size_of::<InflateState>()`
+    /// turned such a caller's successful init into `Z_MEM_ERROR`; here it must
+    /// succeed, and the recorded `size` argument must be C's number.
+    #[test]
+    fn a_c_sized_zalloc_initializes_inflate_and_inflate_back() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::inflate::state::InflateState;
+
+        /// The one `size` argument this allocator recognises for a state request.
+        static STATE_SIZE: AtomicUsize = AtomicUsize::new(0);
+        /// The `size` argument of the first request seen, for the assertion below.
+        static FIRST_SIZE: AtomicUsize = AtomicUsize::new(0);
+        /// Requests refused because their shape was not one of C's.
+        static REFUSED: AtomicUsize = AtomicUsize::new(0);
+
+        /// Serves `(1, STATE_SIZE)` and any `(n, 1)` window request; refuses the
+        /// rest. Byte storage comes from the crate's own test backing allocator.
+        unsafe extern "C" fn c_sized_zalloc(
+            _opaque: *mut c_void,
+            items: c_uint,
+            size: c_uint,
+        ) -> *mut c_void {
+            let (items, size) = (items as usize, size as usize);
+            FIRST_SIZE
+                .compare_exchange(0, size, Ordering::SeqCst, Ordering::SeqCst)
+                .ok();
+            let recognised = (items == 1 && size == STATE_SIZE.load(Ordering::SeqCst))
+                || (size == 1 && items.is_power_of_two());
+            if !recognised {
+                REFUSED.fetch_add(1, Ordering::SeqCst);
+                return ptr::null_mut();
+            }
+            // Storage in the same size-header format `budget_zfree` releases.
+            let bytes = items * size;
+            let layout = alloc::alloc::Layout::from_size_align(BUDGET_HDR + bytes, BUDGET_HDR)
+                .expect("test layout is valid");
+            // SAFETY: `layout` has a non-zero size (`BUDGET_HDR` is 16).
+            let base = unsafe { alloc::alloc::alloc(layout) };
+            if base.is_null() {
+                return ptr::null_mut();
+            }
+            // SAFETY: `base` addresses `BUDGET_HDR + bytes` writable, 16-byte
+            // aligned bytes, so the header write is aligned and in bounds.
+            unsafe {
+                base.cast::<usize>().write(bytes);
+                base.add(BUDGET_HDR).cast::<c_void>()
+            }
+        }
+
+        STATE_SIZE.store(InflateState::C_LAYOUT_SIZE, Ordering::SeqCst);
+        FIRST_SIZE.store(0, Ordering::SeqCst);
+        REFUSED.store(0, Ordering::SeqCst);
+
+        // --- inflateInit2_ then a decode that grows the window ---------------
+        let mut strm = zeroed_stream();
+        strm.zalloc = Some(c_sized_zalloc);
+        strm.zfree = Some(budget_zfree);
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    15,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK,
+            "an allocator serving C's own sizeof(struct inflate_state) must \
+             initialize, as it does against reference zlib"
+        );
+        assert_eq!(
+            FIRST_SIZE.load(Ordering::SeqCst),
+            InflateState::C_LAYOUT_SIZE,
+            "the state request must carry C's byte count"
+        );
+        assert_eq!(REFUSED.load(Ordering::SeqCst), 0);
+
+        // A real decode, so the lazily allocated window is requested too.
+        let payload = b"the quick brown fox jumps over the quick brown dog";
+        let mut compressed = alloc::vec![0u8; crate::util::compress_bound(payload.len())];
+        let produced =
+            crate::util::compress2(&mut compressed, payload, 6).expect("reference compression");
+        let mut out = [0u8; 128];
+        strm.next_in = compressed.as_ptr();
+        strm.avail_in = produced as c_uint;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+        assert_eq!(unsafe { inflate(&mut strm, Z_FINISH) }, Z_STREAM_END);
+        assert_eq!(&out[..payload.len()], payload);
+        assert_eq!(
+            REFUSED.load(Ordering::SeqCst),
+            0,
+            "no request during a normal decode may fall outside C's shapes"
+        );
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+
+        // --- inflateBackInit_ with the same allocator ------------------------
+        FIRST_SIZE.store(0, Ordering::SeqCst);
+        let mut window = alloc::vec![0u8; 1 << 15];
+        let mut back = zeroed_stream();
+        back.zalloc = Some(c_sized_zalloc);
+        back.zfree = Some(budget_zfree);
+        assert_eq!(
+            unsafe {
+                inflateBackInit_(
+                    &mut back,
+                    15,
+                    window.as_mut_ptr(),
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK,
+            "inflateBackInit_ must accept an allocator sized from C's header"
+        );
+        assert_eq!(
+            FIRST_SIZE.load(Ordering::SeqCst),
+            InflateState::C_LAYOUT_SIZE,
+            "infback.c's single ZALLOC must carry C's byte count"
+        );
+        assert_eq!(REFUSED.load(Ordering::SeqCst), 0);
+        assert_eq!(unsafe { inflateBackEnd(&mut back) }, Z_OK);
+
+        // Negative control: the same allocator told to expect this port's own
+        // state size must refuse, proving the assertions above are load-bearing.
+        STATE_SIZE.store(size_of::<InflateState>(), Ordering::SeqCst);
+        let mut wrong = zeroed_stream();
+        wrong.zalloc = Some(c_sized_zalloc);
+        wrong.zfree = Some(budget_zfree);
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut wrong,
+                    15,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_MEM_ERROR,
+            "the state request must be C's size and not this port's own"
+        );
+        assert!(wrong.state.is_null());
+    }
+
+    /// An accepted `inflateBackInit_` must initialize the adopted window, and
+    /// nothing afterwards may re-initialize it (SEC-FFI-01).
+    ///
+    /// C adopts the caller's buffer with a bare pointer store (`infback.c` L60) and
+    /// writes nothing, so its bytes arrive abstract-uninitialized. A
+    /// `&[u8]`/`&mut [u8]` over such bytes is validity UB whether or not it is
+    /// read, and the decoder addresses the window through slices — so it must be
+    /// initialized before the first decode. Doing it at the end of the accepting
+    /// path keeps every *refusing* path, and `inflateBackEnd`, bit-for-bit
+    /// non-writing, which is what `back_init_never_writes_the_callers_window` pins.
+    ///
+    /// This test pins the other half of the contract, in the order a caller
+    /// observes it:
+    ///
+    /// 1. a successful init leaves no pre-fill byte anywhere — the region is
+    ///    initialized;
+    /// 2. anything the caller writes *after* that survives, which is what makes
+    ///    input staged inside the window (SEC-FFI-07) viable at all;
+    /// 3. decoding does not re-initialize: a sentinel planted after the first
+    ///    decode, at an offset the second decode never reaches, survives a second
+    ///    `inflateBack`.
+    #[test]
+    fn an_accepted_back_init_initializes_the_window_once() {
+        const FILL: u8 = 0xC3;
+        const SENTINEL: u8 = 0x5A;
+
+        let mut window = vec![FILL; 1 << 15];
+        let mut strm = zeroed_stream();
+        // SAFETY: `strm` and the window are live and correctly sized.
+        assert_eq!(
+            unsafe {
+                inflateBackInit_(
+                    &mut strm,
+                    15,
+                    window.as_mut_ptr(),
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        assert!(
+            window.iter().all(|&b| b == 0),
+            "an accepted init must initialize the whole adopted region"
+        );
+
+        // Clause 2: a caller write after a successful init is preserved.
+        let probe_after_init = window.len() - 2;
+        window[probe_after_init] = SENTINEL;
+
+        let mut in_state = BackIn {
+            data: RAW_STREAM,
+            given: false,
+        };
+        let mut out_state = BackOut {
+            collected: Vec::new(),
+        };
+        // SAFETY: a live `inflateBack` stream with both callbacks non-null.
+        let rc = unsafe {
+            inflateBack(
+                &mut strm,
+                Some(back_in),
+                &mut in_state as *mut BackIn as *mut c_void,
+                Some(back_out),
+                &mut out_state as *mut BackOut as *mut c_void,
+            )
+        };
+        assert_eq!(rc, Z_STREAM_END);
+        assert_eq!(out_state.collected, MSG);
+
+        assert_eq!(
+            &window[..MSG.len()],
+            MSG,
+            "the decode's output lands at the window base (infback.c L222-L223)"
+        );
+        assert_eq!(
+            window[probe_after_init], SENTINEL,
+            "a caller write made after a successful init must survive the decode"
+        );
+        assert!(
+            window[MSG.len()..probe_after_init].iter().all(|&b| b == 0),
+            "no pre-fill byte may survive an accepted init"
+        );
+
+        // Clause 3: plant a second sentinel past anything a repeat decode of the
+        // same short stream can touch. A re-initialization would erase it.
+        let probe = window.len() - 1;
+        window[probe] = SENTINEL;
+        let mut in_state2 = BackIn {
+            data: RAW_STREAM,
+            given: false,
+        };
+        let mut out_state2 = BackOut {
+            collected: Vec::new(),
+        };
+        // SAFETY: the same live stream; `inflateBack` may be called repeatedly.
+        let rc2 = unsafe {
+            inflateBack(
+                &mut strm,
+                Some(back_in),
+                &mut in_state2 as *mut BackIn as *mut c_void,
+                Some(back_out),
+                &mut out_state2 as *mut BackOut as *mut c_void,
+            )
+        };
+        assert_eq!(rc2, Z_STREAM_END);
+        assert_eq!(out_state2.collected, MSG);
+        assert_eq!(
+            window[probe], SENTINEL,
+            "the window must be initialized at init only, never again per call"
+        );
+        assert_eq!(
+            window[probe_after_init], SENTINEL,
+            "and a second decode must not disturb the caller's own bytes either"
+        );
+
+        // SAFETY: single reclaim of the handle installed above.
+        assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
+    }
+
+    /// Pre-buffered input placed **inside** the adopted window must decode
+    /// correctly (SEC-FFI-07, the `next_in` case).
+    ///
+    /// zlib nowhere requires `next_in` to be disjoint from the `inflateBack`
+    /// window: a caller may perfectly well stage a compressed record in the tail of
+    /// the same buffer it lends as history. C copies bytes with `zmemcpy` through
+    /// raw pointers and does not care. This port's decoder writes the window
+    /// through a `&mut [u8]`, so publishing a `&[u8]` over the same allocation as
+    /// input would put a shared and a unique reference over one region
+    /// simultaneously — immediate aliasing UB, before any bounds check. `CInFunc`
+    /// avoids it by detecting the overlap and staging bounded copies into its own
+    /// storage instead.
+    ///
+    /// The stream is placed at the very end of the window so the decode's output,
+    /// which starts at the base, never overwrites the input it is reading.
+    #[test]
+    fn inflate_back_decodes_input_placed_inside_the_window() {
+        let mut window = vec![0u8; 1 << 15];
+        let at = window.len() - RAW_STREAM.len();
+        window[at..].copy_from_slice(RAW_STREAM);
+
+        let mut strm = zeroed_stream();
+        // SAFETY: `strm` and the window are live and correctly sized.
+        assert_eq!(
+            unsafe {
+                inflateBackInit_(
+                    &mut strm,
+                    15,
+                    window.as_mut_ptr(),
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+
+        // Stage the stream after init: the accepting path's one-time initialization
+        // would otherwise erase it, and staging afterwards is what a real caller
+        // does anyway, since `next_in` is only set on the way into `inflateBack`.
+        window[at..].copy_from_slice(RAW_STREAM);
+        strm.next_in = unsafe { window.as_ptr().add(at) };
+        strm.avail_in = RAW_STREAM.len() as c_uint;
+
+        // The callback signals EOF: everything is pre-buffered.
+        let mut in_state = BackIn {
+            data: &[],
+            given: true,
+        };
+        let mut out_state = BackOut {
+            collected: Vec::new(),
+        };
+        // SAFETY: a live `inflateBack` stream with both callbacks non-null.
+        let rc = unsafe {
+            inflateBack(
+                &mut strm,
+                Some(back_in),
+                &mut in_state as *mut BackIn as *mut c_void,
+                Some(back_out),
+                &mut out_state as *mut BackOut as *mut c_void,
+            )
+        };
+        assert_eq!(
+            rc, Z_STREAM_END,
+            "input inside the window is a legal placement and must decode"
+        );
+        assert_eq!(out_state.collected, MSG);
+        // Every input byte was consumed, so the cursor sits one past the stream.
+        assert_eq!(strm.avail_in, 0);
+        assert_eq!(strm.next_in, unsafe { window.as_ptr().add(window.len()) });
+
+        // SAFETY: single reclaim of the handle installed above.
+        assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
+    }
+
+    /// A **callback** buffer inside the adopted window must decode correctly
+    /// (SEC-FFI-07, the `in_func` case).
+    ///
+    /// Same legal placement as
+    /// `inflate_back_decodes_input_placed_inside_the_window`, reached through the
+    /// other of the two routes input can arrive by. The callback publishes a
+    /// pointer into the window's tail; `CInFunc` must stage from it rather than
+    /// hand the engine a slice aliasing its own output buffer.
+    #[test]
+    fn inflate_back_decodes_a_callback_buffer_inside_the_window() {
+        /// Publishes a region of the caller's own window once, then reports EOF.
+        struct WindowIn {
+            at: *const c_uchar,
+            len: usize,
+            given: bool,
+        }
+
+        unsafe extern "C" fn window_in(desc: *mut c_void, buf: *mut *const c_uchar) -> c_uint {
+            // SAFETY: `desc` is the `*mut WindowIn` handed to `inflateBack` below.
+            let st = unsafe { &mut *(desc as *mut WindowIn) };
+            if st.given {
+                return 0;
+            }
+            st.given = true;
+            // SAFETY: `buf` is a valid out-pointer per the `in_func` contract.
+            unsafe { *buf = st.at };
+            st.len as c_uint
+        }
+
+        let mut window = vec![0u8; 1 << 15];
+        let at = window.len() - RAW_STREAM.len();
+
+        let mut strm = zeroed_stream();
+        // SAFETY: `strm` and the window are live and correctly sized.
+        assert_eq!(
+            unsafe {
+                inflateBackInit_(
+                    &mut strm,
+                    15,
+                    window.as_mut_ptr(),
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        window[at..].copy_from_slice(RAW_STREAM);
+
+        let mut in_state = WindowIn {
+            at: unsafe { window.as_ptr().add(at) },
+            len: RAW_STREAM.len(),
+            given: false,
+        };
+        let mut out_state = BackOut {
+            collected: Vec::new(),
+        };
+        // SAFETY: a live `inflateBack` stream with both callbacks non-null.
+        let rc = unsafe {
+            inflateBack(
+                &mut strm,
+                Some(window_in),
+                &mut in_state as *mut WindowIn as *mut c_void,
+                Some(back_out),
+                &mut out_state as *mut BackOut as *mut c_void,
+            )
+        };
+        assert_eq!(
+            rc, Z_STREAM_END,
+            "a callback buffer inside the window is legal and must decode"
+        );
+        assert_eq!(out_state.collected, MSG);
+
+        // SAFETY: single reclaim of the handle installed above.
+        assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
+    }
+
+    /// `CInFunc` must never form a slice longer than `isize::MAX`, segmenting
+    /// oversized provider buffers instead (SEC-FFI-06).
+    ///
+    /// The zlib `in_func` contract returns a `c_uint`. On a 32-bit target that
+    /// range exceeds `isize::MAX`, so a conforming callback may answer
+    /// `0x8000_0000` — a valid `unsigned` and a valid readable extent for C, but an
+    /// invalid Rust slice length. The buffer is therefore published in segments
+    /// capped at [`IN_SEGMENT_MAX`].
+    ///
+    /// The i686 boundary cannot be reproduced literally on a 64-bit host: it needs
+    /// a single allocation larger than 2 GiB, and there `c_uint::MAX` is *below*
+    /// `isize::MAX`, so the cap is unreachable by construction. The test therefore
+    /// checks the two halves separately and completely:
+    ///
+    /// * the clamping **rule**, evaluated at the 32-bit widths, which is where the
+    ///   bug lived — a `c_uint::MAX` count must clamp to that target's
+    ///   `isize::MAX`;
+    /// * the multi-segment **machinery**, driven end-to-end through the real
+    ///   engine with the cap shrunk to a few bytes, so every transition an
+    ///   oversized buffer would take is exercised: repeated segment publication
+    ///   without re-entering the callback, and exit-cursor reconstruction across a
+    ///   partially-published buffer.
+    #[test]
+    fn c_in_func_segments_buffers_beyond_the_slice_limit() {
+        // The production cap is exactly the slice-length limit.
+        assert_eq!(IN_SEGMENT_MAX, isize::MAX as usize);
+
+        // The rule at 32-bit widths, where `c_uint::MAX > isize::MAX`.
+        const U32_MAX: u64 = u32::MAX as u64;
+        const I32_MAX: u64 = i32::MAX as u64;
+        const {
+            assert!(
+                U32_MAX > I32_MAX,
+                "the hazard only exists because a 32-bit c_uint outruns isize::MAX"
+            )
+        };
+        assert_eq!(
+            U32_MAX.min(I32_MAX),
+            I32_MAX,
+            "an oversized count must clamp to the target's isize::MAX"
+        );
+        assert_eq!(
+            0x8000_0000u64.min(I32_MAX),
+            I32_MAX,
+            "the review's 0x8000_0000 callback answer must clamp, not truncate"
+        );
+        // On any target the clamp keeps every representable c_uint in range.
+        for count in [0u64, 1, I32_MAX, 0x8000_0000, U32_MAX] {
+            let clamped = (count as usize).min(IN_SEGMENT_MAX);
+            assert!(clamped as u64 <= isize::MAX as u64);
+            assert!(clamped as u64 <= count);
+        }
+
+        // The machinery, end-to-end. `inflate_back_init` owns its window, so the
+        // input is disjoint and the in-place (non-staged) segment path runs.
+        const TRAILING: &[u8] = &[0xAA, 0xBB, 0xCC];
+        let mut buf = Vec::with_capacity(RAW_STREAM.len() + TRAILING.len());
+        buf.extend_from_slice(RAW_STREAM);
+        buf.extend_from_slice(TRAILING);
+
+        let mut state =
+            crate::inflate::back::inflate_back_init(15).expect("owned back-inflate window");
+        let mut eof = BackIn {
+            data: &[],
+            given: true,
+        };
+        let mut src = CInFunc::new(
+            back_in,
+            &mut eof as *mut BackIn as *mut c_void,
+            buf.as_ptr(),
+            buf.len(),
+            (0, 0),
+        );
+        // Three bytes per segment: the 17-byte stream spans six of them.
+        src.segment_max = 3;
+        let mut collected = BackOut {
+            collected: Vec::new(),
+        };
+        let mut sink = COutFunc {
+            out_fn: back_out,
+            out_desc: &mut collected as *mut BackOut as *mut c_void,
+        };
+
+        let outcome = crate::inflate::back::inflate_back(&mut state, &mut src, &mut sink);
+        assert_eq!(outcome.code, ReturnCode::StreamEnd);
+        assert_eq!(collected.collected, MSG);
+
+        // Segmentation really happened, and no segment ever exceeded the cap.
+        assert!(
+            src.seg_start > 0,
+            "a 17-byte stream at 3 bytes per segment must publish several segments"
+        );
+        assert!(src.seg_len <= 3, "no segment may exceed the cap");
+        assert!(
+            !src.staged_active,
+            "a disjoint buffer must be published in place"
+        );
+
+        // Exit cursors: the shim's arithmetic over a partially-published buffer.
+        // `consumed` is the offset of the first byte the engine did not take, and
+        // C's `have` is everything after it — the tail of the published segment
+        // plus every segment never published.
+        assert_eq!(
+            src.consumed(),
+            RAW_STREAM.len(),
+            "exactly the raw stream must be consumed"
+        );
+        assert_eq!(
+            src.cur_len - src.consumed(),
+            TRAILING.len(),
+            "avail_in must cover the unpublished tail, not just the last segment"
+        );
+    }
+
+    /// Segmentation and staging must compose: a window-overlapping buffer decoded
+    /// through many small staged segments (SEC-FFI-06 x SEC-FFI-07).
+    ///
+    /// Staging alone is exercised by the two `inside_the_window` tests above, but
+    /// there the whole stream fits in one staged segment. Shrinking the cap forces
+    /// the adapter to stage repeatedly out of a region that overlaps the engine's
+    /// output window, which is the combination in which a stale `seg_start` or a
+    /// mis-sized copy would corrupt the decode rather than merely alias.
+    #[test]
+    fn c_in_func_stages_a_window_overlapping_buffer_across_segments() {
+        let mut window = vec![0u8; 1 << 15];
+        let at = window.len() - RAW_STREAM.len();
+        window[at..].copy_from_slice(RAW_STREAM);
+        let (ws, we) = {
+            let s = window.as_ptr() as usize;
+            (s, s + window.len())
+        };
+
+        let mut state =
+            crate::inflate::back::inflate_back_init(15).expect("owned back-inflate window");
+        let mut eof = BackIn {
+            data: &[],
+            given: true,
+        };
+        let mut src = CInFunc::new(
+            back_in,
+            &mut eof as *mut BackIn as *mut c_void,
+            unsafe { window.as_ptr().add(at) },
+            RAW_STREAM.len(),
+            (ws, we),
+        );
+        src.segment_max = 2;
+        let mut collected = BackOut {
+            collected: Vec::new(),
+        };
+        let mut sink = COutFunc {
+            out_fn: back_out,
+            out_desc: &mut collected as *mut BackOut as *mut c_void,
+        };
+
+        let outcome = crate::inflate::back::inflate_back(&mut state, &mut src, &mut sink);
+        assert_eq!(outcome.code, ReturnCode::StreamEnd);
+        assert_eq!(collected.collected, MSG);
+        assert!(
+            src.staged_active,
+            "a buffer overlapping the window must be staged, never published in place"
+        );
+        assert!(src.seg_len <= 2, "no staged segment may exceed the cap");
+        assert_eq!(
+            src.consumed(),
+            RAW_STREAM.len(),
+            "the whole staged stream must be accounted as consumed"
+        );
+
+        // The overlap test is a real one: disabling it must flip the decision.
+        let mut disjoint = CInFunc::new(
+            back_in,
+            &mut eof as *mut BackIn as *mut c_void,
+            unsafe { window.as_ptr().add(at) },
+            RAW_STREAM.len(),
+            (0, 0),
+        );
+        assert!(!disjoint.overlaps_window());
+        disjoint.cur_ptr = unsafe { window.as_ptr().add(at) };
+        disjoint.cur_len = RAW_STREAM.len();
+        assert!(
+            !disjoint.overlaps_window(),
+            "an empty window range must never report an overlap"
+        );
+    }
+
+    // -- SEC-FFI-02: gzip-header sink aliasing ------------------------------
+    //
+    // C's `inflate` writes the header's three payloads through `head->extra`,
+    // `head->name` and `head->comment` — caller pointers under **no** disjointness
+    // obligation, either with each other or with `strm->next_in`/`next_out`. The
+    // tests below pin both halves of the resolution: overlap between the payloads
+    // is honoured (the boundary holds raw descriptors, never `&mut [u8]`), and
+    // overlap with a *window* is honoured by separating the header phase from the
+    // data phase in time, in C's order.
+
+    /// The 64-byte plaintext [`gzip_stream_with_fields`] compresses.
+    #[cfg(feature = "gzip")]
+    fn hdr_payload() -> Vec<u8> {
+        (0..64u8).map(|i| b'a' + (i % 26)).collect()
+    }
+
+    /// Only `FNAME`, so the header is a fixed 10 bytes followed by the name — a
+    /// layout whose byte offsets a two-pass test can split at exactly.
+    #[cfg(feature = "gzip")]
+    const HDR_NAME_ONLY: HeaderFields = HeaderFields {
+        extra: false,
+        name: true,
+        comment: false,
+        hcrc: false,
+    };
+
+    /// Decompresses `stream` at `windowBits = 31` with `head` registered, writing
+    /// into the caller-provided `[out_ptr, out_len)` window.
+    ///
+    /// The window is a raw pointer/length pair on purpose: these tests place the
+    /// header's payload buffers *inside* it, which a `&mut [u8]` parameter could not
+    /// express without committing the very aliasing under test.
+    #[cfg(feature = "gzip")]
+    unsafe fn inflate_gzip_into(
+        stream: &[u8],
+        head: *mut crate::ffi::types::gz_header,
+        out_ptr: *mut u8,
+        out_len: usize,
+        flush: c_int,
+    ) -> (c_int, usize, usize, c_int) {
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    31,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        assert_eq!(unsafe { inflateGetHeader(&mut strm, head) }, Z_OK);
+        strm.next_in = stream.as_ptr();
+        strm.avail_in = stream.len() as c_uint;
+        strm.next_out = out_ptr;
+        strm.avail_out = out_len as c_uint;
+        let rc = unsafe { inflate(&mut strm, flush) };
+        let observed = (
+            rc,
+            strm.total_in as usize,
+            strm.total_out as usize,
+            strm.data_type,
+        );
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+        observed
+    }
+
+    /// Every byte a C caller can see after one `inflate` call over a gzip stream
+    /// with a registered header.
+    #[cfg(feature = "gzip")]
+    #[derive(Debug, PartialEq, Eq)]
+    struct HeaderObservation {
+        rc: c_int,
+        total_in: usize,
+        total_out: usize,
+        data_type: c_int,
+        output: Vec<u8>,
+        extra: Vec<u8>,
+        name: Vec<u8>,
+        comment: Vec<u8>,
+        extra_len: c_uint,
+        text: c_int,
+        time: c_ulong,
+        xflags: c_int,
+        os: c_int,
+        hcrc: c_int,
+        done: c_int,
+        extra_is_null: bool,
+        name_is_null: bool,
+        comment_is_null: bool,
+    }
+
+    /// Runs one `inflate(flush)` over `stream` with the three header payload
+    /// buffers placed either **inside** the caller's output window or in wholly
+    /// separate allocations, and reports everything the caller can observe.
+    ///
+    /// The two layouts must agree byte for byte: the payload slots sit past the
+    /// produced bytes, so the only difference is whether the boundary must split the
+    /// call to keep the header stores and the window accesses apart in time.
+    #[cfg(feature = "gzip")]
+    fn observe_gzip_header(stream: &[u8], flush: c_int, inside_output: bool) -> HeaderObservation {
+        const CAP: usize = 16;
+        const EXTRA_AT: usize = 96;
+        const NAME_AT: usize = 128;
+        const COMMENT_AT: usize = 160;
+
+        let mut window = vec![0xAAu8; 256];
+        let mut apart = vec![0xAAu8; 3 * CAP];
+        let out_ptr = window.as_mut_ptr();
+        let (extra_ptr, name_ptr, comment_ptr) = if inside_output {
+            // SAFETY: all three offsets plus `CAP` stay inside the 256-byte window.
+            unsafe {
+                (
+                    out_ptr.add(EXTRA_AT),
+                    out_ptr.add(NAME_AT),
+                    out_ptr.add(COMMENT_AT),
+                )
+            }
+        } else {
+            let base = apart.as_mut_ptr();
+            // SAFETY: the three slots are the thirds of a `3 * CAP`-byte allocation.
+            unsafe { (base, base.add(CAP), base.add(2 * CAP)) }
+        };
+
+        let mut head = zeroed_gz_header();
+        head.extra = extra_ptr;
+        head.extra_max = CAP as c_uint;
+        head.name = name_ptr;
+        head.name_max = CAP as c_uint;
+        head.comment = comment_ptr;
+        head.comm_max = CAP as c_uint;
+
+        let splits_before = HEADER_SPLIT_PASSES.load(core::sync::atomic::Ordering::Relaxed);
+        // SAFETY: `window` is a live 256-byte allocation and `stream` a live slice.
+        let (rc, total_in, total_out, data_type) =
+            unsafe { inflate_gzip_into(stream, &mut head, out_ptr, window.len(), flush) };
+        let splits_after = HEADER_SPLIT_PASSES.load(core::sync::atomic::Ordering::Relaxed);
+        // Anti-vacuity: the layout under test must actually have selected the path it
+        // is meant to cover. `inside_output` places the payload buffers inside the
+        // output window, which must split the call; the separate layout must not.
+        assert_eq!(
+            splits_after > splits_before,
+            inside_output,
+            "inside_output = {inside_output}: the boundary took the wrong path"
+        );
+
+        /// Snapshots a payload slot, tolerating a pointer the decoder nulled.
+        fn snapshot(ptr: *const u8, cap: usize) -> Vec<u8> {
+            if ptr.is_null() {
+                return Vec::new();
+            }
+            // SAFETY: a non-null slot is one of the `cap`-byte regions carved above
+            // and is still owned by the live `window`/`apart` vectors.
+            unsafe { core::slice::from_raw_parts(ptr, cap) }.to_vec()
+        }
+
+        HeaderObservation {
+            rc,
+            total_in,
+            total_out,
+            data_type,
+            output: window[..total_out].to_vec(),
+            extra: snapshot(extra_ptr, CAP),
+            name: snapshot(name_ptr, CAP),
+            comment: snapshot(comment_ptr, CAP),
+            extra_len: head.extra_len,
+            text: head.text,
+            time: head.time,
+            xflags: head.xflags,
+            os: head.os,
+            hcrc: head.hcrc,
+            done: head.done,
+            extra_is_null: head.extra.is_null(),
+            name_is_null: head.name.is_null(),
+            comment_is_null: head.comment.is_null(),
+        }
+    }
+
+    /// All three payload buffers may be the **same** memory.
+    ///
+    /// C parses the fields strictly in order — `EXTRA`, then `NAME`, then `COMMENT`
+    /// (`inflate.c` L610-L668) — each writing from offset `0` of its own buffer, so
+    /// the last field to arrive owns the shared bytes. Reproducing that requires
+    /// that no `&mut [u8]` ever cover a payload: three overlapping mutable slices
+    /// are undefined behaviour the moment they are created, before any
+    /// bounds-checked write runs.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn header_payload_buffers_may_all_be_the_same_memory() {
+        let stream = gzip_stream_with_fields(HeaderFields::ALL);
+        let mut shared = vec![0xAAu8; 64];
+        let base = shared.as_mut_ptr();
+        let mut out = vec![0u8; 256];
+
+        let mut head = zeroed_gz_header();
+        head.extra = base;
+        head.extra_max = shared.len() as c_uint;
+        head.name = base;
+        head.name_max = shared.len() as c_uint;
+        head.comment = base;
+        head.comm_max = shared.len() as c_uint;
+
+        let (rc, _, total_out, _) =
+            unsafe { inflate_gzip_into(&stream, &mut head, out.as_mut_ptr(), out.len(), Z_FINISH) };
+
+        assert_eq!(rc, Z_STREAM_END, "the decode must succeed");
+        assert_eq!(
+            &out[..total_out],
+            &hdr_payload()[..],
+            "the payload must round-trip"
+        );
+        assert_eq!(head.done, 1, "the header must be complete");
+        assert_eq!(
+            head.extra_len,
+            HDR_EXTRA.len() as c_uint,
+            "the declared XLEN must be published"
+        );
+        // C's order is EXTRA (`ABCDEF` at 0..6), then NAME (`hello.txt\0` at 0..10),
+        // then COMMENT (`note\0` at 0..5), each from offset 0 of its own buffer — so
+        // the shared bytes end up being the comment followed by the name's tail.
+        assert_eq!(
+            &shared[..10],
+            b"note\0.txt\0",
+            "each field must write from offset 0 in C's parse order, last field winning"
+        );
+        assert!(
+            shared[10..].iter().all(|&b| b == 0xAA),
+            "nothing may be written past the longest field"
+        );
+    }
+
+    /// Pairwise overlap, one pair at a time, so a failure names the pair.
+    ///
+    /// Each case shares one buffer between two payloads and gives the third its own,
+    /// and asserts C's later-field-wins outcome in the shared bytes.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn pairwise_header_buffer_overlap_follows_cs_parse_order() {
+        // (share_extra, share_name, share_comment, expected bytes in the shared slot).
+        // The fixture's fields are EXTRA `ABCDEF`, NAME `hello.txt\0`, COMMENT
+        // `note\0`, written in that order, each from offset 0 of its own buffer.
+        let cases: [(bool, bool, bool, &[u8]); 3] = [
+            // extra ∩ name: NAME is parsed later and is the longer field.
+            (true, true, false, b"hello.txt\0"),
+            // name ∩ comment: COMMENT is parsed later but shorter, so the name's
+            // tail survives behind it.
+            (false, true, true, b"note\0.txt\0"),
+            // extra ∩ comment: COMMENT is parsed later, `ABCDEF`'s last byte survives.
+            (true, false, true, b"note\0F"),
+        ];
+
+        for (share_extra, share_name, share_comment, expected) in cases {
+            let stream = gzip_stream_with_fields(HeaderFields::ALL);
+            let mut shared = vec![0xAAu8; 32];
+            let mut private_slots = vec![0xAAu8; 32];
+            let shared_ptr = shared.as_mut_ptr();
+            let private_ptr = private_slots.as_mut_ptr();
+            let mut out = vec![0u8; 256];
+
+            let mut head = zeroed_gz_header();
+            head.extra = if share_extra { shared_ptr } else { private_ptr };
+            head.extra_max = 32;
+            head.name = if share_name { shared_ptr } else { private_ptr };
+            head.name_max = 32;
+            head.comment = if share_comment {
+                shared_ptr
+            } else {
+                private_ptr
+            };
+            head.comm_max = 32;
+
+            let (rc, _, total_out, _) = unsafe {
+                inflate_gzip_into(&stream, &mut head, out.as_mut_ptr(), out.len(), Z_FINISH)
+            };
+            assert_eq!(
+                rc, Z_STREAM_END,
+                "case {share_extra}/{share_name}/{share_comment}"
+            );
+            assert_eq!(&out[..total_out], &hdr_payload()[..]);
+            assert_eq!(
+                &shared[..expected.len()],
+                expected,
+                "case {share_extra}/{share_name}/{share_comment}: the later field must win"
+            );
+        }
+    }
+
+    /// A payload buffer carved out of the caller's **output** window is filled, and
+    /// the call is observably identical to the disjoint layout.
+    ///
+    /// This is the case raw descriptors alone cannot make sound: the engine holds a
+    /// `&mut [u8]` over the output window for the whole call, and a store through an
+    /// independent header pointer into those same bytes invalidates it. The boundary
+    /// therefore runs the header phase against an empty output window first, in C's
+    /// order, and only then decodes.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn header_payload_buffers_may_live_inside_the_output_window() {
+        let stream = gzip_stream_with_fields(HeaderFields::ALL);
+
+        let apart = observe_gzip_header(&stream, Z_FINISH, false);
+        let inside = observe_gzip_header(&stream, Z_FINISH, true);
+
+        assert_eq!(apart.rc, Z_STREAM_END);
+        assert_eq!(apart.output, hdr_payload());
+        assert_eq!(&apart.extra[..HDR_EXTRA.len()], HDR_EXTRA);
+        assert_eq!(&apart.name[..HDR_NAME.len() + 1], b"hello.txt\0");
+        assert_eq!(&apart.comment[..HDR_COMMENT.len() + 1], b"note\0");
+        assert_eq!(
+            inside, apart,
+            "placing the header buffers inside the output window must change nothing \
+             a caller can observe"
+        );
+    }
+
+    /// The split path composes one call's worth of results for every flush value.
+    ///
+    /// `Z_BLOCK`/`Z_TREES` are the interesting rows: C returns at its `case TYPE`,
+    /// which is exactly where the header phase halts, so the data phase must be
+    /// skipped rather than run on into the first block.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn the_split_header_path_is_observably_identical_to_the_single_pass_path() {
+        /// C `Z_TREES` — stop once each deflate block's trees are decoded.
+        const Z_TREES: c_int = crate::constants::Z_TREES;
+        /// C `Z_SYNC_FLUSH`.
+        const Z_SYNC_FLUSH: c_int = crate::constants::Z_SYNC_FLUSH;
+
+        let stream = gzip_stream_with_fields(HeaderFields::ALL);
+        for flush in [Z_NO_FLUSH, Z_SYNC_FLUSH, Z_FINISH, Z_BLOCK, Z_TREES] {
+            let apart = observe_gzip_header(&stream, flush, false);
+            let inside = observe_gzip_header(&stream, flush, true);
+            assert_eq!(
+                inside, apart,
+                "flush {flush}: the split path must be observably identical"
+            );
+            assert_eq!(
+                apart.done, 1,
+                "flush {flush}: the header completes before any block boundary"
+            );
+        }
+    }
+
+    /// A payload buffer inside the caller's **input** window is filled without
+    /// disturbing the decode.
+    ///
+    /// The hazard mirrors the output case: the engine holds a `&[u8]` over the input
+    /// window, and `store_extra` copies *from* it, so a header buffer inside it would
+    /// be written through an independent pointer while that reference is live. The
+    /// header phase therefore reads through a staged copy.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn a_header_buffer_inside_the_input_window_is_filled() {
+        let stream = gzip_stream_with_fields(HeaderFields::ALL);
+
+        // A generous input buffer: the stream up front, the header sinks in a tail
+        // region the decoder never reads (it stops at the gzip trailer).
+        let mut input = vec![0xAAu8; stream.len() + 128];
+        input[..stream.len()].copy_from_slice(&stream);
+        let in_len = input.len();
+        let in_ptr = input.as_mut_ptr();
+        let tail = stream.len() + 32;
+        let mut out = vec![0u8; 256];
+
+        let mut head = zeroed_gz_header();
+        // SAFETY: `tail + 3 * 16 <= input.len()`, so all three slots are in bounds.
+        unsafe {
+            head.extra = in_ptr.add(tail);
+            head.extra_max = 16;
+            head.name = in_ptr.add(tail + 16);
+            head.name_max = 16;
+            head.comment = in_ptr.add(tail + 32);
+            head.comm_max = 16;
+        }
+
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    31,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        assert_eq!(unsafe { inflateGetHeader(&mut strm, &mut head) }, Z_OK);
+        strm.next_in = in_ptr;
+        strm.avail_in = in_len as c_uint;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+        let splits_before = HEADER_SPLIT_PASSES.load(core::sync::atomic::Ordering::Relaxed);
+        let rc = unsafe { inflate(&mut strm, Z_NO_FLUSH) };
+        assert!(
+            HEADER_SPLIT_PASSES.load(core::sync::atomic::Ordering::Relaxed) > splits_before,
+            "a header buffer inside the input window must select the split path"
+        );
+        let total_out = strm.total_out as usize;
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+
+        assert_eq!(rc, Z_STREAM_END, "the decode must complete");
+        assert_eq!(&out[..total_out], &hdr_payload()[..]);
+        assert_eq!(&input[tail..tail + HDR_EXTRA.len()], HDR_EXTRA);
+        assert_eq!(&input[tail + 16..tail + 26], b"hello.txt\0");
+        assert_eq!(&input[tail + 32..tail + 37], b"note\0");
+    }
+
+    /// A capacity **raised between calls** takes effect, as it does in C.
+    ///
+    /// C re-reads `head->name_max` on every stored byte (`inflate.c` L632-L637) and
+    /// advances `state->length` only when a byte is actually stored, so a caller that
+    /// starts with a small buffer, sees it fill, and enlarges it mid-parse gets the
+    /// remaining bytes at the right offsets. That is only reproducible because the
+    /// descriptors are re-materialized from the caller's live struct on every call.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn a_name_capacity_raised_between_calls_takes_effect() {
+        let stream = gzip_stream_with_fields(HDR_NAME_ONLY);
+
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    31,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+
+        let mut namebuf = vec![0xAAu8; 32];
+        let mut head = zeroed_gz_header();
+        head.name = namebuf.as_mut_ptr();
+        // Deliberately undersized for the first pass: 4 of the 8 name bytes fit.
+        head.name_max = 4;
+        assert_eq!(unsafe { inflateGetHeader(&mut strm, &mut head) }, Z_OK);
+
+        // First pass: the fixed 10-byte gzip header plus 4 bytes of the name.
+        let mut out = vec![0u8; 256];
+        strm.next_in = stream.as_ptr();
+        strm.avail_in = 14;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+        assert_eq!(unsafe { inflate(&mut strm, Z_NO_FLUSH) }, Z_OK);
+        assert_eq!(
+            &namebuf[..4],
+            b"hell",
+            "the first pass must store exactly what the small capacity allowed"
+        );
+        assert_eq!(
+            namebuf[4], 0xAA,
+            "and must not write past the capacity in force at the time"
+        );
+
+        // Raise the capacity, then feed the rest.
+        head.name_max = 32;
+        strm.next_in = unsafe { stream.as_ptr().add(14) };
+        strm.avail_in = (stream.len() - 14) as c_uint;
+        assert_eq!(unsafe { inflate(&mut strm, Z_FINISH) }, Z_STREAM_END);
+        let total_out = strm.total_out as usize;
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+
+        assert_eq!(&out[..total_out], &hdr_payload()[..]);
+        assert_eq!(
+            &namebuf[..10],
+            b"hello.txt\0",
+            "the raised capacity must admit the remaining bytes at C's offsets"
+        );
+        assert_eq!(head.done, 1);
+    }
+
+    /// A header buffer overlapping the bytes the decode *produces* is overwritten by
+    /// them — header first, output second, exactly as reference zlib leaves it.
+    ///
+    /// This is the ordering guarantee the split path exists to preserve. Staging the
+    /// header stores and flushing them after the decode would reverse it and leave
+    /// header bytes where C leaves decompressed data.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn output_overwrites_a_header_buffer_it_overlaps_exactly_as_c_does() {
+        let stream = gzip_stream_with_fields(HDR_NAME_ONLY);
+        let mut window = vec![0xAAu8; 256];
+        let out_ptr = window.as_mut_ptr();
+
+        let mut head = zeroed_gz_header();
+        // Offset 4 lies inside the 27 bytes `MSG` occupies.
+        // SAFETY: `4 + 16 <= 256`.
+        unsafe {
+            head.name = out_ptr.add(4);
+        }
+        head.name_max = 16;
+
+        let splits_before = HEADER_SPLIT_PASSES.load(core::sync::atomic::Ordering::Relaxed);
+        let (rc, _, total_out, _) =
+            unsafe { inflate_gzip_into(&stream, &mut head, out_ptr, window.len(), Z_FINISH) };
+        assert!(
+            HEADER_SPLIT_PASSES.load(core::sync::atomic::Ordering::Relaxed) > splits_before,
+            "a header buffer inside the output window must select the split path"
+        );
+
+        assert_eq!(rc, Z_STREAM_END);
+        assert_eq!(total_out, hdr_payload().len());
+        assert_eq!(
+            &window[..total_out],
+            &hdr_payload()[..],
+            "the decompressed bytes must survive: they are written after the header"
+        );
+        assert!(
+            window[total_out..].iter().all(|&b| b == 0xAA),
+            "nothing may be written past the produced bytes"
         );
     }
 }

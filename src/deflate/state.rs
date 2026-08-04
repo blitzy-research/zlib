@@ -148,12 +148,13 @@ pub const TOO_FAR: usize = 4096;
 /// [`AllocBuffer`]s (an enum with a discriminant) where C holds bare pointers,
 /// index-typed cursors where C holds `uInt`, and Rust enums where C holds `int`.
 /// Its size is therefore legitimately different — 6136 bytes against C's 5968 on
-/// LP64 — so the two numbers cannot be one value, and this mirror exists to keep
-/// C's available: it is what documents, and what the layout tests assert, the
-/// request reference zlib would make. The port's own init paths ask the caller's
-/// `zalloc` for `size_of::<DeflateState>()` instead, because the region it hands
-/// back *is* where the state lives (AAP §0.6.3 has-hook clause, §0.6.5) and C's
-/// smaller block could not hold it.
+/// LP64 — so the two numbers cannot be one value, and the request has to carry
+/// **C's**: an allocator sized from C's header must serve this port exactly as it
+/// serves reference zlib (AAP §0.6.5). This mirror is what makes that number
+/// available, and [`DeflateState::C_LAYOUT_SIZE`] is what the init and copy paths
+/// charge. The consequence is that the caller's region cannot *host* the larger
+/// Rust state, so it is held purely as the accounting token C's `zfree` receives
+/// back, and the state value sits beside it on the global heap.
 ///
 /// # Why this is portable
 ///
@@ -942,6 +943,18 @@ impl DeflateInitError {
 /// is what makes a `DeflateState` installable (AAP §0.3.1, §0.4.2 B2). The
 /// [`Any`] accessors are the MSRV-1.85 spelling of `&dyn EngineState -> &dyn Any`
 /// upcasting, which only became available in Rust 1.86.
+/// The `size` argument reference zlib passes when it charges a caller's `zalloc`
+/// for this engine's state: C's `sizeof(deflate_state)` (`deflate.c` L440), not
+/// this port's own `size_of::<DeflateState>()`.
+///
+/// Forwarding the `#[repr(C)]` mirror's size is what makes an allocator sized
+/// from C's header — one that serves `(1, 5968)` and refuses anything larger —
+/// initialize here exactly as it does against reference zlib (AAP §0.6.5). See
+/// [`C_LAYOUT_SIZE`](DeflateState::C_LAYOUT_SIZE).
+impl crate::stream::EngineFootprint for DeflateState {
+    const C_STATE_SIZE: usize = Self::C_LAYOUT_SIZE;
+}
+
 impl EngineState for DeflateState {
     #[inline]
     fn engine_kind(&self) -> EngineKind {
@@ -1053,19 +1066,20 @@ impl DeflateState {
     /// index cursors, enums) and does not have to be byte-compatible, only
     /// behaviourally so.
     ///
-    /// That difference is why it is **not** the size the init and copy paths
-    /// request. A caller's `zalloc` is asked for `size_of::<DeflateState>()`,
-    /// because the region it returns is the state's real home (AAP §0.6.3
-    /// has-hook clause, §0.6.5): a block of C's smaller `sizeof` could not hold
-    /// it, so preserving the argument *pair* and holding the state in the caller's
-    /// memory are mutually exclusive. AAP §0.6.5 requires the allocation **count**
-    /// and the **failure timing** to match, and both do; the byte count of a
-    /// single request is not something any zlib contract lets a caller assert, and
-    /// C's own value moves with `LIT_MEM` and pointer width.
+    /// **This is exactly the size the init and copy paths request**, forwarded to
+    /// the crate-internal `EngineFootprint::C_STATE_SIZE`
+    /// so that a caller's `zalloc` sees C's `(1, sizeof(deflate_state))` pair and
+    /// an arena sized from C's header serves it exactly as it serves reference
+    /// zlib (AAP §0.6.5). Because a block of C's smaller `sizeof` cannot hold this
+    /// port's state, the charge and the state value are deliberately separate: the
+    /// caller's region is held — unread — until its matching `zfree`, and the
+    /// state itself lives beside it on the global heap. Every property a zlib
+    /// caller can observe (request count, argument pair, sequence position,
+    /// failure timing, release order) is preserved.
     ///
     /// Exposed publicly because it is the ABI mirror's own size, and the only way
     /// an allocator implementation or a memory-accounting test can state what
-    /// reference zlib would have asked for.
+    /// reference zlib asks for.
     pub const C_LAYOUT_SIZE: usize = core::mem::size_of::<DeflateStateC>();
 
     /// Deep-copies this state into a new one, or returns [`ZlibError::MemError`]
@@ -1742,12 +1756,13 @@ impl DeflateState {
     ///
     /// Five requests, in C `deflateInit2_`'s order and only after the parameters
     /// validate: the state (`deflate.c` L440-L442), then `window`, `prev`, `head`
-    /// and `pending_buf` (L458-L460, L505). The region secured for the state
-    /// becomes the finished state's actual home — the value is moved into it — so a
-    /// caller's arena really does hold the `deflate_state` and gets it back through
-    /// `zfree` at `deflateEnd` (AAP §0.6.3 has-hook clause, §0.6.5). Reservation
-    /// and construction are two steps because the charge has to happen before the
-    /// state value exists: the working buffers are its fields.
+    /// and `pending_buf` (L458-L460, L505). The state request carries C's own pair,
+    /// `(1, `[`C_LAYOUT_SIZE`](Self::C_LAYOUT_SIZE)`)`, so an arena sized from C's
+    /// header serves it exactly as it serves reference zlib, and the region is
+    /// handed back through `zfree` at `deflateEnd` after the working buffers —
+    /// C's teardown order (AAP §0.6.5). Reservation and construction are two steps
+    /// because the charge has to happen before the state value exists: the working
+    /// buffers are its fields.
     ///
     /// Whether to charge for the state at all is the allocator's decision
     /// ([`Allocator::reserves_state_footprint`]): the global default declines,
@@ -1868,8 +1883,8 @@ impl DeflateState {
     /// # Mechanism
     ///
     /// An [`EngineReservation`] reproduces C's
-    /// `ZALLOC(strm, 1, sizeof(deflate_state))` for the destination first, and
-    /// becomes the copy's actual home. [`try_clone_in`](Self::try_clone_in) then
+    /// `ZALLOC(strm, 1, sizeof(deflate_state))` for the destination first, with C's
+    /// own byte count. [`try_clone_in`](Self::try_clone_in) then
     /// performs the field-by-field copy, requesting every working buffer from
     /// `alloc` with exactly one request per buffer and none for anything else, so
     /// a caller's counter sees the same request *per buffer* C issues
@@ -1885,12 +1900,12 @@ impl DeflateState {
     /// be detected after the fact. A zero-length buffer stays legitimately owned
     /// even under an active hook, because an empty request never calls `zalloc`.
     ///
-    /// Filling the reservation then installs the finished state — in the caller's
-    /// region when a hook is active, and otherwise on the Rust heap *fallibly*,
-    /// because [`Box::new`] aborts the process on heap exhaustion whereas zlib
-    /// reports `Z_MEM_ERROR` (AAP §0.6.5). If that last step fails, the state is
-    /// dropped normally and every buffer it owns is released through the caller's
-    /// `zfree`.
+    /// Filling the reservation then installs the finished state on the Rust heap
+    /// *fallibly*, carrying the caller's charge with it, because [`Box::new`]
+    /// aborts the process on heap exhaustion whereas zlib reports `Z_MEM_ERROR`
+    /// (AAP §0.6.5). If that last step fails, the state is dropped normally and
+    /// every buffer it owns — plus the charge itself — is released through the
+    /// caller's `zfree`.
     ///
     /// # Returns
     ///
@@ -2668,8 +2683,8 @@ impl DeflateState {
 /// Each buffer is swapped out with [`core::mem::take`] and dropped immediately;
 /// the replacement is an empty [`AllocBuffer`], whose own drop is a no-op, so the
 /// implicit field drops that follow release nothing further. C's final
-/// `ZFREE(strm, strm->state)` happens after this, when the state's own
-/// hook-backed region is handed back — that is the crate-internal `EngineBox`
+/// `ZFREE(strm, strm->state)` happens after this, when the caller's charge for the
+/// state footprint is handed back — that is the crate-internal `EngineBox`
 /// wrapper's responsibility, not this impl's.
 impl Drop for DeflateState {
     fn drop(&mut self) {

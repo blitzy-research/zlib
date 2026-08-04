@@ -332,13 +332,17 @@ jobs:
         # tests are absent; and the build-only row carries 0 because it runs no
         # test step at all.
         #
-        # The two native rows carry a deliberately conservative 941 - fifteen
-        # below the Linux total, the same margin they have always carried,
-        # because their totals differ from the Linux total by
-        # platform-conditional tests (`#[cfg(unix)]` drops three,
-        # `#[cfg(windows)]` adds the `gzopen_w` round trip plus its guards) and
-        # CANNOT be measured from a Linux host, so an exact floor there would be
-        # a guess that breaks the build. 941 still catches the failure this gate
+        # The two native rows carry a deliberately conservative 988, below the
+        # Linux total, because their totals differ from it by
+        # platform-conditional tests (every `#[cfg(unix)]` test is absent on
+        # Windows; `#[cfg(windows)]` adds the `gzopen_w` round trip plus its
+        # guards) and CANNOT be measured from a Linux host, so an exact floor
+        # there would be a guess that breaks the build. The value is DERIVED
+        # rather than guessed: it is the 944 previously carried plus the 44 of
+        # the 56 tests added since that carry no `#[cfg(unix)]` gate and
+        # therefore run on every platform - the remaining 12 are
+        # `#[cfg(unix)]`-gated, so Windows cannot run them and macOS runs more
+        # than the shared floor demands. 988 still catches the failure this gate
         # exists for: a whole target or suite disappearing. Raise any floor when
         # the suite grows; never lower one to make a red row green.
         include:
@@ -349,7 +353,7 @@ jobs:
             arch: X64
             features: ''
             test: true
-            min_tests: 959
+            min_tests: 1015
           # Every feature turned on at once.
           - name: All features
             os: ubuntu-latest
@@ -357,7 +361,7 @@ jobs:
             arch: X64
             features: '--all-features'
             test: true
-            min_tests: 972
+            min_tests: 1028
           # gzip framing + gz file-I/O layer on top of std.
           - name: gzip + gz-io
             os: ubuntu-latest
@@ -365,7 +369,7 @@ jobs:
             arch: X64
             features: '--no-default-features --features std,gzip,gz-io'
             test: true
-            min_tests: 959
+            min_tests: 1015
           # simd-enabled CRC-32 on top of std, with the gzip framing and gz
           # file-I/O layers OFF. That combination is what makes this row distinct
           # rather than a second copy of another one: `Default features` already
@@ -394,7 +398,7 @@ jobs:
             # ubuntu rows because `gz-io` is off: `tests/gzip_compat.rs`
             # contributes nothing and the `cfg(feature = "gzip")` /
             # `cfg(feature = "gz-io")` unit tests do not exist.
-            min_tests: 704
+            min_tests: 721
           # Core-only (no_std) LIBRARY build. `test: false` is what makes this row
           # distinct rather than redundant: `mod no_std_support` in `src/lib.rs` is
           # gated on `all(not(feature = "std"), not(test), panic = "abort")`, so a
@@ -456,15 +460,16 @@ jobs:
             arch: X64
             features: ''
             test: true
-            # 944 = the 941 previously measured on this row plus the three
-            # platform-unconditional tests added since (two in `src/gz/write.rs`'s
-            # `#[cfg(test)] mod tests`, one in `tests/regression.rs`); none carries a
-            # `#[cfg(unix)]` / `#[cfg(windows)]` gate, so every row that runs the
-            # suite gains the same three. The row stays BELOW the ubuntu floor on
-            # purpose: some tests are `#[cfg(unix)]`-only. If a future change
-            # legitimately excludes a test here, lower THIS row with a note rather
-            # than loosening the ubuntu rows.
-            min_tests: 944
+            # 988 = the 944 previously carried on this row plus the 44
+            # platform-unconditional tests added since. Of the 56 tests added, 44
+            # carry no `#[cfg(unix)]` gate - 25 are gated only on
+            # `feature = "gzip"`, which this row's default feature set enables, and
+            # 19 carry no platform or feature gate at all - so every row that runs
+            # the suite gains the same 44. The other 12 are `#[cfg(unix)]`-gated
+            # and cannot run here. The row stays BELOW the ubuntu floor on
+            # purpose. If a future change legitimately excludes a test here, lower
+            # THIS row with a note rather than loosening the ubuntu rows.
+            min_tests: 988
           # Native macOS: builds for the runner's own triple and, unlike a cross
           # row, EXECUTES the suite. This row PINS both that triple
           # (`aarch64-apple-darwin`) and the architecture GitHub reports
@@ -485,11 +490,13 @@ jobs:
             arch: ARM64
             features: ''
             test: true
-            # 944, derived exactly as the Windows row above: 941 plus the three
+            # 988, derived exactly as the Windows row above: 944 plus the 44
             # platform-unconditional tests added since. macOS is a unix target, so
-            # the `#[cfg(unix)]` tests DO run here; the shared 941 base reflects the
-            # non-unix-specific exclusions both native rows share.
-            min_tests: 944
+            # the `#[cfg(unix)]` tests DO run here and the true total is higher
+            # still; the shared, Windows-safe value is deliberately the lower of
+            # the two, and the 944 base reflects the non-unix-specific exclusions
+            # both native rows share.
+            min_tests: 988
     steps:
     - name: Checkout repository
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -781,7 +788,7 @@ jobs:
     # bare numeric floor comes back.
     env:
       RUSTUP_TOOLCHAIN: stable
-      STD_OFF_FLOOR: 696
+      STD_OFF_FLOOR: 713
     steps:
     - name: Checkout repository
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -846,7 +853,7 @@ jobs:
     # tests are silently lost, and AAP directive D-5 fixes the suite at
     # "preserved and only ever increased, zero ignored" (finding TEST-08).
     #
-    # The floor is STD_OFF_FLOOR (696) on all four, the measured std-off total. It is
+    # The floor is STD_OFF_FLOOR (713) on all four, the measured std-off total. It is
     # LOWER than the default-feature total by design: `gz-io` is off, so the
     # `tests/gzip_compat.rs` target contributes nothing and several
     # `cfg(feature = "gz-io")` unit tests do not exist. That gap is the reason
@@ -2997,7 +3004,7 @@ jobs:
     # nothing, since `c-oracle` is not a default feature.
     env:
       RUSTUP_TOOLCHAIN: stable
-      PACKAGED_FLOOR: 959
+      PACKAGED_FLOOR: 1015
     steps:
     - name: Checkout repository
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

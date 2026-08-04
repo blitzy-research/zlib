@@ -564,8 +564,8 @@ contain `unsafe` at all:
 
 | Location | Unsafe-bearing code lines |
 |----------|---------------------------|
-| `src/ffi/` (carve-out 1 — the designated boundary) | **1,497** — `inflate.rs` 478, `deflate.rs` 333, `gz.rs` 186, `util.rs` 184, `types.rs` 148, `mod.rs` 106, `alloc.rs` 62 |
-| `src/lib.rs` (carve-out 2 — the freestanding runtime block, plus the boundary tests that police it) | **49**, split **22 / 27**. The **22** sit inside the private `mod no_std_support` (L207–L422): the libc-backed `#[global_allocator]`, the `#[panic_handler]`, and the personality symbol. The other **27** are all inside `#[cfg(test)] mod tests` — the boundary scanner's own parsing logic, its assertion messages, and the deliberately adversarial corpus it is fed. **No executable `unsafe` exists anywhere else in the file**, and an in-crate test asserts precisely that rather than trusting it |
+| `src/ffi/` (carve-out 1 — the designated boundary) | **1,662** — `inflate.rs` 538, `deflate.rs` 373, `gz.rs` 212, `types.rs` 188, `util.rs` 184, `mod.rs` 113, `alloc.rs` 54 |
+| `src/lib.rs` (carve-out 2 — the freestanding runtime block, plus the boundary tests that police it) | **51**, split **22 / 29**. The **22** sit inside the private `mod no_std_support` (L207–L422): the libc-backed `#[global_allocator]`, the `#[panic_handler]`, and the personality symbol. The other **29** are all inside `#[cfg(test)] mod tests` — the boundary scanner's own parsing logic, its assertion messages, and the deliberately adversarial corpus it is fed. **No executable `unsafe` exists anywhere else in the file**, and an in-crate test asserts precisely that rather than trusting it |
 | `src/deflate/`, `src/inflate/`, `src/checksum/`, `src/gz/`, `src/util/`, `src/error.rs`, `src/constants.rs`, `src/gz_header.rs` | **0** |
 | `src/stream.rs` | **2**, and both are `type` aliases only — `ZallocFn` and `ZfreeFn` merely *name* the C hook signatures the crate interoperates with. `grep -c "unsafe {"` on that file returns **0**, and the module carries its own `#![deny(unsafe_code)]` |
 
@@ -589,7 +589,7 @@ exist for the sole purpose of proving that the scanner ignores commented-out
 `src/ffi/`, `src/lib.rs`, and `src/stream.rs` are all measured by one identical
 method; a mixed methodology would make the rows incomparable.
 
-Every `unsafe` block that does exist is justified in place: **513** `// SAFETY:`
+Every `unsafe` block that does exist is justified in place: **592** `// SAFETY:`
 comments across `src/`, with `#![warn(clippy::undocumented_unsafe_blocks)]` and
 `#![warn(missing_docs)]` promoted to hard errors by the `-D warnings` lint gate.
 Containment is checked four independent ways — the `deny` attribute, that lint
@@ -629,9 +629,9 @@ derivation: [Exported symbol reconciliation](README.md#exported-symbol-reconcili
 
 | Command | Result |
 |---------|--------|
-| `cargo test --locked` | **959 passed / 0 failed / 0 ignored** (799 unit, 131 integration, 29 doctests) |
-| `cargo test --locked --all-features` | **972 passed / 0 failed / 0 ignored** (adds the 13 live C-oracle tests) |
-| `cargo test --locked --no-default-features` | **696 passed / 0 failed / 0 ignored** (571 unit, 98 integration, 27 doctests) |
+| `cargo test --locked` | **1015 passed / 0 failed / 0 ignored** (854 unit, 132 integration, 29 doctests) |
+| `cargo test --locked --all-features` | **1028 passed / 0 failed / 0 ignored** (adds the 13 live C-oracle tests) |
+| `cargo test --locked --no-default-features` | **713 passed / 0 failed / 0 ignored** (587 unit, 99 integration, 27 doctests) |
 
 The **ignored-test count is zero in every configuration and stays zero**. A
 capability that cannot be exercised in a given build is expressed by a feature
@@ -734,10 +734,10 @@ sits here:
   assertion that the freestanding runtime block — the libc-backed allocator, the
   abort panic handler, the personality shim — was genuinely compiled. **`no_std`
   has been validated on a hosted target and compile-verified for bare metal; it
-  has not been exercised on real embedded hardware.** 696 passing hosted tests do
+  has not been exercised on real embedded hardware.** 713 passing hosted tests do
   not prove an embedded target works.
-- **Human code review across the full Rust surface — 72,082 lines across 40 files
-  under `src/`, measured on 2026-08-03 with
+- **Human code review across the full Rust surface — 78,386 lines across 40 files
+  under `src/`, measured on 2026-08-04 with
   `find src -name '*.rs' -print0 | xargs -0 wc -l` — is outstanding**, and it is
   the highest-severity remaining hardening item
   precisely because it cannot be automated away. Everything above is machine

@@ -62,7 +62,7 @@ use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
 
 #[cfg(feature = "gzip")]
-use crate::gz_header::{ForeignGzHeader, ForeignGzHeaderSink};
+use crate::gz_header::{ForeignByteSink, ForeignGzHeader, ForeignGzHeaderSink};
 use crate::gz_header::{GzHeader, HeaderPublication};
 use crate::stream::{AllocBuffer, AllocHook, Allocator, ZStream, ZeroValid};
 
@@ -343,47 +343,51 @@ pub type gzFile = *mut gzFile_s;
 /// unconditional: supplying `zalloc`/`zfree` routes allocation through them and
 /// never breaks the stream, and leaving them null works identically to before.
 ///
-/// # Where the engine *state* itself lives
+/// # How the engine *state* is charged
 ///
-/// The working buffers are not the only thing the hook owns. Placement of the
-/// `deflate_state`/`inflate_state` value is decided by `EngineReservation` in
-/// `src/stream.rs`, whose arm is selected from two allocator predicates —
-/// [`reserves_state_footprint`](Allocator::reserves_state_footprint) and
-/// [`hook().is_active()`](AllocHook::is_active):
+/// The working buffers are not the only thing the hook is billed for. The
+/// `deflate_state`/`inflate_state` charge is made by `EngineReservation` in
+/// `src/stream.rs`, whose arm is selected by one allocator predicate,
+/// [`reserves_state_footprint`](Allocator::reserves_state_footprint):
 ///
-/// | `reserves_state_footprint()` | `hook().is_active()` | Arm | Where the state's bytes are |
-/// |---|---|---|---|
-/// | `false` | — | `Global` | the Rust global heap (`Box<E>`) |
-/// | `true` | `true` | `Foreign` | the region the caller's `zalloc` returned |
-/// | `true` | `false` | `Charged` | the global heap, with the footprint charged beside it |
+/// | `reserves_state_footprint()` | Arm | What the allocator is asked for |
+/// |---|---|---|
+/// | `false` | `Global` | nothing — the state is a plain `Box<E>` on the Rust global heap |
+/// | `true` | `Charged` | C's own `(1, sizeof(deflate_state))` / `(1, sizeof(struct inflate_state))` |
 ///
 /// [`CAllocator`] reports `reserves_state_footprint() == hook().is_active()`
-/// (see its [`Allocator`] impl), so a C caller only ever reaches the first two
-/// rows, and which one is fixed by whether a hook is installed:
+/// (see its [`Allocator`] impl), so which row a C caller reaches is fixed by
+/// whether a hook is installed:
 ///
 /// * **Null hooks — or a pair made up solely of the crate's built-in
 ///   substitutes, which is what a hookless caller ends up publishing —** take
 ///   the `Global` arm. The state and every buffer stay on the Rust global heap,
 ///   keeping a hookless caller's allocation count and footprint byte-for-byte
 ///   what they have always been (AAP §0.6.5).
-/// * **An installed hook** takes the `Foreign` arm, so the state *itself* is
-///   carved from the caller's `zalloc` — reserved where C makes its
-///   `ZALLOC(strm, 1, sizeof(deflate_state))` (`deflate.c` L440), released
-///   through their `zfree`, and reached only through the safe
-///   `ForeignEngine` interface implemented in `src/ffi/alloc.rs`. The caller's
-///   arena is the real owner of the state, not merely of the buffers beside it.
+/// * **An installed hook** takes the `Charged` arm, so the caller's `zalloc` is
+///   billed for the state where C makes its
+///   `ZALLOC(strm, 1, sizeof(deflate_state))` (`deflate.c` L440) — with C's own
+///   `items` **and** C's own `size`, so an arena sized from C's header serves it
+///   exactly as it serves reference zlib — and the region is handed back through
+///   their `zfree` after the working buffers, C's teardown order.
 ///
-/// The `Charged` arm — a globally boxed state with the footprint charged to an
-/// allocator that hands out typed slice buffers and therefore cannot host an
-/// arbitrary Rust value — is unreachable through this bridge and exists only for
-/// a custom Rust [`Allocator`] implementation.
+/// The charged region is held, unread, purely as the caller's accounting token;
+/// the state value itself sits beside it on the global heap. That split is
+/// forced rather than chosen: a block of C's `sizeof` cannot hold this port's
+/// legitimately larger state, so billing C's byte count and hosting the state in
+/// the same block are mutually exclusive. Requesting this port's own
+/// `size_of::<DeflateState>()` instead made a conforming allocator sized for
+/// C refuse, turning a successful `deflateInit2_` into `Z_MEM_ERROR` — a real
+/// drop-in defect. Everything the caller's allocator can observe (request count,
+/// argument pair, sequence position, failure timing, release order) is C-exact;
+/// only the address the state occupies differs, and no zlib contract exposes it.
 ///
-/// What remains on the global heap in *every* arm is the small type-erasing
-/// owner: the `Box` holding the two-arm `EngineBox` handle, which is what lets
-/// the stream's state slot stay a single non-generic boxed trait object. That is
-/// one small allocation per stream, requested fallibly, so a refusal surfaces as
-/// `Z_MEM_ERROR` and never aborts; it never re-requests the caller's region, so
-/// C's allocation *count* is unaffected by it.
+/// What remains on the global heap in *both* arms is the small owning handle:
+/// the `Box` holding `EngineBox`, which is what lets the stream's state slot stay
+/// a single non-generic boxed trait object. That is one small allocation per
+/// stream, requested fallibly, so a refusal surfaces as `Z_MEM_ERROR` and never
+/// aborts; it never re-requests the caller's region, so C's allocation *count* is
+/// unaffected by it.
 #[derive(Clone, Copy)]
 pub struct CAllocator {
     /// The caller's allocation hook, or `None` (mirrors [`z_stream::zalloc`]).
@@ -1108,7 +1112,9 @@ pub struct DeflateHandle {
     /// caller's struct each time the engine needs it, so mutations made after
     /// registration but before emission are honored exactly as in C
     /// (`deflate.c` L893-L907, L1092-L1188). Holding a raw pointer requires no
-    /// `unsafe`; the dereference is confined to `borrow_gz_header`.
+    /// `unsafe`; every field access is confined to `read_gz_header_source`, which
+    /// reads through `addr_of!` projections and never forms a reference over the
+    /// caller's struct or its payload buffers.
     #[cfg(feature = "gzip")]
     pub(crate) head: *mut gz_header,
 }
@@ -1413,6 +1419,15 @@ pub fn stream_buffers_valid(strm: &z_stream) -> bool {
 /// `next_in` must stay within the caller's input buffer.
 #[inline]
 pub unsafe fn advance_input(strm: &mut z_stream, consumed: usize) {
+    // `consumed` is always an engine-reported count over the very slice built from
+    // `avail_in`, so it cannot exceed it and the subtraction cannot underflow. That
+    // makes this categorically different from `rewind_input`, whose addend is
+    // unbounded by the field it is added to. The assertion pins the invariant in
+    // debug and test builds without costing anything in release.
+    debug_assert!(
+        consumed <= strm.avail_in as usize,
+        "advance_input must never consume more than avail_in"
+    );
     // SAFETY: `consumed <= avail_in`, so the offset stays within the input
     // buffer the caller guaranteed for `next_in`.
     strm.next_in = unsafe { strm.next_in.add(consumed) };
@@ -1457,8 +1472,22 @@ pub(crate) unsafe fn rewind_input(strm: &mut z_stream, rewound: usize) {
     // `wrapping_sub` rather than `sub`: the offset is only guaranteed in-bounds by
     // the caller's contiguous-buffer contract, and this crate never dereferences
     // the result — it is published to the caller, which owns the memory.
-    strm.next_in = strm.next_in.wrapping_sub(rewound);
-    strm.avail_in += rewound as c_uint;
+    //
+    // `wrapping_add` rather than `+`: C recomputes the count in `unsigned`
+    // arithmetic, which wraps. `inffast.c` L295 is
+    // `strm->avail_in = (unsigned)(in < last ? 5 + (last - in) : 5 - (in - last));`
+    // — a `uInt` expression with no overflow check — so a caller who presents
+    // `avail_in` near `u32::MAX` and triggers a buffered-byte rewind observes the
+    // wrapped value in reference zlib. A checked `+` would instead panic, which
+    // under this crate's `panic = "abort"` profiles (`Cargo.toml`) terminates the
+    // host process: a denial of service where C returns a defined, if surprising,
+    // count. Both fields are computed and then committed together, so no
+    // intermediate state where the cursor moved but the count did not is ever
+    // observable.
+    let next_in = strm.next_in.wrapping_sub(rewound);
+    let avail_in = strm.avail_in.wrapping_add(rewound as c_uint);
+    strm.next_in = next_in;
+    strm.avail_in = avail_in;
 }
 
 /// Republishes [`z_stream::total_in`] using C's per-call input delta.
@@ -1502,6 +1531,12 @@ pub(crate) fn republish_total_in(
 /// `next_out` must stay within the caller's output buffer.
 #[inline]
 pub unsafe fn advance_output(strm: &mut z_stream, produced: usize) {
+    // As in `advance_input`: `produced` is an engine-reported count over the slice
+    // built from `avail_out`, so it is bounded by the field it is subtracted from.
+    debug_assert!(
+        produced <= strm.avail_out as usize,
+        "advance_output must never produce more than avail_out"
+    );
     // SAFETY: `produced <= avail_out`, so the offset stays within the output
     // buffer the caller guaranteed for `next_out`.
     strm.next_out = unsafe { strm.next_out.add(produced) };
@@ -1584,99 +1619,579 @@ unsafe fn cstr_bytes(ptr: *const c_uchar) -> Result<Vec<u8>, TryReserveError> {
     try_copy_bytes(unsafe { slice::from_raw_parts(ptr, len) })
 }
 
-/// Returns the bytes of a NUL-terminated C string as a **borrowed** slice,
-/// excluding the terminator.
+/// Returns the length of a NUL-terminated C string, excluding the terminator,
+/// **without forming a slice over it**.
 ///
-/// The allocation-free counterpart of [`cstr_bytes`]. It exists because C's
-/// `deflateSetHeader` copies nothing: `deflate` re-reads `s->gzhead->name[...]`
-/// straight out of caller memory at emission time (`deflate.c` L1158), so the
-/// shim must be able to hand the engine a borrow rather than a copy. Being
-/// infallible is the point — C's registration cannot fail for want of memory, so
-/// neither may this path (AAP §0.6.5).
+/// The allocation-free counterpart of [`cstr_bytes`], and the read-side mirror of
+/// [`CRawHeaderSink`]. It exists because C's `deflateSetHeader` copies nothing:
+/// `deflate` re-reads `s->gzhead->name[...]` straight out of caller memory at
+/// emission time (`deflate.c` L1158), so the shim must be able to *describe* the
+/// caller's buffer without committing to a reference over it. Being infallible is
+/// the point — C's registration cannot fail for want of memory, so neither may
+/// this path (AAP §0.6.5).
+///
+/// Returning a length rather than a `&[u8]` is what lets the caller decide
+/// *whether* a reference may be formed at all: a field that overlaps the output
+/// window must be staged instead (see [`CGzHeaderSource`]).
 ///
 /// # Safety
 ///
 /// `ptr` must be non-null and point at a NUL-terminated sequence of bytes that
-/// stays valid, and unmutated, for the lifetime `'a`.
+/// stays valid for the duration of the scan, and **no mutable reference may be
+/// live over the scanned bytes**. The scan reads through the raw pointer, so it
+/// creates no reference of its own, but a read through an unrelated pointer is
+/// still a foreign access that would invalidate a `&mut` covering the same
+/// region — which is why the boundary performs every scan before it bridges the
+/// caller's output window.
 #[cfg(feature = "gzip")]
-unsafe fn cstr_slice<'a>(ptr: *const c_uchar) -> &'a [u8] {
+unsafe fn cstr_len(ptr: *const c_uchar) -> usize {
     let mut len = 0usize;
     // SAFETY: per the contract, `ptr` points at a NUL-terminated string, so
-    // every `ptr.add(len)` up to and including the terminator is readable.
+    // every `ptr.add(len)` up to and including the terminator is readable, and no
+    // conflicting reference is live over them.
     while unsafe { *ptr.add(len) } != 0 {
         len += 1;
     }
-    // SAFETY: bytes `ptr[0..len]` precede the NUL and are therefore readable,
-    // and the contract keeps them valid for `'a`.
-    unsafe { slice::from_raw_parts(ptr, len) }
+    len
 }
 
-/// Borrows a live caller-owned [`gz_header`] as a [`ForeignGzHeader`], or
+/// Whether the half-open address ranges `[a_start, a_end)` and `[b_start, b_end)`
+/// share at least one byte.
+///
+/// Plain integer comparison is deliberate. Addresses that may belong to different
+/// allocations cannot be compared as *pointers* in any defined way, but comparing
+/// them as `usize` is total and exact — and "do these two byte ranges touch" is
+/// precisely the question the boundary must answer before deciding whether a
+/// reference may be formed over a caller-supplied buffer.
+///
+/// Both empty-range cases answer `false`, because a range spanning no bytes cannot
+/// share a byte with anything: an empty *field* (a non-null `head->extra` with
+/// `extra_len == 0`, or a `name` that is just its NUL) occupies nothing, and an
+/// empty *window* (`avail_out == 0`, which the engine sees as `&mut []`) covers
+/// nothing. Adjacency — one range ending exactly where the other begins — is
+/// likewise not an overlap.
+#[cfg(feature = "gzip")]
+#[inline]
+fn ranges_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool {
+    a_start < a_end && b_start < b_end && a_start < b_end && b_start < a_end
+}
+
+/// Reads a live caller-owned [`gz_header`] into a [`CGzHeaderSource`], or
 /// [`None`] when `head` is null.
 ///
 /// This is the read side of the C ABI's gzip-header contract and the reason
 /// `deflateSetHeader` needs no allocation at all. C stores the caller's pointer
 /// and re-reads every field lazily when the header is emitted (`deflate.c` L717,
-/// L893-L907, L1092-L1188); this function reproduces that by materializing
-/// borrowed slices over the caller's own buffers, once per engine call.
+/// L893-L907, L1092-L1188); this function reproduces that by re-describing the
+/// caller's own buffers once per engine call.
 ///
 /// Nothing is copied and nothing is allocated, so unlike
 /// [`gz_header_to_idiomatic`] this cannot fail — which is required, because
 /// reference zlib's `deflateSetHeader` returns only `Z_OK` or `Z_STREAM_ERROR`
 /// and can never report `Z_MEM_ERROR`.
 ///
+/// # Why a descriptor and not a [`ForeignGzHeader`]
+///
+/// The engine consumes borrowed slices, but the boundary must not *decide* to form
+/// them until it knows whether they would overlap a window the engine holds
+/// mutably: `zlib.h` L843-L847 lets a caller point `head->name` straight at
+/// `strm->next_out`, and a shared borrow over bytes covered by a live `&mut` is
+/// undefined behaviour regardless of how carefully it is bounded. This function
+/// therefore stops one step short of the borrow, and
+/// [`CGzHeaderSource::borrow`]/[`CGzHeaderSource::stage_into`] complete it.
+///
 /// # Safety
 ///
-/// `head` must be null, or point at a valid `gz_header` that stays valid for
-/// `'a`, whose `extra` (when non-null) is readable for `extra_len` bytes and
-/// whose `name`/`comment` (when non-null) are NUL-terminated — exactly the
-/// contract `zlib.h` L843-L847 places on the caller.
+/// `head` must be null, or point at a valid `gz_header` that stays valid for the
+/// duration of the call, whose `extra` (when non-null) is readable for `extra_len`
+/// bytes and whose `name`/`comment` (when non-null) are NUL-terminated — exactly
+/// the contract `zlib.h` L843-L847 places on the caller. No mutable reference may
+/// be live over the `name`/`comment` bytes, which are scanned for their terminator
+/// here; the boundary satisfies this by calling before it bridges the caller's
+/// output window.
 #[cfg(feature = "gzip")]
-pub(crate) unsafe fn borrow_gz_header<'a>(head: *const gz_header) -> Option<ForeignGzHeader<'a>> {
+pub(crate) unsafe fn read_gz_header_source(head: *const gz_header) -> Option<CGzHeaderSource> {
     if head.is_null() {
         return None;
     }
-    // SAFETY: `head` is non-null and, per the contract, a valid `gz_header`.
-    let h = unsafe { &*head };
-    Some(ForeignGzHeader {
-        text: h.text != 0,
+    // Every field is projected with `addr_of!` and read through the resulting raw
+    // pointer. Forming `&*head` instead would create a shared reference over the
+    // caller's whole `gz_header`, which is both unnecessary and — if the caller
+    // placed that struct inside a region the boundary also references — a foreign
+    // access. `addr_of!` never materializes a reference, so the question cannot
+    // arise.
+    //
+    // SAFETY: `head` is non-null and, per the contract, points at a valid
+    // `gz_header` for the duration of this call, so every field projection is
+    // in-bounds, aligned and initialized.
+    let (text, time, os, hcrc, extra_ptr, extra_len, name_ptr, comment_ptr) = unsafe {
+        (
+            ptr::addr_of!((*head).text).read(),
+            ptr::addr_of!((*head).time).read(),
+            ptr::addr_of!((*head).os).read(),
+            ptr::addr_of!((*head).hcrc).read(),
+            ptr::addr_of!((*head).extra).read(),
+            ptr::addr_of!((*head).extra_len).read(),
+            ptr::addr_of!((*head).name).read(),
+            ptr::addr_of!((*head).comment).read(),
+        )
+    };
+
+    // The two NUL scans are hoisted out of the struct literal so each carries its
+    // own safety justification: `clippy::undocumented_unsafe_blocks` requires the
+    // comment on the line immediately preceding the block, and a single comment
+    // above a struct literal does not cover a second block further down it.
+    //
+    // SAFETY: a non-null `name` is a NUL-terminated C string that stays valid for
+    // the duration of this call (`zlib.h` L843-L847), and this function runs before
+    // the boundary bridges the caller's output window, so no mutable reference is
+    // live over the scanned bytes.
+    let name_len = unsafe { cstr_len_of(name_ptr) };
+    // SAFETY: identical to `name` above — a non-null `comment` is a NUL-terminated
+    // C string valid for this call, scanned before any output window is bridged.
+    let comment_len = unsafe { cstr_len_of(comment_ptr) };
+
+    Some(CGzHeaderSource {
+        text: text != 0,
         // C writes the low four bytes of `head->time` (`deflate.c` L1098-L1101),
         // so a 64-bit `uLong` is truncated exactly as C truncates it. The
         // narrowing goes through `ulong_to_u32` because it is the identity on
         // LLP64 targets, where a bare `as u32` trips `clippy::unnecessary_cast`.
-        time: ulong_to_u32(h.time),
-        os: h.os,
-        hcrc: h.hcrc != 0,
-        extra: if h.extra.is_null() {
-            None
-        } else {
-            // C bounds the field by `head->extra_len & 0xffff` (`deflate.c`
-            // L1120), and `zlib.h` L845-L846 makes `extra_len` bytes readable
-            // the caller's responsibility.
-            // SAFETY: a non-null `extra` is readable for `extra_len` bytes and
-            // stays valid for `'a` per this function's contract.
-            Some(unsafe { slice::from_raw_parts(h.extra, h.extra_len as usize) })
-        },
-        name: if h.name.is_null() {
-            None
-        } else {
-            // SAFETY: a non-null `name` is a NUL-terminated C string valid for `'a`.
-            Some(unsafe { cstr_slice(h.name) })
-        },
-        comment: if h.comment.is_null() {
-            None
-        } else {
-            // SAFETY: a non-null `comment` is a NUL-terminated C string valid for `'a`.
-            Some(unsafe { cstr_slice(h.comment) })
-        },
+        time: ulong_to_u32(time),
+        os,
+        hcrc: hcrc != 0,
+        // C bounds the field by `head->extra_len & 0xffff` when it emits XLEN
+        // (`deflate.c` L1120), but the *descriptor* records `extra_len` verbatim:
+        // the engine applies the mask itself, and `extra_len & 0xffff` is not
+        // recoverable from a pre-masked length (`0x1_0005 & 0xffff == 5`, whereas
+        // masking `0x1_0000` first yields `0`). `zlib.h` L845-L846 makes those
+        // bytes readable the caller's responsibility.
+        //
+        // A non-null pointer with a zero length stays `Some`, because presence —
+        // not length — is what sets FLG bit 4 (`s->gzhead->extra != Z_NULL`), so a
+        // caller registering an empty `extra` gets an empty extra field emitted.
+        extra: CRawHeaderSource::describe(extra_ptr, extra_len as usize),
+        // `name` and `comment` are NUL-terminated rather than length-prefixed, so
+        // their extents come from the scans performed above.
+        name: CRawHeaderSource::describe(name_ptr, name_len),
+        comment: CRawHeaderSource::describe(comment_ptr, comment_len),
     })
 }
 
-/// Borrows a live caller-owned [`gz_header`]'s **output buffers** as a
-/// [`ForeignGzHeaderSink`], or [`None`] when `head` is null.
+/// [`cstr_len`] lifted over a possibly-null pointer, yielding `0` for null.
 ///
-/// This is the read direction's counterpart of [`borrow_gz_header`], and it must
-/// be called immediately before each engine call rather than once at
+/// Keeps [`read_gz_header_source`] free of a nested `if` per field: the length is
+/// irrelevant when the pointer is null, because [`CRawHeaderSource::describe`]
+/// discards it.
+///
+/// # Safety
+///
+/// Same contract as [`cstr_len`] when `ptr` is non-null.
+#[cfg(feature = "gzip")]
+unsafe fn cstr_len_of(ptr: *const c_uchar) -> usize {
+    if ptr.is_null() {
+        return 0;
+    }
+    // SAFETY: `ptr` is non-null and the caller upholds `cstr_len`'s contract.
+    unsafe { cstr_len(ptr) }
+}
+
+/// One gzip-header payload field belonging to a C caller, addressed as a bare
+/// pointer plus a length — the **read**-side counterpart of [`CRawHeaderSink`].
+///
+/// # Why not a slice
+///
+/// C's `deflate` reads the header's three payloads through three independent
+/// caller pointers — `head->extra`, `head->name`, `head->comment` — and `zlib.h`
+/// L843-L847 imposes **no disjointness** between them or with `strm->next_out`. A
+/// caller may legally set `head->name = strm->next_out`. Materializing such a
+/// field as `&[u8]` while the engine holds the output window as `&mut [u8]` is
+/// undefined behaviour: both references cover the same bytes, the shared read
+/// invalidates the unique tag, and the engine's next write through it is invalid.
+/// Bounds checking cannot help — the violation is committed when the second
+/// reference is *created*.
+///
+/// Splitting *describing* a field from *reading* it is what makes the legal
+/// overlap expressible. The boundary measures the overlap first, then chooses
+/// between borrowing in place (disjoint — the allocation-free zero-copy path,
+/// which is what C does) and staging a copy before the output window is bridged
+/// (overlapping).
+///
+/// # Invariants
+///
+/// * `ptr` is non-null and addresses at least `len` readable bytes for as long as
+///   this value lives.
+/// * `len` is the caller's *live* field length: `head->extra_len` verbatim for
+///   `extra`, and the distance to the terminating NUL for `name`/`comment`.
+#[cfg(feature = "gzip")]
+#[derive(Clone, Copy)]
+pub(crate) struct CRawHeaderSource {
+    /// The caller's buffer pointer, non-null and valid for `len` readable bytes.
+    ptr: *const c_uchar,
+    /// The caller's live length for this field, in bytes.
+    len: usize,
+}
+
+#[cfg(feature = "gzip")]
+impl CRawHeaderSource {
+    /// Describes `ptr`/`len` as a field, or [`None`] when `ptr` is null.
+    ///
+    /// Null is the only rejection: unlike the sink side, a zero *length* is a
+    /// meaningful, emittable field (see [`read_gz_header_source`]).
+    #[inline]
+    fn describe(ptr: *const c_uchar, len: usize) -> Option<Self> {
+        if ptr.is_null() {
+            None
+        } else {
+            Some(Self { ptr, len })
+        }
+    }
+
+    /// The half-open address range `[start, end)` this field occupies, as plain
+    /// integers, with a saturating end so a caller-declared length that would wrap
+    /// the address space cannot panic.
+    #[inline]
+    fn range(self) -> (usize, usize) {
+        let start = self.ptr as usize;
+        (start, start.saturating_add(self.len))
+    }
+
+    /// Whether this field shares a byte with the half-open range `[start, end)`.
+    #[inline]
+    fn intersects(self, start: usize, end: usize) -> bool {
+        let (f_start, f_end) = self.range();
+        ranges_overlap(f_start, f_end, start, end)
+    }
+
+    /// Materializes the borrow the engine consumes.
+    ///
+    /// # Safety
+    ///
+    /// The field's bytes must be readable for `len` and remain valid and unmutated
+    /// for `'a`, and **no mutable reference may be live over them** for `'a`. The
+    /// second clause is the one that matters here and the reason this is not simply
+    /// done at construction: the caller must have established disjointness from
+    /// every window the engine holds (see [`CGzHeaderSource::intersects`]).
+    #[inline]
+    unsafe fn borrow<'a>(self) -> &'a [u8] {
+        // SAFETY: per the contract the region is readable for `len` and no
+        // conflicting reference exists, which is exactly `from_raw_parts`'
+        // precondition. `c_uchar` needs no alignment.
+        unsafe { slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    /// Copies the field into `dst`, which is cleared first.
+    ///
+    /// Used only when the field overlaps a window the engine will hold, so that the
+    /// engine reads the staged copy instead of the caller's memory.
+    ///
+    /// # Safety
+    ///
+    /// As [`borrow`](Self::borrow): the copy reads the caller's bytes, so it must
+    /// run while no mutable reference is live over them — that is, *before* the
+    /// boundary bridges the output window.
+    unsafe fn stage(self, dst: &mut Vec<u8>) -> Result<(), TryReserveError> {
+        dst.clear();
+        dst.try_reserve_exact(self.len)?;
+        // SAFETY: the caller upholds `borrow`'s contract, and the borrow ends
+        // inside this statement — it never coexists with the engine's windows.
+        dst.extend_from_slice(unsafe { self.borrow() });
+        Ok(())
+    }
+}
+
+/// Owned storage for a staged copy of the three header payloads.
+///
+/// Lives in the FFI shim's own frame for the duration of one call. Only the
+/// overlapping path fills it; the universal disjoint path leaves all three vectors
+/// empty and never allocates, which is what keeps `deflate`'s header handling as
+/// allocation-free as C's (AAP §0.6.5).
+#[cfg(feature = "gzip")]
+#[derive(Debug, Default)]
+pub(crate) struct CGzHeaderStage {
+    /// Staged `head->extra`.
+    extra: Vec<u8>,
+    /// Staged `head->name`, excluding its NUL.
+    name: Vec<u8>,
+    /// Staged `head->comment`, excluding its NUL.
+    comment: Vec<u8>,
+}
+
+/// A live caller-owned [`gz_header`] read as scalars plus three raw field
+/// descriptors — the read-side counterpart of [`CGzHeaderSinks`].
+///
+/// This is what `deflateSetHeader`'s stored pointer becomes at every point C would
+/// re-read it: inside `deflate` at emission time (`deflate.c` L1092-L1188) and
+/// inside `deflateBound` (`deflate.c` L893-L907). Re-reading per call is what makes
+/// a mutation performed after registration but before emission observable in the
+/// output bytes, exactly as in C, and is required for byte identity
+/// (AAP §0.8.1 D-1).
+#[cfg(feature = "gzip")]
+pub(crate) struct CGzHeaderSource {
+    /// C `head->text`.
+    text: bool,
+    /// C `head->time`, truncated to the four bytes C writes.
+    time: u32,
+    /// C `head->os`.
+    os: c_int,
+    /// C `head->hcrc`.
+    hcrc: bool,
+    /// C `head->extra`, length `head->extra_len` verbatim.
+    extra: Option<CRawHeaderSource>,
+    /// C `head->name`, length up to but excluding its NUL.
+    name: Option<CRawHeaderSource>,
+    /// C `head->comment`, length up to but excluding its NUL.
+    comment: Option<CRawHeaderSource>,
+}
+
+#[cfg(feature = "gzip")]
+impl CGzHeaderSource {
+    /// Whether any present payload field shares a byte with the half-open address
+    /// range `[start, end)`.
+    ///
+    /// The boundary asks this about the caller's output window. An intersection
+    /// means the engine would hold a `&mut [u8]` over bytes a header borrow also
+    /// covers, so the fields must be staged; a disjoint answer — the universal
+    /// case — keeps the zero-copy path.
+    pub(crate) fn intersects(&self, start: usize, end: usize) -> bool {
+        [self.extra, self.name, self.comment]
+            .into_iter()
+            .flatten()
+            .any(|field| field.intersects(start, end))
+    }
+
+    /// The zero-copy view: the engine reads the caller's own memory, as C does.
+    ///
+    /// # Safety
+    ///
+    /// Every present field must satisfy [`CRawHeaderSource::borrow`]'s contract for
+    /// `'a`. In particular the caller must have established, via
+    /// [`intersects`](Self::intersects), that no field overlaps a window held as
+    /// `&mut` for `'a`.
+    pub(crate) unsafe fn borrow<'a>(&self) -> ForeignGzHeader<'a> {
+        ForeignGzHeader {
+            text: self.text,
+            time: self.time,
+            os: self.os,
+            hcrc: self.hcrc,
+            // SAFETY: delegated to this function's contract, field by field.
+            extra: self.extra.map(|f| unsafe { f.borrow() }),
+            // SAFETY: as above.
+            name: self.name.map(|f| unsafe { f.borrow() }),
+            // SAFETY: as above.
+            comment: self.comment.map(|f| unsafe { f.borrow() }),
+        }
+    }
+
+    /// The staged view: the payloads are copied into `stage` and the engine reads
+    /// the copies.
+    ///
+    /// Field *presence* is preserved exactly — a present-but-empty field stays
+    /// present — because presence is what drives the FLG bits, and a staged length
+    /// equals the caller's length, so `extra_len & 0xffff`, the emitted XLEN and
+    /// `deflateBound`'s wrapper term are all unchanged.
+    ///
+    /// # Safety
+    ///
+    /// Must be called while no mutable reference is live over any field's bytes —
+    /// that is, before the boundary bridges the caller's output window. The
+    /// resulting view borrows `stage`, not the caller's memory, so it may then be
+    /// held across the engine call.
+    pub(crate) unsafe fn stage_into<'a>(
+        &self,
+        stage: &'a mut CGzHeaderStage,
+    ) -> Result<ForeignGzHeader<'a>, TryReserveError> {
+        let CGzHeaderStage {
+            extra,
+            name,
+            comment,
+        } = stage;
+        if let Some(field) = self.extra {
+            // SAFETY: delegated to this function's contract.
+            unsafe { field.stage(extra) }?;
+        }
+        if let Some(field) = self.name {
+            // SAFETY: delegated to this function's contract.
+            unsafe { field.stage(name) }?;
+        }
+        if let Some(field) = self.comment {
+            // SAFETY: delegated to this function's contract.
+            unsafe { field.stage(comment) }?;
+        }
+        Ok(ForeignGzHeader {
+            text: self.text,
+            time: self.time,
+            os: self.os,
+            hcrc: self.hcrc,
+            extra: self.extra.map(|_| &extra[..]),
+            name: self.name.map(|_| &name[..]),
+            comment: self.comment.map(|_| &comment[..]),
+        })
+    }
+}
+
+/// One gzip-header payload buffer belonging to a C caller, addressed as a bare
+/// pointer plus a capacity.
+///
+/// # Why not a slice
+///
+/// C's `inflate` writes the header's three payloads through three independent
+/// caller pointers — `head->extra`, `head->name`, `head->comment` — and the API
+/// requires **no disjointness** between them or with `strm->next_out`
+/// (`inflate.c` L614-L621, L632-L637, L654-L659). Materializing them as three
+/// `&mut [u8]` is undefined behaviour the instant any two overlap, and the
+/// violation is committed when the references are *created*: a bounds-checked
+/// write is already too late. Keeping the raw pointer and performing one isolated
+/// access per store reproduces C exactly, including its overlap behaviour, and
+/// removes the hazard entirely.
+///
+/// # Invariants
+///
+/// * `ptr` is non-null and addresses at least `cap` bytes writable for as long as
+///   this value lives.
+/// * `cap` is the caller's *live* `extra_max`/`name_max`/`comm_max`, read when
+///   this descriptor was built.
+/// * The bytes need not be initialized: nothing here ever reads them, and no
+///   reference is ever formed over the region.
+#[cfg(feature = "gzip")]
+pub(crate) struct CRawHeaderSink {
+    /// The caller's buffer pointer, non-null and valid for `cap` writable bytes.
+    ptr: *mut c_uchar,
+    /// The caller's live capacity for this field, in bytes.
+    cap: usize,
+}
+
+#[cfg(feature = "gzip")]
+impl CRawHeaderSink {
+    /// The half-open address range `[start, end)` this buffer occupies, as plain
+    /// integers.
+    ///
+    /// Used by the boundary to decide whether the buffer overlaps the caller's
+    /// input or output window. Integer arithmetic is deliberate: comparing
+    /// addresses that may belong to different allocations is meaningless as
+    /// pointer arithmetic but perfectly well-defined on `usize`, and the
+    /// saturating end keeps a caller-declared capacity that would wrap the address
+    /// space from panicking.
+    fn range(&self) -> (usize, usize) {
+        let start = self.ptr as usize;
+        (start, start.saturating_add(self.cap))
+    }
+}
+
+#[cfg(feature = "gzip")]
+impl ForeignByteSink for CRawHeaderSink {
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    #[inline]
+    fn store_byte(&mut self, index: usize, byte: u8) -> bool {
+        if index >= self.cap {
+            return false;
+        }
+        // SAFETY: `index < cap` and, per this type's invariants, `ptr` addresses
+        // `cap` writable bytes, so `ptr.add(index)` is inside the caller's buffer
+        // and aligned (`c_uchar` has alignment 1). No reference over the region
+        // exists — that is the whole point of the descriptor — so this write
+        // cannot invalidate one, and it is exactly C's
+        // `head->name[state->length++] = byte`.
+        unsafe { self.ptr.add(index).write(byte) };
+        true
+    }
+
+    #[inline]
+    fn store_bytes(&mut self, offset: usize, src: &[u8]) -> usize {
+        if offset >= self.cap {
+            return 0;
+        }
+        let room = self.cap - offset;
+        let n = if src.len() > room { room } else { src.len() };
+        // SAFETY: `offset + n <= cap`, so the whole destination lies inside the
+        // caller's buffer, which the invariants make writable for `cap` bytes;
+        // `src` is a live slice of at least `n` readable bytes. The two ranges are
+        // disjoint: `src` is the decoder's input window, and the boundary routes
+        // any call whose header buffers overlap that window through a staged copy
+        // (see `inflate`), so `src` never aliases the destination here. `u8` needs
+        // no alignment.
+        unsafe { ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.add(offset), n) };
+        n
+    }
+}
+
+/// The three caller-owned gzip-header payload buffers, owned as raw descriptors
+/// for the duration of one FFI call.
+///
+/// This is the *owner*; [`view`](Self::view) hands the decoder the borrowed
+/// [`ForeignGzHeaderSink`] it programs against. Splitting owner from view lets a
+/// single set of descriptors serve several consecutive engine calls within one
+/// `inflate` invocation — which the header/output overlap path needs — while the
+/// declared `XLEN` the decoder maintains persists across them in the view.
+#[cfg(feature = "gzip")]
+pub(crate) struct CGzHeaderSinks {
+    /// `head->extra`, bounded by the live `extra_max`; `None` when absent.
+    extra: Option<CRawHeaderSink>,
+    /// `head->name`, bounded by the live `name_max`; `None` when absent.
+    name: Option<CRawHeaderSink>,
+    /// `head->comment`, bounded by the live `comm_max`; `None` when absent.
+    comment: Option<CRawHeaderSink>,
+    /// The caller's `head->extra_len` as read when the descriptors were built.
+    extra_len: u32,
+}
+
+#[cfg(feature = "gzip")]
+impl CGzHeaderSinks {
+    /// Lends the decoder a borrowed view over these descriptors.
+    ///
+    /// The view is what `inflate` passes to the engine; it carries the declared
+    /// `XLEN` by value because the engine assigns it (`inflate.c` L599-L600) and
+    /// then derives the extra field's write offset from it (L616-L617).
+    pub(crate) fn view(&mut self) -> ForeignGzHeaderSink<'_> {
+        ForeignGzHeaderSink {
+            extra_len: self.extra_len,
+            extra: self
+                .extra
+                .as_mut()
+                .map(|sink| sink as &mut dyn ForeignByteSink),
+            name: self
+                .name
+                .as_mut()
+                .map(|sink| sink as &mut dyn ForeignByteSink),
+            comment: self
+                .comment
+                .as_mut()
+                .map(|sink| sink as &mut dyn ForeignByteSink),
+        }
+    }
+
+    /// Whether any present payload buffer intersects the half-open address range
+    /// `[start, end)`.
+    ///
+    /// The boundary asks this about the caller's input and output windows. An
+    /// intersection means a header store and a decoder access would touch the same
+    /// bytes while a Rust reference exists over one of them, so the call must be
+    /// split into header and data phases; a disjoint answer — the universal case —
+    /// keeps the single-pass path.
+    pub(crate) fn intersects(&self, start: usize, end: usize) -> bool {
+        [
+            self.extra.as_ref(),
+            self.name.as_ref(),
+            self.comment.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|sink| {
+            let (f_start, f_end) = sink.range();
+            ranges_overlap(f_start, f_end, start, end)
+        })
+    }
+}
+
+/// Borrows a live caller-owned [`gz_header`]'s **output buffers** as a
+/// [`CGzHeaderSinks`], or [`None`] when `head` is null.
+///
+/// This is the write direction's counterpart of [`read_gz_header_source`], and it
+/// must be called immediately before each engine call rather than once at
 /// registration: C re-reads `head->extra`/`name`/`comment` and their
 /// `extra_max`/`name_max`/`comm_max` capacities on **every stored byte**
 /// (`inflate.c` L614-L621, L632-L637, L654-L659), so a caller may install,
@@ -1685,57 +2200,61 @@ pub(crate) unsafe fn borrow_gz_header<'a>(head: *const gz_header) -> Option<Fore
 /// mutate its header *during* a synchronous call, so per-call and per-byte
 /// freshness observe the same bytes.
 ///
-/// Nothing is copied and nothing is allocated — the slices alias the caller's own
-/// storage, which is exactly why the header path can no longer report a
-/// `Z_MEM_ERROR` C never reports.
+/// Nothing is copied and nothing is allocated — the descriptors address the
+/// caller's own storage, which is exactly why the header path can no longer report
+/// a `Z_MEM_ERROR` C never reports.
+///
+/// Every field of `*head` is read through a raw projection rather than a
+/// `&mut gz_header`: a caller is free to place a payload buffer *inside* the
+/// header struct itself, and a reference covering the struct would then alias the
+/// descriptor built from it.
 ///
 /// # Safety
 ///
 /// `head` must be null, or point at a valid `gz_header` that stays valid and
-/// unaliased for `'a`. When `extra`/`name`/`comment` are non-null, each must
-/// address at least `extra_max`/`name_max`/`comm_max` **writable** bytes — the
-/// contract `zlib.h` L1076-L1085 places on an `inflateGetHeader` caller.
+/// unaliased for as long as the returned value lives. When `extra`/`name`/
+/// `comment` are non-null, each must address at least `extra_max`/`name_max`/
+/// `comm_max` **writable** bytes — the contract `zlib.h` L1076-L1085 places on an
+/// `inflateGetHeader` caller.
 #[cfg(feature = "gzip")]
-pub(crate) unsafe fn borrow_gz_header_sink<'a>(
-    head: *mut gz_header,
-) -> Option<ForeignGzHeaderSink<'a>> {
+pub(crate) unsafe fn borrow_gz_header_sink(head: *mut gz_header) -> Option<CGzHeaderSinks> {
     if head.is_null() {
         return None;
     }
-    // SAFETY: `head` is non-null and, per the contract, a valid `gz_header`
-    // exclusively available to this call.
-    let h = unsafe { &mut *head };
-    // Each capacity is read *now*, so a mid-decode change takes effect on the
-    // next call — C's per-byte re-read, at call granularity.
-    let extra_max = h.extra_max as usize;
-    let name_max = h.name_max as usize;
-    let comm_max = h.comm_max as usize;
-    Some(ForeignGzHeaderSink {
+    // Each pointer and capacity is read *now* through a raw field projection, so a
+    // mid-decode change takes effect on the next call — C's per-byte re-read, at
+    // call granularity — and no reference spanning the struct is ever created.
+    // SAFETY: `head` is non-null and, per the contract, points at a valid
+    // `gz_header`; `addr_of!` forms field pointers without materializing a
+    // reference to the whole struct, and each field is a plain `Copy` scalar or
+    // pointer that is initialized in any valid `gz_header`.
+    let (extra_ptr, name_ptr, comment_ptr, extra_len, extra_max, name_max, comm_max) = unsafe {
+        (
+            ptr::addr_of!((*head).extra).read(),
+            ptr::addr_of!((*head).name).read(),
+            ptr::addr_of!((*head).comment).read(),
+            ptr::addr_of!((*head).extra_len).read(),
+            ptr::addr_of!((*head).extra_max).read() as usize,
+            ptr::addr_of!((*head).name_max).read() as usize,
+            ptr::addr_of!((*head).comm_max).read() as usize,
+        )
+    };
+    /// Builds a descriptor for one payload, or `None` for C's "field absent"
+    /// encodings: a null pointer, or a capacity of zero that admits no byte.
+    fn describe(ptr: *mut c_uchar, cap: usize) -> Option<CRawHeaderSink> {
+        if ptr.is_null() || cap == 0 {
+            None
+        } else {
+            Some(CRawHeaderSink { ptr, cap })
+        }
+    }
+    Some(CGzHeaderSinks {
+        extra: describe(extra_ptr, extra_max),
+        name: describe(name_ptr, name_max),
+        comment: describe(comment_ptr, comm_max),
         // C derives the extra field's write offset from the caller's own
         // `extra_len` (`inflate.c` L616-L617), so it belongs to the live view.
-        extra_len: h.extra_len,
-        extra: if h.extra.is_null() || extra_max == 0 {
-            None
-        } else {
-            // SAFETY: a non-null `extra` addresses `extra_max` writable bytes and
-            // stays valid for `'a` per this function's contract; the slice is the
-            // only live reference to that range for the duration of the call.
-            Some(unsafe { slice::from_raw_parts_mut(h.extra, extra_max) })
-        },
-        name: if h.name.is_null() || name_max == 0 {
-            None
-        } else {
-            // SAFETY: a non-null `name` addresses `name_max` writable bytes valid
-            // for `'a`; see above.
-            Some(unsafe { slice::from_raw_parts_mut(h.name, name_max) })
-        },
-        comment: if h.comment.is_null() || comm_max == 0 {
-            None
-        } else {
-            // SAFETY: a non-null `comment` addresses `comm_max` writable bytes
-            // valid for `'a`; see above.
-            Some(unsafe { slice::from_raw_parts_mut(h.comment, comm_max) })
-        },
+        extra_len,
     })
 }
 
@@ -1902,103 +2421,109 @@ pub(crate) unsafe fn publish_gz_header(
     if head.is_null() {
         return;
     }
-    // SAFETY: `head` is non-null and, per the contract, points at a valid,
-    // uniquely-borrowed `gz_header` whose buffers are sized by its `*_max`
-    // fields.
-    let h = unsafe { &mut *head };
 
-    // --- scalars: each written only by the state that assigns it in C ---------
-    if published.text {
-        h.text = c_int::from(src.text);
-    }
-    if published.time {
-        h.time = src.time as c_ulong;
-    }
-    if published.os {
-        // C assigns `xflags` and `os` together under one guard (`inflate.c`
-        // L539-L542), so one flag covers both.
-        h.xflags = src.xflags;
-        h.os = src.os;
-    }
-    if published.hcrc {
-        h.hcrc = c_int::from(src.hcrc);
-    }
-    if let Some(done) = published.done {
-        // The tri-state reaches the caller verbatim: `-1` for "not a gzip header",
-        // `1` for "header complete".
-        h.done = done.as_c_int() as c_int;
-    }
+    // Every access below is a *raw field projection*: a `&mut gz_header` spanning
+    // the struct is deliberately never formed. A caller may legally point
+    // `extra`/`name`/`comment` at storage that overlaps a sibling payload buffer,
+    // the decoder's output window, or even the header struct itself, and a
+    // reference covering the struct would then alias the very bytes this function
+    // writes through those pointers. Reference zlib performs exactly these
+    // independent accesses, so reproducing them literally is both faithful and
+    // sound.
+    //
+    // SAFETY: this applies to every access in the block below. `head` is non-null
+    // and, per this function's contract, points at a valid `gz_header` exclusively
+    // available to this call, so `addr_of!`/`addr_of_mut!` yield field pointers
+    // that are in bounds, aligned, and (for reads) initialized in any valid
+    // `gz_header`. Each payload write is separately bounded by the capacity read
+    // from that same struct: `copy_tail_bounded` clamps to it, and the two NUL
+    // stores are guarded by a strict `len < cap` test, so no write leaves the
+    // caller's declared region.
+    unsafe {
+        // --- scalars: each written only by the state that assigns it in C -----
+        if published.text {
+            ptr::addr_of_mut!((*head).text).write(c_int::from(src.text));
+        }
+        if published.time {
+            ptr::addr_of_mut!((*head).time).write(src.time as c_ulong);
+        }
+        if published.os {
+            // C assigns `xflags` and `os` together under one guard (`inflate.c`
+            // L539-L542), so one flag covers both.
+            ptr::addr_of_mut!((*head).xflags).write(src.xflags);
+            ptr::addr_of_mut!((*head).os).write(src.os);
+        }
+        if published.hcrc {
+            ptr::addr_of_mut!((*head).hcrc).write(c_int::from(src.hcrc));
+        }
+        if let Some(done) = published.done {
+            // The tri-state reaches the caller verbatim: `-1` for "not a gzip
+            // header", `1` for "header complete".
+            ptr::addr_of_mut!((*head).done).write(done.as_c_int() as c_int);
+        }
 
-    // --- extra ---------------------------------------------------------------
-    if let Some(declared_xlen) = published.extra_len {
-        // The stream's declared 16-bit `XLEN`, published unconditionally and
-        // *unclamped* — gated on neither `extra`'s nullity nor `extra_max`'s size
-        // (`inflate.c` L599-L600), while the copy below is separately clamped
-        // (L614-L621). Reproducing both halves is what makes
-        // `extra_len > extra_max` a usable truncation signal per `zlib.h`, and
-        // what lets a caller pass a null `extra` purely to learn the length.
-        h.extra_len = declared_xlen as c_uint;
-    }
-    if published.extra_null {
-        // C's no-`FEXTRA` branch: `state->head->extra = Z_NULL` (`inflate.c`
-        // L605-L606). That assignment is how a C caller distinguishes "the header
-        // declared no extra field" from "it declared one"; leaving a stale
-        // non-null pointer would misreport an absent field as present.
-        h.extra = ptr::null_mut();
-    }
-    if published.extra_stored != 0 {
-        if let Some(extra) = &src.extra {
-            // SAFETY: bounded by `extra_max`; see `copy_tail_bounded`.
-            unsafe {
-                copy_tail_bounded(h.extra, extra, published.extra_stored, h.extra_max as usize);
+        // --- extra -----------------------------------------------------------
+        if let Some(declared_xlen) = published.extra_len {
+            // The stream's declared 16-bit `XLEN`, published unconditionally and
+            // *unclamped* — gated on neither `extra`'s nullity nor `extra_max`'s
+            // size (`inflate.c` L599-L600), while the copy below is separately
+            // clamped (L614-L621). Reproducing both halves is what makes
+            // `extra_len > extra_max` a usable truncation signal per `zlib.h`, and
+            // what lets a caller pass a null `extra` purely to learn the length.
+            ptr::addr_of_mut!((*head).extra_len).write(declared_xlen as c_uint);
+        }
+        if published.extra_null {
+            // C's no-`FEXTRA` branch: `state->head->extra = Z_NULL` (`inflate.c`
+            // L605-L606). That assignment is how a C caller distinguishes "the
+            // header declared no extra field" from "it declared one"; leaving a
+            // stale non-null pointer would misreport an absent field as present.
+            ptr::addr_of_mut!((*head).extra).write(ptr::null_mut());
+        }
+        if published.extra_stored != 0 {
+            if let Some(extra) = &src.extra {
+                // Re-read after the possible nulling above, so C's ordering — the
+                // `Z_NULL` assignment first, the clamped copy second — is preserved
+                // and a nulled field copies nothing.
+                let dst = ptr::addr_of!((*head).extra).read();
+                let cap = ptr::addr_of!((*head).extra_max).read() as usize;
+                copy_tail_bounded(dst, extra, published.extra_stored, cap);
             }
         }
-    }
 
-    // --- name ----------------------------------------------------------------
-    if published.name_null {
-        // C's no-`FNAME` branch: `state->head->name = Z_NULL` (`inflate.c`
-        // L643-L644).
-        h.name = ptr::null_mut();
-    }
-    if let Some(name) = &src.name {
-        let cap = h.name_max as usize;
-        if published.name_stored != 0 {
-            // SAFETY: bounded by `name_max`; see `copy_tail_bounded`.
-            unsafe {
-                copy_tail_bounded(h.name, name, published.name_stored, cap);
+        // --- name ------------------------------------------------------------
+        if published.name_null {
+            // C's no-`FNAME` branch: `state->head->name = Z_NULL` (`inflate.c`
+            // L643-L644).
+            ptr::addr_of_mut!((*head).name).write(ptr::null_mut());
+        }
+        if let Some(name) = &src.name {
+            let dst = ptr::addr_of!((*head).name).read();
+            let cap = ptr::addr_of!((*head).name_max).read() as usize;
+            if published.name_stored != 0 {
+                copy_tail_bounded(dst, name, published.name_stored, cap);
+            }
+            if published.name_terminated && !dst.is_null() && name.len() < cap {
+                // C stores the NUL at `head->name[state->length]`, and
+                // `state->length` is exactly the number of content bytes captured
+                // so far; `name.len() < cap` puts it inside the buffer.
+                dst.add(name.len()).write(0);
             }
         }
-        if published.name_terminated && !h.name.is_null() && name.len() < cap {
-            // SAFETY: `h.name` has `name_max` writable bytes and
-            // `name.len() < cap`, so this byte is inside the buffer. C stores the
-            // NUL at `head->name[state->length]`, and `state->length` is exactly
-            // the number of content bytes captured so far.
-            unsafe {
-                *h.name.add(name.len()) = 0;
-            }
-        }
-    }
 
-    // --- comment -------------------------------------------------------------
-    if published.comment_null {
-        // C's no-`FCOMMENT` branch: `state->head->comment = Z_NULL` (`inflate.c`
-        // L665-L666).
-        h.comment = ptr::null_mut();
-    }
-    if let Some(comment) = &src.comment {
-        let cap = h.comm_max as usize;
-        if published.comment_stored != 0 {
-            // SAFETY: bounded by `comm_max`; see `copy_tail_bounded`.
-            unsafe {
-                copy_tail_bounded(h.comment, comment, published.comment_stored, cap);
-            }
+        // --- comment ---------------------------------------------------------
+        if published.comment_null {
+            // C's no-`FCOMMENT` branch: `state->head->comment = Z_NULL`
+            // (`inflate.c` L665-L666).
+            ptr::addr_of_mut!((*head).comment).write(ptr::null_mut());
         }
-        if published.comment_terminated && !h.comment.is_null() && comment.len() < cap {
-            // SAFETY: `h.comment` has `comm_max` writable bytes and
-            // `comment.len() < cap`, so this byte is inside the buffer.
-            unsafe {
-                *h.comment.add(comment.len()) = 0;
+        if let Some(comment) = &src.comment {
+            let dst = ptr::addr_of!((*head).comment).read();
+            let cap = ptr::addr_of!((*head).comm_max).read() as usize;
+            if published.comment_stored != 0 {
+                copy_tail_bounded(dst, comment, published.comment_stored, cap);
+            }
+            if published.comment_terminated && !dst.is_null() && comment.len() < cap {
+                dst.add(comment.len()).write(0);
             }
         }
     }
@@ -3094,15 +3619,15 @@ mod tests {
     /// this port reproduces that as index arithmetic inside one owned buffer
     /// (AAP §0.3.2 rule T3).
     ///
-    /// The four working buffers reproduce C's `(items, size)` pairs exactly. The
-    /// state's request is `(1, size_of::<DeflateState>())` rather than
-    /// `(1, `[`DeflateState::C_LAYOUT_SIZE`]`)`, because the region it secures *is*
-    /// where the state lives (AAP §0.6.3 has-hook clause) and this port's state is
-    /// legitimately larger than C's — a block of C's `sizeof` could not hold it. Of
-    /// the two, holding the state in the caller's memory is the property AAP §0.6.5
-    /// asks for: it fixes the allocation **count** and the **failure timing**, and a
-    /// single request's byte count is not something any zlib contract lets a caller
-    /// assert (C's own value moves with `LIT_MEM` and pointer width).
+    /// All five requests reproduce C's `(items, size)` pairs exactly, the state's
+    /// included: it is `(1, `[`DeflateState::C_LAYOUT_SIZE`]`)`, C's own
+    /// `sizeof(deflate_state)`, so an allocator sized from C's header serves this
+    /// port exactly as it serves reference zlib (AAP §0.6.5). Because a block of
+    /// C's `sizeof` cannot hold this port's legitimately larger state value, the
+    /// charge and the value are separate objects — the caller's region is held
+    /// unread until its matching `zfree` and the state sits beside it on the global
+    /// heap — which is what lets the observable pair, count, order, failure timing
+    /// and release order all stay C-exact.
     #[test]
     fn deflate_new_in_presents_c_zalloc_geometry() {
         use core::sync::atomic::{AtomicUsize, Ordering};
@@ -3160,7 +3685,7 @@ mod tests {
         let lit_bufsize = 1usize << (8 + 6);
         let expected: [(usize, usize); 5] = [
             // C: ZALLOC(strm, 1, sizeof(deflate_state))   -- deflate.c L440
-            (1, size_of::<DeflateState>()),
+            (1, DeflateState::C_LAYOUT_SIZE),
             // C: ZALLOC(strm, s->w_size, 2 * sizeof(Byte)) -- deflate.c L458
             (w_size, 2),
             // C: ZALLOC(strm, s->w_size, sizeof(Pos))      -- deflate.c L459
@@ -3265,8 +3790,9 @@ mod tests {
         let lit_bufsize = 1usize << (4 + 6);
         let expected: [(usize, usize); 5] = [
             // C: ZALLOC(dest, 1, sizeof(deflate_state))     -- deflate.c L1335
-            // (this port's own `size_of`; see the init-geometry test for why)
-            (1, size_of::<DeflateState>()),
+            // (C's own `sizeof`; see the init-geometry test for why the state
+            // charge and the state value are separate objects)
+            (1, DeflateState::C_LAYOUT_SIZE),
             // C: ZALLOC(dest, ds->w_size, 2 * sizeof(Byte)) -- deflate.c L1341
             (w_size, 2),
             // C: ZALLOC(dest, ds->w_size, sizeof(Pos))      -- deflate.c L1342
@@ -3298,7 +3824,11 @@ mod tests {
         assert_eq!(copy.lit_bufsize, state.lit_bufsize);
         assert_eq!(copy.pending_buf.len(), state.pending_buf.len());
         assert_eq!(&copy.window[..], &state.window[..]);
-        assert!(copy.pending_buf.is_foreign() && copy.is_foreign());
+        assert!(
+            copy.pending_buf.is_foreign() && copy.is_charged(),
+            "the copy's buffers live in the caller's arena and its state footprint \
+             was charged to the caller's `zalloc`"
+        );
     }
 
     /// Regression guard: the engines must release their buffers in the **reverse of
@@ -3479,7 +4009,7 @@ mod tests {
             1,
         )
         .expect("healthy hook initializes the state");
-        assert!(state.window.is_foreign() && state.is_foreign());
+        assert!(state.window.is_foreign() && state.is_charged());
 
         {
             let copy = state
@@ -3490,8 +4020,9 @@ mod tests {
                     && copy.prev.is_foreign()
                     && copy.head.is_foreign()
                     && copy.pending_buf.is_foreign()
-                    && copy.is_foreign(),
-                "the copy's state and every buffer must stay in the caller's arena"
+                    && copy.is_charged(),
+                "every buffer of the copy must stay in the caller's arena, and the \
+                 copy's state footprint must be charged to the caller's `zalloc`"
             );
             assert_eq!(copy.window.len(), state.window.len());
             assert_eq!(&copy.window[..], &state.window[..]);
@@ -4602,6 +5133,70 @@ mod tests {
         assert!(mixed.hook().is_active());
     }
 
+    /// `rewind_input` must reproduce C's `uInt` wrap instead of overflowing.
+    ///
+    /// C recomputes the count in `unsigned` arithmetic with no overflow check
+    /// (`inffast.c` L295), so a caller presenting `avail_in` at or near
+    /// `u32::MAX` and triggering a buffered-byte rewind observes a wrapped value.
+    /// A checked `+` would instead panic — and under this crate's `panic =
+    /// "abort"` profiles that terminates the host process, turning a defined C
+    /// result into a denial of service. The cursor and the count must also be
+    /// committed together, so no state where one moved and the other did not is
+    /// observable.
+    #[test]
+    fn rewind_input_wraps_at_u32_max_like_c() {
+        // A real buffer so `next_in` has honest provenance; `rewind_input` never
+        // dereferences it, but the pointer arithmetic should stay in-bounds.
+        let buf = [0u8; 8];
+        let base = buf.as_ptr();
+
+        // Exactly at the boundary: one rewound byte must wrap the count to 0.
+        let mut strm = zeroed_stream();
+        strm.next_in = unsafe { base.add(4) };
+        strm.avail_in = c_uint::MAX;
+        // SAFETY: one byte precedes `next_in` inside `buf`, which is still live.
+        unsafe { rewind_input(&mut strm, 1) };
+        assert_eq!(
+            strm.avail_in, 0,
+            "u32::MAX + 1 must wrap to 0 exactly as C's uInt arithmetic does"
+        );
+        assert_eq!(
+            strm.next_in,
+            unsafe { base.add(3) },
+            "the cursor must move back by the rewound count"
+        );
+
+        // Past the boundary: the wrap is modulo 2^32, not a saturation.
+        let mut over = zeroed_stream();
+        over.next_in = unsafe { base.add(4) };
+        over.avail_in = c_uint::MAX - 1;
+        // SAFETY: three bytes precede `next_in` inside the live `buf`.
+        unsafe { rewind_input(&mut over, 3) };
+        assert_eq!(
+            over.avail_in, 1,
+            "(u32::MAX - 1) + 3 must wrap to 1, matching C's uInt overflow"
+        );
+        assert_eq!(over.next_in, unsafe { base.add(1) });
+
+        // A zero rewind is a no-op on both fields (the early return).
+        let mut none = zeroed_stream();
+        none.next_in = unsafe { base.add(4) };
+        none.avail_in = c_uint::MAX;
+        // SAFETY: a zero rewind touches nothing.
+        unsafe { rewind_input(&mut none, 0) };
+        assert_eq!(none.avail_in, c_uint::MAX);
+        assert_eq!(none.next_in, unsafe { base.add(4) });
+
+        // The ordinary case is unchanged: no wrap, plain addition.
+        let mut plain = zeroed_stream();
+        plain.next_in = unsafe { base.add(4) };
+        plain.avail_in = 10;
+        // SAFETY: two bytes precede `next_in` inside the live `buf`.
+        unsafe { rewind_input(&mut plain, 2) };
+        assert_eq!(plain.avail_in, 12);
+        assert_eq!(plain.next_in, unsafe { base.add(2) });
+    }
+
     // -- test helpers -------------------------------------------------------
 
     /// Builds a fully-zeroed `z_stream` for tests (the state a C caller would
@@ -4623,5 +5218,422 @@ mod tests {
             adler: 0,
             reserved: 0,
         }
+    }
+
+    // -- CRawHeaderSink / borrow_gz_header_sink -----------------------------
+
+    /// A `gz_header` whose three payload buffers are carved out of one backing
+    /// allocation at the given offsets, so overlap can be constructed exactly.
+    #[cfg(feature = "gzip")]
+    fn header_over(
+        backing: &mut [u8],
+        extra: Option<(usize, usize)>,
+        name: Option<(usize, usize)>,
+        comment: Option<(usize, usize)>,
+    ) -> gz_header {
+        let base = backing.as_mut_ptr();
+        // SAFETY: every caller below keeps `offset + cap` inside `backing`.
+        let at = |slot: Option<(usize, usize)>| match slot {
+            Some((offset, cap)) => (unsafe { base.add(offset) }, cap as c_uint),
+            None => (ptr::null_mut(), 0),
+        };
+        let (extra_ptr, extra_max) = at(extra);
+        let (name_ptr, name_max) = at(name);
+        let (comment_ptr, comm_max) = at(comment);
+        gz_header {
+            text: 0,
+            time: 0,
+            xflags: 0,
+            os: 0,
+            extra: extra_ptr,
+            extra_len: 0,
+            extra_max,
+            name: name_ptr,
+            name_max,
+            comment: comment_ptr,
+            comm_max,
+            hcrc: 0,
+            done: 0,
+        }
+    }
+
+    /// A null `gz_header` yields no descriptors at all — C's "no header
+    /// registered" state.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn borrowing_a_null_header_sink_yields_nothing() {
+        assert!(unsafe { borrow_gz_header_sink(ptr::null_mut()) }.is_none());
+    }
+
+    /// C's two "field absent" encodings — a null pointer, and a capacity that
+    /// admits no byte — must both produce an absent descriptor, because the
+    /// decoder's store predicate is `Option`-plus-bounds.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn an_absent_or_zero_capacity_field_yields_no_descriptor() {
+        let mut backing = [0u8; 16];
+        // `name` present with capacity 0, `comment` absent, `extra` present.
+        let mut head = header_over(&mut backing, Some((0, 4)), Some((8, 0)), None);
+        head.extra_len = 7;
+        let mut sinks = unsafe { borrow_gz_header_sink(&mut head) }.expect("head is non-null");
+        let view = sinks.view();
+        assert_eq!(
+            view.extra_len, 7,
+            "the live declared XLEN travels in the view"
+        );
+        assert!(
+            view.extra.is_some(),
+            "a non-null field with capacity is present"
+        );
+        assert!(view.name.is_none(), "a zero capacity is C's absent field");
+        assert!(view.comment.is_none(), "a null pointer is C's absent field");
+    }
+
+    /// Each descriptor's stores are bounded by its own capacity and refuse — never
+    /// clamp — an out-of-range target, exactly as C's guards drop such bytes.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn a_raw_descriptor_refuses_out_of_range_stores() {
+        let mut backing = [0xAAu8; 16];
+        let mut head = header_over(&mut backing, Some((0, 4)), Some((8, 2)), None);
+        let mut sinks = unsafe { borrow_gz_header_sink(&mut head) }.expect("head is non-null");
+        let mut view = sinks.view();
+
+        assert_eq!(view.store_extra(0, b"ABCDEF"), 4, "clamped to extra_max");
+        assert_eq!(
+            view.store_extra(4, b"Z"),
+            0,
+            "an offset at the capacity stores nothing"
+        );
+        assert_eq!(
+            view.store_extra(usize::MAX, b"Z"),
+            0,
+            "and neither does a wild one"
+        );
+        assert!(view.store_name(1, b'!'));
+        assert!(!view.store_name(2, b'?'), "clamped to name_max");
+        assert!(!view.store_name(usize::MAX, b'?'));
+
+        assert_eq!(&backing[..4], b"ABCD");
+        assert!(
+            backing[4..8].iter().all(|&b| b == 0xAA),
+            "nothing may be written between the two fields"
+        );
+        assert_eq!(&backing[8..10], &[0xAA, b'!']);
+        assert!(backing[10..].iter().all(|&b| b == 0xAA));
+    }
+
+    /// Overlapping payload buffers behave as in C: the writes are independent, so
+    /// the last one to land owns the shared bytes.
+    ///
+    /// This configuration is undefined behaviour to express as `&mut [u8]` and is
+    /// the reason the descriptors exist.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn overlapping_raw_descriptors_write_independently() {
+        let mut backing = [0xAAu8; 8];
+        // All three fields address the same 8 bytes.
+        let mut head = header_over(&mut backing, Some((0, 8)), Some((0, 8)), Some((0, 8)));
+        let mut sinks = unsafe { borrow_gz_header_sink(&mut head) }.expect("head is non-null");
+        let mut view = sinks.view();
+
+        assert_eq!(view.store_extra(0, b"1234"), 4);
+        assert!(view.store_name(0, b'n'));
+        assert!(view.store_comment(1, b'c'));
+
+        assert_eq!(&backing[..4], b"nc34", "each store lands independently");
+        assert!(backing[4..].iter().all(|&b| b == 0xAA));
+    }
+
+    /// The window-intersection test is a half-open range overlap over plain
+    /// addresses: adjacency is not overlap, and an empty range never overlaps.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn descriptor_intersection_is_half_open_range_overlap() {
+        let mut backing = [0u8; 32];
+        let mut head = header_over(&mut backing, Some((8, 4)), None, None);
+        let sinks = unsafe { borrow_gz_header_sink(&mut head) }.expect("head is non-null");
+
+        let base = backing.as_ptr() as usize;
+        let field = (base + 8, base + 12);
+        assert!(
+            sinks.intersects(field.0, field.1),
+            "the field overlaps itself"
+        );
+        assert!(
+            sinks.intersects(base, base + 32),
+            "an enclosing window overlaps"
+        );
+        assert!(
+            sinks.intersects(base + 11, base + 20),
+            "a partial tail overlaps"
+        );
+        assert!(sinks.intersects(base, base + 9), "a partial head overlaps");
+        assert!(
+            !sinks.intersects(base, base + 8),
+            "a window ending where the field begins is adjacent, not overlapping"
+        );
+        assert!(
+            !sinks.intersects(base + 12, base + 32),
+            "a window beginning where the field ends is adjacent, not overlapping"
+        );
+        assert!(
+            !sinks.intersects(field.0, field.0),
+            "an empty window never overlaps"
+        );
+    }
+
+    /// A `extra_max` large enough that `ptr + cap` may wrap the address space — a
+    /// `c_uint` capacity is up to 4 GiB, which a 32-bit target cannot always add to
+    /// a real address — must neither panic nor mis-answer the intersection test.
+    ///
+    /// The comparison is over the *declared* capacity, because that is the region C
+    /// is entitled to write, and the range end saturates rather than overflowing.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn a_capacity_that_could_wrap_the_address_space_saturates() {
+        let mut backing = [0u8; 4];
+        let mut head = header_over(&mut backing, Some((0, 4)), None, None);
+        head.extra_max = c_uint::MAX;
+        let sinks = unsafe { borrow_gz_header_sink(&mut head) }.expect("head is non-null");
+
+        let base = backing.as_ptr() as usize;
+        assert!(
+            sinks.intersects(base.saturating_add(4096), base.saturating_add(8192)),
+            "a window inside the declared capacity must overlap, even though it is \
+             far past the four bytes actually backing it"
+        );
+        assert!(
+            !sinks.intersects(base.wrapping_sub(64), base),
+            "a window ending at the field's first byte is still adjacent, not \
+             overlapping"
+        );
+        // The extreme window: the only requirement is a defined answer, arrived at
+        // without overflowing the saturating end.
+        let _ = sinks.intersects(usize::MAX - 1, usize::MAX);
+    }
+    // -- CRawHeaderSource / read_gz_header_source ---------------------------
+
+    /// A `gz_header` presenting `extra`/`name`/`comment` as **read** fields carved
+    /// out of one backing allocation, so overlap can be constructed exactly.
+    ///
+    /// `extra` takes an explicit declared length so the `> 0xffff` case is
+    /// reachable; `name`/`comment` are located by their offset and terminated by
+    /// whatever NUL the backing bytes already contain.
+    #[cfg(feature = "gzip")]
+    fn source_header(
+        backing: &mut [u8],
+        extra: Option<(usize, c_uint)>,
+        name: Option<usize>,
+        comment: Option<usize>,
+    ) -> gz_header {
+        let base = backing.as_mut_ptr();
+        // SAFETY: every caller below keeps the offsets inside `backing`.
+        let at = |slot: Option<usize>| match slot {
+            Some(offset) => unsafe { base.add(offset) },
+            None => ptr::null_mut(),
+        };
+        let (extra_ptr, extra_len) = match extra {
+            Some((offset, len)) => (at(Some(offset)), len),
+            None => (ptr::null_mut(), 0),
+        };
+        gz_header {
+            text: 1,
+            time: 0x0102_0304,
+            xflags: 0,
+            os: 3,
+            extra: extra_ptr,
+            extra_len,
+            extra_max: 0,
+            name: at(name),
+            name_max: 0,
+            comment: at(comment),
+            comm_max: 0,
+            hcrc: 1,
+            done: 0,
+        }
+    }
+
+    /// A null `head` describes nothing, exactly as C's `gzhead == Z_NULL` means "no
+    /// registered header".
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn reading_a_null_header_source_yields_nothing() {
+        // SAFETY: a null `head` is the documented "no header" input.
+        assert!(unsafe { read_gz_header_source(ptr::null()) }.is_none());
+    }
+
+    /// Null distinguishes "absent" from "empty": a non-null pointer with a zero
+    /// length is a *present* field, because C keys the FLG bits off the pointer
+    /// (`deflate.c` L1106-L1108), never off the length.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn a_null_field_is_absent_but_a_zero_length_field_is_present() {
+        let mut backing = *b"\0padding";
+        let mut head = source_header(&mut backing, Some((0, 0)), Some(0), None);
+        // SAFETY: `head` is a live, valid `gz_header`; `name` points at a NUL.
+        let src = unsafe { read_gz_header_source(&head) }.expect("head is non-null");
+        // SAFETY: nothing else references `backing` for the duration of the borrow.
+        let view = unsafe { src.borrow() };
+        assert_eq!(view.extra, Some(&[][..]), "extra_len 0 is a present field");
+        assert_eq!(
+            view.name,
+            Some(&[][..]),
+            "an immediate NUL is a present field"
+        );
+        assert_eq!(view.comment, None, "a null comment is absent");
+        assert!(view.text, "scalars come through");
+        assert!(view.hcrc);
+        assert_eq!(view.time, 0x0102_0304);
+        assert_eq!(view.os, 3);
+
+        head.extra = ptr::null_mut();
+        // SAFETY: as above.
+        let src = unsafe { read_gz_header_source(&head) }.expect("head is non-null");
+        // SAFETY: as above.
+        assert_eq!(unsafe { src.borrow() }.extra, None);
+    }
+
+    /// `name`/`comment` lengths come from a NUL scan; `extra`'s comes from
+    /// `extra_len` **verbatim**, un-masked.
+    ///
+    /// The mask matters: C emits `extra_len & 0xffff` (`deflate.c` L1120), and that
+    /// value is not recoverable from a pre-masked length — `0x1_0005 & 0xffff` is
+    /// `5`, whereas masking `0x1_0000` first yields `0`. Recording the raw length and
+    /// letting the engine mask is the only faithful arrangement.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn field_lengths_are_the_callers_own() {
+        let mut backing = std::vec![0x41u8; 0x1_0005];
+        backing[0x1_0004] = 0;
+        let head = source_header(&mut backing, Some((0, 0x1_0005)), Some(0), None);
+        // SAFETY: `head` is valid; `extra` is readable for `extra_len` and `name`
+        // reaches a NUL inside `backing`.
+        let src = unsafe { read_gz_header_source(&head) }.expect("head is non-null");
+        // SAFETY: nothing else references `backing` here.
+        let view = unsafe { src.borrow() };
+        assert_eq!(
+            view.extra.map(<[u8]>::len),
+            Some(0x1_0005),
+            "extra_len must be recorded verbatim so the engine can mask it"
+        );
+        assert_eq!(
+            view.extra.map(|e| e.len() & 0xffff),
+            Some(5),
+            "and masking it must still give C's XLEN"
+        );
+        assert_eq!(
+            view.name.map(<[u8]>::len),
+            Some(0x1_0004),
+            "name runs to its NUL, which the view excludes"
+        );
+    }
+
+    /// Field intersection is half-open range overlap, with both empty cases
+    /// answering "no".
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn source_intersection_is_half_open_range_overlap() {
+        let mut backing = [0x41u8; 32];
+        backing[19] = 0;
+        // `extra` = [8, 12); `name` starts at 16 and runs to the NUL at 19.
+        let head = source_header(&mut backing, Some((8, 4)), Some(16), None);
+        let base = backing.as_ptr() as usize;
+        // SAFETY: `head` is valid and its fields lie inside `backing`.
+        let src = unsafe { read_gz_header_source(&head) }.expect("head is non-null");
+
+        assert!(
+            src.intersects(base + 8, base + 12),
+            "the field overlaps itself"
+        );
+        assert!(
+            src.intersects(base, base + 32),
+            "an enclosing window overlaps"
+        );
+        assert!(
+            src.intersects(base + 11, base + 20),
+            "a partial tail overlaps"
+        );
+        assert!(
+            src.intersects(base + 18, base + 32),
+            "the name overlaps too"
+        );
+        assert!(
+            !src.intersects(base, base + 8),
+            "a window ending where extra begins is adjacent, not overlapping"
+        );
+        assert!(
+            !src.intersects(base + 12, base + 16),
+            "the gap between the two fields overlaps neither"
+        );
+        assert!(
+            !src.intersects(base + 9, base + 9),
+            "an empty window never overlaps"
+        );
+
+        // An empty *field* occupies no bytes and so overlaps nothing, however the
+        // window is placed around it.
+        let empty = source_header(&mut backing, Some((8, 0)), None, None);
+        // SAFETY: as above.
+        let src = unsafe { read_gz_header_source(&empty) }.expect("head is non-null");
+        assert!(
+            !src.intersects(base, base + 32),
+            "a present-but-empty field cannot share a byte with anything"
+        );
+    }
+
+    /// Staging copies every present field, preserves presence and length exactly,
+    /// and leaves the view borrowing the stage rather than the caller.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn staging_copies_every_present_field_and_preserves_presence() {
+        let mut backing = *b"EXTRAname\0comment\0";
+        let head = source_header(&mut backing, Some((0, 5)), Some(5), Some(10));
+        // SAFETY: `head` is valid and every field lies inside `backing`.
+        let src = unsafe { read_gz_header_source(&head) }.expect("head is non-null");
+        let mut stage = CGzHeaderStage::default();
+        // SAFETY: nothing references `backing` mutably here.
+        let view = unsafe { src.stage_into(&mut stage) }.expect("the copy must fit");
+
+        assert_eq!(view.extra, Some(&b"EXTRA"[..]));
+        assert_eq!(view.name, Some(&b"name"[..]));
+        assert_eq!(view.comment, Some(&b"comment"[..]));
+        assert!(view.text && view.hcrc);
+        assert_eq!(view.time, 0x0102_0304);
+        assert_eq!(view.os, 3);
+
+        // The view must not alias the caller's storage: overwriting `backing` after
+        // the copy cannot change what the engine will read.
+        let staged_extra = view.extra.expect("present");
+        let staged_addr = staged_extra.as_ptr() as usize;
+        let caller_addr = backing.as_ptr() as usize;
+        assert!(
+            !(caller_addr..caller_addr + backing.len()).contains(&staged_addr),
+            "a staged field must live in the stage, not in the caller's buffer"
+        );
+    }
+
+    /// An absent field stages nothing and stays absent, so the FLG bits a staged
+    /// header produces are the same ones the zero-copy view produces.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn staging_an_absent_field_keeps_it_absent() {
+        let mut backing = *b"only-extra";
+        let head = source_header(&mut backing, Some((0, 4)), None, None);
+        // SAFETY: `head` is valid and `extra` lies inside `backing`.
+        let src = unsafe { read_gz_header_source(&head) }.expect("head is non-null");
+        let mut stage = CGzHeaderStage::default();
+        // SAFETY: nothing references `backing` mutably here.
+        let staged = unsafe { src.stage_into(&mut stage) }.expect("the copy must fit");
+        // SAFETY: as above.
+        let direct = unsafe { src.borrow() };
+        assert_eq!(staged.extra, direct.extra, "same bytes");
+        assert_eq!(staged.name, None);
+        assert_eq!(staged.comment, None);
+        assert_eq!(
+            staged.name, direct.name,
+            "same presence as the zero-copy view"
+        );
+        assert_eq!(staged.comment, direct.comment);
     }
 }

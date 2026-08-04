@@ -222,6 +222,7 @@ pub use close::{gzclose, gzclose_r, gzclose_w};
 // this layer supplies the safe half — "finalize everything and hand me the
 // still-open descriptor" — and the shim supplies the `unsafe` remainder.
 pub(crate) use close::{gzclose_r_release, gzclose_release, gzclose_w_release};
+pub(crate) use state::ReleasedFile;
 
 /// The descriptor-flag contract between this layer and `src/ffi/gz.rs`: unix
 /// only, because both flags it carries are POSIX descriptor bits.
@@ -240,16 +241,17 @@ pub(crate) use open::{gzopen_bytes, gzopen64_bytes};
 //
 // `validate_mode` exists so an invalid `gzdopen` mode is rejected *before* the
 // caller's descriptor is adopted (`gzlib.c` L150-L197 precede L263), which must
-// happen before the `unsafe` `File::from_raw_fd` / `File::from_raw_handle`;
-// `gzdopen_bytes` is the safe remainder of that adoption, and `GzFile` is what
-// the shim installs the adopted descriptor into once allocation succeeds. All
-// three consumers live inside the `#[cfg(any(unix, windows))]` `gzdopen` /
-// `dopen_state` pair, and the shim's own import of `GzFile` is already
-// `#[cfg(all(any(unix, windows), feature = "gz-io"))]` — adopting a raw C `int`
-// descriptor is `from_raw_fd` on Unix and `_get_osfhandle` plus
-// `from_raw_handle` on Windows, with no portable `std` equivalent anywhere
-// else, so the fallback `gzdopen` returns null unconditionally and reaches none
-// of the three names.
+// happen before any raw-descriptor ownership is taken; `gzdopen_adopted` is the
+// safe remainder of that adoption, `GzFile` is what the shim installs the adopted
+// descriptor into once allocation succeeds, and `RawFileIo` is the capability the
+// shim implements for a descriptor that cannot soundly become a
+// [`std::fs::File`]. Every consumer lives inside the `#[cfg(any(unix, windows))]`
+// `gzdopen` / `dopen_state` pair, and the shim's own import of `GzFile` is already
+// `#[cfg(all(any(unix, windows), feature = "gz-io"))]` — owning a raw C `int`
+// descriptor needs `close(2)` on Unix and the CRT `_read`/`_write`/`_lseeki64`/
+// `_close` family on Windows, with no portable `std` equivalent anywhere else, so
+// the fallback `gzdopen` returns null unconditionally and reaches none of these
+// names.
 //
 // Without these gates all three re-exports are genuinely unused on such a
 // target and the compiler says so, which is a real signal, not noise: an
@@ -258,9 +260,9 @@ pub(crate) use open::{gzopen_bytes, gzopen64_bytes};
 // diagnostic, so no `#[allow(unused_imports)]` is needed anywhere and the
 // warnings-denied CI gates stay meaningful.
 #[cfg(any(unix, windows))]
-pub(crate) use open::{gzdopen_bytes, validate_mode};
+pub(crate) use open::{gzdopen_adopted, validate_mode};
 #[cfg(any(unix, windows))]
-pub(crate) use state::GzFile;
+pub(crate) use state::{GzFile, RawFileIo};
 
 #[cfg(test)]
 pub(crate) mod test_temp {

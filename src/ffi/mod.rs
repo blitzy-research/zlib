@@ -1570,6 +1570,147 @@ mod tests {
         );
     }
 
+    /// No caller-owned gzip-header field is ever reached through a Rust reference.
+    ///
+    /// # What this pins
+    ///
+    /// A C `gz_header`'s `extra`, `name` and `comment` are three independent caller
+    /// pointers, and `inflateGetHeader`'s contract (`zlib.h` L1076-L1085) places **no
+    /// disjointness requirement** on them — nor between them and `strm->next_in`/
+    /// `next_out`. Reference zlib is unbothered: its stores are plain indexed writes
+    /// through each pointer (`inflate.c` L614-L621, L632-L637, L654-L659). Rust is
+    /// not: two `&mut [u8]` over overlapping ranges are undefined behaviour *at the
+    /// moment they are created*, before any bounds test runs, and so is a
+    /// `&mut gz_header` spanning a struct that a payload buffer lives inside.
+    ///
+    /// The boundary therefore reaches every header field through raw
+    /// pointer-plus-capacity descriptors (`CRawHeaderSink`) and raw field
+    /// projections. That property is invisible to a behavioural test — the wrong
+    /// code produces the right bytes and the right return code, and only a
+    /// Miri-style aliasing model would object — so it is asserted structurally,
+    /// exactly as the crate asserts its layer graph and its validation ordering.
+    ///
+    /// The scan is deliberately narrow: it covers the two header helpers, and it
+    /// requires each to be found, so renaming one out from under the test fails
+    /// rather than silently passing.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn no_gz_header_field_is_reached_through_a_reference() {
+        /// Constructs that would place a Rust reference over a caller-owned header
+        /// field or over the struct that may contain one.
+        const FORBIDDEN: [&str; 4] = [
+            "slice::from_raw_parts_mut",
+            "slice::from_raw_parts",
+            "&mut *head",
+            "&*head",
+        ];
+
+        let source = strip_line_comments(&repo_file("src/ffi/types.rs"));
+        // Each helper's body runs from its `fn` keyword to the start of the next
+        // top-level item, which in this file is always a column-0 `///`, `#[` or
+        // `pub`/`fn`/`impl`/`struct` line. Bounding on the next column-0 `fn ` or
+        // `pub ` is sufficient and keeps the parser trivial.
+        for helper in [
+            "pub(crate) unsafe fn borrow_gz_header_sink(",
+            "pub(crate) unsafe fn publish_gz_header(",
+            "pub(crate) unsafe fn read_gz_header_source(",
+            "unsafe fn cstr_len(",
+        ] {
+            let at = source.find(helper).unwrap_or_else(|| {
+                panic!(
+                    "{helper} must exist in src/ffi/types.rs — if it was renamed, \
+                     retarget this guard rather than deleting it"
+                )
+            });
+            let rest = &source[at + helper.len()..];
+            let end = rest
+                .find("\npub ")
+                .into_iter()
+                .chain(rest.find("\nfn "))
+                .chain(rest.find("\nimpl "))
+                .min()
+                .unwrap_or(rest.len());
+            let body = &rest[..end];
+            for marker in FORBIDDEN {
+                assert!(
+                    !body.contains(marker),
+                    "{helper} reaches a caller-owned gzip-header field through \
+                     `{marker}`; the C API allows `extra`/`name`/`comment`/`next_out` \
+                     to overlap, so every access must be a raw, individually bounded \
+                     one (AAP §0.6.2, standard S2)"
+                );
+            }
+        }
+
+        // Anti-vacuity: the raw descriptor type the helpers must use has to exist,
+        // and its stores have to be raw writes.
+        let sink = source
+            .find("impl ForeignByteSink for CRawHeaderSink")
+            .expect("the raw header-sink descriptor must implement ForeignByteSink");
+        let sink_body = &source[sink..];
+        assert!(
+            sink_body.contains("self.ptr.add(index).write(byte)"),
+            "CRawHeaderSink::store_byte must be a single raw write"
+        );
+        assert!(
+            sink_body.contains("ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.add(offset), n)"),
+            "CRawHeaderSink::store_bytes must be a single bounded raw copy"
+        );
+
+        // Anti-vacuity for the read direction: the fields must actually be reached
+        // through `addr_of!` projections, not merely not-reached through a reference.
+        let read = source
+            .find("pub(crate) unsafe fn read_gz_header_source(")
+            .expect("the raw header-source reader must exist");
+        let read_body = &source[read..];
+        for projection in [
+            "ptr::addr_of!((*head).extra).read()",
+            "ptr::addr_of!((*head).name).read()",
+            "ptr::addr_of!((*head).comment).read()",
+            "ptr::addr_of!((*head).extra_len).read()",
+        ] {
+            assert!(
+                read_body.contains(projection),
+                "read_gz_header_source must read each field with `{projection}`,                  which forms no reference over the caller's struct"
+            );
+        }
+
+        // The load-bearing ordering. A shared borrow of a header payload is sound
+        // only while no `&mut` covers the same bytes, and `zlib.h` L843-L847 lets a
+        // caller point `head->extra`/`name`/`comment` straight into `next_out`. The
+        // `deflate` shim therefore MUST read and stage the header before
+        // `output_slice` bridges the output window. Nothing about the emitted bytes
+        // reveals a violation of this — the wrong order still produces the right
+        // output — so, like the aliasing rule above, it is asserted structurally.
+        let deflate_src = strip_line_comments(&repo_file("src/ffi/deflate.rs"));
+        let shim = deflate_src
+            .find("\npub unsafe extern \"C\" fn deflate(")
+            .expect("the deflate shim must exist");
+        let after = &deflate_src[shim..];
+        let shim_end = after[1..]
+            .find("\npub unsafe extern \"C\" fn ")
+            .map_or(after.len(), |i| i + 1);
+        let shim_body = &after[..shim_end];
+        let read_at = shim_body
+            .find("read_gz_header_source(")
+            .expect("the deflate shim must read the live header through the raw reader");
+        let stage_at = shim_body
+            .find("stage_into(")
+            .expect("the deflate shim must stage an overlapping header");
+        let out_at = shim_body
+            .find("output_slice(")
+            .expect("the deflate shim must bridge the output window");
+        assert!(
+            read_at < out_at && stage_at < out_at,
+            "the deflate shim must read (offset {read_at}) and stage (offset \
+             {stage_at}) the caller's gzip header before `output_slice` (offset \
+             {out_at}) bridges the output window; reading afterwards places a shared \
+             borrow over bytes a live `&mut [u8]` may cover, which `zlib.h` \
+             L843-L847 explicitly permits a caller to arrange (AAP §0.6.2, \
+             standard S2)"
+        );
+    }
+
     /// Every exported C symbol resolves to a live, distinct code address **in
     /// the configuration under test**.
     ///

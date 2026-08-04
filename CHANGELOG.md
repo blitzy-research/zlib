@@ -164,12 +164,12 @@ every entry in one would have to be invented.
   [`tests/gzip_compat.rs`](tests/gzip_compat.rs); checksum known-answer vectors
   in [`tests/checksum.rs`](tests/checksum.rs); and the two-tier byte-identity and
   wire-format gate in [`tests/interop.rs`](tests/interop.rs).
-  **959 tests pass** by default — 799 in-crate unit tests, 131 integration tests
-  (`checksum` 23, `gzip_compat` 17, `inflate_coverage` 29, `interop` 30,
+  **1015 tests pass** by default — 854 in-crate unit tests, 132 integration tests
+  (`checksum` 23, `gzip_compat` 17, `inflate_coverage` 30, `interop` 30,
   `regression` 13, `round_trip` 19), and 29 doctests (28 runnable plus one
   `compile_fail`) — with **0 failed and 0 ignored**. `--no-default-features`
-  passes **696** (571 unit + 98 integration + 27 doctests) and `--all-features`
-  passes **972**. CI parses every
+  passes **713** (587 unit + 99 integration + 27 doctests) and `--all-features`
+  passes **1028**. CI parses every
   `test result:` line and fails on any failure, on any *ignored* test, or on a
   count below a per-row lower bound, because `cargo test` exits 0 when tests are
   skipped.
@@ -308,7 +308,7 @@ the security properties the initial release establishes.
   aliases only** — `ZallocFn` and `ZfreeFn`, which merely *name* the C hook
   signatures the crate must interoperate with. `grep -c "unsafe {"` on that file
   returns 0, and the module carries its own `#![deny(unsafe_code)]`.)
-- **Every `unsafe` block that does exist is justified in place.** **513
+- **Every `unsafe` block that does exist is justified in place.** **592
   `// SAFETY:` comments** across `src/`, with
   `#![warn(clippy::undocumented_unsafe_blocks)]` and `#![warn(missing_docs)]`
   promoted to hard errors by the `-D warnings` lint gate. Containment is checked
@@ -487,8 +487,8 @@ the security properties the initial release establishes.
   | `cargo fmt --all -- --check` | exit 0 |
   | `cargo clippy --locked --all-targets --all-features -- -D warnings` | exit 0 |
   | `cargo build --locked` | exit 0 |
-  | `cargo test --locked` | **959 passed / 0 failed / 0 ignored** |
-  | `cargo test --locked --no-default-features` | **696 passed / 0 failed / 0 ignored** |
+  | `cargo test --locked` | **1015 passed / 0 failed / 0 ignored** |
+  | `cargo test --locked --no-default-features` | **713 passed / 0 failed / 0 ignored** |
   | `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features` | exit 0, 0 warnings |
   | `mkdocs build --strict --site-dir "$(mktemp -d)/site"` | exit 0, 0 strict diagnostics |
 
@@ -505,8 +505,8 @@ the security properties the initial release establishes.
   `#[ignore]`.
 - **Release artifacts** from `cargo build --locked --release` under **default**
   features on `x86_64-unknown-linux-gnu` with `rustc 1.97.1 (8bab26f4f 2026-07-14)`,
-  into the repository's default `target/release/`: `libzlib_rs.rlib` 2,791,948 bytes ·
-  `libzlib_rs.so` 660,944 · `libzlib_rs.a` 22,441,620, observed on **2026-08-03**.
+  into the repository's default `target/release/`: `libzlib_rs.rlib` 2,930,500 bytes ·
+  `libzlib_rs.so` 667,552 · `libzlib_rs.a` 22,464,508, observed on **2026-08-04**.
   Read those as a dated, environment-specific snapshot of one build — not a
   reproducible invariant and not a size budget: no gate asserts them, and they move
   with the compiler, the feature row, the profile, and any change to the crate's own

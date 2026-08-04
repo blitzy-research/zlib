@@ -235,6 +235,73 @@ impl InflateMode {
             | InflateMode::Sync => true,
         }
     }
+
+    /// Whether this mode is one of the gzip/zlib **header** parser states — the
+    /// span in which `inflate` may store bytes into a caller-registered
+    /// `gz_header`, and in which it can never produce output.
+    ///
+    /// C's header states run `HEAD` through `HCRC` (`inflate.h`): `HEAD` reads the
+    /// magic, `FLAGS`/`TIME`/`OS`/`EXLEN` the fixed gzip fields, `EXTRA`/`NAME`/
+    /// `COMMENT` the three variable-length payloads, and `HCRC` the optional header
+    /// CRC. Every store into `head->extra`/`name`/`comment` happens inside that
+    /// span (`inflate.c` L614-L621, L632-L637, L654-L659), and none of those states
+    /// writes a decompressed byte.
+    ///
+    /// `DICTID`/`DICT` are excluded even though they precede the first block: they
+    /// belong to zlib's preset-dictionary handshake, store nothing into a
+    /// `gz_header`, and `DICT` has its own early return.
+    ///
+    /// The FFI boundary uses this to bound the header phase of a call whose header
+    /// buffers overlap the caller's input or output window, where the two phases
+    /// must be separated in time rather than merely bounds-checked. It is an
+    /// exhaustive `match` so that a newly added mode must be classified here
+    /// instead of silently defaulting to "not a header state".
+    ///
+    /// Gated on `gzip` because that overlap can only arise for a registered
+    /// `gz_header`, so the sole caller — `inflate_split_over_header` in
+    /// `src/ffi/inflate.rs` — carries the same gate. Without the gate this method
+    /// is dead code in every `gzip`-off configuration, which the `--no-default-
+    /// features`, `no-std` and `std,simd` rows each report as a `dead_code`
+    /// warning; matching the caller's gate removes the warning at its cause
+    /// instead of silencing it.
+    #[cfg(feature = "gzip")]
+    #[must_use]
+    pub(crate) const fn is_header_phase(self) -> bool {
+        match self {
+            InflateMode::Head
+            | InflateMode::Flags
+            | InflateMode::Time
+            | InflateMode::Os
+            | InflateMode::ExLen
+            | InflateMode::Extra
+            | InflateMode::Name
+            | InflateMode::Comment
+            | InflateMode::Hcrc => true,
+            InflateMode::DictId
+            | InflateMode::Dict
+            | InflateMode::Type
+            | InflateMode::TypeDo
+            | InflateMode::Stored
+            | InflateMode::CopyUnderscore
+            | InflateMode::Copy
+            | InflateMode::Table
+            | InflateMode::LenLens
+            | InflateMode::CodeLens
+            | InflateMode::LenUnderscore
+            | InflateMode::Len
+            | InflateMode::LenExt
+            | InflateMode::Dist
+            | InflateMode::DistExt
+            | InflateMode::Match
+            | InflateMode::Lit
+            | InflateMode::Check
+            | InflateMode::Length
+            | InflateMode::Done
+            | InflateMode::Bad
+            | InflateMode::Mem
+            | InflateMode::Sync => false,
+        }
+    }
 }
 
 impl Default for InflateMode {
@@ -536,11 +603,13 @@ pub struct InflateState {
 /// [`AllocBuffer`] where C holds a bare `unsigned char *`, a
 /// [`TableSource`] discriminant plus offsets where C holds three interior
 /// `code *` pointers, and Rust enums where C holds `int`s. The two numbers
-/// therefore cannot be one value, and this mirror exists to keep C's available:
-/// it is what documents, and what the layout tests assert, the request reference
-/// zlib would make. The port's own init paths ask for `size_of::<InflateState>()`
-/// instead, because the region they receive is where the state actually lives
-/// (AAP §0.6.3 has-hook clause, §0.6.5).
+/// therefore cannot be one value, and the request has to carry **C's**: an
+/// allocator sized from C's header must serve this port exactly as it serves
+/// reference zlib (AAP §0.6.5). This mirror is what makes that number available,
+/// and [`InflateState::C_LAYOUT_SIZE`] is what the init and copy paths charge. The
+/// consequence is that the caller's region cannot *host* the larger Rust state, so
+/// it is held purely as the accounting token C's `zfree` receives back, and the
+/// state value sits beside it on the global heap.
 ///
 /// Every field is a `core::ffi` scalar alias or a raw pointer and the struct is
 /// `#[repr(C)]`, so rustc applies the platform C ABI's layout rules — the same
@@ -620,6 +689,18 @@ const DMAX_DEFAULT: u32 = 32768;
 /// [`Any`] accessors are the MSRV-1.85 spelling of
 /// `&dyn EngineState -> &dyn Any` upcasting, which only became available in
 /// Rust 1.86.
+/// The `size` argument reference zlib passes when it charges a caller's `zalloc`
+/// for this engine's state: C's `sizeof(struct inflate_state)` (`inflate.c` L198,
+/// `infback.c` L51), not this port's own `size_of::<InflateState>()`.
+///
+/// Forwarding the `#[repr(C)]` mirror's size is what makes an allocator sized from
+/// C's header — one that serves `(1, 7160)` and refuses anything larger —
+/// initialize here exactly as it does against reference zlib (AAP §0.6.5). See
+/// [`C_LAYOUT_SIZE`](InflateState::C_LAYOUT_SIZE).
+impl crate::stream::EngineFootprint for InflateState {
+    const C_STATE_SIZE: usize = Self::C_LAYOUT_SIZE;
+}
+
 impl EngineState for InflateState {
     #[inline]
     fn engine_kind(&self) -> EngineKind {
@@ -749,19 +830,20 @@ impl InflateState {
     /// shapes (owned buffers, `Option`s, offsets) and does not have to be
     /// byte-compatible, only behaviourally so.
     ///
-    /// That difference is why it is **not** the size the init paths request. A
-    /// caller's `zalloc` is asked for `size_of::<InflateState>()`, because the
-    /// region it returns is the state's real home (AAP §0.6.3 has-hook clause,
-    /// §0.6.5): a block of C's smaller `sizeof` could not hold it, so preserving
-    /// the argument *pair* and holding the state in the caller's memory are
-    /// mutually exclusive. AAP §0.6.5 requires the allocation **count** and the
-    /// **failure timing** to match, and both do; the byte count of a single
-    /// request is not something any zlib contract lets a caller assert, and C's
-    /// own value moves with `LIT_MEM` and pointer width.
+    /// **This is exactly the size the init paths request**, forwarded to
+    /// the crate-internal `EngineFootprint::C_STATE_SIZE`
+    /// so that a caller's `zalloc` sees C's `(1, sizeof(struct inflate_state))`
+    /// pair and an arena sized from C's header serves it exactly as it serves
+    /// reference zlib (AAP §0.6.5). Because a block of C's smaller `sizeof` cannot
+    /// hold this port's state, the charge and the state value are deliberately
+    /// separate: the caller's region is held — unread — until its matching
+    /// `zfree`, and the state itself lives beside it on the global heap. Every
+    /// property a zlib caller can observe (request count, argument pair, sequence
+    /// position, failure timing, release order) is preserved.
     ///
     /// Exposed publicly because it is the ABI mirror's own size, and the only way
     /// an allocator implementation or a memory-accounting test can state what
-    /// reference zlib would have asked for.
+    /// reference zlib asks for.
     pub const C_LAYOUT_SIZE: usize = core::mem::size_of::<InflateStateC>();
 
     /// Creates a new, boxed inflate state for the given wrapper mode and window
@@ -857,10 +939,10 @@ impl InflateState {
     ///
     /// The paths that must reproduce C's caller-visible allocation schedule do
     /// **not** use it: they take a `crate::stream::EngineReservation` at C's
-    /// position in the sequence, build the state with
-    /// `build_in`, and move it into the reserved region, so a
-    /// caller's `zalloc` really does hold the `inflate_state` and gets it back
-    /// through `zfree` (AAP §0.6.3 has-hook clause, §0.6.5):
+    /// position in the sequence — charging the caller's `zalloc` C's own
+    /// `(1, `[`C_LAYOUT_SIZE`](Self::C_LAYOUT_SIZE)`)` pair, released again through
+    /// their `zfree` after the window (AAP §0.6.5) — and build the state with
+    /// `build_in`:
     ///
     /// | Caller | Caller-hook requests, in order |
     /// |--------|--------------------------------|
@@ -871,8 +953,8 @@ impl InflateState {
     /// Each of those paths charges the hook only when its
     /// [`Allocator::reserves_state_footprint`] says to, so the global-allocator
     /// path keeps its historical footprint: there the `Box` already *is* that
-    /// allocation, and charging a second equally sized region would double every
-    /// stream's fixed overhead (AAP §0.6.5).
+    /// allocation, and charging a second region would double every stream's fixed
+    /// overhead (AAP §0.6.5).
     #[must_use]
     pub fn try_new_in(hook: AllocHook, wrap: i32, wbits: u32) -> Option<Box<InflateState>> {
         try_box(Self::build(hook, wrap, wbits))
@@ -884,7 +966,7 @@ impl InflateState {
     /// This is the entry point the C-parity init paths use: they take a
     /// `crate::stream::EngineReservation` where C issues
     /// `ZALLOC(strm, 1, sizeof(struct inflate_state))`, call this to produce the
-    /// value, and then move the value into the reserved region. Splitting
+    /// value, and then attach the charge to the finished state. Splitting
     /// reservation from construction is unavoidable, because the reservation has
     /// to be charged *before* the state exists in order to fail where C fails.
     ///
@@ -1109,9 +1191,9 @@ impl InflateState {
 /// Releases the window in **C `inflateEnd`'s order**, ahead of the state itself.
 ///
 /// Ownership alone already frees the window — that is what makes C's explicit
-/// `ZFREE` unnecessary — but the state's own storage is released by the
-/// crate-internal `EngineBox` wrapper that holds it, which runs *after* this
-/// impl. Reference zlib's order is fixed by its source:
+/// `ZFREE` unnecessary — but the caller's charge for the state footprint is
+/// released by the crate-internal `EngineBox` wrapper that holds it, which runs
+/// *after* this impl. Reference zlib's order is fixed by its source:
 ///
 /// ```text
 /// if (state->window != Z_NULL) ZFREE(strm, state->window);  /* inflate.c L1160 */

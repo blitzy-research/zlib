@@ -98,10 +98,7 @@ use core::ffi::{c_uint, c_void};
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 
-use crate::stream::{
-    AllocHook, FallibleBoxAlloc, ForeignAlloc, ForeignBuffer, ForeignEngine, ForeignEngineHome,
-    ForeignEnginePlace, ZeroValid,
-};
+use crate::stream::{AllocHook, FallibleBoxAlloc, ForeignAlloc, ForeignBuffer, ZeroValid};
 
 /// A working buffer backed by a caller-supplied C `zalloc`/`zfree` pair.
 ///
@@ -177,6 +174,17 @@ impl<T: Copy + Default + ZeroValid + 'static> ForeignBuffer<T> for CForeignBuffe
         unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
+    #[inline]
+    fn len(&self) -> usize {
+        // The recorded element count, returned without touching the region. This
+        // buffer's bytes *are* initialized (`try_alloc_foreign_items` writes a
+        // `T::default()` into every slot), so measuring through `as_slice` would
+        // also be sound here — but the trait forbids it uniformly so that the one
+        // implementor whose bytes are not yet initialized cannot be the exception
+        // that is forgotten.
+        self.len
+    }
+
     fn clone_foreign(&self) -> Option<Box<dyn ForeignBuffer<T>>> {
         // Allocate a fresh foreign region through the SAME hook (matching C
         // `deflateCopy`, which `ZALLOC`s new buffers) with the SAME `(items,
@@ -238,18 +246,40 @@ impl<T: Copy + Default + ZeroValid> Drop for CForeignBuffer<T> {
 /// Established once by [`borrow_caller_window`], the only producer:
 ///
 /// * `ptr` is non-null and `len` is non-zero;
-/// * the region addresses exactly `len` bytes that are valid to read and write.
-///   They are **not** initialized by this crate — `borrow_caller_window`
-///   deliberately writes nothing, because C's `state->window = window;`
-///   (`infback.c` L60) is a bare store. Forming slices over them is still sound:
-///   `u8` has no invalid bit pattern and no niche, so whatever the caller left
-///   there is a valid inhabitant, and the decoder never *reads* a window byte it
-///   has not itself written (`whave` and `wnext` both start at `0` and bound
-///   every match copy);
+/// * the region addresses exactly `len` bytes that are valid to read and write;
 /// * `len <= isize::MAX`, so the region is a valid Rust slice length;
 /// * the caller keeps the region valid and grants exclusive access for as long as
 ///   the `inflateBack` state lives, which is the documented `# Safety` contract of
 ///   the `inflateBackInit_` shim.
+///
+/// # Initialization is a caller-of-this-type obligation
+///
+/// The bytes are **not** initialized at adoption: `borrow_caller_window` writes
+/// nothing, because C's `state->window = window;` (`infback.c` L60) is a bare
+/// pointer store and matching it is what leaves a caller's pre-filled buffer
+/// byte-for-byte intact across `inflateBackInit_` *and* `inflateBackEnd`.
+///
+/// A `&[u8]`/`&mut [u8]` over abstract-uninitialized bytes is validity UB even
+/// when it is never read, so the slice-producing methods below carry a hard
+/// precondition: **the region must have been initialized before either is
+/// called.** Two mechanisms together discharge it, and neither relies on the
+/// engine's read discipline:
+///
+/// * [`len`](ForeignBuffer::len) answers from the recorded count and forms no
+///   slice, so the length queries the engine performs at init
+///   (`build_back_state`) and at entry (`inflate_back`) never touch the bytes.
+///   This is the reason `ForeignBuffer::len` exists as a trait method at all.
+/// * `inflateBackInit_` zero-fills the whole region as the last act of its
+///   accepting path — after every fallible step, and still before any slice over
+///   the region can exist. From then on every byte is initialized for the rest of
+///   the handle's life.
+///
+/// So the region is initialized before its first reference and stays that way,
+/// while every path C leaves untouched — every refusal, and `inflateBackEnd` —
+/// stays untouched here too. The engine's independent guarantee that it never
+/// *reads* an unwritten window byte (`whave` and `wnext` both start at `0` and
+/// bound every match copy) remains true but is no longer load-bearing for
+/// soundness.
 ///
 /// # Not clonable
 ///
@@ -258,8 +288,11 @@ impl<T: Copy + Default + ZeroValid> Drop for CForeignBuffer<T> {
 /// provided. Nothing needs it to — zlib has no `inflateBackCopy`, so no code path
 /// ever clones an `inflateBack` window.
 struct CBorrowedBuffer {
-    /// Non-null pointer to `len` caller-owned bytes, readable and writable but
-    /// not initialized by this crate.
+    /// Non-null pointer to `len` caller-owned bytes, readable and writable.
+    ///
+    /// Initialized not by this type but by `inflateBackInit_`'s accepting-path
+    /// zero-fill, which runs before any slice over the region can exist — see the
+    /// type-level "Initialization is a caller-of-this-type obligation".
     ptr: NonNull<u8>,
     /// Length of the lent region in bytes.
     len: usize,
@@ -269,24 +302,39 @@ impl ForeignBuffer<u8> for CBorrowedBuffer {
     #[inline]
     fn as_slice(&self) -> &[u8] {
         // SAFETY: `borrow_caller_window` established every `from_raw_parts`
-        // precondition — non-null pointer, `len <= isize::MAX`, and `u8`'s alignment
-        // of 1 which every address satisfies. The bytes need not be initialized:
-        // `u8` has no invalid bit pattern and no niche, so every byte the caller
-        // left behind is a valid inhabitant of the slice's element type. The
-        // caller's `# Safety` contract on `inflateBackInit_` guarantees the region
-        // stays valid and is not aliased for the life of the state, so a shared
-        // slice for this `&self` borrow is sound.
+        // precondition — non-null pointer, `len <= isize::MAX`, and `u8`'s
+        // alignment of 1 which every address satisfies. The bytes are initialized:
+        // the only route to this method is through the engine's decode path, and
+        // `inflateBackInit_` zero-fills the whole region before it returns
+        // `Z_OK` (length queries take `ForeignBuffer::len`, which forms no slice,
+        // so they cannot precede that fill).
+        // The caller's `# Safety` contract on `inflateBackInit_` guarantees the
+        // region stays valid and is not aliased for the life of the state, so a
+        // shared slice for this `&self` borrow is sound.
         unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
     #[inline]
     fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: same validity and length reasoning as `as_slice`, including that
-        // uninitialized `u8`s are valid inhabitants; the `&mut self` borrow
-        // additionally guarantees no other reference into the region exists on our
-        // side, and the caller's `inflateBackInit_` contract guarantees none exists
-        // on theirs, so a unique slice is sound.
+        // SAFETY: same validity, length and initialization reasoning as
+        // `as_slice`; the `&mut self` borrow additionally guarantees no other
+        // reference into the region exists on our side, and the caller's
+        // `inflateBackInit_` contract guarantees none exists on theirs. The one
+        // way a foreign *read* could still alias this unique slice — an input or
+        // callback buffer placed inside the window, which zlib permits — is
+        // eliminated by `CInFunc`, which stages such input into private storage
+        // instead of publishing a slice over the window.
         unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        // The recorded byte count, answered without forming a slice. This is the
+        // whole reason `ForeignBuffer::len` is a trait method: the engine asks for
+        // the window's length at init and at entry, both of which precede the
+        // shim's zero-fill, so answering through `as_slice` would create a
+        // reference over uninitialized bytes.
+        self.len
     }
 
     fn clone_foreign(&self) -> Option<Box<dyn ForeignBuffer<u8>>> {
@@ -313,18 +361,26 @@ impl ForeignBuffer<u8> for CBorrowedBuffer {
 /// C stores the pointer and nothing else — `infback.c` L60 is a bare
 /// `state->window = window;` — so this function writes **no** bytes to it
 /// either. That parity is directly observable: a caller who pre-fills its window
-/// and then makes an `inflateBackInit_` call that fails (an exhausted allocator)
-/// must find the buffer byte-for-byte as it left it, because C never reached the
-/// adoption at all.
+/// and then makes an `inflateBackInit_` call that **fails** — a rejected argument,
+/// an exhausted allocator, an exhausted Rust heap — must find the buffer
+/// byte-for-byte as it left it, because C never reached the adoption at all. The
+/// same holds for `inflateBackEnd`, which frees only the state (`infback.c`
+/// L572-L577) and touches no window byte here either.
 ///
-/// Forming a `&mut [u8]` over the region without initializing it first is sound
-/// here for two independent reasons. `u8` has no invalid bit patterns and no
-/// niche, so every byte value — however the caller left it — is a valid
-/// inhabitant; and the decoder never *reads* a window byte it has not itself
-/// written, because `whave` and `wnext` both start at `0` and every match copy
-/// is bounded by `whave`. The caller's obligation is therefore only that the
-/// region be live, un-aliased and at least `len` bytes long, which is exactly
-/// what `zlib.h` already demands of the `window` argument.
+/// # Who initializes it, and when
+///
+/// Because this function writes nothing, the adopted bytes start out
+/// abstract-uninitialized, and a `&[u8]`/`&mut [u8]` over such bytes is validity
+/// UB whether or not it is read. The obligation is discharged one level up:
+/// `inflateBackInit_` zero-fills the region as the last act of its accepting path
+/// — after every fallible step, and still before anything can form a window slice
+/// — and [`ForeignBuffer::len`] answers the length queries that happen before then
+/// without forming one. See `CBorrowedBuffer`'s "Initialization is a
+/// caller-of-this-type obligation".
+///
+/// The caller's obligation is therefore only that the region be live, un-aliased
+/// and at least `len` bytes long, which is exactly what `zlib.h` already demands
+/// of the `window` argument.
 ///
 /// # Safety
 ///
@@ -347,12 +403,10 @@ pub(crate) unsafe fn borrow_caller_window(
 
     // No write of any kind happens here: C's `state->window = window;`
     // (`infback.c` L60) copies a pointer, and matching it is what keeps a
-    // caller's pre-filled buffer intact across both a successful and a refused
-    // init. The `ForeignBuffer` methods above form their slices over a live,
-    // `len`-byte, un-aliased region of `u8` — a type with no invalid bit pattern
-    // — and the decoder reads only bytes it has already written (`whave` starts
-    // at `0` and bounds every match copy), so no uninitialized byte is ever
-    // observed as a value.
+    // caller's pre-filled buffer intact across every refused init and across
+    // `inflateBackEnd`. Initialization — required before any slice over the region
+    // may exist — is performed by `inflateBackInit_` once its accepting path is
+    // committed; see this function's doc comment and `CBorrowedBuffer`.
     let borrowed = try_box(CBorrowedBuffer { ptr, len })?;
     Some(crate::stream::AllocBuffer::Foreign(borrowed))
 }
@@ -846,224 +900,6 @@ pub(crate) unsafe extern "C" fn default_zfree(_opaque: *mut c_void, address: *mu
 }
 
 // ===========================================================================
-// Caller-hook-backed engine states
-// ===========================================================================
-
-/// A caller-`zalloc`'d region reserved for one engine state and not yet filled.
-///
-/// # Why the reservation is a separate object
-///
-/// Reference zlib charges its allocator for the state *first* and for the working
-/// buffers afterwards:
-///
-/// ```text
-/// s = (deflate_state *) ZALLOC(strm, 1, sizeof(deflate_state));  /* deflate.c L305 */
-/// if (s == Z_NULL) return Z_MEM_ERROR;
-/// ...
-/// s->window = (Bytef *) ZALLOC(strm, s->w_size, 2*sizeof(Byte)); /* L346 */
-/// ```
-///
-/// A caller with a bounded arena observes `Z_MEM_ERROR` from whichever of those
-/// requests exhausts it, so the *order* is part of the behaviour (AAP §0.6.5).
-/// The Rust state value, however, cannot exist until after its buffers do — they
-/// are its fields. Reserving the region up front and moving the finished state
-/// into it afterwards is what reconciles the two.
-///
-/// # Type invariants
-///
-/// Established once by [`try_reserve_engine`], the only producer:
-///
-/// * `ptr` is non-null, was returned by `hook`'s `zalloc`, and is aligned for `E`;
-/// * it addresses at least `size_of::<E>()` writable bytes;
-/// * the region is **uninitialized** — nothing is written to it before [`fill`]
-///   moves an `E` in, matching C, whose `ZALLOC` is `malloc` and not `calloc`
-///   (`zutil.c` `zcalloc`);
-/// * `hook` is the hook the region came from and is still
-///   [active](AllocHook::is_active).
-///
-/// [`fill`]: ForeignEngineHome::fill
-struct CEngineHome<E> {
-    /// Non-null, `E`-aligned pointer to the reserved region.
-    ptr: NonNull<E>,
-    /// The hook the region came from; its `zfree` releases it.
-    hook: AllocHook,
-}
-
-impl<E: 'static> ForeignEngineHome<E> for CEngineHome<E> {
-    fn fill(self: Box<Self>, engine: E) -> Option<Box<dyn ForeignEngine<E>>> {
-        let ptr = self.ptr;
-        let hook = self.hook;
-        // Allocate the type-erasing owner **before** the region is committed, and
-        // fallibly. Doing it in this order is what makes heap exhaustion here
-        // reportable instead of fatal: on refusal `self` is still alive and still
-        // owns the reservation, so returning `None` runs `CEngineHome::drop` and
-        // hands the region back through the caller's `zfree`, while `engine` is
-        // dropped by the caller and releases its working buffers through the same
-        // hook. That is C's `deflate.c` L505-L514 recovery. The infallible
-        // `Box::new` this replaced aborted the process, which zlib never does.
-        let owner = try_box(CEngine { ptr, hook })?;
-        // Hand ownership of the region to `owner` *without* running this home's
-        // `Drop`, which would free the region out from under it. `mem::forget` is
-        // the transfer, and neither it nor the `write` below can panic, so `owner`
-        // cannot be dropped while it still points at uninitialized memory.
-        core::mem::forget(self);
-        // SAFETY: the type invariants give a non-null, `E`-aligned pointer to at
-        // least `size_of::<E>()` writable, unaliased bytes. `write` moves `engine`
-        // in without reading or dropping whatever bit pattern was there, which is
-        // required because the region is uninitialized.
-        unsafe { ptr.as_ptr().write(engine) };
-        Some(owner)
-    }
-}
-
-impl<E> Drop for CEngineHome<E> {
-    /// Releases an *unfilled* reservation.
-    ///
-    /// Reached when the state could not be built after the region was already
-    /// charged — C's own early-return paths, which `ZFREE` the state before
-    /// returning `Z_MEM_ERROR` (for example `deflate.c` L505-L514). No `E` was
-    /// ever written, so nothing is dropped in place.
-    fn drop(&mut self) {
-        if let Some(zfree) = self.hook.zfree() {
-            // SAFETY: `ptr` came from this same hook's `zalloc`, has not been
-            // freed (a filled home is `mem::forget`ten, so this runs only for an
-            // unfilled one), and `zfree`/`opaque` are the matching pair from the
-            // same `z_stream` — exactly zlib's `ZFREE(strm, addr)`.
-            unsafe { zfree(self.hook.opaque(), self.ptr.as_ptr() as *mut c_void) };
-        }
-    }
-}
-
-/// An engine state living in memory the caller's `zalloc` returned.
-///
-/// This is the concrete, `ffi`-local implementor of [`ForeignEngine`]. It is what
-/// makes the caller's arena the real home of a `deflate_state` /
-/// `inflate_state` rather than merely being charged for one: the accessors hand
-/// out ordinary borrows into that region, so every layer above sees `&E` /
-/// `&mut E` and never a pointer (AAP §0.6.2).
-///
-/// # Type invariants
-///
-/// Established by [`CEngineHome::fill`], the only producer:
-///
-/// * `ptr` is non-null, `E`-aligned, and addresses one **initialized** `E`;
-/// * this value is that `E`'s unique owner, so the borrows below cannot alias and
-///   [`Drop`] runs its destructor exactly once;
-/// * `hook` is the hook the region came from and is still
-///   [active](AllocHook::is_active).
-struct CEngine<E> {
-    /// Non-null, `E`-aligned pointer to one live `E`.
-    ptr: NonNull<E>,
-    /// The hook the region came from; its `zfree` releases it.
-    hook: AllocHook,
-}
-
-impl<E: 'static> ForeignEngine<E> for CEngine<E> {
-    #[inline]
-    fn get(&self) -> &E {
-        // SAFETY: the type invariants give a non-null, aligned pointer to one
-        // initialized `E` that this value uniquely owns, so a shared borrow tied
-        // to `&self` cannot alias a live `&mut E`.
-        unsafe { self.ptr.as_ref() }
-    }
-
-    #[inline]
-    fn get_mut(&mut self) -> &mut E {
-        // SAFETY: same validity and initialization reasoning as `get`; the
-        // `&mut self` borrow additionally guarantees no other reference into the
-        // region exists, so a unique borrow is sound.
-        unsafe { self.ptr.as_mut() }
-    }
-}
-
-impl<E> Drop for CEngine<E> {
-    /// Runs the engine's destructor **in place**, then hands the region back to
-    /// the caller's `zfree`.
-    ///
-    /// The order matters: the state owns [`AllocBuffer`]s of its own, several of
-    /// which may be foreign-backed, and their `zfree` calls must happen while the
-    /// state still exists. That is the same order C uses — `deflateEnd` releases
-    /// `pending_buf`, `head`, `prev` and `window` and only then the state itself
-    /// (`deflate.c` L1104-L1112).
-    ///
-    /// [`AllocBuffer`]: crate::stream::AllocBuffer
-    fn drop(&mut self) {
-        // SAFETY: `ptr` addresses one initialized `E` that this value uniquely
-        // owns and `Drop` runs once, so the destructor runs exactly once and
-        // nothing reads the region afterwards.
-        unsafe { core::ptr::drop_in_place(self.ptr.as_ptr()) };
-        if let Some(zfree) = self.hook.zfree() {
-            // SAFETY: `ptr` came from this same hook's `zalloc` and has not been
-            // freed; `zfree`/`opaque` are the matching pair from the same
-            // `z_stream`, so this is zlib's `ZFREE(strm, addr)`. The `E` has just
-            // been dropped, so the region holds nothing live.
-            unsafe { zfree(self.hook.opaque(), self.ptr.as_ptr() as *mut c_void) };
-        }
-    }
-}
-
-/// Requests one engine footprint from `hook` as `(1, size_of::<E>())`.
-///
-/// Returns [`None`] — reported by every caller as `Z_MEM_ERROR`, the code C
-/// returns from its failed state `ZALLOC` — when the request cannot be expressed
-/// to the C hook ABI, when `zalloc` reports out-of-memory, when the returned
-/// region is misaligned for `E`, or when the small owning cell cannot be boxed.
-///
-/// Nothing is written to the region: an engine state is moved in whole by
-/// [`CEngineHome::fill`], so pre-zeroing would be wasted work C does not do
-/// either.
-fn try_reserve_engine<E: 'static>(hook: AllocHook) -> Option<Box<dyn ForeignEngineHome<E>>> {
-    debug_assert!(
-        hook.is_active(),
-        "try_reserve_engine is only called for an active hook"
-    );
-
-    // Both halves of an active hook are present; re-check to obtain the pointer
-    // without unwrapping.
-    let zalloc = hook.zalloc()?;
-
-    // Shape and validate `(1, size_of::<E>())` against the Rust layout rules and
-    // the C `uInt` hook ABI before the hook is consulted at all. A zero-sized
-    // engine is rejected here, which is unreachable for the two real engines.
-    let HookRequest {
-        layout,
-        items: items_arg,
-        size: size_arg,
-        count,
-    } = hook_request::<E>(1, core::mem::size_of::<E>())?;
-    debug_assert_eq!(count, 1, "one engine footprint is exactly one element");
-
-    // SAFETY: `zalloc` is a caller-supplied `alloc_func` from a valid `z_stream`
-    // with the `zlib.h` L85 signature, called with a validated, non-overflowing
-    // `items * size`; `opaque` is the caller's cookie forwarded verbatim. Only
-    // the returned pointer value is inspected.
-    let raw = unsafe { zalloc(hook.opaque(), items_arg, size_arg) } as *mut E;
-
-    // A null return is the zlib out-of-memory signal (AAP §0.6.5).
-    let ptr = NonNull::new(raw)?;
-
-    // A conforming `alloc_func` returns memory suitable for any object of the
-    // requested size, but that is the caller's promise rather than something this
-    // crate may assume: writing an `E` through an under-aligned pointer would be
-    // undefined behaviour. Verify it, and on failure hand the region straight back
-    // so nothing leaks.
-    if ptr.as_ptr().addr() % layout.align() != 0 {
-        if let Some(zfree) = hook.zfree() {
-            // SAFETY: `raw` was just returned by this hook's `zalloc`, has not
-            // been freed, and no owner was constructed over it; `zfree`/`opaque`
-            // are the caller's matching pair.
-            unsafe { zfree(hook.opaque(), raw as *mut c_void) };
-        }
-        return None;
-    }
-
-    // The cell is small and its allocation is fallible, so a boxing failure
-    // releases the region through `CEngineHome::drop` instead of leaking it.
-    let home: Box<CEngineHome<E>> = try_box(CEngineHome { ptr, hook })?;
-    Some(home)
-}
-
-// ===========================================================================
 // Core-declared allocation capabilities, implemented at the boundary
 // ===========================================================================
 //
@@ -1082,13 +918,6 @@ impl<T> FallibleBoxAlloc for T {
     #[inline]
     fn try_box_fallible(self) -> Option<Box<Self>> {
         try_box(self)
-    }
-}
-
-impl<T: Sized + 'static> ForeignEnginePlace for T {
-    #[inline]
-    fn try_reserve_foreign(hook: AllocHook) -> Option<Box<dyn ForeignEngineHome<Self>>> {
-        try_reserve_engine::<Self>(hook)
     }
 }
 

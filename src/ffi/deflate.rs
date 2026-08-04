@@ -325,6 +325,23 @@ pub unsafe extern "C" fn deflateInit_(
     }
 }
 
+/// Counts header stagings, for the tests' anti-vacuity assertions only.
+///
+/// Staging happens only when a registered header buffer shares bytes with the
+/// caller's output window, which no ordinary caller arranges. A test that
+/// *believes* it built that layout but got the address arithmetic wrong would
+/// silently assert about the zero-copy path instead and pass for the wrong reason,
+/// so the tests read this counter to confirm the path they mean to cover ran.
+#[cfg(all(test, feature = "gzip"))]
+static HEADER_STAGE_PASSES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Reads [`HEADER_STAGE_PASSES`].
+#[cfg(all(test, feature = "gzip"))]
+fn header_stage_passes() -> usize {
+    HEADER_STAGE_PASSES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 // ===========================================================================
 // Phase 2 — Core driver
 // ===========================================================================
@@ -338,6 +355,40 @@ pub unsafe extern "C" fn deflateInit_(
 /// forward progress is possible. Input consumption and output production are
 /// written back onto the raw `z_stream`, along with `adler`, `data_type`, and
 /// `msg`.
+///
+/// # A registered gzip header may overlap the output buffer
+///
+/// `zlib.h` L843-L847 imposes no disjointness between a registered header's
+/// `extra`/`name`/`comment` buffers and `next_out`, so pointing one of them into
+/// the output buffer is legal C and is honored here rather than rejected. It is
+/// handled by reading the header before the output window is bridged: when no
+/// field overlaps the window — every ordinary call — the engine reads the caller's
+/// own memory with nothing copied and nothing allocated, exactly as C does; when a
+/// field does overlap, that field is copied first and the engine reads the copy,
+/// because a shared borrow over bytes a live `&mut` also covers is undefined
+/// behaviour no matter how it is bounded.
+///
+/// Two consequences are worth stating plainly, since neither is visible in the
+/// return codes of an ordinary call:
+///
+/// - **`Z_MEM_ERROR` becomes reachable in that corner alone.** C never returns it
+///   from `deflate`, and neither does this shim unless a caller has aliased a
+///   header field into its own output window *and* the allocator refuses the copy.
+///   There is no third option: without the copy the only alternatives are undefined
+///   behaviour or rejecting a legal configuration.
+/// - **The staged bytes are those present on entry.** C interleaves header reads
+///   with `flush_pending` writes only when a field is longer than the whole pending
+///   buffer (`pending_buf_size`, `4 << (memLevel + 6)`), and only then can it read
+///   back bytes it has just overwritten through the very pointer it is reading. For
+///   an overlapping field short enough to fit — which is every field at the default
+///   `memLevel`, since C fills `pending_buf` completely before flushing any of it —
+///   the staged copy reproduces C byte for byte. Beyond that length the two diverge,
+///   with C emitting a mixture of original and freshly-overwritten bytes; that
+///   behaviour is not something `zlib.h` promises, and it is deliberately not
+///   reproduced (AAP §0.7.2 S5).
+///
+/// [`deflateBound`] needs no such treatment: it consumes only the header's
+/// *lengths* and bridges no output window.
 ///
 /// # Safety
 ///
@@ -427,6 +478,82 @@ pub unsafe extern "C" fn deflate(strm: z_streamp, flush: c_int) -> c_int {
             return Z_STREAM_ERROR;
         }
 
+        // Read the caller's live `gz_header` — and decide whether its payloads may
+        // be borrowed in place — *before* the output window is bridged below.
+        //
+        // C re-reads the caller's header here, at emission time, through the
+        // pointer `deflateSetHeader` stored (`deflate.c` L1092-L1188). Re-reading
+        // it on every call is what makes a mutation performed after registration
+        // but before emission observable in the output bytes, exactly as in C, and
+        // is required for byte identity (AAP §0.8.1 D-1).
+        //
+        // The ordering is a soundness requirement, not a style choice.
+        // `zlib.h` L843-L847 imposes no disjointness between `head->extra`,
+        // `head->name`, `head->comment` and `strm->next_out`, so a caller may
+        // legally point a header field straight into the output buffer. Once
+        // `output` below is a live `&mut [u8]`, *any* access to those bytes through
+        // an unrelated pointer — even a bounds-checked read — invalidates it and
+        // makes the engine's next write undefined. Reading the header first is what
+        // makes the legal overlap expressible at all: the fields are described
+        // rather than borrowed, the overlap is measured as plain address
+        // arithmetic, and only then is one of two paths taken.
+        //
+        // SAFETY: `handle.head` is null, or the `gz_header` the caller passed to
+        // `deflateSetHeader` and undertook to keep valid until emission completes
+        // (`zlib.h` L843-L847). No `&mut` is live over its payloads yet, which is
+        // `read_gz_header_source`'s remaining precondition.
+        #[cfg(feature = "gzip")]
+        let source = {
+            // SAFETY: `state`, when non-null, was installed by `deflateInit*` as a
+            // `Box<DeflateHandle>`; `deflate_handle` confirms the
+            // `HandleKind::DEFLATE` tag before reborrowing. The borrow ends with
+            // this block, well before the windows below are formed.
+            let Some(handle) = (unsafe { deflate_handle(s) }) else {
+                return Z_STREAM_ERROR;
+            };
+            let head = handle.head;
+            // SAFETY: as documented immediately above.
+            unsafe { read_gz_header_source(head) }
+        };
+
+        // Staging storage for the overlapping path. Left empty — and therefore
+        // never allocated — on the universal disjoint path, which is what keeps
+        // header handling as allocation-free as C's (AAP §0.6.5).
+        #[cfg(feature = "gzip")]
+        let mut stage = CGzHeaderStage::default();
+        #[cfg(feature = "gzip")]
+        let staged = {
+            // The output window as plain integers. `stream_buffers_valid` has
+            // already rejected a null `next_out`, and an `avail_out` of zero yields
+            // an empty range, which overlaps nothing — correctly, because the
+            // engine then holds `&mut []`, covering no bytes at all.
+            let out_start = s.next_out as usize;
+            let out_end = out_start.saturating_add(s.avail_out as usize);
+            match source.as_ref() {
+                Some(src) if src.intersects(out_start, out_end) => {
+                    #[cfg(test)]
+                    HEADER_STAGE_PASSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    // SAFETY: no reference over the caller's buffers exists yet, so
+                    // the copy is a plain read of readable caller memory. The
+                    // resulting view borrows `stage`, not the caller's memory, and
+                    // may therefore be held across the engine call.
+                    match unsafe { src.stage_into(&mut stage) } {
+                        Ok(view) => Some(view),
+                        // A copy is the only way to honor an overlapping header
+                        // without forming aliasing references, so an allocation
+                        // refusal has nowhere left to go. C never reports
+                        // `Z_MEM_ERROR` from `deflate`; it also never copies, and
+                        // reaching this arm requires the caller to have aliased a
+                        // header field into its own output window *and* the
+                        // allocator to refuse ~65 KiB. The divergence is confined to
+                        // that corner and is documented on `deflate`.
+                        Err(_) => return Z_MEM_ERROR,
+                    }
+                }
+                _ => None,
+            }
+        };
+
         // Bridge the raw C buffers to slices. These carry detached lifetimes and
         // alias the caller's external buffers (never the `z_stream` struct), so
         // the subsequent `&mut` reborrow of `s` for `deflate_state` is sound.
@@ -446,17 +573,23 @@ pub unsafe extern "C" fn deflate(strm: z_streamp, flush: c_int) -> c_int {
             let Some(handle) = (unsafe { deflate_handle(s) }) else {
                 return Z_STREAM_ERROR;
             };
-            // C re-reads the caller's `gz_header` here, at emission time, through
-            // the pointer `deflateSetHeader` stored (`deflate.c` L1092-L1188).
-            // Re-borrowing it on every call is what makes a mutation performed
-            // after registration but before emission observable in the output
-            // bytes, exactly as in C.
-            //
-            // SAFETY: `handle.head` is null, or the `gz_header` the caller passed
-            // to `deflateSetHeader` and undertook to keep valid until emission
-            // completes (`zlib.h` L843-L847). The borrow lives only for this call.
+            // Complete the header read decided above. On the disjoint path the
+            // engine reads the caller's own memory, byte for byte as C does; on the
+            // overlapping path it reads the staged copy. Exactly one of the two is
+            // ever `Some`.
             #[cfg(feature = "gzip")]
-            let lent = unsafe { borrow_gz_header(handle.head) };
+            let direct = match staged {
+                Some(_) => None,
+                // SAFETY: `staged` is `Some` precisely when a field intersects the
+                // output window, so reaching this arm proves every present field is
+                // disjoint from `output` (and from `input`, which is shared anyway
+                // and so could never conflict with a shared header borrow). The
+                // caller's buffers stay valid for the call per `zlib.h` L843-L847.
+                None => source.as_ref().map(|src| unsafe { src.borrow() }),
+            };
+            #[cfg(feature = "gzip")]
+            let lent: Option<&crate::gz_header::ForeignGzHeader<'_>> =
+                staged.as_ref().or(direct.as_ref());
             let zs = &mut handle.zs;
             let outcome = engine::deflate_lending(
                 zs,
@@ -464,7 +597,7 @@ pub unsafe extern "C" fn deflate(strm: z_streamp, flush: c_int) -> c_int {
                 output,
                 flush,
                 #[cfg(feature = "gzip")]
-                lent.as_ref(),
+                lent,
             );
             (
                 outcome.code.as_c_int(),
@@ -816,10 +949,20 @@ pub unsafe extern "C" fn deflateBound(strm: z_streamp, source_len: uLong) -> uLo
             // reborrowing `handle.zs`.
             if let Some(handle) = unsafe { deflate_handle(s) } {
                 // C's `deflateBound` reads the live header too (`deflate.c`
-                // L893-L907).
-                // SAFETY: as in `deflate`; see `borrow_gz_header`.
+                // L893-L907), and only for its *lengths* — the wrapper term is
+                // `2 + extra_len`, `name_len + 1`, `comment_len + 1` and `2` for
+                // the header CRC. No payload byte is examined.
+                //
+                // SAFETY: `handle.head` is null or the caller's valid `gz_header`
+                // (`zlib.h` L843-L847). Unlike `deflate`, this entry point bridges
+                // no output window and holds no `&mut` over caller memory, so a
+                // header field that overlaps `next_out` cannot conflict with
+                // anything here and the zero-copy borrow needs no staging.
                 #[cfg(feature = "gzip")]
-                let lent = unsafe { borrow_gz_header(handle.head) };
+                let source = unsafe { read_gz_header_source(handle.head) };
+                // SAFETY: as above — no conflicting reference exists.
+                #[cfg(feature = "gzip")]
+                let lent = source.as_ref().map(|src| unsafe { src.borrow() });
                 return engine::deflate_bound_lending(
                     &handle.zs,
                     source_len as usize,
@@ -852,10 +995,16 @@ pub unsafe extern "C" fn deflateBound_z(strm: z_streamp, source_len: z_size_t) -
         // `deflate_state` validates the `HandleKind::DEFLATE` tag before
         // reborrowing `handle.zs`.
         if let Some(handle) = unsafe { deflate_handle(s) } {
-            // C's `deflateBound` reads the live header too (`deflate.c` L893-L907).
-            // SAFETY: as in `deflate`; see `borrow_gz_header`.
+            // C's `deflateBound` reads the live header too (`deflate.c` L893-L907),
+            // and only for its lengths; see the note in `deflateBound`.
+            // SAFETY: `handle.head` is null or the caller's valid `gz_header`
+            // (`zlib.h` L843-L847). This entry point bridges no output window, so
+            // no `&mut` over caller memory can conflict with the borrow.
             #[cfg(feature = "gzip")]
-            let lent = unsafe { borrow_gz_header(handle.head) };
+            let source = unsafe { read_gz_header_source(handle.head) };
+            // SAFETY: as above — no conflicting reference exists.
+            #[cfg(feature = "gzip")]
+            let lent = source.as_ref().map(|src| unsafe { src.borrow() });
             return engine::deflate_bound_z_lending(
                 &handle.zs,
                 source_len,
@@ -3309,21 +3458,21 @@ mod tests {
         assert_eq!(stats.live_bytes(), 0);
     }
 
-    /// The caller's `zalloc` is the real home of the engine state, not merely the
-    /// payer for a same-sized reservation, and the whole schedule matches C.
+    /// The caller's `zalloc` is charged for the engine state exactly as reference
+    /// zlib charges it, and the whole schedule matches C.
     ///
-    /// This is the C-ABI end-to-end statement of the hook-backed-ownership
-    /// requirement (AAP §0.6.5). It pins four things at once:
+    /// This is the C-ABI end-to-end statement of the allocator-parity requirement
+    /// (AAP §0.6.5). It pins four things at once:
     ///
     /// * the **count** — five requests for `deflateInit2_`, exactly C's
     ///   `ZALLOC(1, sizeof(deflate_state))` plus `window`, `prev`, `head` and the
     ///   single overlaid `pending_buf` (`deflate.c` L440, L458-L460, L505);
-    /// * the **residency** — outstanding bytes after init equal the state's own
-    ///   footprint *plus* the working buffers, which is only possible if the state
-    ///   value itself lives in the arena. A reservation charged and then abandoned
-    ///   would show the same byte count, so the companion assertions in
-    ///   `crate::ffi::types` additionally check the buffer and state handles report
-    ///   foreign backing;
+    /// * the **byte total** — outstanding bytes after init equal C's
+    ///   `sizeof(deflate_state)` *plus* the working buffers, so a caller's arena
+    ///   sized from C's header is billed precisely what reference zlib bills it.
+    ///   The companion assertions in `crate::ffi::types` additionally check that
+    ///   the state charge really reached the hook (`is_charged`) and that every
+    ///   working buffer reports foreign backing;
     /// * the **release order** — `[4, 3, 2, 1, 0]`, C's reverse-of-allocation
     ///   teardown with the state last (`deflate.c` L1300-L1306);
     /// * the **balance** — zero outstanding bytes afterwards, so nothing leaked
@@ -3373,10 +3522,10 @@ mod tests {
         const WORKING: usize = 262_144;
         assert_eq!(
             stats.live_bytes(),
-            size_of::<DeflateState>() + WORKING,
-            "the arena must hold the state value itself as well as every working \
-             buffer; a hook charged only for the buffers, or charged for the state \
-             and then handed a global `Box` instead, would not add up"
+            DeflateState::C_LAYOUT_SIZE + WORKING,
+            "the arena must be billed C's `sizeof(deflate_state)` for the state on \
+             top of every working buffer; a hook charged only for the buffers, or \
+             charged this port's own larger `size_of`, would not add up"
         );
 
         assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
@@ -4293,5 +4442,579 @@ mod tests {
             "a deflateCopy clone must emit the same gzip header as its source"
         );
         assert_eq!(&from_dst[10..15], b"copy\0", "the clone emits the name");
+    }
+    /// A caller `zalloc` sized from reference zlib's own header must satisfy
+    /// `deflateInit2_`.
+    ///
+    /// This is the C-ABI reproduction of the drop-in allocator requirement, and the
+    /// deflate twin of
+    /// `crate::ffi::inflate`'s `a_c_sized_zalloc_initializes_inflate_and_inflate_back`.
+    /// The hook below serves only the request shapes reference zlib is known to
+    /// make — `(1, sizeof(deflate_state))` for the state (`deflate.c` L440),
+    /// `(w_size, 2)` for the doubled window, `prev` and `head`, and
+    /// `(lit_bufsize, 4)` for the single overlaid pending buffer (L458-L460, L505)
+    /// — and refuses everything else, exactly as a validating or tightly bounded
+    /// allocator written against reference zlib does. Charging this port's own,
+    /// legitimately larger `size_of::<DeflateState>()` turned such a caller's
+    /// successful `deflateInit2_` into `Z_MEM_ERROR`; here it must succeed, the
+    /// recorded `size` must be C's number, and a full compression must run through
+    /// the same allocator without a single unrecognised request.
+    #[test]
+    fn a_c_sized_zalloc_initializes_deflate() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::deflate::state::DeflateState;
+
+        /// The one `size` argument this allocator recognises for a state request.
+        static STATE_SIZE: AtomicUsize = AtomicUsize::new(0);
+        /// The `size` argument of the first request seen.
+        static FIRST_SIZE: AtomicUsize = AtomicUsize::new(0);
+        /// Requests refused because their shape was not one of C's.
+        static REFUSED: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn c_sized_zalloc(
+            _opaque: *mut c_void,
+            items: c_uint,
+            size: c_uint,
+        ) -> *mut c_void {
+            let (items, size) = (items as usize, size as usize);
+            FIRST_SIZE
+                .compare_exchange(0, size, Ordering::SeqCst, Ordering::SeqCst)
+                .ok();
+            // C's shapes for `deflateInit2_(level, Z_DEFLATED, 15, 8, ...)`.
+            let recognised = (items == 1 && size == STATE_SIZE.load(Ordering::SeqCst))
+                || (items == 1 << 15 && size == 2)
+                || (items == 1 << 14 && size == 4);
+            if !recognised {
+                REFUSED.fetch_add(1, Ordering::SeqCst);
+                return ptr::null_mut();
+            }
+            // Storage in the same size-header format `budget_zfree` releases.
+            let bytes = items * size;
+            let layout = std::alloc::Layout::from_size_align(BUDGET_HDR + bytes, BUDGET_HDR)
+                .expect("test layout is valid");
+            // SAFETY: `layout` has a non-zero size (`BUDGET_HDR` is 16).
+            let base = unsafe { std::alloc::alloc(layout) };
+            if base.is_null() {
+                return ptr::null_mut();
+            }
+            // SAFETY: `base` addresses `BUDGET_HDR + bytes` writable, 16-byte
+            // aligned bytes, so the header write is aligned and in bounds.
+            unsafe {
+                base.cast::<usize>().write(bytes);
+                base.add(BUDGET_HDR).cast::<c_void>()
+            }
+        }
+
+        STATE_SIZE.store(DeflateState::C_LAYOUT_SIZE, Ordering::SeqCst);
+        FIRST_SIZE.store(0, Ordering::SeqCst);
+        REFUSED.store(0, Ordering::SeqCst);
+
+        let mut strm = zeroed_stream();
+        strm.zalloc = Some(c_sized_zalloc);
+        strm.zfree = Some(budget_zfree);
+        assert_eq!(
+            unsafe {
+                deflateInit2_(
+                    &mut strm,
+                    6,
+                    Z_DEFLATED,
+                    15,
+                    8,
+                    Z_DEFAULT_STRATEGY,
+                    ver(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK,
+            "an allocator serving C's own sizeof(deflate_state) must initialize, as \
+             it does against reference zlib"
+        );
+        assert_eq!(
+            FIRST_SIZE.load(Ordering::SeqCst),
+            DeflateState::C_LAYOUT_SIZE,
+            "the state request must carry C's byte count"
+        );
+        assert_eq!(REFUSED.load(Ordering::SeqCst), 0);
+
+        // A real compression, so nothing later in the stream's life reaches for a
+        // shape C never asks for.
+        let payload = b"the quick brown fox jumps over the quick brown dog";
+        let mut out = std::vec![0u8; 256];
+        strm.next_in = payload.as_ptr();
+        strm.avail_in = payload.len() as c_uint;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+        assert_eq!(unsafe { deflate(&mut strm, Z_FINISH) }, Z_STREAM_END);
+        assert_eq!(REFUSED.load(Ordering::SeqCst), 0);
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+
+        // Negative control: the same allocator told to expect this port's own state
+        // size must refuse, proving the assertion above is load-bearing.
+        STATE_SIZE.store(size_of::<DeflateState>(), Ordering::SeqCst);
+        let mut wrong = zeroed_stream();
+        wrong.zalloc = Some(c_sized_zalloc);
+        wrong.zfree = Some(budget_zfree);
+        assert_eq!(
+            unsafe {
+                deflateInit2_(
+                    &mut wrong,
+                    6,
+                    Z_DEFLATED,
+                    15,
+                    8,
+                    Z_DEFAULT_STRATEGY,
+                    ver(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_MEM_ERROR,
+            "the state request must be C's size and not this port's own"
+        );
+        assert!(wrong.state.is_null());
+    }
+    // -----------------------------------------------------------------------
+    // SEC-FFI-05 / SEC-DEF-11 — a live foreign gzip header that overlaps the
+    // output window, and one whose declared lengths shrink between calls.
+    //
+    // `zlib.h` L843-L847 places no disjointness requirement on `head->extra`,
+    // `head->name`, `head->comment` or `strm->next_out`, so every placement
+    // exercised below is legal C. The obligations are therefore: honor it (never
+    // reject it), keep the emitted bytes identical to the disjoint placement, and
+    // never form a Rust reference over bytes the engine also holds mutably.
+    //
+    // The bytes are compared against a *control* run whose header lives in its own
+    // allocation. That is the strongest available assertion and needs no oracle:
+    // the two runs differ in nothing but the address of the caller's header
+    // buffers, so any difference is a defect by construction.
+    // -----------------------------------------------------------------------
+
+    /// Where the caller placed its three header payload buffers.
+    ///
+    /// `Apart` is the control; the rest overlap the output window at offsets chosen
+    /// to be beyond the bytes this payload produces, so the source bytes survive
+    /// the call and the two runs must agree exactly.
+    #[cfg(feature = "gzip")]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum HeaderPlacement {
+        /// Header buffers in their own allocation — what a normal caller does.
+        Apart,
+        /// `extra` inside the output window.
+        ExtraInOutput,
+        /// `name` inside the output window.
+        NameInOutput,
+        /// All three inside the output window, at distinct offsets.
+        AllInOutput,
+        /// All three inside the output window at *exactly the offsets the header
+        /// occupies*, so emitting the header overwrites the very bytes it is read
+        /// from. Nothing may change: the payloads were captured before the window
+        /// was bridged, and each is written back where it came from.
+        SelfReferential,
+    }
+
+    /// Emits one gzip stream whose header payloads sit where `placement` says, and
+    /// returns `(bytes, deflate_bound)`.
+    ///
+    /// The output buffer is 4 KiB and the payload compresses to far less, so the
+    /// overlapping placements at offsets 1024/2048/3072 are never actually written
+    /// over: the run is observationally a pure relocation of the caller's header.
+    #[cfg(feature = "gzip")]
+    fn emit_with_placement(placement: HeaderPlacement) -> (Vec<u8>, uLong) {
+        const EXTRA: [c_uchar; 6] = [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6];
+        const NAME: &[u8] = b"overlap.txt\0";
+        const COMMENT: &[u8] = b"a comment\0";
+
+        let payload = b"deflate header overlap payload ".repeat(8);
+        let mut out = std::vec![0u8; 4096];
+        // The control's own storage, kept alive for the whole call.
+        let mut apart_extra = EXTRA;
+        let mut apart_name = NAME.to_vec();
+        let mut apart_comment = COMMENT.to_vec();
+
+        let base = out.as_mut_ptr();
+        // Offsets inside the output window. The far ones are past anything this run
+        // emits; the self-referential ones are exactly where the gzip header puts
+        // each field (10 fixed bytes, 2 XLEN, then extra, name, comment).
+        let (extra_at, name_at, comment_at) = match placement {
+            HeaderPlacement::SelfReferential => (12usize, 18, 30),
+            _ => (1024usize, 2048, 3072),
+        };
+        // Seed the in-window copies before the call: they are the caller's data.
+        if placement != HeaderPlacement::Apart {
+            out[extra_at..extra_at + EXTRA.len()].copy_from_slice(&EXTRA);
+            out[name_at..name_at + NAME.len()].copy_from_slice(NAME);
+            out[comment_at..comment_at + COMMENT.len()].copy_from_slice(COMMENT);
+        }
+
+        let stagings_before = header_stage_passes();
+        let mut strm = zeroed_stream();
+        init_gzip(&mut strm);
+        let head = raw_header();
+        // SAFETY: `head` is a live, uniquely-owned `gz_header`, and every buffer
+        // named below outlives the call.
+        unsafe {
+            (*head).text = 1;
+            (*head).time = 0x0102_0304;
+            (*head).os = 3;
+            (*head).hcrc = 1;
+            (*head).extra_len = EXTRA.len() as uInt;
+            match placement {
+                HeaderPlacement::Apart => {
+                    (*head).extra = apart_extra.as_mut_ptr();
+                    (*head).name = apart_name.as_mut_ptr();
+                    (*head).comment = apart_comment.as_mut_ptr();
+                }
+                HeaderPlacement::ExtraInOutput => {
+                    (*head).extra = base.add(extra_at);
+                    (*head).name = apart_name.as_mut_ptr();
+                    (*head).comment = apart_comment.as_mut_ptr();
+                }
+                HeaderPlacement::NameInOutput => {
+                    (*head).extra = apart_extra.as_mut_ptr();
+                    (*head).name = base.add(name_at);
+                    (*head).comment = apart_comment.as_mut_ptr();
+                }
+                HeaderPlacement::AllInOutput | HeaderPlacement::SelfReferential => {
+                    (*head).extra = base.add(extra_at);
+                    (*head).name = base.add(name_at);
+                    (*head).comment = base.add(comment_at);
+                }
+            }
+        }
+        assert_eq!(
+            unsafe { deflateSetHeader(&mut strm, head) },
+            Z_OK,
+            "{placement:?}: registration must succeed"
+        );
+
+        // `deflateBound` reads the same live header (`deflate.c` L893-L907) and must
+        // be unaffected by where those bytes live.
+        let bound = unsafe { deflateBound(&mut strm, payload.len() as uLong) };
+
+        strm.next_in = payload.as_ptr().cast_mut();
+        strm.avail_in = payload.len() as uInt;
+        strm.next_out = base;
+        strm.avail_out = out.len() as uInt;
+        let rc = unsafe { deflate(&mut strm, Z_FINISH) };
+        assert_eq!(
+            rc, Z_STREAM_END,
+            "{placement:?}: an overlapping header must be honored, not rejected"
+        );
+        let produced = out.len() - strm.avail_out as usize;
+        if placement != HeaderPlacement::SelfReferential {
+            assert!(
+                produced < 1024,
+                "{placement:?}: the run must not reach the relocated buffers ({produced} bytes)"
+            );
+        }
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+        free_header(head);
+
+        // Anti-vacuity: an overlapping placement must have gone through the staged
+        // path, and the control must not have. Without this a mis-computed offset
+        // would quietly test the zero-copy path four times over.
+        assert_eq!(
+            header_stage_passes() > stagings_before,
+            placement != HeaderPlacement::Apart,
+            "{placement:?}: staged exactly when the header overlaps the output window"
+        );
+
+        out.truncate(produced);
+        // Touch the control storage after the call so it cannot be optimized away.
+        let _ = (apart_extra[0], apart_name[0], apart_comment[0]);
+        (out, bound)
+    }
+
+    /// A header payload that overlaps the output window is emitted byte for byte as
+    /// if it had lived in its own allocation, for every placement, and
+    /// `deflateBound` agrees.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn a_header_payload_may_live_inside_the_output_window() {
+        let (control, control_bound) = emit_with_placement(HeaderPlacement::Apart);
+
+        // The control is a real gzip stream carrying every field, so the comparison
+        // below cannot be vacuously satisfied by an empty header.
+        assert_eq!(&control[..3], &[0x1f, 0x8b, 0x08], "gzip magic and method");
+        assert_eq!(control[3], 0x1f, "FTEXT|FHCRC|FEXTRA|FNAME|FCOMMENT");
+        assert_eq!(&control[10..12], &[6, 0], "XLEN");
+        assert_eq!(&control[12..18], &[0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6]);
+        assert_eq!(&control[18..30], b"overlap.txt\0");
+        assert_eq!(&control[30..40], b"a comment\0");
+
+        for placement in [
+            HeaderPlacement::ExtraInOutput,
+            HeaderPlacement::NameInOutput,
+            HeaderPlacement::AllInOutput,
+            HeaderPlacement::SelfReferential,
+        ] {
+            let (bytes, bound) = emit_with_placement(placement);
+            assert_eq!(
+                bytes, control,
+                "{placement:?} must emit exactly what the disjoint placement emits"
+            );
+            assert_eq!(
+                bound, control_bound,
+                "{placement:?} must not change deflateBound"
+            );
+        }
+    }
+
+    /// Header payload buffers may overlap **each other** on the read side, with no
+    /// bearing on what is emitted: nothing writes to them.
+    ///
+    /// Kept separate from the output-window case because the two hazards are
+    /// different — this one is read-vs-read, which C also allows and which must not
+    /// be turned into three conflicting Rust borrows.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn header_payload_buffers_may_be_the_same_memory() {
+        // One region read as all three fields at once: `extra_len = 4` takes the
+        // first four bytes, and `name`/`comment` each run to the shared NUL.
+        let mut shared = *b"abc\0";
+        let payload = b"shared header source".to_vec();
+        let mut out = std::vec![0u8; 1024];
+
+        let mut strm = zeroed_stream();
+        init_gzip(&mut strm);
+        let head = raw_header();
+        // SAFETY: `head` and `shared` are live and uniquely owned here.
+        unsafe {
+            (*head).os = 3;
+            (*head).extra = shared.as_mut_ptr();
+            (*head).extra_len = shared.len() as uInt;
+            (*head).name = shared.as_mut_ptr();
+            (*head).comment = shared.as_mut_ptr();
+        }
+        assert_eq!(unsafe { deflateSetHeader(&mut strm, head) }, Z_OK);
+
+        strm.next_in = payload.as_ptr().cast_mut();
+        strm.avail_in = payload.len() as uInt;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as uInt;
+        assert_eq!(unsafe { deflate(&mut strm, Z_FINISH) }, Z_STREAM_END);
+        let produced = out.len() - strm.avail_out as usize;
+        out.truncate(produced);
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+        free_header(head);
+
+        assert_eq!(out[3], 0x1c, "FEXTRA|FNAME|FCOMMENT, no FTEXT/FHCRC");
+        assert_eq!(&out[10..12], &[4, 0], "XLEN counts all four bytes");
+        assert_eq!(
+            &out[12..16],
+            b"abc\0",
+            "the extra field is the whole region"
+        );
+        assert_eq!(&out[16..20], b"abc\0", "NAME stops at the shared NUL");
+        assert_eq!(&out[20..24], b"abc\0", "COMMENT likewise");
+        assert_eq!(&shared, b"abc\0", "the caller's region is never written");
+    }
+
+    /// A non-null `extra` with `extra_len == 0` is a *present* empty field: FLG bit
+    /// 4 is set and `XLEN` is zero.
+    ///
+    /// Guards the descriptor's null-versus-empty distinction — C keys FEXTRA off
+    /// `s->gzhead->extra != Z_NULL` (`deflate.c` L1106-L1108), never off the length.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn a_present_but_empty_extra_field_is_still_emitted() {
+        let mut nothing = [0u8; 1];
+        let mut out = std::vec![0u8; 512];
+        let mut strm = zeroed_stream();
+        init_gzip(&mut strm);
+        let head = raw_header();
+        // SAFETY: `head` and `nothing` are live and uniquely owned here.
+        unsafe {
+            (*head).os = 3;
+            (*head).extra = nothing.as_mut_ptr();
+            (*head).extra_len = 0;
+        }
+        assert_eq!(unsafe { deflateSetHeader(&mut strm, head) }, Z_OK);
+
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as uInt;
+        assert_eq!(unsafe { deflate(&mut strm, Z_FINISH) }, Z_STREAM_END);
+        let produced = out.len() - strm.avail_out as usize;
+        out.truncate(produced);
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+        free_header(head);
+
+        assert_eq!(out[3] & 0x04, 0x04, "FEXTRA must be set for an empty field");
+        assert_eq!(&out[10..12], &[0, 0], "XLEN must be zero");
+    }
+
+    /// Initializes `strm` for gzip framing at `mem_level`, which sets
+    /// `pending_buf_size = 4 << (mem_level + 6)` and so decides how large an
+    /// `extra` field has to be to stall mid-phase.
+    #[cfg(feature = "gzip")]
+    fn init_gzip_mem_level(strm: &mut z_stream, mem_level: c_int) {
+        let rc = unsafe {
+            deflateInit2_(
+                strm,
+                6,
+                Z_DEFLATED,
+                31,
+                mem_level,
+                Z_DEFAULT_STRATEGY,
+                ver(),
+                size_of::<z_stream>() as c_int,
+            )
+        };
+        assert_eq!(rc, Z_OK, "gzip deflateInit2_ must succeed");
+    }
+
+    /// **SEC-DEF-11.** Shrinking a live `extra_len` after the `Extra` phase has
+    /// already copied part of the field is rejected with `Z_STREAM_ERROR` instead
+    /// of aborting the process, and the stream stays usable if the caller puts the
+    /// length back.
+    ///
+    /// C computes `ulg left = (extra_len & 0xffff) - s->gzindex` (`deflate.c` L1120)
+    /// on an unsigned type: the subtraction wraps to a near-`ULONG_MAX` count and
+    /// the copy loop reads far past the caller's buffer, so there is no C behaviour
+    /// to preserve — only a choice between a defined rejection and an over-read.
+    /// Both shipped profiles set `panic = "abort"`, so the pre-fix underflow (or the
+    /// slice bound check that follows it in release) took the whole host process
+    /// down.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn shrinking_a_live_extra_len_between_calls_is_a_stream_error() {
+        // `mem_level = 1` gives `pending_buf_size = 512`, so a 2000-byte extra
+        // field cannot be copied in one pass.
+        const FULL: uInt = 2000;
+        let extra = std::vec![0x5au8; FULL as usize];
+        let payload = b"x".repeat(64);
+        let mut out = std::vec![0u8; 8192];
+
+        let mut strm = zeroed_stream();
+        init_gzip_mem_level(&mut strm, 1);
+        let head = raw_header();
+        // SAFETY: `head` is live and uniquely owned; `extra` outlives the calls.
+        unsafe {
+            (*head).os = 3;
+            (*head).extra = extra.as_ptr().cast_mut();
+            (*head).extra_len = FULL;
+        }
+        assert_eq!(unsafe { deflateSetHeader(&mut strm, head) }, Z_OK);
+
+        // Call 1: a tiny output window forces the phase to stall with `gzindex`
+        // strictly between 0 and `extra_len`. `next_out`/`avail_out` are then left
+        // for the engine to advance, exactly as a C caller does, so the assertions
+        // at the end see one contiguous stream.
+        strm.next_in = payload.as_ptr().cast_mut();
+        strm.avail_in = payload.len() as uInt;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = 4;
+        assert_eq!(
+            unsafe { deflate(&mut strm, Z_NO_FLUSH) },
+            Z_OK,
+            "the first call must stall inside the Extra phase"
+        );
+        assert_eq!(strm.avail_out, 0, "the tiny window must have been filled");
+        let mut pending: c_uint = 0;
+        let mut bits: c_int = 0;
+        assert_eq!(
+            unsafe { deflatePending(&mut strm, &mut pending, &mut bits) },
+            Z_OK
+        );
+        assert!(
+            pending > 0,
+            "the stall must leave pending header bytes, else nothing was copied yet"
+        );
+
+        // The caller now shrinks the field below the progress already made. C would
+        // underflow; this must be a clean, defined rejection.
+        // SAFETY: `head` is still live and uniquely owned.
+        unsafe { (*head).extra_len = 1 };
+        strm.avail_out = (out.len() - 4) as uInt;
+        assert_eq!(
+            unsafe { deflate(&mut strm, Z_NO_FLUSH) },
+            Z_STREAM_ERROR,
+            "a live extra_len below gzindex must be rejected, not underflowed"
+        );
+        // C flushes whatever is already pending at the *top* of `deflate()`, before
+        // the header phases run (`deflate.c` L1013-L1020), so the rejected call
+        // legitimately drains the bytes the stall left behind — and nothing more. It
+        // must not advance the field by a single byte.
+        assert_eq!(
+            strm.avail_out,
+            (out.len() - 4 - pending as usize) as uInt,
+            "the rejection may drain pending output but must copy no new field bytes"
+        );
+
+        // The rejection leaves the phase untouched, so restoring the length lets the
+        // stream finish normally — proving nothing was corrupted on the way out.
+        // SAFETY: as above.
+        unsafe { (*head).extra_len = FULL };
+        let rc = unsafe { deflate(&mut strm, Z_FINISH) };
+        assert_eq!(rc, Z_STREAM_END, "restoring the length must resume cleanly");
+        let produced = out.len() - strm.avail_out as usize;
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+        free_header(head);
+
+        // The emitted stream must carry the whole 2000-byte field: a header that
+        // survives the rejection is not enough, the bytes have to be intact.
+        out.truncate(produced);
+        assert_eq!(&out[..3], &[0x1f, 0x8b, 0x08], "gzip magic and method");
+        assert_eq!(out[3] & 0x04, 0x04, "FEXTRA");
+        assert_eq!(
+            &out[10..12],
+            &[0xd0, 0x07],
+            "XLEN must be the restored 2000, little-endian"
+        );
+        assert!(
+            out.len() > 12 + FULL as usize,
+            "the whole extra field plus compressed data must be present ({} bytes)",
+            out.len()
+        );
+        assert!(
+            out[12..12 + FULL as usize].iter().all(|&b| b == 0x5a),
+            "every extra byte must be the caller's, none skipped or duplicated"
+        );
+    }
+
+    /// The sibling `Name`/`Comment` phases are immune to the same mutation by
+    /// construction: the field is re-scanned to the caller's NUL on every call, so
+    /// moving the terminator below `gzindex` ends the field instead of running off
+    /// the buffer.
+    ///
+    /// Locks in the audit result recorded alongside the `Extra` guard, so a future
+    /// rewrite of these loops into index arithmetic cannot silently reintroduce the
+    /// hazard.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn shortening_a_live_name_between_calls_terminates_the_field() {
+        // 2000 bytes of name with `pending_buf_size = 512` stalls the Name phase.
+        let mut name = std::vec![b'n'; 2001];
+        *name.last_mut().expect("non-empty") = 0;
+        let payload = b"y".repeat(64);
+        let mut out = std::vec![0u8; 8192];
+
+        let mut strm = zeroed_stream();
+        init_gzip_mem_level(&mut strm, 1);
+        let head = raw_header();
+        // SAFETY: `head` is live and uniquely owned; `name` outlives the calls.
+        unsafe {
+            (*head).os = 3;
+            (*head).name = name.as_mut_ptr();
+        }
+        assert_eq!(unsafe { deflateSetHeader(&mut strm, head) }, Z_OK);
+
+        strm.next_in = payload.as_ptr().cast_mut();
+        strm.avail_in = payload.len() as uInt;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = 4;
+        assert_eq!(unsafe { deflate(&mut strm, Z_NO_FLUSH) }, Z_OK);
+
+        // Move the terminator to the very front, far below the emitted progress.
+        name[0] = 0;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as uInt;
+        let rc = unsafe { deflate(&mut strm, Z_FINISH) };
+        assert_eq!(
+            rc, Z_STREAM_END,
+            "a shortened name must end the field, not fault"
+        );
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+        free_header(head);
     }
 }

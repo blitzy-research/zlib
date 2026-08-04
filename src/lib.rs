@@ -991,30 +991,25 @@ mod tests {
         );
     }
 
-    /// Every allocation on the hook-backed placement path is **fallible**.
+    /// Every allocation on the hook-backed allocation path is **fallible**.
     ///
     /// zlib answers heap exhaustion with `Z_MEM_ERROR`; it never aborts. The two
-    /// modules that own hook-backed placement must therefore reach the global
+    /// modules that own hook-backed memory must therefore reach the global
     /// allocator only through the fallible `try_box`, never through `Box::new`,
     /// whose failure path is `handle_alloc_error` and hence process abort:
     ///
     /// * `src/stream.rs` holds the ownership model — `AllocBuffer`, `EngineBox`
     ///   and `EngineReservation`;
-    /// * `src/ffi/alloc.rs` supplies its `ForeignBuffer` / `ForeignEngineHome` /
-    ///   `ForeignEngine` implementations, the only code that touches the region a
-    ///   caller's `zalloc` returned.
+    /// * `src/ffi/alloc.rs` supplies its `ForeignBuffer` implementation, the only
+    ///   code that touches the region a caller's `zalloc` returned.
     ///
     /// Preserving C's allocation *count* means the small owning handles this port
     /// needs cannot become extra `zalloc` requests, so they come from the global
     /// heap — which is exactly why their failure has to be reportable (AAP
-    /// §0.6.5).
-    ///
-    /// This port shipped precisely that defect: `CEngineHome::fill` ended in
-    /// `Box::new(CEngine { .. })`, so a caller with a healthy bounded arena but an
-    /// exhausted global heap would have been aborted instead of receiving
-    /// `Z_MEM_ERROR`. Ordering the fallible allocation *before* the region is
-    /// committed is what makes the failure recoverable: the reservation is still
-    /// owned, so it goes back through the caller's `zfree`.
+    /// §0.6.5). `EngineReservation::fill` is the concrete case: it boxes the engine
+    /// state through `try_box` while still holding the caller's charge, so an
+    /// exhausted global heap surfaces as `Z_MEM_ERROR` and the charge goes back
+    /// through the caller's `zfree` instead of leaking.
     ///
     /// One occurrence is sanctioned — the zero-sized fast path *inside* `try_box`
     /// itself, where the allocator is provably never consulted.
@@ -2926,6 +2921,17 @@ mod tests {
     /// enforced only when rustdoc actually runs with warnings promoted to errors,
     /// and `cargo doc` alone prints the same diagnostics and still exits 0 — so
     /// `RUSTDOCFLAGS: -D warnings` is what makes it gate at all.
+    ///
+    /// Finally, `-D warnings` is also what gives `[lints.rust.unexpected_cfgs]`
+    /// in `Cargo.toml` its teeth, so that table's `level` and `check-cfg` are
+    /// asserted here as well. The crate matches on one `target_os` value the
+    /// MSRV compiler does not know (`cygwin`), and teaching the lint that single
+    /// value is deliberately different from switching the lint off: the same
+    /// lint is what rejected `target_arch = "hppa"` and `"alpha"` — neither of
+    /// which exists — while the platform-constant cascades were being written.
+    /// A future edit to `allow`, or to `values(any())`, would keep every gate
+    /// green while making a misspelled predicate compile into an arm that can
+    /// never be taken, so it must fail a test instead.
     #[test]
     fn the_lint_job_runs_the_documented_clippy_gate() {
         const CLIPPY_GATE: &str = "clippy --locked --all-targets --all-features -- -D warnings";
@@ -2979,6 +2985,44 @@ mod tests {
             "the ci.yml `docs` job's rustdoc step must set \
              `RUSTDOCFLAGS: -D warnings`; without it `cargo doc` prints its \
              warnings and still exits 0, so the gate would not gate"
+        );
+
+        // `[lints.rust.unexpected_cfgs]` is only a GATE because of the `-D
+        // warnings` asserted above: at `level = "warn"` a bogus `cfg` value is a
+        // warning locally and a hard error under this job. Downgrading it to
+        // `allow` — or widening `check-cfg` into a blanket permit — would keep
+        // every gate green while silently restoring the class of defect this
+        // lint exists to catch, so both halves are asserted here rather than
+        // trusted to review.
+        let lints = manifest_table("lints.rust.unexpected_cfgs");
+        assert!(
+            lints.contains("level = \"warn\""),
+            "`[lints.rust.unexpected_cfgs]` must stay at `level = \"warn\"`, \
+             which the `-D warnings` clippy gate promotes to an error. At \
+             `allow` a misspelled `target_os`/`target_arch` value compiles \
+             silently and its arm is simply never taken - the exact failure \
+             mode that caught `target_arch = \"hppa\"` and `\"alpha\"`, two \
+             values that do not exist, during the platform-constant work. \
+             Found instead: {lints:?}"
+        );
+        // The allowance must stay an ENUMERATION of real values. `check-cfg`
+        // accepts `cfg(target_os, values(any()))`, which would permit every
+        // spelling including the misspellings, so the enumerated form is the
+        // whole point of keeping the lint on.
+        assert!(
+            lints.contains("values(\"cygwin\")"),
+            "`check-cfg` must keep enumerating exactly the extra `target_os` \
+             values this crate matches on but the MSRV rustc does not know - \
+             today only `cygwin`, which `src/gz/open.rs` and `src/ffi/gz.rs` \
+             place in the newlib `O_NONBLOCK` and POSIX `FD_CLOEXEC`/fcntl \
+             families. Found instead: {lints:?}"
+        );
+        assert!(
+            !lints.contains("any()"),
+            "`check-cfg` must not use `values(any())`: that permits every \
+             spelling, including the misspellings the lint exists to reject, \
+             which is indistinguishable from switching the lint off. \
+             Found: {lints:?}"
         );
     }
 
@@ -3591,6 +3635,140 @@ mod tests {
         );
     }
 
+    /// A `gzdopen` descriptor must never be wrapped in a [`std::fs::File`] unless
+    /// it has been **proven** open, and a Windows CRT descriptor must never be
+    /// wrapped at all.
+    ///
+    /// # Why this is a source-text guard
+    ///
+    /// The Windows half of the defect cannot be executed anywhere in this
+    /// environment: every CI job and every local run is Linux, so a
+    /// `#[cfg(windows)]` body is compiled at most (by `cargo check --target`) and
+    /// never run. That is precisely how the defect survived review — the code that
+    /// double-owned the CRT handle was invisible to every executed test. Pinning
+    /// the *shape* of the fix in text is therefore the only mechanism that can hold
+    /// it, and it holds on every host.
+    ///
+    /// What is pinned:
+    ///
+    /// * `_get_osfhandle` appears nowhere. It only **lends** the `HANDLE` the CRT
+    ///   descriptor-table slot owns, so building an owning `File` from its result
+    ///   creates a second owner and a later double close (CWE-664, CWE-672).
+    /// * `from_raw_handle` appears nowhere, for the same reason — and because
+    ///   `OwnedHandle` excludes `INVALID_HANDLE_VALUE`, so the `-1` an unopened CRT
+    ///   descriptor reports is an immediately invalid value.
+    /// * The Windows owner does its I/O through the CRT family reference zlib
+    ///   compiles to: `_read`, `_write`, `_lseeki64`, `_close`.
+    /// * Exactly one non-test `from_raw_fd` call site survives, it lives in
+    ///   `adopt_descriptor`, and `descriptor_is_open` is consulted *before* it.
+    ///   `File::from_raw_fd` requires an open descriptor and `gzdopen` must accept
+    ///   one that is not (`zlib.h` L1422-L1426), so the proof has to come first.
+    #[test]
+    fn a_gzdopen_descriptor_is_never_wrapped_without_proof() {
+        let mut saw = false;
+
+        for (rel, text) in crate_sources() {
+            if rel != "src/ffi/gz.rs" {
+                continue;
+            }
+            saw = true;
+            let blanked = blank_comments_and_literals(&text);
+            // The boundary is the test *module*, not the first `#[cfg(test)]`: this
+            // file gates a close-failure seam under `#[cfg(test)]` several hundred
+            // lines before `adopt_descriptor`, so cutting at that attribute would
+            // silently exclude the very code this guard exists to inspect — and the
+            // guard would pass by finding nothing.
+            let non_test = &blanked[..blanked.find("\nmod tests {").unwrap_or(blanked.len())];
+            assert!(
+                non_test.len() > 100_000,
+                "the pre-test region of src/ffi/gz.rs looks truncated ({} bytes), so \
+                 this guard would be vacuous",
+                non_test.len()
+            );
+            assert!(
+                non_test.contains("unsafe fn adopt_descriptor("),
+                "the inspected region must contain `adopt_descriptor`, or every \
+                 assertion below is vacuous"
+            );
+
+            // The borrowed-handle trap, in both of its spellings.
+            for banned in ["_get_osfhandle", "from_raw_handle", "FromRawHandle"] {
+                assert!(
+                    !blanked.contains(banned),
+                    "src/ffi/gz.rs must not name `{banned}`: the Windows CRT only \
+                     LENDS the HANDLE behind an int descriptor, so wrapping it in an \
+                     owning File double-owns it and the second close is a double \
+                     close"
+                );
+            }
+
+            // The Windows owner must reach the CRT directly, exactly as C does.
+            // `#[link_name = "..."]` string literals survive comment blanking only
+            // as their quotes, so the raw text is searched for these.
+            for crt in ["\"_read\"", "\"_write\"", "\"_lseeki64\"", "\"_close\""] {
+                assert!(
+                    text.contains(crt),
+                    "src/ffi/gz.rs must declare the CRT entry point {crt}: owning the \
+                     CRT descriptor is what removes the second owner, and these are \
+                     the calls reference zlib compiles to on Windows (`gzlib.c` L11 \
+                     defines LSEEK as _lseeki64)"
+                );
+            }
+
+            // Exactly one non-test `from_raw_fd` call, inside `adopt_descriptor`,
+            // after the proof.
+            let calls: alloc::vec::Vec<usize> = non_test
+                .match_indices("from_raw_fd(")
+                .map(|(at, _)| at)
+                .collect();
+            assert_eq!(
+                calls.len(),
+                1,
+                "expected exactly one non-test `from_raw_fd` call site in \
+                 src/ffi/gz.rs (the proven-open arm of `adopt_descriptor`), found {}",
+                calls.len()
+            );
+            let call = calls[0];
+
+            let owner_fn = non_test[..call]
+                .rfind("unsafe fn adopt_descriptor(")
+                .expect(
+                    "the only non-test `from_raw_fd` call must live in \
+                     `adopt_descriptor`, which is the one place that owns the \
+                     caller's descriptor",
+                );
+            let proof = non_test[owner_fn..call].find("descriptor_is_open(").expect(
+                "`adopt_descriptor` must consult `descriptor_is_open` BEFORE \
+                     `from_raw_fd`: the latter requires an open descriptor, and \
+                     `gzdopen` is required to accept one that is not (zlib.h \
+                     L1422-L1426)",
+            );
+            assert!(
+                proof < call - owner_fn,
+                "the descriptor proof must precede the `from_raw_fd` that relies on it"
+            );
+
+            // And the raw owners must not smuggle a `File` in by another route.
+            for owner in [
+                "impl crate::gz::RawFileIo for DeadDescriptor",
+                "impl crate::gz::RawFileIo for CrtDescriptor",
+            ] {
+                let at = non_test
+                    .find(owner)
+                    .unwrap_or_else(|| panic!("src/ffi/gz.rs must define `{owner}`"));
+                let body = &non_test[at..];
+                let end = body.find("\nimpl ").unwrap_or(body.len());
+                assert!(
+                    !body[..end].contains("std::fs::File"),
+                    "`{owner}` must do its I/O on the raw descriptor, never by \
+                     constructing a File from it"
+                );
+            }
+        }
+
+        assert!(saw, "src/ffi/gz.rs must be present in the source walk");
+    }
+
     /// `OS_CODE` — the gzip-header operating-system byte — is declared in exactly
     /// one module, and the gzip emission path reads that one declaration.
     ///
@@ -3603,6 +3781,237 @@ mod tests {
     /// divergence, because that host does not build the target the divergence
     /// appears on. Counting declarations does, from any host, whichever platforms
     /// CI happens to run.
+    /// The platform descriptor-flag and `fcntl` command cascades must degrade to
+    /// "do nothing" on an unrecognised platform, never to a borrowed value
+    /// (findings SEC-GZ-08 and SEC-GZ-09).
+    ///
+    /// # Why this is a source-text test
+    ///
+    /// The property at stake lives in the arms this host cannot compile. The
+    /// terminal arm of each cascade is, by definition, selected only on a platform
+    /// nobody enumerated — so no host can evaluate it, no `cargo check --target`
+    /// can reach it, and a unit test can only observe the arm its own target
+    /// picked. Reading the cascade's own text is the only way to prove, from here,
+    /// that the fallback is `None` rather than a guess.
+    ///
+    /// It also pins the two orderings that make the tables safe: the platforms
+    /// that renumber `fcntl`'s commands must be matched *before* the broad POSIX
+    /// arm (otherwise they would inherit POSIX numbers), and no `fcntl` call may
+    /// name its command with a literal (otherwise the table is bypassed).
+    #[test]
+    fn platform_flag_cascades_never_guess() {
+        let mut saw_open = false;
+        let mut saw_ffi = false;
+
+        for (rel, text) in crate_sources() {
+            let blanked = blank_comments_and_literals(&text);
+
+            if rel == "src/gz/open.rs" {
+                saw_open = true;
+
+                // The replaced defect: a two-branch cascade whose `else` answered
+                // `0o0004` for every non-Linux unix. That value must not reappear
+                // in the module's own code.
+                //
+                // Scoped to the pre-`#[cfg(test)]` region on purpose: the test
+                // module legitimately names the old value in order to assert that
+                // no enumerated platform is answered with it, and forbidding it
+                // there would forbid the very regression test that proves it gone.
+                let non_test = &blanked[..blanked.find("#[cfg(test)]").unwrap_or(blanked.len())];
+                assert!(
+                    !non_test.contains("0o0004"),
+                    "src/gz/open.rs must not reintroduce the `0o0004` blanket \
+                     fallback; on MIPS/SPARC Linux, Solaris, illumos, Haiku, QNX, \
+                     GNU/Hurd, NuttX, Cygwin and Redox that bit is a different, \
+                     real flag, so the old code set the wrong one rather than \
+                     failing to set O_NONBLOCK"
+                );
+
+                // Both flag cascades must terminate in `None`.
+                for name in [
+                    "const O_NONBLOCK: Option<i32>",
+                    "const FD_CLOEXEC: Option<i32>",
+                ] {
+                    let start = blanked
+                        .find(name)
+                        .unwrap_or_else(|| panic!("{rel} must declare `{name}`"));
+                    let body = &blanked[start..];
+                    let end = body
+                        .find("\n};")
+                        .unwrap_or_else(|| panic!("`{name}` must be a `;`-terminated cascade"));
+                    let cascade = &body[..end];
+                    let tail = cascade
+                        .rfind("} else {")
+                        .unwrap_or_else(|| panic!("`{name}` must have a terminal `else` arm"));
+                    let terminal = cascade[tail..].trim();
+                    assert!(
+                        terminal.contains("None"),
+                        "the terminal arm of `{name}` must be `None` so an \
+                         unenumerated platform gets no flag at all, but it reads: \
+                         {terminal:?}"
+                    );
+                    // Every non-terminal arm must yield a *named* constant, never
+                    // an inline literal: an inline literal is unverifiable from a
+                    // host that does not compile that arm, which is exactly how
+                    // the original wrong values survived review.
+                    let arms = cascade.matches("Some(").count();
+                    assert!(
+                        arms >= 2,
+                        "`{name}` must enumerate at least two platform classes"
+                    );
+                    for digit in ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'] {
+                        let inline = alloc::format!("Some({digit}");
+                        assert!(
+                            !cascade.contains(&inline),
+                            "`{name}` must select a named constant per arm, not the \
+                             inline literal `{inline}..`, so that the \
+                             `const _: () = {{ .. }}` block can prove every \
+                             platform's value from any host"
+                        );
+                    }
+                }
+            }
+
+            if rel == "src/ffi/gz.rs" {
+                saw_ffi = true;
+
+                // The command cascade must terminate in the all-`None` table.
+                let start = blanked
+                    .find("const FCNTL: FcntlCmds")
+                    .expect("src/ffi/gz.rs must declare the FCNTL selection");
+                let body = &blanked[start..];
+                let end = body
+                    .find("\n};")
+                    .expect("the FCNTL cascade must be `;`-terminated");
+                let cascade = &body[..end];
+                let tail = cascade
+                    .rfind("} else {")
+                    .expect("the FCNTL cascade must have a terminal `else` arm");
+                assert!(
+                    cascade[tail..].contains("FCNTL_UNKNOWN"),
+                    "the terminal arm of the FCNTL cascade must be FCNTL_UNKNOWN, \
+                     not FCNTL_POSIX: a platform nobody enumerated must be sent no \
+                     fcntl command rather than POSIX's numbers"
+                );
+
+                // Ordering: every platform that renumbers the commands must be
+                // matched before the broad POSIX arm, or `cfg!`'s first-match-wins
+                // would hand it POSIX numbers.
+                let posix_at = cascade
+                    .find("FCNTL_POSIX")
+                    .expect("the cascade must have a POSIX arm");
+                for (divergent, why) in [
+                    (
+                        "FCNTL_HAIKU",
+                        "Haiku's F_DUPFD is the POSIX F_GETFD, so a POSIX-numbered \
+                         call there duplicates and leaks the descriptor",
+                    ),
+                    (
+                        "FCNTL_NUTTX",
+                        "NuttX renumbers F_GETFL/F_SETFL and defines no F_SETFD",
+                    ),
+                ] {
+                    let at = cascade
+                        .find(divergent)
+                        .unwrap_or_else(|| panic!("the cascade must have a {divergent} arm"));
+                    assert!(
+                        at < posix_at,
+                        "{divergent} (offset {at}) must be matched before \
+                         FCNTL_POSIX (offset {posix_at}): {why}"
+                    );
+                }
+
+                // No `fcntl` call may name its command with a literal. Every call
+                // must pass a value bound out of the table, which is what makes the
+                // per-platform numbering effective and guarantees a command is
+                // never issued on a platform that does not define it.
+                let mut inspected = 0usize;
+                let mut from = 0usize;
+                while let Some(at) = blanked[from..].find("fcntl(") {
+                    let abs = from + at;
+                    from = abs + "fcntl(".len();
+                    // Require a word boundary before the name, so an identifier
+                    // that merely *ends* in `fcntl` — such as the test function
+                    // `a_partially_known_platform_issues_no_fcntl` — is not
+                    // mistaken for a call.
+                    let preceded_by_word_char = abs
+                        .checked_sub(1)
+                        .and_then(|i| blanked.as_bytes().get(i))
+                        .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+                    if preceded_by_word_char {
+                        continue;
+                    }
+                    // Skip the `extern "C"` declaration itself, whose parameter
+                    // list legitimately names `cmd: c_int`.
+                    let args = &blanked[from..];
+                    let close = match args.find(')') {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    let arglist = &args[..close];
+                    if arglist.contains("c_int") {
+                        continue;
+                    }
+                    inspected += 1;
+                    let second = arglist.split(',').nth(1).unwrap_or("").trim();
+                    assert!(
+                        !second.is_empty(),
+                        "an fcntl call must pass a command: {arglist:?}"
+                    );
+                    assert!(
+                        !second.chars().next().is_some_and(|c| c.is_ascii_digit()),
+                        "the fcntl command at offset {abs} is the literal \
+                         {second:?}; it must come from the FCNTL table instead, so \
+                         that Haiku and NuttX cannot be sent POSIX numbers"
+                    );
+
+                    // `fcntl` is variadic, so its arity is part of the command's
+                    // contract rather than of its type: `F_GETFD`/`F_GETFL` take
+                    // no third argument and `F_SETFD`/`F_SETFL` take exactly one
+                    // `int`. Passing the wrong number is undefined behaviour that
+                    // no signature can catch, so it is checked here against the
+                    // table binding the call names.
+                    let arity = arglist.split(',').count();
+                    if second.starts_with("get_") {
+                        assert_eq!(
+                            arity, 2,
+                            "the fcntl call at offset {abs} names the getter \
+                             {second:?}, which takes no third argument, but passes \
+                             {arity} arguments: {arglist:?}"
+                        );
+                    } else if second.starts_with("set_") {
+                        assert_eq!(
+                            arity, 3,
+                            "the fcntl call at offset {abs} names the setter \
+                             {second:?}, which requires exactly one `int` third \
+                             argument, but passes {arity} arguments: {arglist:?} — \
+                             a variadic call missing its argument reads whatever \
+                             happens to be in the argument register"
+                        );
+                    } else {
+                        panic!(
+                            "the fcntl command at offset {abs} is {second:?}, which \
+                             is neither a `get_*` nor a `set_*` binding from the \
+                             FCNTL table; its required arity is therefore unknown \
+                             and cannot be checked"
+                        );
+                    }
+                }
+                assert!(
+                    inspected >= 4,
+                    "at least the four reconciliation/probe fcntl call sites must \
+                     be inspected, found {inspected} — a zero or low count would \
+                     make this assertion vacuous"
+                );
+            }
+        }
+
+        assert!(
+            saw_open && saw_ffi,
+            "both files owning a platform cascade must be scanned"
+        );
+    }
+
     #[test]
     fn os_code_is_declared_in_exactly_one_module() {
         let mut declaring: alloc::vec::Vec<(std::string::String, usize)> = alloc::vec::Vec::new();

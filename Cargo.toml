@@ -399,3 +399,33 @@ panic = "abort"
 # (see the detailed rationale in `[profile.release]` above). Setting it here
 # keeps debug and release builds consistent for both the std and no_std targets.
 panic = "abort"
+
+# `target_os = "cygwin"` IS A REAL VALUE THAT THE MSRV COMPILER HAS NOT HEARD OF.
+#
+# The platform-constant cascades added for the `gzdopen` flag work name every unix
+# family explicitly rather than guessing: `src/gz/open.rs` places cygwin in the
+# newlib `O_NONBLOCK` family (`0x4000`) and the POSIX `FD_CLOEXEC` family (`1`),
+# and `src/ffi/gz.rs` places it in the POSIX `fcntl` command family. Those three
+# arms are load-bearing — delete them and cygwin falls through to the terminal
+# "do not guess" arm, which is safe but silently stops requesting the nonblocking
+# open that mode `"rbN"` asked for.
+#
+# `cygwin` became a known `target_os` after 1.85.0, the MSRV this crate declares
+# and CI pins. So current stable compiles those arms silently while 1.85.0 emits
+# three `unexpected_cfgs` warnings for a value that is entirely correct. Declaring
+# the value here is the narrow fix: it teaches the lint this ONE extra `target_os`
+# and nothing else.
+#
+# What this deliberately does NOT do is switch the lint off. `level = "warn"`
+# keeps it at its default severity, so `-D warnings` in the `lint` and
+# `cross-targets` jobs still promotes it to an error, and every OTHER unknown
+# `cfg` value is still reported. That distinction is load-bearing: this exact lint
+# is what caught `target_arch = "hppa"` and `target_arch = "alpha"` — two values
+# that do not exist — during the same platform work. An
+# `#[allow(unexpected_cfgs)]` on the cascades would have silenced those typos
+# along with this legitimate value, which is precisely the safety net worth
+# keeping. Verify with `RUSTUP_TOOLCHAIN=1.85.0 cargo check --locked
+# --all-targets`, which must report zero warnings.
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ['cfg(target_os, values("cygwin"))']

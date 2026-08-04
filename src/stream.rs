@@ -191,6 +191,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::ffi::{c_uint, c_void};
 use core::fmt;
+use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 
 use crate::constants::DataType;
@@ -583,6 +584,30 @@ pub trait ForeignBuffer<T: Copy + Default + ZeroValid> {
     /// The buffer contents as a unique (mutable) slice of `T`.
     fn as_mut_slice(&mut self) -> &mut [T];
 
+    /// The element count, answered **without materializing a slice**.
+    ///
+    /// [`AllocBuffer::len`](AllocBuffer::len) forwards here rather than measuring
+    /// `as_slice().len()`, and the distinction is a soundness requirement, not a
+    /// micro-optimization. One foreign region — the caller-supplied `inflateBack`
+    /// window, adopted by a bare pointer store exactly as `infback.c` L60 does —
+    /// is *not* initialized at adoption time. A length query that reached for
+    /// `as_slice()` would create a `&[T]` over abstract-uninitialized bytes before
+    /// anything had written them, which is validity UB regardless of whether the
+    /// resulting slice is ever read. Every implementor therefore records its own
+    /// element count and returns it directly.
+    fn len(&self) -> usize;
+
+    /// Whether the buffer holds no elements, derived from
+    /// [`len`](ForeignBuffer::len) and therefore equally slice-free.
+    ///
+    /// Every foreign region in this crate is non-empty by construction (a
+    /// zero-length request is rejected before a buffer is built), so this exists
+    /// to keep the length accessor idiomatic rather than to serve a real caller.
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Deep-clones into a fresh foreign region allocated through the **same**
     /// hook, with the same `(items, item_size)` pair the original was requested
     /// with (matching C `deflateCopy`/`inflateCopy`, which `ZALLOC` their new
@@ -667,119 +692,76 @@ pub(crate) trait ForeignAlloc: Copy + Default + ZeroValid + 'static {
     ) -> Option<Box<dyn ForeignBuffer<Self>>>;
 }
 
-/// Foreign (caller-`zalloc`'d) *engine-state* placement — the capability behind
+/// The byte count reference zlib charges a caller's allocator for one engine
+/// state — the `size` half of C's `ZALLOC(strm, 1, sizeof(deflate_state))`
+/// (`deflate.c` L440) and `ZALLOC(strm, 1, sizeof(struct inflate_state))`
+/// (`inflate.c` L198, `infback.c` L51) — the capability behind
 /// [`EngineReservation`].
 ///
 /// Reference zlib does not put its engine state on some private heap: it charges
-/// the caller's allocator for it, with a single
-/// `ZALLOC(strm, 1, sizeof(deflate_state))` (`deflate.c` L305) or
-/// `ZALLOC(strm, 1, sizeof(struct inflate_state))` (`inflate.c` L198,
-/// `infback.c` L51). A caller who installs a bounded arena therefore expects the
-/// state itself to come out of that arena and to be handed back through `zfree`.
-/// This trait is what makes that true here: the reservation it returns *is* the
-/// state's home, not a placeholder charged alongside a private allocation.
+/// the caller's allocator for it, exactly once, *before* any working buffer, and
+/// hands the region back through `zfree` last. A caller who installs a bounded
+/// arena sizes that arena from C's `sizeof`, so a drop-in replacement has to ask
+/// for C's pair: an allocator that serves `(1, 5968)` for deflate and
+/// `(1, 7160)` for inflate and refuses anything larger must still initialize.
+/// Requesting this port's own, legitimately larger `size_of::<Self>()` made such
+/// an allocator report `Z_MEM_ERROR` where reference zlib succeeds — an exact
+/// drop-in allocator-behaviour defect, not merely a cosmetic one.
 ///
-/// Declared here and implemented for every `Sized + 'static` type by a blanket
-/// implementation in the sanctioned `crate::ffi::alloc` zone, which owns the hook
-/// invocation, the alignment check, the in-place move, and the `zfree`-on-drop.
-///
-/// Implementations must request `(1, size_of::<Self>())` so the hook sees the
-/// same one-region, one-item shape C uses, must return [`None`] — with any region
-/// already obtained released through `zfree` — rather than falling back to the
-/// global allocator, and must never write to the region before the state is
-/// moved into it (AAP §0.6.2, §0.6.3 has-hook clause, §0.6.5).
-///
-/// # The one place this port cannot match C's argument pair
-///
-/// C passes `sizeof(struct inflate_state)`; this port passes
-/// `size_of::<Self>()`, and the two differ (7160 against 7272 for inflate, 5968
-/// against 6136 for deflate) because the Rust state is not layout-identical to
-/// the C struct. Holding the real state *and* advertising C's byte count are
-/// mutually exclusive, so this port keeps the property zlib's contract actually
-/// exposes — one request, made at C's point in the sequence, with C's failure
-/// timing (AAP §0.6.5) — and lets the byte count be its own. Nothing in the zlib
-/// API lets a caller assert a particular `size` argument, and C's own value
-/// already varies with `LIT_MEM` and with the target's pointer width.
-pub(crate) trait ForeignEnginePlace: Sized + 'static {
-    /// Requests `(1, size_of::<Self>())` from `hook` and returns the region as an
-    /// unfilled home, or [`None`] if the caller's `zalloc` refused it or returned
-    /// a region misaligned for `Self`.
-    fn try_reserve_foreign(hook: AllocHook) -> Option<Box<dyn ForeignEngineHome<Self>>>;
-}
-
-/// A caller-`zalloc`'d region large enough and aligned for one engine state,
-/// reserved but not yet filled.
-///
-/// Splitting reservation from filling is what lets the request happen where C
-/// makes it — *before* the working buffers — while the state value itself is
-/// still being built. Dropping an unfilled home releases the region through the
-/// caller's `zfree`, which is what C's early-return paths do.
-pub(crate) trait ForeignEngineHome<E: 'static>: 'static {
-    /// Moves `engine` into the reserved region and yields the owning handle.
+/// This trait is what keeps the request C-exact: [`EngineReservation::take`]
+/// charges `(1, Self::C_STATE_SIZE)`, computed from the engine's field-exact
+/// `#[repr(C)]` layout mirror so it tracks C's `sizeof` on every target and
+/// pointer width, while the Rust state value lives on the global heap beside the
+/// charge. That split is required rather than merely convenient: a block of C's
+/// smaller `sizeof` cannot hold this port's state, so charging C's byte count and
+/// hosting the state in the same region are mutually exclusive. What a caller's
+/// allocator can observe — the request count, the argument pair, the position in
+/// the sequence, the failure timing, and the release order (AAP §0.6.5) — is
+/// preserved in full; only the address the state happens to occupy differs, and
+/// no zlib contract exposes that.
+pub(crate) trait EngineFootprint: Sized + 'static {
+    /// C's `sizeof` for this engine's state struct — 5968 for `deflate_state`
+    /// and 7160 for `struct inflate_state` on LP64.
     ///
-    /// Returns [`None`] when the type-erasing owner cannot be allocated, in which
-    /// case the reservation is released by this home's own `Drop` and `engine` is
-    /// dropped — freeing its working buffers back through the same hook, which is
-    /// what C's failure paths do before returning `Z_MEM_ERROR`. Reporting the
-    /// failure rather than aborting is required: zlib answers heap exhaustion with
-    /// a return code (AAP §0.6.5).
-    fn fill(self: Box<Self>, engine: E) -> Option<Box<dyn ForeignEngine<E>>>;
+    /// Implementors forward their own `C_LAYOUT_SIZE`, the size of the
+    /// field-exact `#[repr(C)]` ABI mirror, so this value moves with the target
+    /// exactly as C's `sizeof` does.
+    const C_STATE_SIZE: usize;
 }
 
-/// An engine state that lives in memory the caller's `zalloc` returned, released
-/// through the same hook's `zfree` when dropped.
-///
-/// The accessors hand out ordinary borrows, so every layer above this module
-/// works with `&E` / `&mut E` and never sees a pointer (AAP §0.6.2).
-pub(crate) trait ForeignEngine<E: 'static>: 'static {
-    /// Borrows the engine state.
-    fn get(&self) -> &E;
-
-    /// Mutably borrows the engine state.
-    fn get_mut(&mut self) -> &mut E;
-}
-
-/// The single owning handle for an engine state, backed **either** by the Rust
-/// global allocator **or** by the caller's `zalloc`/`zfree` pair — the
-/// state-shaped counterpart of [`AllocBuffer`].
+/// The single owning handle for an engine state: the state value itself plus the
+/// allocator charge reference zlib makes for it — the state-shaped counterpart of
+/// [`AllocBuffer`].
 ///
 /// Both engines hand their state to a stream as a [`BoxedEngine`], and both
-/// recover it the same way, so exactly one code path exists regardless of who
-/// owns the memory. Dereferencing costs a two-arm branch and never a type
+/// recover it the same way, so exactly one code path exists regardless of which
+/// allocator is installed. Dereferencing is a field access and never a type
 /// lookup, which matters because the decoder touches its state hundreds of times
 /// per call.
 ///
 /// # Cost of the uniform handle
 ///
-/// On the global-allocator path this adds one 24-byte allocation per stream — the
-/// `Box` holding this enum — on top of the `Box<E>` that already existed. That is
-/// deliberate: it is what lets `StreamState` stay a single non-generic
-/// `Box<dyn EngineState>` while the hook path keeps its state out of the global
-/// heap entirely. Nothing observes it, because a stream with no hook installed
-/// exposes no allocation accounting at all.
-pub(crate) enum EngineBox<E: EngineState + 'static> {
-    /// Global-allocator storage — the historical, hook-free path.
-    Owned {
-        /// The state itself, on the Rust heap.
-        engine: Box<E>,
-        /// Normally **empty**, with a no-op drop.
-        ///
-        /// It is non-empty only for a custom Rust [`Allocator`] that asked to be
-        /// charged for the state footprint but, handing out typed slice buffers,
-        /// cannot host the state value; see [`EngineReservation`]. Declared *after*
-        /// `engine` so it is released after the state's working buffers, which is
-        /// C's `deflateEnd`/`inflateEnd` order (state last). No C caller can reach
-        /// this: an active hook takes the [`Foreign`](EngineBox::Foreign) arm and an
-        /// inactive one is never charged.
-        ///
-        /// Named with a leading underscore because it is a pure drop guard: nothing
-        /// ever reads it, its whole job is to reach the allocator's `zfree` at the
-        /// right moment.
-        _footprint: AllocBuffer<u8>,
-    },
-    /// Caller-`zalloc`'d storage, reached through the safe [`ForeignEngine`]
-    /// interface so this module never touches the raw pointer.
-    Foreign(Box<dyn ForeignEngine<E>>),
+/// This adds one small allocation per stream — the `Box` holding this handle — on
+/// top of the `Box<E>` that already existed. That is deliberate: it is what lets
+/// `StreamState` stay a single non-generic `Box<dyn EngineState>` while still
+/// carrying the caller's state charge to its `zfree` at the right moment. Nothing
+/// observes it, because the extra `Box` comes from the global heap, which exposes
+/// no allocation accounting to a zlib caller.
+pub(crate) struct EngineBox<E: EngineState + 'static> {
+    /// The state itself, on the Rust heap.
+    engine: Box<E>,
+    /// The caller's charge for the state footprint — C's
+    /// `ZALLOC(strm, 1, sizeof(deflate_state))` region — or an **empty** buffer
+    /// with a no-op drop when no allocator asked to be charged (the historical
+    /// global-allocator path; see [`EngineReservation`]).
+    ///
+    /// Declared *after* `engine` so it is released after the state's working
+    /// buffers, which is C's `deflateEnd`/`inflateEnd` order — state last.
+    ///
+    /// Named with a leading underscore because it is a pure drop guard: nothing
+    /// ever reads it, its whole job is to reach the allocator's `zfree` at the
+    /// right moment.
+    _footprint: AllocBuffer<u8>,
 }
 
 /// An engine state boxed for installation into a [`ZStream`].
@@ -801,23 +783,23 @@ impl<E: EngineState + 'static> EngineBox<E> {
     #[inline]
     fn try_owned_charged(engine: E, footprint: AllocBuffer<u8>) -> Option<BoxedEngine<E>> {
         let engine = try_box(engine)?;
-        try_box(EngineBox::Owned {
+        try_box(EngineBox {
             engine,
             _footprint: footprint,
         })
     }
 
-    /// `true` when the engine's bytes live in memory a caller's `zalloc` returned
-    /// rather than on the Rust global heap.
+    /// `true` when a caller's `zalloc` was charged for this state's footprint —
+    /// the C-ABI path, where the charge is C's
+    /// `ZALLOC(strm, 1, sizeof(deflate_state))` region held for `zfree`.
     ///
-    /// This is what makes the M6-10 contract assertable: the counterpart of
-    /// [`AllocBuffer::is_foreign`] for the state itself, so a test can prove the
-    /// caller's arena really holds the engine and not merely a same-sized
-    /// reservation beside it.
+    /// This is what makes the charge assertable from a test: `false` means the
+    /// handle carries the empty drop guard of the historical global-allocator
+    /// path, `true` means the caller's arena really was billed for the state.
     #[cfg(test)]
     #[inline]
-    pub(crate) fn is_foreign(&self) -> bool {
-        matches!(self, EngineBox::Foreign(_))
+    pub(crate) fn is_charged(&self) -> bool {
+        !self._footprint.is_empty()
     }
 }
 
@@ -826,20 +808,14 @@ impl<E: EngineState + 'static> Deref for EngineBox<E> {
 
     #[inline]
     fn deref(&self) -> &E {
-        match self {
-            EngineBox::Owned { engine, .. } => engine,
-            EngineBox::Foreign(home) => home.get(),
-        }
+        &self.engine
     }
 }
 
 impl<E: EngineState + 'static> DerefMut for EngineBox<E> {
     #[inline]
     fn deref_mut(&mut self) -> &mut E {
-        match self {
-            EngineBox::Owned { engine, .. } => engine,
-            EngineBox::Foreign(home) => home.get_mut(),
-        }
+        &mut self.engine
     }
 }
 
@@ -863,90 +839,88 @@ impl<E: EngineState + 'static> EngineState for EngineBox<E> {
     }
 
     /// Returns *this wrapper*, not the wrapped state: the owning view has to stay
-    /// the handle, because a foreign-backed state cannot be moved out of the
-    /// caller's region without allocating somewhere else. `downcast::<EngineBox<E>>`
-    /// is therefore the spelling the engines use, and it is allocation-free.
+    /// the handle, because moving the state out of it would strand the caller's
+    /// footprint charge, whose `zfree` must happen after the state's working
+    /// buffers. `downcast::<EngineBox<E>>` is therefore the spelling the engines
+    /// use, and it is allocation-free.
     #[inline]
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
         self
     }
 }
 
-/// The reservation half of hook-backed engine placement: made where C makes its
-/// state `ZALLOC`, filled once the state value is complete.
+/// The reservation half of engine-state allocation: the charge is made where C
+/// makes its state `ZALLOC`, and travels with the state once the state value is
+/// complete.
 ///
-/// Which of the three arms is taken is decided entirely by the allocator, and the
-/// decision is what makes the C ABI faithful without breaking the Rust-native
-/// extension point:
+/// Which of the two arms is taken is decided entirely by the allocator:
 ///
-/// | `reserves_state_footprint()` | `hook().is_active()` | Arm | Who reaches it |
-/// |---|---|---|---|
-/// | `false` | — | [`Global`](Self::Global) | [`DefaultAllocator`]; a C caller with null `zalloc`/`zfree` |
-/// | `true` | `true` | [`Foreign`](Self::Foreign) | every C caller with an installed hook — the state lives in *their* memory |
-/// | `true` | `false` | [`Charged`](Self::Charged) | a custom Rust [`Allocator`] only |
+/// | `reserves_state_footprint()` | Arm | Who reaches it |
+/// |---|---|---|
+/// | `false` | [`Global`](Self::Global) | [`DefaultAllocator`]; a C caller with null `zalloc`/`zfree`, where zlib itself uses its built-in allocator |
+/// | `true` | [`Charged`](Self::Charged) | every C caller with an installed hook, and any custom Rust [`Allocator`] that opts in |
 ///
-/// The middle row is the one the C ABI always takes, and it is the one that makes
-/// the caller's `zalloc` the real owner of the `deflate_state` /
-/// `inflate_state`. The last row exists because an [`Allocator`] hands out typed
-/// slice buffers and therefore cannot host an arbitrary Rust value; charging it and
-/// holding the region beside a globally boxed state keeps its request count and
-/// failure timing C-equivalent, which is the only thing that path can observe.
-/// [`CAllocator`](crate::ffi::types::CAllocator) reports
-/// `reserves_state_footprint() == hook().is_active()`, so no C caller can ever
-/// land there.
-pub(crate) enum EngineReservation<E: EngineState + ForeignEnginePlace + 'static> {
-    /// The caller's `zalloc` returned the region the state itself will occupy.
-    Foreign(Box<dyn ForeignEngineHome<E>>),
-    /// A custom Rust [`Allocator`] was charged for the footprint; the state is
-    /// boxed globally and the charge travels with it.
+/// The second row is the one the C ABI takes, and it is what bills the caller's
+/// `zalloc` for the `deflate_state` / `inflate_state` with C's own
+/// `(1, sizeof(...))` pair. The charge is a region the allocator hands over and
+/// this port holds — unread — until the matching `zfree`; the Rust state value
+/// sits beside it on the global heap, because an [`Allocator`] hands out typed
+/// slice buffers and this port's state is legitimately larger than C's struct, so
+/// C's byte count and hosting the state in the same block are mutually exclusive
+/// (see [`EngineFootprint`]). Everything the caller's allocator can observe — the
+/// request count, the argument pair, its position in the sequence, the failure
+/// timing, and the release order — is C-exact (AAP §0.6.5).
+pub(crate) enum EngineReservation<E: EngineState + EngineFootprint + 'static> {
+    /// The allocator was charged for the state footprint; the state is boxed
+    /// globally and the charge travels with it, reaching `zfree` after the
+    /// state's working buffers.
     Charged(AllocBuffer<u8>),
     /// No charge: the `Box` already *is* the allocation.
-    Global,
+    ///
+    /// `PhantomData` rides on this arm so the reservation stays bound to the
+    /// engine it was taken for; the binding is what lets [`take`](Self::take)
+    /// charge `E`'s C-exact `size` and [`fill`](Self::fill) accept only that same
+    /// engine, making a state/charge mismatch unrepresentable.
+    Global(PhantomData<fn() -> E>),
 }
 
-impl<E: EngineState + ForeignEnginePlace + 'static> EngineReservation<E> {
+impl<E: EngineState + EngineFootprint + 'static> EngineReservation<E> {
     /// Charges `alloc` for one engine footprint if it reserves them, in C's
-    /// position in the allocation sequence.
+    /// position in the allocation sequence — first, before any working buffer.
     ///
-    /// The request is always shaped `(1, size_of::<E>())` — one state object — so an
-    /// inspecting allocator sees the same `items` C passes and a `size` that is this
-    /// port's own `sizeof`. It cannot be C's `sizeof`: the region *is* the state's
-    /// home and this port's states are legitimately larger than C's, so the two
-    /// requirements are mutually exclusive and AAP §0.6.5 asks for the count and the
-    /// failure timing, which this preserves.
+    /// The request is shaped `(1, E::C_STATE_SIZE)`: C's `items` and C's `size`,
+    /// so an allocator sized from `sizeof(deflate_state)` or
+    /// `sizeof(struct inflate_state)` serves it exactly as it serves reference
+    /// zlib's. This is a hard drop-in requirement, not a nicety — asking for this
+    /// port's larger `size_of::<E>()` made a conforming C-sized allocator refuse
+    /// and turned a successful `deflateInit2_` into `Z_MEM_ERROR`.
     ///
     /// Returns [`None`] only when a charge was attempted and refused — the
-    /// `Z_MEM_ERROR` C reports from its failed state `ZALLOC`.
+    /// `Z_MEM_ERROR` C reports from its failed state `ZALLOC`, at C's moment.
     #[inline]
     pub(crate) fn take<A: Allocator>(alloc: &A) -> Option<Self> {
         if !alloc.reserves_state_footprint() {
-            return Some(Self::Global);
+            return Some(Self::Global(PhantomData));
         }
-        let hook = alloc.hook();
-        if hook.is_active() {
-            Some(Self::Foreign(E::try_reserve_foreign(hook)?))
-        } else {
-            Some(Self::Charged(
-                alloc.allocate_zeroed_items::<u8>(1, size_of::<E>())?,
-            ))
-        }
+        Some(Self::Charged(
+            alloc.allocate_zeroed_items::<u8>(1, E::C_STATE_SIZE)?,
+        ))
     }
 
-    /// Moves `engine` into the reserved region, or onto the global heap when the
-    /// reservation was not a foreign one.
+    /// Boxes `engine` on the global heap and attaches the charge taken by
+    /// [`take`](Self::take).
     ///
     /// Returns [`None`] whenever the global heap cannot hold the small owning
     /// handles this port needs to keep the state's memory type-erased. The
-    /// caller-`zalloc`'d region itself was already secured by
-    /// [`take`](Self::take) and is never re-requested here, so C's request
-    /// *count* is unaffected either way; a refusal is reported as `Z_MEM_ERROR`
-    /// exactly as C reports a refused `ZALLOC`, and never aborts.
+    /// caller's charge was already secured by [`take`](Self::take) and is never
+    /// re-requested here, so C's request *count* is unaffected either way; a
+    /// refusal is reported as `Z_MEM_ERROR` exactly as C reports a refused
+    /// `ZALLOC`, and never aborts.
     #[inline]
     pub(crate) fn fill(self, engine: E) -> Option<BoxedEngine<E>> {
         match self {
-            Self::Foreign(home) => try_box(EngineBox::Foreign(home.fill(engine)?)),
             Self::Charged(footprint) => EngineBox::try_owned_charged(engine, footprint),
-            Self::Global => EngineBox::try_owned(engine),
+            Self::Global(_) => EngineBox::try_owned(engine),
         }
     }
 }
@@ -1180,7 +1154,11 @@ impl<T: Copy + Default + ZeroValid> AllocBuffer<T> {
     pub fn len(&self) -> usize {
         match self {
             AllocBuffer::Owned(v) => v.len(),
-            AllocBuffer::Foreign(b) => b.as_slice().len(),
+            // `ForeignBuffer::len`, never `as_slice().len()`: the caller-supplied
+            // `inflateBack` window is adopted uninitialized (C `infback.c` L60 is
+            // a bare pointer store), so measuring it through a slice would form a
+            // reference over uninitialized bytes.
+            AllocBuffer::Foreign(b) => b.len(),
         }
     }
 

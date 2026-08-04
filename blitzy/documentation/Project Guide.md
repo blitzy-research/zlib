@@ -77,11 +77,11 @@ pie showData title Historical AAP-Scoped Effort Estimate — 89.9% of Estimated 
 
 ### 1.3 Key Accomplishments
 
-- [x] **Full C→Rust source rewrite** — 40 modules under `src/` (72,082 lines today; AAP baseline: 32,354 LOC) covering deflate, inflate, checksum, gz file I/O, one-call wrappers, the public API surface, and the FFI boundary, plus 7 integration suites (six default, plus the opt-in C-oracle harness), 3 Criterion benches, and 5 fuzz targets. No `todo!()`, `unimplemented!()`, `TODO`, `FIXME`, or `XXX` anywhere in `src/`.
+- [x] **Full C→Rust source rewrite** — 40 modules under `src/` (78,386 lines today; AAP baseline: 32,354 LOC) covering deflate, inflate, checksum, gz file I/O, one-call wrappers, the public API surface, and the FFI boundary, plus 7 integration suites (six default, plus the opt-in C-oracle harness), 3 Criterion benches, and 5 fuzz targets. No `todo!()`, `unimplemented!()`, `TODO`, `FIXME`, or `XXX` anywhere in `src/`.
 - [x] **C-ABI drop-in verified by linking and running** — `#[repr(C)]` `z_stream` (14 fields) and `gz_header` (13 fields) mirrors plus `extern "C"` shims. The fail-closed C harness in §9.6, compiled against the retained `zlib.h` and linked **statically** against `libzlib_rs.a`, prints `version=1.3.2.1-motley roundtrip=OK bound=58 crc32=0xcbf43926 adler32=0x091e01de`; linked **dynamically** against `libzlib_rs.so` it prints the same line and additionally round-trips 50,000 bytes byte-exactly with correct `1f 8b` gzip framing at `windowBits=31`.
 - [x] **Verified numeric values (AAP §0.6.6)** — `crc32("123456789") = 0xcbf43926`, `adler32("123456789") = 0x091e01de`, the exact `compressBound` term-for-term formula with `compressBound(9) = 22`, and `ENOUGH = 1444` (`ENOUGH_LENS 852` + `ENOUGH_DISTS 592`).
 - [x] **Full feature parity** — 10 compression levels, 5 strategies, 7 flush modes, preset dictionaries, `inflateBack`, and the overloaded `windowBits` contract (raw `-8..-15`, zlib `8..15`, gzip `+16`, auto-detect `+32`) resolved in a single `constants::parse_window_bits`.
-- [x] **Test suite green with nothing ignored** — measured this session: **959 tests pass** by default (799 unit + 131 integration + 29 doctests), **696** under `--no-default-features`, **972** under `--all-features`; **0 failed and 0 ignored in every configuration**. The suites are ports of the official C drivers.
+- [x] **Test suite green with nothing ignored** — measured this session: **1015 tests pass** by default (854 unit + 132 integration + 29 doctests), **713** under `--no-default-features`, **1028** under `--all-features`; **0 failed and 0 ignored in every configuration**. The suites are ports of the official C drivers.
 - [x] **Core-compression safety constraint honoured** — `src/deflate/**`, `src/inflate/**`, `src/checksum/**`, `src/gz/**`, `src/util/**`, `src/error.rs`, `src/constants.rs`, and `src/gz_header.rs` each contain **zero** `unsafe`, verified by a comment-excluded token scan. `src/lib.rs` carries a crate-wide `#![deny(unsafe_code)]` with exactly **two** narrowly scoped `#[allow(unsafe_code)]` carve-outs — `pub mod ffi` and the private no-`std` runtime block — so a stray `unsafe` in a core module is a compile error, not a review finding.
 - [x] **Exported symbol surface reconciles exactly** — 96 declared public FFI functions, 95 `T` symbols emitted on Linux, delta of exactly one: the `#[cfg(windows)]`-gated `gzopen_w`, correctly absent on Linux. All 54 `zlib.map` `global:` names are present, none of the 10 `local:` names leaked, and nothing is emitted that was not declared.
 - [x] **Byte-identity proven against a live C oracle** — the in-repository harness built reference C zlib from the retained in-tree sources and reported **50/50** on the smoke sweep and **3,750/3,750** byte-identical on the full grid, observed passing this session.
@@ -107,7 +107,7 @@ No defect blocks the build, and no test fails or is ignored. The items below are
 
 ### 1.6 Recommended Next Steps
 
-1. **[High]** Conduct formal human code review & sign-off of the migration (72,082 lines across the 40 `src/` modules today; AAP baseline 32,354 LOC), focusing on the `unsafe` FFI boundary and its `// SAFETY:` justifications (~16h). This is the one item that cannot be automated away.
+1. **[High]** Conduct formal human code review & sign-off of the migration (78,386 lines across the 40 `src/` modules today; AAP baseline 32,354 LOC), focusing on the `unsafe` FFI boundary and its `// SAFETY:` justifications (~16h). This is the one item that cannot be automated away.
 2. **[High]** Obtain an actual security & supply-chain **audit result** over the 102-package governed closure, and reconcile it with the landed `deny.toml` policy and `audit.yml` workflow (~8h).
 3. **[Medium]** Observe the expanded CI matrix through real runs, and close the gap that big-endian (`s390x-unknown-linux-gnu`) is currently type-checked rather than executed (~6h).
 4. **[Medium]** Validate the `no_std` build on real embedded hardware, not only as a bare-metal compile (~5h).
@@ -143,7 +143,7 @@ No defect blocks the build, and no test fails or is ignored. The items below are
 
 | Category | Hours | Priority | Gap ID | Current state |
 |---|---:|---|---|---|
-| Human code review & sign-off of the safety-critical migration (72,082 lines today; AAP baseline 32,354 LOC) | 16 | High | — | Outstanding; cannot be automated away |
+| Human code review & sign-off of the safety-critical migration (78,386 lines today; AAP baseline 32,354 LOC) | 16 | High | — | Outstanding; cannot be automated away |
 | Security & supply-chain **audit result** (`cargo audit` / `cargo deny` + manual `unsafe`/FFI review) | 8 | High | D1, D2 | Policy and workflow landed; no audit result observed |
 | Cross-platform CI matrix (Windows / macOS / aarch64 / 32-bit / big-endian) | 6 | Medium | D3 | Landed; big-endian is type-checked, not executed; no run observed here |
 | crates.io packaging & release governance | 3 | Medium | D12 | Package-content check landed; publish pipeline still absent |
@@ -170,17 +170,17 @@ No defect blocks the build, and no test fails or is ignored. The items below are
 
 | Test Category | Framework | Total Tests | Passed | Failed | Coverage % | Notes |
 |---|---|---:|---:|---:|---|---|
-| Unit (library) | Rust `#[test]` | 799 | 799 | 0 | Parity-based* | Per-module tests across deflate/inflate/checksum/gz/util/ffi |
-| Integration | Rust (`tests/`) | 131 | 131 | 0 | Parity-based* | checksum 23 · gzip_compat 17 · inflate_coverage 29 · interop 30 · regression 13 · round_trip 19 |
+| Unit (library) | Rust `#[test]` | 854 | 854 | 0 | Parity-based* | Per-module tests across deflate/inflate/checksum/gz/util/ffi |
+| Integration | Rust (`tests/`) | 132 | 132 | 0 | Parity-based* | checksum 23 · gzip_compat 17 · inflate_coverage 30 · interop 30 · regression 13 · round_trip 19 |
 | Doctests | rustdoc | 29 | 29 | 0 | — | 28 executed API examples plus 1 `compile_fail` example |
-| **Total (default)** | — | **959** | **959** | **0** | — | **0 ignored** |
+| **Total (default)** | — | **1015** | **1015** | **0** | — | **0 ignored** |
 
 **Additional configurations & harnesses:**
 
 | Test Category | Framework | Total | Passed | Failed | Notes |
 |---|---|---:|---:|---:|---|
-| `--no-default-features` (no_std / `Z_SOLO`) | Rust | 696 | 696 | 0 | 571 unit + 98 integration + 27 doctests; gz-io/gzip/simd tests correctly compiled out |
-| `--all-features` | Rust | 972 | 972 | 0 | Full feature surface — adds the 13 `c_oracle` tests, which are gated behind `c-oracle` |
+| `--no-default-features` (no_std / `Z_SOLO`) | Rust | 713 | 713 | 0 | 587 unit + 99 integration + 27 doctests; gz-io/gzip/simd tests correctly compiled out |
+| `--all-features` | Rust | 1028 | 1028 | 0 | Full feature surface — adds the 13 `c_oracle` tests, which are gated behind `c-oracle` |
 | Live C-oracle sweep | `--features c-oracle` | 13 | 13 | 0 | Builds reference C zlib from the retained in-tree sources, then diffs live output |
 | Fuzzing (smoke) | cargo-fuzz / libFuzzer | 5 targets | 5 | 0 | Recorded single campaign at the pull-request budget of 120 s per target on the pinned `nightly-2026-08-01`: **1,674,289 executions, 0 crashes, 0 crash artifacts** (per-target split in `doc/technical-specifications.md` §0.6.7). `fuzz.yml` runs weekly on `cron: '0 3 * * 1'` |
 | Benchmarks | criterion | 3 | 3 | 0 | **Compile-only in CI.** The `benches` job runs `cargo bench --no-run` — a compile gate, never a measurement, because a shared runner cannot produce trustworthy timings. The harness is Rust-only and links **no** C library, so it cannot yield a C-relative figure. The counts are the three bench targets compiling; **no throughput number is claimed** |
@@ -257,8 +257,8 @@ There is consequently no screen inventory, no component tree, no design-token se
 - ✅ **Operational — gzip framing.** `deflateInit2` at `windowBits = 31` emits the `1f 8b` magic; `inflateInit2` auto-detect consumes it.
 - ✅ **Operational — FFI symbol surface.** `nm -D --defined-only target/release/libzlib_rs.so` reports **95** symbols, all of type `T`. Against **96** declared public FFI functions the delta is exactly one — the `#[cfg(windows)]`-gated `gzopen_w`, correctly absent on Linux and gated in C by `#if defined(_WIN32) && !defined(Z_SOLO)`. All **54** `zlib.map` `global:` names are present; **0 of 10** `local:` names leaked (`deflate_copyright`, `inflate_copyright`, `inflate_fast`, `inflate_fixed`, `inflate_table`, `zcalloc`, `zcfree`, `z_errmsg`, `gz_error`, `gz_intmax` are all correctly hidden); and no symbol is emitted that was not declared.
 - ✅ **Operational — live byte-identity oracle.** The opt-in C-oracle harness built reference C zlib in-repository and reported **50/50** and **3,750/3,750** byte-identical, empty diff.
-- ✅ **Operational — artifacts.** All three crate types emit under `--release`. Measured this session from a clean default-feature release build on `rustc 1.97.1`: `libzlib_rs.rlib` 2,791,948 B (≈ 2.7 MiB) · `libzlib_rs.so` 660,944 B (≈ 646 KiB) · `libzlib_rs.a` 22,441,620 B (≈ 21.4 MiB). These are a dated observation rather than a budget — exact bytes move with the feature row and the toolchain, and the `.rlib` additionally embeds absolute build paths, so no gate asserts them. Reproduce with `stat -c '%s' target/release/libzlib_rs.{rlib,so,a}`.
-- ✅ **Operational — packaging.** `cargo package --locked --list` resolves to 76 files and packages **zero** `.c` or `.h` sources, so the retained C baseline stays in-repository and out of the published crate.
+- ✅ **Operational — artifacts.** All three crate types emit under `--release`. Measured this session from a clean default-feature release build on `rustc 1.97.1`: `libzlib_rs.rlib` 2,930,500 B (≈ 2.8 MiB) · `libzlib_rs.so` 667,552 B (≈ 652 KiB) · `libzlib_rs.a` 22,464,508 B (≈ 21.4 MiB). These are a dated observation rather than a budget — exact bytes move with the feature row and the toolchain, and the `.rlib` additionally embeds absolute build paths, so no gate asserts them. Reproduce with `stat -c '%s' target/release/libzlib_rs.{rlib,so,a}`.
+- ✅ **Operational — packaging.** `cargo package --locked --list` resolves to **75** files and packages **zero** `.c` or `.h` sources, so the retained C baseline stays in-repository and out of the published crate. Reproduce the count with `cargo package --locked --list | wc -l`; three of the 75 (`Cargo.lock`, the rewritten `Cargo.toml` and `Cargo.toml.orig`) are synthesised by `cargo` and are not tracked files, which is why the total does not match any `git ls-files` count directly.
 - ✅ **Operational — fuzz stability.** 5 targets; a recorded single campaign at 120 s per target completed 1,674,289 executions with 0 crashes and 0 crash artifacts, and `fuzz.yml` is scheduled weekly with a cached per-target corpus so coverage accumulates across runs.
 
 **What runtime validation does *not* cover.** Big-endian is type-checked (`s390x-unknown-linux-gnu`) but never executed, so the big-endian CRC braid tables have no runtime evidence. The bare-metal `thumbv7em-none-eabihf` row compiles but does not run. The one platform-conditional mechanism with genuine execution coverage is the Windows-gated `gzopen_w`, which the Windows CI row exercises directly.
@@ -282,7 +282,7 @@ There is consequently no screen inventory, no component tree, no design-token se
 | `unsafe` isolated and `// SAFETY:`-documented | ✅ Pass | Confined to `src/ffi/**` plus the private no-`std` runtime block; see §5.2 for the distribution |
 | Test suite ported from official C drivers | ✅ Pass | `example.c`, `infcover.c`, `minigzip.c` — provenance table in §3 |
 | Rust edition 2024 / MSRV 1.85.0 | ✅ Pass | `cargo +1.85.0 build --locked` and `cargo +1.85.0 check --locked --all-targets` both exit 0; 1.85.0 is precisely the release in which edition 2024 became available, making the pairing the tightest self-consistent one |
-| `no_std` via feature flag | ✅ Pass | Builds and links; 696 tests pass under `--no-default-features` |
+| `no_std` via feature flag | ✅ Pass | Builds and links; 713 tests pass under `--no-default-features` |
 | Zero C dependency in the shipped artifact | ✅ Pass | Runtime closure is `cfg-if` plus optional `crc32fast`, both pure Rust; `flate2`/`miniz_oxide` are dev-only oracles |
 | clippy clean / `fmt` clean | ✅ Pass | `cargo clippy --locked --all-targets --all-features -- -D warnings` and `cargo fmt --all -- --check` both exit 0 |
 | cargo-fuzz targets | ✅ Pass | 5 targets in a detached workspace; weekly schedule in `fuzz.yml` |
@@ -293,7 +293,7 @@ There is consequently no screen inventory, no component tree, no design-token se
 
 `unsafe` is permitted in exactly two places: `src/ffi/**`, the C ABI boundary, and a private runtime-support block in `src/lib.rs` that supplies a libc-backed global allocator and an abort panic handler for true non-test no-`std` panic-abort builds. It is forbidden everywhere else.
 
-**Measured distribution.** Counting comment-stripped `\bunsafe\b` construct lines, the same method `doc/technical-specifications.md` §0.6.2 uses: **1,497** in `src/ffi/**` (`inflate.rs` 478, `deflate.rs` 333, `gz.rs` 186, `util.rs` 184, `types.rs` 148, `mod.rs` 106, `alloc.rs` 62); **47** in the private no-`std` runtime support in `src/lib.rs`; **2 in `src/stream.rs`, and those are type aliases only** — `ZallocFn` and `ZfreeFn` merely *name* the C hook signatures the crate must interoperate with, and the file contains no executable `unsafe` block at all; and **zero** across all eight core module groups. There are **513** `// SAFETY:` comments in `src/`. The AAP's recorded baseline of 568 / 20 / 284 predates the hardening work and is retained here only as a historical datum; counting `unsafe { … }` *blocks* instead answers a different question and yields 1,118, which is the figure `doc/project-guide.md` §8.5 quotes.
+**Measured distribution.** Counting comment-stripped `\bunsafe\b` construct lines, the same method `doc/technical-specifications.md` §0.6.2 uses: **1,662** in `src/ffi/**` (`inflate.rs` 538, `deflate.rs` 373, `gz.rs` 212, `types.rs` 188, `util.rs` 184, `mod.rs` 113, `alloc.rs` 54); **51** in `src/lib.rs`, of which 22 are the private no-`std` runtime support and 29 the in-crate boundary tests that police it; **2 in `src/stream.rs`, and those are type aliases only** — `ZallocFn` and `ZfreeFn` merely *name* the C hook signatures the crate must interoperate with, and the file contains no executable `unsafe` block at all; and **zero** across all eight core module groups. There are **592** `// SAFETY:` comments in `src/`. The AAP's recorded baseline of 568 / 20 / 284 predates the hardening work and is retained here only as a historical datum; counting `unsafe { … }` *blocks* instead answers a different question and yields 1,265, which is the figure `doc/project-guide.md` §8.5 quotes.
 
 **Freshly verified invariants.** These are the properties that actually matter, and each was re-checked this session rather than taken on trust:
 
@@ -325,7 +325,7 @@ The directives below are the preservation obligations recorded in **AAP §0.8.1*
 |---|---|---|
 | **D-1** | Strong byte identity with reference zlib | Tier-1 baked-oracle gate plus the live sweep at 50/50 and 3,750/3,750. The eight decision points that determine identity — hash function, `hash_shift` derivation, chain-insertion order, the four `longest_match` thresholds and two early exits, the lazy-match `TOO_FAR` filter, block-type selection, the Huffman `<=` tie-break, and the per-level tuning table — are ported to the exact operator and must not be "improved" |
 | **D-2** | Numeric constants must never be altered | Flush codes `0..6`; the nine return codes `Z_OK 0` through `Z_VERSION_ERROR -6`; levels `-1`/`0..9`; strategies `0..4`; data types `0..2`; `Z_DEFLATED 8`; `MIN_MATCH 3`; `MAX_MATCH 258`; `PRESET_DICT 0x20`; `TOO_FAR 4096`; `ENOUGH 1444`; Adler `BASE 65521` / `NMAX 5552`; CRC polynomial `0xEDB88320`; and the state discriminants (`DeflateStatus` 42/57/69/73/91/103/113/666, `InflateMode` from `Head = 16180`) are all fixed by the ABI and the wire format |
-| **D-5** | Tests are never removed, weakened, or ignored, and counts stay accurate | 959 default / 696 no-default / 972 all-features, **0 failed and 0 ignored** in every configuration, measured this session. The four official-driver ports are load-bearing and carry the operationalisation of user constraint 4 |
+| **D-5** | Tests are never removed, weakened, or ignored, and counts stay accurate | 1015 default / 713 no-default / 1028 all-features, **0 failed and 0 ignored** in every configuration, measured this session. The four official-driver ports are load-bearing and carry the operationalisation of user constraint 4 |
 | **D-7** | The C oracle sources are retained unmodified | `*.c`, `*.h`, `test/*.c`, and `zlib.map` are read, cited, and compiled for cross-validation — never edited. They are the specification and the tie-breaker for every ambiguity the RFCs leave open |
 | **D-8** | Same-repository migration; C sources excluded only from the published crate | No new repository. The Rust crate shares the root `Cargo.toml`, and the C baseline is kept out of the published artifact by the manifest's `exclude` contract — verified by `cargo package --list` packaging zero `.c`/`.h` files |
 
@@ -413,7 +413,7 @@ Severities are fixed by the AAP's authoritative register. Three identifier corre
 
 | Risk | Category | Severity | Probability | Mitigation | Status |
 |---|---|---|---|---|---|
-| No formal human code review or sign-off across the migration surface (72,082 lines today; AAP baseline 32,354 LOC) | Governance | High | High | Human review of the `unsafe` FFI boundary and its `// SAFETY:` justifications; cannot be automated away | Open |
+| No formal human code review or sign-off across the migration surface (78,386 lines today; AAP baseline 32,354 LOC) | Governance | High | High | Human review of the `unsafe` FFI boundary and its `// SAFETY:` justifications; cannot be automated away | Open |
 | No observed security / supply-chain **audit result** | Security | High | Medium | `deny.toml` (D1) and the `audit.yml` workflow (D2) have landed and govern the 102-package closure; a landed policy is **not** an audit finding, so this stays open until an actual result exists | Open — policy landing only |
 | `unsafe` at the FFI boundary — UB if a C caller passes invalid pointers | Security | Medium | Low | Confinement to `src/ffi/**` enforced by `#![deny(unsafe_code)]` with two scoped carve-outs; mandatory `// SAFETY:` justifications; null and wrong-engine guards tested; a dedicated FFI round-trip fuzz target covering the `deflateCopy`/`Reset`/`ResetKeep` and `inflateCopy`/`Reset`/`Reset2`/`ResetKeep` lifecycle and its misuse paths | Mitigated (audit pending) |
 | Compression below C throughput (aggregate ≈85%, attributed) | Technical | Low | Medium | Tuning is outstanding and strictly gated on byte-identity: any candidate speed-up must pass the identity gate before it is viable, and the tuning values themselves are off limits. Note the axis: the C-relative headroom sits on the **compressible** profiles (≈58–64%), while incompressible input — the slowest in absolute bytes per second — is the *closest* to C (≈82–86%). See §5.6 | Open (tracked) |
@@ -426,7 +426,7 @@ Severities are fixed by the AAP's authoritative register. Three identifier corre
 | Sustained fuzzing coverage | Operational | Low | Low | A weekly `cron: '0 3 * * 1'` schedule already existed; the landing hardening adds event-dependent time budgets and corpus caching. No campaign run is observed here | Partially addressed |
 | `cdylib` carries no `@ZLIB_1.x` symbol-version tags | Integration | Low | Low | Opt-in, environment-gated GNU-ld version-script wiring exists in `build.rs` but is off by default and platform-limited, so tags remain absent. The symbol *set* is exactly right. See AAP §0.8.2 Divergence 4 / gap D8 — and note that AAP §0.6.2 is the correct citation for symbol-surface *counts*, never for linker scripts | Open (optional) |
 | `#[repr(C)]` `z_stream` layout parity evidenced on x86_64 Linux | Integration | Medium | Low | Static and dynamic C linkage both observed working against a real C consumer, with the exact drop-in vector line and a 50,000-byte byte-exact gzip round trip (§4). Other ABIs are type-checked, not run | Mitigated |
-| gz file I/O depends on `std::fs`; `Z_SOLO`/`no_std` consumers must avoid `gz-io` | Integration | Low | Low | Feature-gated on `gz-io`; compiles out cleanly, and 696 tests still pass without it | Mitigated |
+| gz file I/O depends on `std::fs`; `Z_SOLO`/`no_std` consumers must avoid `gz-io` | Integration | Low | Low | Feature-gated on `gz-io`; compiles out cleanly, and 713 tests still pass without it | Mitigated |
 
 ---
 
@@ -449,7 +449,7 @@ pie showData title Historical Effort Estimate (Total 523h)
 %%{init: {'theme':'base','themeVariables':{'pie1':'#5B39F3','pie2':'#7A6DEC','pie3':'#D9D9D9','pieSectionTextColor':'#333333','pieStrokeColor':'#333333'}}}%%
 pie showData title Remaining Estimated Work by Priority (53h)
     "High" : 24
-    "Medium" : 5
+    "Medium" : 21
     "Low" : 8
 ```
 
@@ -459,7 +459,7 @@ pie showData title Remaining Estimated Work by Priority (53h)
 
 ## 8. Summary & Recommendations
 
-**Achievements.** The zlib→Rust migration is functionally complete and, on every gate that can be run here, green. The full source rewrite, the DEFLATE and inflate engines including `inflateBack`, all framing modes, the C-ABI drop-in, all levels/strategies/flush modes, checksums, the ported official test suites, benches, and fuzz targets are implemented and compile without warnings. Measured this session: **959 default / 696 no-default / 972 all-features tests pass, 0 failed and 0 ignored**; all nine quality gates exit 0; MSRV 1.85.0 builds and checks clean. The C drop-in was linked both statically and dynamically against a real C consumer and produced the exact expected vector line plus a 50,000-byte byte-exact gzip round trip. The live C-oracle harness reported **50/50** and **3,750/3,750** byte-identical output against reference C zlib built from the retained in-tree sources.
+**Achievements.** The zlib→Rust migration is functionally complete and, on every gate that can be run here, green. The full source rewrite, the DEFLATE and inflate engines including `inflateBack`, all framing modes, the C-ABI drop-in, all levels/strategies/flush modes, checksums, the ported official test suites, benches, and fuzz targets are implemented and compile without warnings. Measured this session: **1015 default / 713 no-default / 1028 all-features tests pass, 0 failed and 0 ignored**; all nine quality gates exit 0; MSRV 1.85.0 builds and checks clean. The C drop-in was linked both statically and dynamically against a real C consumer and produced the exact expected vector line plus a 50,000-byte byte-exact gzip round trip. The live C-oracle harness reported **50/50** and **3,750/3,750** byte-identical output against reference C zlib built from the retained in-tree sources.
 
 **What is genuinely outstanding.** Five things, and none of them is closed by a compiler:
 
@@ -493,8 +493,12 @@ Additionally, incompressible-input compression tuning remains open at Low severi
 
 > **On dates in this document.** The engagement snapshot elsewhere in this guide is dated
 > **Wednesday, July 29, 2026**; the measurements in §1.3, §3, §4 and §5 were taken on
-> **Monday, August 3, 2026**, which is the current date. Neither is a build requirement — both are recorded
-> so that every figure can be attributed to the moment it was observed rather than presented as timeless.
+> **Monday, August 3, 2026**. Both are absolute dated observations, not statements about the present:
+> this document is read long after it is written, so calling either one "the current date" would age into
+> a false claim the moment the next day began — and did, when a review dated **Tuesday, August 4, 2026**
+> found exactly that wording here. Neither date is a build requirement; both are recorded so that every
+> figure can be attributed to the moment it was observed rather than presented as timeless. When a figure
+> is re-measured, restate the date it was re-measured on rather than describing any date as current.
 
 ### 9.2 Environment Setup
 
@@ -519,7 +523,7 @@ cargo build --locked --release
 ls -lh target/release/libzlib_rs.rlib target/release/libzlib_rs.so target/release/libzlib_rs.a
 ```
 
-Expected: `Finished ... release [optimized]` and three artifacts. Measured this session, a default-feature release build is ≈ 2.7 MiB `.rlib` (2,791,948 B), ≈ 646 KiB `.so` (660,944 B), and ≈ 21.4 MiB `.a` (22,441,620 B) — a dated observation, not a budget.
+Expected: `Finished ... release [optimized]` and three artifacts. Measured this session, a default-feature release build is ≈ 2.8 MiB `.rlib` (2,930,500 B), ≈ 652 KiB `.so` (667,552 B), and ≈ 21.4 MiB `.a` (22,464,508 B) — a dated observation, not a budget.
 
 > **Artifact aliasing.** `target/release/libzlib_rs.{a,so,rlib}` is a single shared location across feature rows: the last `cargo build --release <features>` wins. Rebuild with the intended features immediately before linking a C consumer, or give each feature row its own `CARGO_TARGET_DIR`.
 
@@ -531,9 +535,9 @@ Expected: `Finished ... release [optimized]` and three artifacts. Measured this 
 cargo fmt --all -- --check                                            # format gate
 cargo clippy --locked --all-targets --all-features -- -D warnings     # lint gate
 cargo build --locked                                                  # debug build
-cargo test --locked                                # 959 pass (799 unit + 131 integration + 29 doctests), 0 ignored
-cargo test --locked --no-default-features          # 696 pass (no_std / Z_SOLO)
-cargo test --locked --all-features                 # 972 pass (adds the 13 c_oracle tests)
+cargo test --locked                                # 1015 pass (854 unit + 132 integration + 29 doctests), 0 ignored
+cargo test --locked --no-default-features          # 713 pass (no_std / Z_SOLO)
+cargo test --locked --all-features                 # 1028 pass (adds the 13 c_oracle tests)
 cargo doc --locked --no-deps                                          # documentation gate
 cargo build --locked --release                                        # release build, all 3 crate types
 RUSTUP_TOOLCHAIN=1.85.0 cargo build --locked && \
@@ -736,9 +740,9 @@ All commands take `--locked`; both lockfiles are committed. Prefix with `RUSTUP_
 | Command | Purpose |
 |---|---|
 | `cargo build --locked --release` | Optimized build; emits `lib` + `cdylib` + `staticlib` |
-| `cargo test --locked` | Full default test suite (959 pass, 0 ignored) |
-| `cargo test --locked --no-default-features` | no_std / `Z_SOLO` suite (696 pass) |
-| `cargo test --locked --all-features` | Full feature surface (972 pass) |
+| `cargo test --locked` | Full default test suite (1015 pass, 0 ignored) |
+| `cargo test --locked --no-default-features` | no_std / `Z_SOLO` suite (713 pass) |
+| `cargo test --locked --all-features` | Full feature surface (1028 pass) |
 | `cargo test --locked --features c-oracle --test c_oracle` | Opt-in live C-oracle sweep; needs a C compiler |
 | `cargo clippy --locked --all-targets --all-features -- -D warnings` | Lint gate |
 | `cargo fmt --all -- --check` | Format gate |

@@ -1611,13 +1611,12 @@ unsafe extern "C" fn cap_free(opaque: *mut c_void, address: *mut c_void) {
 #[test]
 fn mem_limit_forces_mem_error() {
     // Bytes the inflate state reservation charges the caller's `zalloc` at
-    // `inflateInit2_`. Reference zlib passes `sizeof(struct inflate_state)`; this
-    // port passes `size_of::<InflateState>()` because the region it gets back is
-    // where the state actually lives, and this port's state is legitimately larger
-    // than C's — see `external_allocator_observes_every_deflate_request` for the
-    // full argument. Only the request *count* and the failure *timing* are fixed
-    // by AAP §0.6.5, and both still match C exactly.
-    const STATE_SIZE: usize = core::mem::size_of::<zlib_rs::inflate::InflateState>();
+    // `inflateInit2_`: C's own `sizeof(struct inflate_state)`, which is what
+    // `InflateState::C_LAYOUT_SIZE` computes from the field-exact `#[repr(C)]`
+    // mirror. An allocator sized from C's header therefore serves this port
+    // exactly as it serves reference zlib — see
+    // `external_allocator_observes_every_deflate_request` for the full argument.
+    const STATE_SIZE: usize = zlib_rs::inflate::InflateState::C_LAYOUT_SIZE;
     // The raw 8-bit inflate window (`1 << 8`) allocated lazily by `inflate`.
     const WINDOW_8: usize = 1 << 8;
 
@@ -1788,9 +1787,9 @@ fn compress_with_dictionary(payload: &[u8], dictionary: &[u8]) -> (Vec<u8>, u32)
 /// dictionary-compressed payload that must decode byte-exactly.
 #[test]
 fn set_dictionary_window_allocation_failure_is_a_mem_error() {
-    // Reserved through the caller's `zalloc` by `inflateInit2_`, sized by this
-    // port's own state rather than C's (see `mem_limit_forces_mem_error`).
-    const STATE_SIZE: usize = core::mem::size_of::<zlib_rs::inflate::InflateState>();
+    // Reserved through the caller's `zalloc` by `inflateInit2_` with C's own
+    // `sizeof(struct inflate_state)` (see `mem_limit_forces_mem_error`).
+    const STATE_SIZE: usize = zlib_rs::inflate::InflateState::C_LAYOUT_SIZE;
     // `windowBits = 8` => the 256-byte window `updatewindow` allocates lazily.
     const WINDOW_8: usize = 1 << 8;
     // C's `inf("8 b8 0 0 0 1", "need dictionary", 0, 8, 0, Z_NEED_DICT)` fixture:
@@ -1983,7 +1982,7 @@ fn set_dictionary_window_allocation_failure_is_a_mem_error() {
         const PAYLOAD: &[u8] =
             b"the quick brown fox jumps over the lazy dog, and the lazy dog naps on";
         let (compressed, dict_id) = compress_with_dictionary(PAYLOAD, DICTIONARY);
-        let state_size = core::mem::size_of::<zlib_rs::inflate::InflateState>();
+        let state_size = zlib_rs::inflate::InflateState::C_LAYOUT_SIZE;
         // `windowBits = 15` => a 32 KiB window, requested as C's
         // `ZALLOC(strm, 1U << wbits, sizeof(unsigned char))`.
         let window_15 = 1usize << 15;
@@ -2079,7 +2078,7 @@ fn set_dictionary_window_allocation_failure_is_a_mem_error() {
 ///    nothing on the destination.
 #[test]
 fn inflate_copy_honors_the_caller_allocator_budget() {
-    const STATE_SIZE: usize = core::mem::size_of::<zlib_rs::inflate::InflateState>();
+    const STATE_SIZE: usize = zlib_rs::inflate::InflateState::C_LAYOUT_SIZE;
 
     /// Initializes `strm` as a raw 8-bit-window inflate stream on `cap`.
     ///
@@ -2315,21 +2314,20 @@ fn external_allocator_observes_every_deflate_request() {
     // (`deflate.c` L440-L442), so the very first request an external allocator
     // sees is the one-item engine-state pair.
     //
-    // The `size` argument is `size_of::<DeflateState>()` rather than C's
-    // `sizeof(deflate_state)` (`DeflateState::C_LAYOUT_SIZE`, 5968 on LP64)
-    // because the region this request secures *is* where the state lives
-    // (AAP §0.6.3 has-hook clause), and this port's state is legitimately larger
-    // than C's — a block of C's `sizeof` could not hold it, so holding the state
-    // in the caller's memory and advertising C's byte count are mutually
-    // exclusive. AAP §0.6.5 fixes the allocation **count** and the **failure
-    // timing**, both of which still match; no zlib contract lets a caller assert
-    // a particular `size` argument, and C's own value moves with `LIT_MEM` and
-    // pointer width.
+    // The `size` argument is C's own `sizeof(deflate_state)`
+    // (`DeflateState::C_LAYOUT_SIZE`, 5968 on LP64), so an allocator sized from
+    // C's header serves this port exactly as it serves reference zlib
+    // (AAP §0.6.5). Because a block of C's `sizeof` cannot hold this port's
+    // legitimately larger state value, the charge and the value are separate
+    // objects: the caller's region is held — unread — until its matching `zfree`,
+    // and the state itself sits beside it on the global heap. Everything a zlib
+    // caller can observe (request count, argument pair, sequence position,
+    // failure timing, release order) is preserved.
     assert_eq!(
         requests.first().copied(),
-        Some((1, core::mem::size_of::<DeflateState>())),
+        Some((1, DeflateState::C_LAYOUT_SIZE)),
         "the engine-state footprint must be the first request, as in C, and it must \
-         be the one-item region the state itself occupies"
+         carry C's own `(1, sizeof(deflate_state))` pair"
     );
 
     // The doubled sliding window, the `prev` chain, and the `head` hash table
@@ -2357,7 +2355,7 @@ fn external_allocator_observes_every_deflate_request() {
     assert_eq!(
         requests,
         vec![
-            (1, core::mem::size_of::<DeflateState>()),
+            (1, DeflateState::C_LAYOUT_SIZE),
             (w_size, 2),
             (w_size, 2),
             (hash_size, 2),
@@ -2374,11 +2372,8 @@ fn external_allocator_observes_every_deflate_request() {
         .iter()
         .map(|(items, size)| items * size)
         .sum::<usize>();
-    let minimum = core::mem::size_of::<DeflateState>()
-        + 2 * w_size
-        + 2 * w_size
-        + 2 * hash_size
-        + 4 * lit_bufsize;
+    let minimum =
+        DeflateState::C_LAYOUT_SIZE + 2 * w_size + 2 * w_size + 2 * hash_size + 4 * lit_bufsize;
     assert!(
         charged >= minimum,
         "the allocator was charged {charged} bytes but the deflate footprint is at least {minimum}"
@@ -2392,7 +2387,7 @@ fn external_allocator_observes_every_deflate_request() {
 /// working buffer (`deflate.c` L440-L442).
 #[test]
 fn external_allocator_refusal_fails_deflate_init() {
-    let state_size = core::mem::size_of::<DeflateState>();
+    let state_size = DeflateState::C_LAYOUT_SIZE;
     let alloc = ExternalAllocator::with_budget(state_size - 1);
     let mut strm = ZStream::with_allocator(alloc);
 
@@ -2422,7 +2417,7 @@ fn external_allocator_refusal_fails_deflate_init() {
 /// the two makes init succeed and the first `inflate` fail.
 #[test]
 fn external_allocator_refusal_fails_inflate_init_then_window() {
-    let state_size = core::mem::size_of::<zlib_rs::inflate::InflateState>();
+    let state_size = zlib_rs::inflate::InflateState::C_LAYOUT_SIZE;
     // The raw 8-bit window (`1 << 8`) `inflate` grows on first use.
     let window_8 = 1usize << 8;
     // A minimal raw-DEFLATE fragment that drives the engine to grow its window
@@ -3184,7 +3179,7 @@ fn need_dict_leaves_the_running_byte_totals_behind() {
 /// here — or that discarded the delivered bytes — would diverge observably.
 #[test]
 fn window_allocation_failure_keeps_the_bytes_but_not_the_totals() {
-    const STATE_SIZE: usize = core::mem::size_of::<zlib_rs::inflate::InflateState>();
+    const STATE_SIZE: usize = zlib_rs::inflate::InflateState::C_LAYOUT_SIZE;
     // `windowBits = -9` => a 512-byte raw window, allocated lazily by `inflate`.
     const WINDOW_9: usize = 1 << 9;
 
@@ -3471,4 +3466,174 @@ fn gzip_header_metadata_is_retrievable_by_a_safe_rust_consumer() {
         Some(&b"metadata.bin"[..]),
         "the retrieved metadata outlives the stream it came from"
     );
+}
+
+// ===========================================================================
+// C-exact allocator request geometry
+// ===========================================================================
+
+/// An [`Allocator`] that serves **only** the `(items, item_size)` pairs
+/// reference zlib is known to ask for, and refuses everything else.
+///
+/// This models the allocator the review scenario describes: one written against
+/// reference zlib, sized from `sizeof(deflate_state)` / `sizeof(struct
+/// inflate_state)` and C's buffer arithmetic, which therefore rejects any request
+/// whose shape it does not recognise. A drop-in replacement must be served by it
+/// exactly as reference zlib is (AAP §0.6.5).
+struct SchedulingAllocator {
+    /// The request shapes this allocator recognises.
+    allowed: Vec<(usize, usize)>,
+    /// Every request seen, in call order, including refused ones.
+    seen: RefCell<Vec<(usize, usize)>>,
+}
+
+impl SchedulingAllocator {
+    fn new(allowed: &[(usize, usize)]) -> Self {
+        Self {
+            allowed: allowed.to_vec(),
+            seen: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn seen(&self) -> Vec<(usize, usize)> {
+        self.seen.borrow().clone()
+    }
+}
+
+impl Allocator for SchedulingAllocator {
+    fn allocate_zeroed<T>(&self, count: usize) -> Option<AllocBuffer<T>>
+    where
+        T: Copy + Default + ZeroValid + 'static,
+    {
+        self.allocate_zeroed_items(count, core::mem::size_of::<T>())
+    }
+
+    fn allocate_zeroed_items<T>(&self, items: usize, item_size: usize) -> Option<AllocBuffer<T>>
+    where
+        T: Copy + Default + ZeroValid + 'static,
+    {
+        self.seen.borrow_mut().push((items, item_size));
+        if !self.allowed.contains(&(items, item_size)) {
+            return None;
+        }
+        AllocBuffer::try_zeroed_items(items, item_size, self.hook())
+    }
+}
+
+/// An allocator that serves reference zlib's exact state request — and nothing
+/// wider — must initialize every engine, and must **refuse** if this port ever
+/// reverts to charging its own larger `size_of`.
+///
+/// Reference zlib charges `ZALLOC(strm, 1, sizeof(deflate_state))`
+/// (`deflate.c` L440) and `ZALLOC(strm, 1, sizeof(struct inflate_state))`
+/// (`inflate.c` L198, `infback.c` L51). A caller who sized a bounded arena — or
+/// wrote a validating `zalloc` — from those numbers is entitled to see this port
+/// succeed where reference zlib succeeds; charging the port's own, legitimately
+/// larger state size turned such a caller's successful `deflateInit2` into
+/// `Z_MEM_ERROR`, which is an exact-drop-in defect rather than a cosmetic one.
+///
+/// Both directions are asserted, because only the pair is evidence: serving C's
+/// size must succeed, and serving *only* the Rust size must fail. A port that
+/// charged a third value would fail both halves.
+#[test]
+fn a_c_sized_allocator_initializes_every_engine() {
+    const W_BITS: i32 = 15;
+    let w_size = 1usize << W_BITS;
+    let hash_size = 1usize << (DEF_MEM_LEVEL as u32 + 7);
+    let lit_bufsize = 1usize << (DEF_MEM_LEVEL as u32 + 6);
+
+    let c_deflate = DeflateState::C_LAYOUT_SIZE;
+    let c_inflate = zlib_rs::inflate::InflateState::C_LAYOUT_SIZE;
+
+    // C `deflateInit2_`: the state, then window/prev/head and the single overlaid
+    // pending buffer (`deflate.c` L440, L458-L460, L505).
+    let deflate_schedule = [
+        (1, c_deflate),
+        (w_size, 2),
+        (hash_size, 2),
+        (lit_bufsize, 4),
+    ];
+    {
+        let mut strm = ZStream::with_allocator(SchedulingAllocator::new(&deflate_schedule));
+        assert_eq!(
+            rc(deflate_init2(
+                &mut strm,
+                6,
+                Z_DEFLATED,
+                W_BITS,
+                DEF_MEM_LEVEL,
+                Strategy::Default,
+            )),
+            ReturnCode::Ok,
+            "an allocator that serves C's own (1, sizeof(deflate_state)) must \
+             initialize; it saw {:?}",
+            strm.allocator().seen()
+        );
+        assert_eq!(
+            strm.allocator().seen().first().copied(),
+            Some((1, c_deflate)),
+            "the state charge must be C's pair"
+        );
+        assert_eq!(rc(deflate_end(&mut strm)), ReturnCode::Ok);
+    }
+
+    // Negative control: an allocator that serves only this port's own state size
+    // must fail, proving the assertion above is load-bearing.
+    {
+        let mut rust_sized: Vec<(usize, usize)> = deflate_schedule.to_vec();
+        rust_sized[0] = (1, core::mem::size_of::<DeflateState>());
+        let mut strm = ZStream::with_allocator(SchedulingAllocator::new(&rust_sized));
+        assert_eq!(
+            deflate_init2(
+                &mut strm,
+                6,
+                Z_DEFLATED,
+                W_BITS,
+                DEF_MEM_LEVEL,
+                Strategy::Default
+            ),
+            Err(ZlibError::MemError),
+            "the state charge must not be this port's own size_of"
+        );
+    }
+
+    // C `inflateInit2_`: the state only; the window comes later, lazily
+    // (`inflate.c` L198, L261).
+    {
+        let mut strm =
+            ZStream::with_allocator(SchedulingAllocator::new(&[(1, c_inflate), (w_size, 1)]));
+        assert_eq!(
+            rc(inflate_init2(&mut strm, W_BITS)),
+            ReturnCode::Ok,
+            "an allocator that serves C's own (1, sizeof(struct inflate_state)) \
+             must initialize; it saw {:?}",
+            strm.allocator().seen()
+        );
+        assert_eq!(
+            strm.allocator().seen(),
+            vec![(1, c_inflate)],
+            "init charges the state and nothing else"
+        );
+        assert_eq!(rc(inflate_end(&mut strm)), ReturnCode::Ok);
+    }
+    {
+        let mut strm = ZStream::with_allocator(SchedulingAllocator::new(&[(
+            1,
+            core::mem::size_of::<zlib_rs::inflate::InflateState>(),
+        )]));
+        assert_eq!(
+            inflate_init2(&mut strm, W_BITS),
+            Err(ZlibError::MemError),
+            "the inflate state charge must not be this port's own size_of"
+        );
+    }
+
+    // The back-inflate C-ABI path is charged identically, but through the
+    // crate-private borrowed-window entry point the FFI shim drives — the public
+    // Rust `inflate_back_init_with` allocates its own window and boxes the state
+    // globally, since C has no such variant (`inflateBackInit_` receives the window
+    // from the caller, `infback.c` L60). Its geometry is pinned by
+    // `crate::inflate::back`'s `borrowed_window_init_makes_only_the_state_request`
+    // and, end to end through the C ABI, by
+    // `crate::ffi::inflate`'s `a_c_sized_zalloc_initializes_inflate_and_inflate_back`.
 }

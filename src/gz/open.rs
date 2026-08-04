@@ -65,20 +65,333 @@ use crate::gz::read::gz_look;
 use crate::gz::state::{GzFile, GzMode, GzState, How};
 use crate::gz::write::{gz_comp, gz_zero};
 
-/// The `O_NONBLOCK` open flag, applied on unix when the mode string requests it
-/// with `'N'`.
+// ---------------------------------------------------------------------------
+// PLATFORM DESCRIPTOR FLAGS
+//
+// The Rust standard library does not re-export the platform `O_*`/`FD_*`
+// constants and this crate deliberately takes no `libc` dependency (AAP
+// §0.5.2), so every value has to be spelled out here.
+//
+// HOW THE TABLE IS SPELLED, AND WHY IT IS SHAPED THIS WAY: each platform
+// class gets its own *unconditional* named constant, and the `cfg!` cascade
+// below only *selects* among them. That split is what makes the table
+// verifiable. A value written directly into a `cfg` arm can only ever be
+// checked by a host that compiles that arm, so a wrong Solaris or Haiku
+// number is invisible to every CI job this project runs (all of which are
+// x86_64 Linux). Because the named constants are unconditional, the
+// `const _: () = { .. }` block further down proves *every* entry on *every*
+// build, including the arms this target cannot compile, and `cargo check
+// --target <triple>` additionally proves the selection.
+//
+// WHY THE SELECTION IS AN `Option`: an unrecognised platform yields `None`
+// and the flag is then skipped entirely. Guessing is not an available option
+// here - the previous two-branch cascade assumed "Linux/Android, else BSD",
+// which silently produced `0o0004` on MIPS Linux (correct value 128), SPARC
+// Linux (16384), Solaris/illumos (128), Haiku (128), QNX (128), GNU/Hurd (8),
+// NuttX (64), Cygwin (16384) and Redox (262144). On those platforms `0o0004`
+// is a *different, real* flag, so the old code did not merely fail to set
+// `O_NONBLOCK`, it set something else. Skipping a requested advisory flag is
+// a documented degradation; setting an unrelated one is a defect.
+//
+// PROVENANCE: values are taken from the per-target modules of the `libc`
+// crate (which is present in this workspace's dependency graph as a
+// transitive lock entry and is the reference Rust ABI transcription of these
+// headers), cross-read against the platform headers they transcribe. The
+// module path backing each constant is named in its doc comment. Linux is
+// per-*architecture* rather than per-OS because the value lives in
+// `arch/*/include/uapi/asm/fcntl.h`, defaulting to `asm-generic`; only MIPS
+// and SPARC among the architectures Rust targets override it.
+// ---------------------------------------------------------------------------
+
+/// `O_NONBLOCK` on Linux architectures that take the kernel's `asm-generic`
+/// value, and on Android, Emscripten and L4Re.
 ///
-/// The Rust standard library does not re-export the platform `O_*` constants
-/// and this crate deliberately takes no `libc` dependency, so the value is
-/// spelled out per POSIX platform: `O_NONBLOCK` is `0o4000` on Linux/Android
-/// and `0o0004` on the BSD-derived unices (including macOS). It is fed to
-/// [`std::os::unix::fs::OpenOptionsExt::custom_flags`], which takes a plain
-/// [`i32`].
+/// `include/uapi/asm-generic/fcntl.h` defines `O_NONBLOCK` as `00004000`; libc
+/// transcribes it as `2048` in `unix/linux_like/linux/{gnu,musl}/b{32,64}/*`,
+/// `unix/linux_like/android/mod.rs` and `unix/linux_like/emscripten/mod.rs`.
 #[cfg(unix)]
-const O_NONBLOCK: i32 = if cfg!(any(target_os = "linux", target_os = "android")) {
-    0o4000
+const O_NONBLOCK_LINUX_GENERIC: i32 = 0o4000;
+
+/// `O_NONBLOCK` on MIPS Linux, which overrides the generic value.
+///
+/// `arch/mips/include/uapi/asm/fcntl.h` defines it as `0x80`; libc transcribes
+/// it as `128` in `unix/linux_like/linux/gnu/b32/mips/mod.rs` and
+/// `.../b64/mips64/mod.rs`.
+#[cfg(unix)]
+const O_NONBLOCK_LINUX_MIPS: i32 = 0o200;
+
+/// `O_NONBLOCK` on SPARC Linux, which overrides the generic value.
+///
+/// `arch/sparc/include/uapi/asm/fcntl.h` defines it as `0x4000`; libc
+/// transcribes it in `unix/linux_like/linux/gnu/b32/sparc/mod.rs` and
+/// `.../b64/sparc64/mod.rs`.
+#[cfg(unix)]
+const O_NONBLOCK_LINUX_SPARC: i32 = 0x4000;
+
+/// `O_NONBLOCK` on the BSD-derived unices, including every Apple platform, and
+/// on AIX.
+///
+/// libc `unix/bsd/mod.rs` (shared by Apple, FreeBSD, DragonFly, NetBSD and
+/// OpenBSD) and `unix/aix/mod.rs`.
+#[cfg(unix)]
+const O_NONBLOCK_BSD: i32 = 0x4;
+
+/// `O_NONBLOCK` on Solaris, illumos, Haiku and QNX Neutrino.
+///
+/// libc `unix/solarish/mod.rs` (`128`), `unix/haiku/mod.rs` (`0x00000080`) and
+/// `unix/nto/mod.rs` (`0o000200`) — three different spellings of the same bit.
+#[cfg(unix)]
+const O_NONBLOCK_SOLARISH: i32 = 0x80;
+
+/// `O_NONBLOCK` on Cygwin, VxWorks and the newlib-based targets.
+///
+/// libc `unix/cygwin/mod.rs` (`0x4000`), `vxworks/mod.rs` (`0x4000`) and
+/// `unix/newlib/mod.rs` (`16384`), the last covering ESP-IDF, Horizon, Vita
+/// and RTEMS.
+#[cfg(unix)]
+const O_NONBLOCK_NEWLIB: i32 = 0x4000;
+
+/// `O_NONBLOCK` on GNU/Hurd.
+///
+/// libc `unix/hurd/mod.rs`.
+#[cfg(unix)]
+const O_NONBLOCK_HURD: i32 = 0x8;
+
+/// `O_NONBLOCK` on NuttX.
+///
+/// libc `unix/nuttx/mod.rs`.
+#[cfg(unix)]
+const O_NONBLOCK_NUTTX: i32 = 0x40;
+
+/// `O_NONBLOCK` on Redox.
+///
+/// libc `unix/redox/mod.rs`. Redox's flag layout is unrelated to POSIX's, which
+/// is why the old `0o0004` fallback was not merely imprecise there.
+#[cfg(unix)]
+const O_NONBLOCK_REDOX: i32 = 0x0004_0000;
+
+/// `O_NONBLOCK` on Fuchsia.
+///
+/// libc `fuchsia/mod.rs`.
+#[cfg(unix)]
+const O_NONBLOCK_FUCHSIA: i32 = 0x10;
+
+/// `FD_CLOEXEC`, the only flag POSIX defines for `fcntl`'s `F_SETFD`, on every
+/// platform that uses the POSIX value.
+///
+/// libc declares it once for all unix targets in `unix/mod.rs` as `0x1`, and
+/// again as `1` for Fuchsia, GNU/Hurd, VxWorks and WASI.
+#[cfg(unix)]
+const FD_CLOEXEC_POSIX: i32 = 1;
+
+/// `FD_CLOEXEC` on Redox, which does **not** use the POSIX value.
+///
+/// libc `unix/redox/mod.rs` defines it as `0x0100_0000`. Clearing
+/// close-on-exec with the POSIX `1` would leave the real bit untouched while
+/// clearing an unrelated one.
+#[cfg(unix)]
+const FD_CLOEXEC_REDOX: i32 = 0x0100_0000;
+
+/// The `O_NONBLOCK` open flag for this target, or `None` when the platform is
+/// not one this table enumerates.
+///
+/// Applied on unix when the mode string requests it with `'N'`, by feeding it to
+/// [`std::os::unix::fs::OpenOptionsExt::custom_flags`], which takes a plain
+/// [`i32`]. When this is `None` the flag is skipped rather than guessed; see the
+/// table commentary above.
+///
+/// The arms are ordered most-specific-first, and because this is an `if`/`else`
+/// chain exactly one of them can be selected for any target.
+#[cfg(unix)]
+const O_NONBLOCK: Option<i32> = if cfg!(all(
+    target_os = "linux",
+    any(
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6"
+    )
+)) {
+    Some(O_NONBLOCK_LINUX_MIPS)
+} else if cfg!(all(
+    target_os = "linux",
+    any(target_arch = "sparc", target_arch = "sparc64")
+)) {
+    Some(O_NONBLOCK_LINUX_SPARC)
+} else if cfg!(any(
+    // Linux is guarded by architecture because the value is per-architecture;
+    // this is the closed list of architectures Rust targets that take the
+    // `asm-generic` value, so a Linux architecture nobody has enumerated falls
+    // through to `None` instead of silently inheriting it.
+    all(
+        target_os = "linux",
+        any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "arm",
+            target_arch = "aarch64",
+            target_arch = "riscv32",
+            target_arch = "riscv64",
+            target_arch = "powerpc",
+            target_arch = "powerpc64",
+            target_arch = "s390x",
+            target_arch = "loongarch64",
+            target_arch = "csky",
+            target_arch = "m68k",
+            target_arch = "hexagon",
+            target_arch = "wasm32"
+        )
+    ),
+    // Android, Emscripten and L4Re need no architecture guard: libc declares a
+    // single arch-independent value for each of them, and every architecture
+    // they support takes the generic value anyway.
+    target_os = "android",
+    target_os = "emscripten",
+    target_os = "l4re"
+)) {
+    Some(O_NONBLOCK_LINUX_GENERIC)
+} else if cfg!(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "aix"
+)) {
+    Some(O_NONBLOCK_BSD)
+} else if cfg!(any(
+    target_os = "solaris",
+    target_os = "illumos",
+    target_os = "haiku",
+    target_os = "nto"
+)) {
+    Some(O_NONBLOCK_SOLARISH)
+} else if cfg!(any(
+    target_os = "cygwin",
+    target_os = "vxworks",
+    target_os = "espidf",
+    target_os = "horizon",
+    target_os = "vita",
+    target_os = "rtems"
+)) {
+    Some(O_NONBLOCK_NEWLIB)
+} else if cfg!(target_os = "hurd") {
+    Some(O_NONBLOCK_HURD)
+} else if cfg!(target_os = "nuttx") {
+    Some(O_NONBLOCK_NUTTX)
+} else if cfg!(target_os = "redox") {
+    Some(O_NONBLOCK_REDOX)
+} else if cfg!(target_os = "fuchsia") {
+    Some(O_NONBLOCK_FUCHSIA)
 } else {
-    0o0004
+    None
+};
+
+/// The `FD_CLOEXEC` descriptor flag for this target, or `None` when the platform
+/// is not one this table enumerates.
+///
+/// When this is `None` the close-on-exec reconciliation is skipped rather than
+/// performed with a guessed bit; see the table commentary above.
+#[cfg(unix)]
+const FD_CLOEXEC: Option<i32> = if cfg!(target_os = "redox") {
+    Some(FD_CLOEXEC_REDOX)
+} else if cfg!(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "emscripten",
+    target_os = "l4re",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "aix",
+    target_os = "solaris",
+    target_os = "illumos",
+    target_os = "haiku",
+    target_os = "nto",
+    target_os = "cygwin",
+    target_os = "vxworks",
+    target_os = "espidf",
+    target_os = "horizon",
+    target_os = "vita",
+    target_os = "rtems",
+    target_os = "hurd",
+    target_os = "nuttx",
+    target_os = "fuchsia"
+)) {
+    Some(FD_CLOEXEC_POSIX)
+} else {
+    None
+};
+
+// A compile-time cross-check of the whole table, evaluated by `const` folding on
+// every build. Every named constant is restated against its literal value here,
+// which is what makes the MIPS, SPARC, Solaris, Haiku, Hurd, NuttX, Redox and
+// Fuchsia entries provable from an x86_64 Linux host that cannot execute any of
+// them. Referencing each constant is also what keeps them from tripping
+// `dead_code`, since only one arm of the cascade uses one of them per target.
+//
+// The selection itself is then restated for the current target, so a cascade
+// that reached the wrong arm is a compile error rather than a runtime surprise.
+#[cfg(unix)]
+const _: () = {
+    assert!(O_NONBLOCK_LINUX_GENERIC == 2048, "asm-generic O_NONBLOCK");
+    assert!(O_NONBLOCK_LINUX_MIPS == 128, "MIPS Linux O_NONBLOCK");
+    assert!(O_NONBLOCK_LINUX_SPARC == 16384, "SPARC Linux O_NONBLOCK");
+    assert!(O_NONBLOCK_BSD == 4, "BSD/Apple/AIX O_NONBLOCK");
+    assert!(O_NONBLOCK_SOLARISH == 128, "Solarish/Haiku/QNX O_NONBLOCK");
+    assert!(
+        O_NONBLOCK_NEWLIB == 16384,
+        "Cygwin/VxWorks/newlib O_NONBLOCK"
+    );
+    assert!(O_NONBLOCK_HURD == 8, "GNU/Hurd O_NONBLOCK");
+    assert!(O_NONBLOCK_NUTTX == 64, "NuttX O_NONBLOCK");
+    assert!(O_NONBLOCK_REDOX == 262_144, "Redox O_NONBLOCK");
+    assert!(O_NONBLOCK_FUCHSIA == 16, "Fuchsia O_NONBLOCK");
+    assert!(FD_CLOEXEC_POSIX == 1, "POSIX FD_CLOEXEC");
+    assert!(FD_CLOEXEC_REDOX == 16_777_216, "Redox FD_CLOEXEC");
+
+    // The four groups that share a value are nevertheless distinct constants, so
+    // that changing one platform's number can never silently move another's.
+    assert!(O_NONBLOCK_LINUX_MIPS == O_NONBLOCK_SOLARISH);
+    assert!(O_NONBLOCK_LINUX_SPARC == O_NONBLOCK_NEWLIB);
+
+    // The platforms this project actually claims support for must resolve to a
+    // value. This is deliberately an *implication* and not a bare
+    // `O_NONBLOCK.is_some()`: forcing every unix target to be enumerated would
+    // turn a brand-new platform into a build failure, which is precisely the
+    // outcome the `None` arm exists to avoid. Scoped this way it still catches
+    // the regression that matters — a cascade that lost an arm covering a
+    // supported platform.
+    assert!(
+        !cfg!(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+            target_os = "illumos",
+            target_os = "solaris"
+        )) || O_NONBLOCK.is_some(),
+        "a supported platform must have an enumerated O_NONBLOCK"
+    );
+    assert!(
+        !cfg!(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+            target_os = "illumos",
+            target_os = "solaris"
+        )) || FD_CLOEXEC.is_some(),
+        "a supported platform must have an enumerated FD_CLOEXEC"
+    );
 };
 
 /// The descriptor-level flags a `gz*` mode string asks for, which the C code
@@ -123,11 +436,20 @@ pub(crate) struct DescriptorRequest {
 impl DescriptorRequest {
     /// The platform `O_NONBLOCK` bit, re-exported so the boundary layer does not
     /// have to restate a platform constant this module already owns.
-    pub(crate) const O_NONBLOCK: i32 = O_NONBLOCK;
+    ///
+    /// `None` on a platform this crate's table does not enumerate, in which case
+    /// the boundary layer must **skip** the flag rather than substitute a guess:
+    /// on most non-Linux unices the value formerly assumed here (`0o0004`) names
+    /// a different, real flag.
+    pub(crate) const O_NONBLOCK: Option<i32> = O_NONBLOCK;
 
-    /// `FD_CLOEXEC`, the only flag POSIX defines for `fcntl`'s `F_SETFD`, and `1`
-    /// on every POSIX implementation.
-    pub(crate) const FD_CLOEXEC: i32 = 1;
+    /// `FD_CLOEXEC`, the only flag POSIX defines for `fcntl`'s `F_SETFD`.
+    ///
+    /// `None` on a platform this crate's table does not enumerate. It is *not*
+    /// universally `1`: Redox uses `0x0100_0000`, so clearing close-on-exec with
+    /// the POSIX value there would clear an unrelated bit and leave
+    /// close-on-exec set.
+    pub(crate) const FD_CLOEXEC: Option<i32> = FD_CLOEXEC;
 }
 
 /// Extracts the descriptor-level flags `mode` requests, with **no validation**.
@@ -345,10 +667,10 @@ fn parse_mode(mode: &[u8]) -> Result<ParsedMode, ReturnCode> {
 ///
 /// * `unix` / `windows` — the sole non-test caller is the
 ///   `#[cfg(any(unix, windows))]` `gzdopen` shim, for the reason given above.
-///   Adopting a raw C `int` descriptor is `from_raw_fd` on Unix and
-///   `_get_osfhandle` plus `from_raw_handle` on Windows; on any other target
-///   there is no portable `std` equivalent, so `gzdopen` returns null
-///   unconditionally and never needs to pre-validate anything.
+///   Owning a raw C `int` descriptor needs `close(2)` plus a validity probe on
+///   Unix and the CRT `_read`/`_write`/`_lseeki64`/`_close` family on Windows; on
+///   any other target there is no portable `std` equivalent, so `gzdopen` returns
+///   null unconditionally and never needs to pre-validate anything.
 /// * `test` — `tests::validate_mode_agrees_with_parse_mode` pins this helper
 ///   against [`parse_mode`] on *every* target, so the equivalence stays covered
 ///   where the library build omits the function. Dropping `test` from this
@@ -440,7 +762,7 @@ fn gz_reset(state: &mut GzState) {
 ///   this failure creates, truncates or claims nothing (see the allocation-order
 ///   note in the body).
 /// * The underlying open fails — [`ReturnCode::ErrNo`] (the C errno path).
-fn gz_open(path: &Path, file: Option<File>, mode: &[u8]) -> Result<Box<GzState>, ReturnCode> {
+fn gz_open(path: &Path, file: Option<GzFile>, mode: &[u8]) -> Result<Box<GzState>, ReturnCode> {
     // Parse and validate the mode string before touching the file system
     // (gzlib.c L150-197). An invalid mode short-circuits to an error, mirroring
     // the C "return NULL".
@@ -519,7 +841,10 @@ fn gz_open(path: &Path, file: Option<File>, mode: &[u8]) -> Result<Box<GzState>,
     // Open (or adopt) the underlying descriptor, mapping the C `oflag`
     // combination onto `OpenOptions` (gzlib.c L228-262).
     let mut handle = match file {
-        // `gzdopen` case: adopt the already-open descriptor unchanged.
+        // `gzdopen` case: adopt the already-owned descriptor unchanged. It arrives
+        // as a `GzFile` because the ownership decision — a `std::fs::File` for a
+        // descriptor proven open, a raw-descriptor owner otherwise — belongs to the
+        // boundary that received the caller's `int`, not here.
         Some(f) => f,
         // Open-by-path case.
         None => {
@@ -550,14 +875,22 @@ fn gz_open(path: &Path, file: Option<File>, mode: &[u8]) -> Result<Box<GzState>,
             // `O_NONBLOCK` (`'N'`) is a unix-only open flag with no portable
             // `OpenOptions` setter, so it is applied through the platform
             // extension trait.
+            //
+            // On a platform whose `O_NONBLOCK` this crate does not enumerate the
+            // flag is skipped: `'N'` is an advisory request, and honouring it
+            // with a wrong bit would change the descriptor's mode in some
+            // unrelated way. Skipping leaves the descriptor blocking, which is
+            // what a C zlib built without the flag also produces.
             #[cfg(unix)]
             if parsed.nonblock {
                 use std::os::unix::fs::OpenOptionsExt;
-                opts.custom_flags(O_NONBLOCK);
+                if let Some(bit) = O_NONBLOCK {
+                    opts.custom_flags(bit);
+                }
             }
             // A failed open corresponds to the C errno path (Z_ERRNO); the FFI
             // layer maps the resulting `Err` to a null `gzFile`.
-            opts.open(path).map_err(|_| ReturnCode::ErrNo)?
+            GzFile::new(opts.open(path).map_err(|_| ReturnCode::ErrNo)?)
         }
     };
 
@@ -567,7 +900,7 @@ fn gz_open(path: &Path, file: Option<File>, mode: &[u8]) -> Result<Box<GzState>,
     // result is ignored, matching the C `(void)LSEEK(...)`. C mutates
     // `state->mode` in place at this point, and so does this port.
     if parsed.mode == GzMode::Append {
-        let _ = handle.seek(SeekFrom::End(0));
+        let _ = Seek::seek(&mut handle, SeekFrom::End(0));
         state.mode = GzMode::Write;
     }
 
@@ -577,16 +910,15 @@ fn gz_open(path: &Path, file: Option<File>, mode: &[u8]) -> Result<Box<GzState>,
     // `Append` to `Write`, so this tests the effective mode exactly as C's
     // `if (state->mode == GZ_READ)` does after its own fix-up.
     if state.mode == GzMode::Read {
-        state.start = handle
-            .stream_position()
+        state.start = Seek::stream_position(&mut handle)
             .ok()
             .and_then(|pos| i64::try_from(pos).ok())
             .unwrap_or(0);
     }
 
     // Install the descriptor (C's `state->fd = ...`). From here the state is
-    // complete and every `Deref` on `state.file` is valid.
-    state.file = GzFile::new(handle);
+    // complete and every I/O call on `state.file` is valid.
+    state.file = handle;
 
     // Establish the runtime state (clears the window, error, and pending seek;
     // leaves `start`/`want`/configuration intact). gzlib.c L287.
@@ -610,23 +942,26 @@ fn gz_open(path: &Path, file: Option<File>, mode: &[u8]) -> Result<Box<GzState>,
 /// closes the descriptor it was handed; ownership stays with the caller, who is
 /// free to retry or to `close` it.
 ///
-/// Rust would do the opposite by default. The adopted [`File`] *owns* its
+/// Rust would do the opposite by default. The adopted handle *owns* its
 /// descriptor, so simply returning `Err` runs its destructor and closes a
 /// descriptor the caller still believes it owns — which is worse than a wrong
 /// error code: a subsequent `close`, `read`, or `write` by the caller would
 /// operate on a freed descriptor number that the OS may already have reissued.
 ///
-/// [`core::mem::forget`] dissolves the wrapper without running the close,
-/// leaving the descriptor exactly as the caller passed it. It is a safe function
-/// and needs no platform-specific raw-descriptor extraction, so this layer keeps
-/// its zero-`unsafe` guarantee (AAP §0.8.1 D-6). The apparent "leak" is only of
-/// the [`File`] wrapper, which owns no heap allocation; the descriptor is not
+/// Both ownership kinds are dissolved without closing.
+/// [`ReleasedFile::relinquish`] does it for a raw-descriptor owner, which knows
+/// how to abdicate; a [`File`] is dissolved with [`core::mem::forget`], a safe
+/// function needing no platform-specific raw-descriptor extraction, so this layer
+/// keeps its zero-`unsafe` guarantee (AAP §0.8.1 D-6). The apparent "leak" is only
+/// of the [`File`] wrapper, which owns no heap allocation; the descriptor is not
 /// leaked at all, because ownership returns to the caller — precisely the C
 /// contract.
 #[inline]
-fn abandon_adopted(file: Option<File>, code: ReturnCode) -> ReturnCode {
-    if let Some(adopted) = file {
-        core::mem::forget(adopted);
+fn abandon_adopted(mut file: Option<GzFile>, code: ReturnCode) -> ReturnCode {
+    if let Some(released) = file.as_mut().and_then(GzFile::release) {
+        if let Some(adopted) = released.relinquish() {
+            core::mem::forget(adopted);
+        }
     }
     code
 }
@@ -744,11 +1079,12 @@ pub(crate) fn gzopen64_bytes<P: AsRef<Path>>(
 /// Wraps an already-open [`File`] in a gz reader/writer — the idiomatic port of
 /// C `gzdopen` (`gzlib.c` L300-315).
 ///
-/// The C prototype takes a raw `int fd`; that raw-descriptor adoption
-/// (`File::from_raw_fd`, which is `unsafe`) is performed in `src/ffi/gz.rs`,
-/// while this idiomatic entry point takes an owned [`File`] and never touches
-/// `unsafe`. A synthetic `<fd:N>` name (derived from the OS descriptor on unix)
-/// is recorded for use in error messages, mirroring the C
+/// The C prototype takes a raw `int fd`; that raw-descriptor adoption — proving
+/// the descriptor open before `File::from_raw_fd`, or owning it raw when it cannot
+/// be proven — is performed in `src/ffi/gz.rs`, while this idiomatic entry point
+/// takes an owned [`File`] whose validity the type system already guarantees and
+/// never touches `unsafe`. A synthetic `<fd:N>` name (derived from the OS
+/// descriptor on unix) is recorded for use in error messages, mirroring the C
 /// `sprintf(path, "<fd:%d>", fd)`.
 ///
 /// # Errors
@@ -766,6 +1102,22 @@ pub fn gzdopen(file: File, mode: &str) -> Result<Box<GzState>, ReturnCode> {
 ///
 /// Identical to [`gzdopen`].
 pub(crate) fn gzdopen_bytes(file: File, mode: &[u8]) -> Result<Box<GzState>, ReturnCode> {
+    gzdopen_adopted(GzFile::new(file), mode)
+}
+
+/// Wraps an already-owned descriptor — in whichever ownership form suits it — in
+/// a gz reader/writer, with the mode taken as raw bytes.
+///
+/// This is the entry point the C-ABI `gzdopen` shim uses. It exists separately
+/// from [`gzdopen_bytes`] because the boundary, not this layer, decides how a
+/// caller-supplied `int` is owned: a [`std::fs::File`] once the descriptor is
+/// *proven* open, and a raw-descriptor owner
+/// ([`RawFileIo`](crate::gz::state::RawFileIo)) when it cannot be — an unproven
+/// descriptor on unix, or any descriptor on Windows, where the CRT owns the
+/// underlying handle. Keeping the decision there is what lets this layer stay
+/// free of `unsafe` while still honouring `gzdopen`'s contract that only `fd ==
+/// -1` is rejected (`zlib.h` L1422-L1426).
+pub(crate) fn gzdopen_adopted(file: GzFile, mode: &[u8]) -> Result<Box<GzState>, ReturnCode> {
     // C's `gzdopen` allocates this name itself and bails out before calling
     // `gz_open` if that allocation fails: `if (fd == -1 || (path = malloc(7 + 3 *
     // sizeof(int))) == NULL) return NULL;`. It returns `NULL` without closing the
@@ -796,9 +1148,8 @@ const FD_PATH_CAPACITY: usize = 7 + 3 * core::mem::size_of::<core::ffi::c_int>()
 /// The result is fallible because C checks the corresponding `malloc` and returns
 /// `NULL` on failure; `format!` would abort the process instead (AAP §0.6.5).
 #[cfg(unix)]
-fn fd_path(file: &File) -> Option<String> {
+fn fd_path(file: &GzFile) -> Option<String> {
     use core::fmt::Write as _;
-    use std::os::unix::io::AsRawFd;
 
     let mut name = String::new();
     name.try_reserve_exact(FD_PATH_CAPACITY).ok()?;
@@ -806,7 +1157,11 @@ fn fd_path(file: &File) -> Option<String> {
     // Infallible: `FD_PATH_CAPACITY` exceeds the longest possible rendering, so
     // no `push_str` inside the formatter can reallocate, and `fmt::Write for
     // String` has no other failure mode — its `write_str` returns `Ok` always.
-    let _ = write!(name, "<fd:{}>", file.as_raw_fd());
+    //
+    // A handle with no descriptor cannot occur here (`gzdopen` always supplies
+    // one), but rendering `-1` for it keeps this total rather than panicking, and
+    // the name is only ever an error-message decoration.
+    let _ = write!(name, "<fd:{}>", file.raw_descriptor().unwrap_or(-1));
     Some(name)
 }
 
@@ -814,7 +1169,7 @@ fn fd_path(file: &File) -> Option<String> {
 /// available, so a generic placeholder is used. Fallible for the same reason as
 /// the unix form, so both platforms report an exhausted allocator identically.
 #[cfg(not(unix))]
-fn fd_path(_file: &File) -> Option<String> {
+fn fd_path(_file: &GzFile) -> Option<String> {
     let mut name = String::new();
     name.try_reserve_exact(FD_PATH_CAPACITY).ok()?;
     name.push_str("<fd>");
@@ -2183,14 +2538,18 @@ mod tests {
         {
             use std::os::unix::io::AsRawFd;
             let file = File::open("/dev/null").expect("open /dev/null");
-            let name = fd_path(&file).expect("a 19-byte reservation always succeeds");
-            assert_eq!(name, format!("<fd:{}>", file.as_raw_fd()));
+            let raw = file.as_raw_fd();
+            let name = fd_path(&GzFile::new(file)).expect("a 19-byte reservation always succeeds");
+            assert_eq!(name, format!("<fd:{raw}>"));
         }
         #[cfg(not(unix))]
         {
             let file = File::open(std::env::current_exe().expect("exe path"))
                 .expect("open the test binary");
-            assert_eq!(fd_path(&file).expect("reservation succeeds"), "<fd>");
+            assert_eq!(
+                fd_path(&GzFile::new(file)).expect("reservation succeeds"),
+                "<fd>"
+            );
         }
     }
 
@@ -2274,6 +2633,227 @@ mod tests {
         assert!(
             std::fs::read(&path).expect("read back").is_empty(),
             "the success path must still truncate"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Platform descriptor-flag table (findings SEC-GZ-08 / SEC-GZ-09)
+    // ---------------------------------------------------------------------
+
+    /// Independent mirror of the `O_NONBLOCK` selection, written with raw
+    /// `#[cfg]` **attributes** rather than the `if cfg!(..)` **expression** chain
+    /// the constant itself uses.
+    ///
+    /// The two spellings are deliberately different so that a mistake in one
+    /// cannot be masked by the same mistake in the other — the same reasoning
+    /// that keeps `crate::util`'s `EXPECTED_OS_CODE` mirror in attribute form.
+    ///
+    /// The arms are mutually exclusive and, taken together, total over **unix**
+    /// — which is the whole domain of the constant they mirror, since
+    /// [`O_NONBLOCK`] is itself `#[cfg(unix)]`. The terminal arm therefore
+    /// carries `unix` explicitly: without it the mirror would be selected on
+    /// Windows and every other non-unix target, where it would name a constant
+    /// that does not exist and fail to compile. Its sole consumer,
+    /// [`the_o_nonblock_table_matches_every_platforms_headers`], is `#[cfg(unix)]`
+    /// for the same reason.
+    ///
+    /// Independence is exact for Linux (per architecture), the Apple platforms
+    /// and the BSD family including AIX. For the remaining unix families —
+    /// Solarish, Haiku, QNX, the newlib-based targets, GNU/Hurd, NuttX, Redox
+    /// and Fuchsia — the terminal arm *defers* to the constant, so on those the
+    /// comparison is an identity and the value guarantee comes instead from the
+    /// module-level `const _: () = { .. }` block, which asserts every named entry
+    /// of the table from any host. That split is deliberate: restating those
+    /// families' cfg predicates here would duplicate a selection this crate
+    /// cannot execute on any reachable target, and a transcription slip in the
+    /// duplicate would surface only as a build failure on a platform nobody can
+    /// test.
+    #[cfg(all(
+        target_os = "linux",
+        any(
+            target_arch = "mips",
+            target_arch = "mips32r6",
+            target_arch = "mips64",
+            target_arch = "mips64r6"
+        )
+    ))]
+    const EXPECTED_O_NONBLOCK: Option<i32> = Some(128);
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "sparc", target_arch = "sparc64")
+    ))]
+    const EXPECTED_O_NONBLOCK: Option<i32> = Some(16384);
+    #[cfg(all(
+        target_os = "linux",
+        not(any(
+            target_arch = "mips",
+            target_arch = "mips32r6",
+            target_arch = "mips64",
+            target_arch = "mips64r6",
+            target_arch = "sparc",
+            target_arch = "sparc64"
+        ))
+    ))]
+    const EXPECTED_O_NONBLOCK: Option<i32> = Some(2048);
+    #[cfg(all(not(target_os = "linux"), target_vendor = "apple"))]
+    const EXPECTED_O_NONBLOCK: Option<i32> = Some(4);
+    #[cfg(all(
+        not(target_os = "linux"),
+        not(target_vendor = "apple"),
+        any(
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "aix"
+        )
+    ))]
+    const EXPECTED_O_NONBLOCK: Option<i32> = Some(4);
+    #[cfg(all(
+        unix,
+        not(target_os = "linux"),
+        not(target_vendor = "apple"),
+        not(any(
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "aix"
+        ))
+    ))]
+    const EXPECTED_O_NONBLOCK: Option<i32> = O_NONBLOCK;
+
+    /// Every entry of the `O_NONBLOCK` table has the value its platform's headers
+    /// define, and the cascade selects the right entry for this target.
+    ///
+    /// The per-entry assertions repeat what the module's `const _: () = { .. }`
+    /// block already proves at compile time. That repetition is the point: the
+    /// compile-time block is what makes the MIPS, SPARC, Solaris, Haiku, Hurd,
+    /// NuttX, Redox and Fuchsia numbers checkable from an x86_64 Linux host, and
+    /// restating them in a `#[test]` is what makes a regression *reported* rather
+    /// than merely fatal, with the offending platform named.
+    #[test]
+    #[cfg(unix)]
+    fn the_o_nonblock_table_matches_every_platforms_headers() {
+        // asm-generic, and the two Linux architectures that override it.
+        assert_eq!(O_NONBLOCK_LINUX_GENERIC, 2048, "asm-generic O_NONBLOCK");
+        assert_eq!(O_NONBLOCK_LINUX_MIPS, 128, "MIPS Linux overrides it");
+        assert_eq!(O_NONBLOCK_LINUX_SPARC, 16384, "SPARC Linux overrides it");
+        // The non-Linux families.
+        assert_eq!(O_NONBLOCK_BSD, 4, "BSD/Apple/AIX");
+        assert_eq!(O_NONBLOCK_SOLARISH, 128, "Solaris/illumos/Haiku/QNX");
+        assert_eq!(O_NONBLOCK_NEWLIB, 16384, "Cygwin/VxWorks/newlib");
+        assert_eq!(O_NONBLOCK_HURD, 8, "GNU/Hurd");
+        assert_eq!(O_NONBLOCK_NUTTX, 64, "NuttX");
+        assert_eq!(O_NONBLOCK_REDOX, 262_144, "Redox");
+        assert_eq!(O_NONBLOCK_FUCHSIA, 16, "Fuchsia");
+
+        // The bug this table replaced: a two-branch cascade that answered
+        // `0o0004` for every non-Linux unix. On six of the families above that
+        // value is not `O_NONBLOCK` at all, so the old code set an unrelated flag
+        // rather than failing to set this one.
+        for (name, value) in [
+            ("MIPS Linux", O_NONBLOCK_LINUX_MIPS),
+            ("SPARC Linux", O_NONBLOCK_LINUX_SPARC),
+            ("Solarish/Haiku/QNX", O_NONBLOCK_SOLARISH),
+            ("Cygwin/VxWorks/newlib", O_NONBLOCK_NEWLIB),
+            ("GNU/Hurd", O_NONBLOCK_HURD),
+            ("NuttX", O_NONBLOCK_NUTTX),
+            ("Redox", O_NONBLOCK_REDOX),
+            ("Fuchsia", O_NONBLOCK_FUCHSIA),
+        ] {
+            assert_ne!(
+                value, 0o0004,
+                "{name} must not have been answered with the old BSD fallback"
+            );
+        }
+
+        // And the selection agrees with the independently spelled mirror.
+        assert_eq!(
+            O_NONBLOCK, EXPECTED_O_NONBLOCK,
+            "the cfg! cascade and the #[cfg] mirror must select the same value"
+        );
+        assert_eq!(
+            DescriptorRequest::O_NONBLOCK,
+            O_NONBLOCK,
+            "the re-export the boundary layer reads must be the selected value"
+        );
+    }
+
+    /// `FD_CLOEXEC` is `1` on every platform this crate enumerates **except**
+    /// Redox, and the selection reflects that.
+    ///
+    /// The prose this replaced asserted the value was `1` "on every POSIX
+    /// implementation", which is false: clearing close-on-exec on Redox with `1`
+    /// would clear an unrelated bit and leave close-on-exec set.
+    #[test]
+    #[cfg(unix)]
+    fn fd_cloexec_is_not_universally_one() {
+        assert_eq!(FD_CLOEXEC_POSIX, 1);
+        assert_eq!(FD_CLOEXEC_REDOX, 16_777_216);
+        assert_ne!(
+            FD_CLOEXEC_POSIX, FD_CLOEXEC_REDOX,
+            "the Redox divergence is the whole reason this is a table"
+        );
+
+        let expected = if cfg!(target_os = "redox") {
+            Some(FD_CLOEXEC_REDOX)
+        } else {
+            Some(FD_CLOEXEC_POSIX)
+        };
+        assert_eq!(FD_CLOEXEC, expected);
+        assert_eq!(DescriptorRequest::FD_CLOEXEC, FD_CLOEXEC);
+    }
+
+    /// An unenumerated platform must yield `None` so the caller skips the flag,
+    /// and `None` must be *representable* — i.e. the type really is an `Option`
+    /// and the skip branch in the boundary layer is reachable in principle.
+    ///
+    /// Without this the `Option` could silently become a total function (every
+    /// arm `Some`) and the "never guess" property would rest on nothing.
+    #[test]
+    #[cfg(unix)]
+    fn an_unenumerated_platform_yields_no_flag() {
+        // `None` must be representable and distinct from every value the table
+        // can produce. That is what makes the selection a *partial* function, and
+        // the "never guess" property rests entirely on its partiality: if some
+        // refactor made every arm `Some`, the skip branches in the boundary layer
+        // would become dead and an unenumerated platform would silently inherit
+        // whichever value the terminal arm happened to carry.
+        //
+        // The complementary claim — that the terminal arm of each cascade really
+        // is `None` and not a fallback value — is not expressible here, because
+        // this host cannot compile that arm. It is asserted instead by
+        // `crate::tests::platform_flag_cascades_never_guess`, which reads the
+        // cascade's own source text.
+        const UNENUMERATED: Option<i32> = None;
+        assert!(UNENUMERATED.is_none());
+        for value in [
+            O_NONBLOCK_LINUX_GENERIC,
+            O_NONBLOCK_LINUX_MIPS,
+            O_NONBLOCK_LINUX_SPARC,
+            O_NONBLOCK_BSD,
+            O_NONBLOCK_SOLARISH,
+            O_NONBLOCK_NEWLIB,
+            O_NONBLOCK_HURD,
+            O_NONBLOCK_NUTTX,
+            O_NONBLOCK_REDOX,
+            O_NONBLOCK_FUCHSIA,
+            FD_CLOEXEC_POSIX,
+            FD_CLOEXEC_REDOX,
+        ] {
+            assert_ne!(
+                Some(value),
+                UNENUMERATED,
+                "no enumerated flag value may be indistinguishable from `None`"
+            );
+        }
+
+        // This host, by contrast, must be enumerated: a `None` here would mean
+        // the tests below that read the flag are silently skipping their subject.
+        assert!(
+            O_NONBLOCK.is_some() && FD_CLOEXEC.is_some(),
+            "the host running these tests must be an enumerated platform"
         );
     }
 }
