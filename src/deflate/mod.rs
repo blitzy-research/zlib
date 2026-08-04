@@ -3136,29 +3136,27 @@ mod tests {
     // engine-free sizing formula and the scripted-engine driver tests stay in
     // `crate::util::compress`.
     //
-    // These decompress with `flate2` (its pure-Rust `miniz_oxide` backend) to
-    // prove the emitted stream is valid zlib. `std` is available under
-    // `cfg(test)` even though the crate is `no_std`, so `Vec`, `vec!`, and
-    // `std::io` may be used freely here.
+    // These decompress with the crate's own inflate engine, through the
+    // [`inflate_all`] helper this module already uses for its emitted-byte
+    // assertions, which proves the emitted stream is valid zlib without naming a
+    // third-party codec: AAP §0.5.2 forbids any `use` of `flate2`, `quickcheck`,
+    // `rand`, or `criterion` under `src/**`, and `src/lib.rs`'s
+    // `TEST_ONLY_CROSS_LAYER_EXCEPTIONS` sanctions this `deflate` -> `inflate`
+    // edge on exactly that ground — in-crate decoding keeps the tests free of
+    // `std` and of any third-party codec so they run in every feature
+    // configuration. `inflate_all` is the stricter oracle of the two: where
+    // `read_to_end` merely returns the bytes, it also asserts `Z_STREAM_END` and
+    // that the decoder consumed the whole stream, so a stream that decodes but
+    // carries trailing garbage now fails where it previously passed. The
+    // independent-decoder cross-check against `flate2`/`miniz_oxide` lives in
+    // `tests/interop.rs`, which drives these very entry points.
     // =======================================================================
 
     use crate::util::compress_bound;
-    use flate2::read::ZlibDecoder;
-    use std::io::Read;
 
     // ---------------------------------------------------------------------
     // Round-trip helpers
     // ---------------------------------------------------------------------
-
-    /// Decompresses a complete zlib stream with `flate2`, returning the bytes.
-    fn inflate_with_flate2(compressed: &[u8]) -> Vec<u8> {
-        let mut decoder = ZlibDecoder::new(compressed);
-        let mut out = Vec::new();
-        decoder
-            .read_to_end(&mut out)
-            .expect("compress2 must emit a valid zlib stream");
-        out
-    }
 
     /// Compresses `data` at `level` into a `compress_bound`-sized buffer, then
     /// verifies it decompresses back to `data`.
@@ -3166,7 +3164,7 @@ mod tests {
         let mut buf = vec![0u8; compress_bound(data.len())];
         let produced = compress2(&mut buf, data, level)
             .unwrap_or_else(|err| panic!("compress2 at level {level} failed: {err:?}"));
-        let restored = inflate_with_flate2(&buf[..produced]);
+        let restored = inflate_all(&buf[..produced], data.len());
         assert_eq!(restored, data, "round-trip mismatch at level {level}");
     }
 
@@ -3208,7 +3206,7 @@ mod tests {
         let mut buf = vec![0u8; compress_bound(data.len())];
         let produced = compress2(&mut buf, &data, 9).expect("compress2 failed");
         assert!(produced < data.len() / 10, "expected strong compression");
-        assert_eq!(inflate_with_flate2(&buf[..produced]), data);
+        assert_eq!(inflate_all(&buf[..produced], data.len()), data);
     }
 
     #[test]
@@ -3220,7 +3218,7 @@ mod tests {
             produced > 0,
             "an empty input still emits header + block + trailer"
         );
-        assert_eq!(inflate_with_flate2(&buf[..produced]), Vec::<u8>::new());
+        assert_eq!(inflate_all(&buf[..produced], 0), Vec::<u8>::new());
     }
 
     // ---------------------------------------------------------------------
@@ -3291,7 +3289,7 @@ mod tests {
         let data = b"the quick brown fox jumps over the lazy dog. ".repeat(200);
         let mut buf = vec![0u8; compress_bound(data.len())];
         let produced = compress(&mut buf, &data).expect("compress failed");
-        assert_eq!(inflate_with_flate2(&buf[..produced]), data);
+        assert_eq!(inflate_all(&buf[..produced], data.len()), data);
     }
 
     #[test]

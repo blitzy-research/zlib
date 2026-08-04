@@ -1240,8 +1240,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::gz::close::gzclose_w;
+    use crate::gz::test_decode::{Decoded, GZIP_WINDOW_BITS, decode};
     use crate::gz::write::gz_write;
-    use std::io::Read as _;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1614,19 +1614,6 @@ mod tests {
         }
     }
 
-    /// Decompresses a complete gzip member, or reports how far it got.
-    ///
-    /// Uses the reference `flate2` decoder (its pure-Rust `miniz_oxide` backend),
-    /// so "is this a valid gzip member?" is answered by an independent
-    /// implementation rather than by this crate's own inflate.
-    fn gunzip(bytes: &[u8]) -> (std::io::Result<()>, Vec<u8>) {
-        let mut out = Vec::new();
-        let result = flate2::read::GzDecoder::new(bytes)
-            .read_to_end(&mut out)
-            .map(|_| ());
-        (result, out)
-    }
-
     /// Drives one bare-drop scenario at the given `gz_write` chunk size and
     /// asserts every property of an unfinished member.
     fn assert_bare_drop_leaves_member_unfinished(tag: &str, chunk: usize) {
@@ -1668,18 +1655,26 @@ mod tests {
             payload.len()
         );
 
-        // ...and it was left *unfinished*. An independent gzip decoder cannot
-        // complete it, because the final DEFLATE block and the 8-byte
-        // CRC-32/ISIZE trailer were never emitted.
-        let (result, recovered) = gunzip(&bytes);
-        let error = result.expect_err(
-            "a dropped-without-close writer must not leave a decodable gzip member;              if this now succeeds, `Drop for GzState` has started finishing the              stream, which silently swallows the write errors `gzclose_w` exists              to report",
-        );
-        assert_eq!(
-            error.kind(),
-            std::io::ErrorKind::UnexpectedEof,
-            "the member must fail as truncated, not as corrupt: {error}"
-        );
+        // ...and it was left *unfinished*. A gzip decoder cannot complete it,
+        // because the final DEFLATE block and the 8-byte CRC-32/ISIZE trailer were
+        // never emitted. The verdict has to distinguish the two ways a decode can
+        // fail: running out of input is the property under test, while an outright
+        // rejection would mean the bytes already on disk are corrupt, which is a
+        // different — and worse — bug than the one this test pins.
+        let recovered = match decode(&bytes, GZIP_WINDOW_BITS) {
+            Decoded::Truncated(partial) => partial,
+            Decoded::Complete(_) => panic!(
+                "a dropped-without-close writer must not leave a decodable gzip \
+                 member; if this now succeeds, `Drop for GzState` has started \
+                 finishing the stream, which silently swallows the write errors \
+                 `gzclose_w` exists to report"
+            ),
+            Decoded::Rejected(code, partial) => panic!(
+                "the member must fail as truncated, not as corrupt: the decoder \
+                 rejected it with {code:?} after {} recovered byte(s)",
+                partial.len()
+            ),
+        };
         assert!(
             recovered.len() < payload.len(),
             "an unfinished member cannot yield the whole payload ({} of {})",
@@ -1782,8 +1777,19 @@ mod tests {
         let bytes = temp.bytes();
         assert_eq!(&bytes[..3], &[0x1f, 0x8b, 0x08]);
 
-        let (result, recovered) = gunzip(&bytes);
-        result.expect("an explicitly closed member must decode");
+        let recovered = match decode(&bytes, GZIP_WINDOW_BITS) {
+            Decoded::Complete(bytes) => bytes,
+            Decoded::Truncated(partial) => panic!(
+                "an explicitly closed member must decode, but the decoder \
+                 exhausted its input after {} recovered byte(s)",
+                partial.len()
+            ),
+            Decoded::Rejected(code, partial) => panic!(
+                "an explicitly closed member must decode, but the decoder rejected \
+                 it with {code:?} after {} recovered byte(s)",
+                partial.len()
+            ),
+        };
         assert_eq!(
             recovered, payload,
             "the closed member must round-trip byte-for-byte"

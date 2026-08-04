@@ -41,7 +41,7 @@
 //!
 //! `gzdopen` adopts a raw descriptor, so *when* it adopts is part of the ABI. C
 //! performs every mode-grammar rejection and every `malloc` before storing the
-//! descriptor in `state->fd` (`gzlib.c` L150-L197 and L206-L210 precede L263), so
+//! descriptor in `state->fd` (`gzlib.c` L108-L197 and L206-L210 precede L262), so
 //! **no** `gzdopen` failure closes the caller's descriptor. This shim matches
 //! that: the mode is pre-validated before `adopt_descriptor`, and every
 //! allocation failure after adoption releases the descriptor rather than closing
@@ -1611,7 +1611,7 @@ fn release_descriptor(released: crate::gz::ReleasedFile) {
 /// On **failure the caller keeps `fd`**, open and usable, exactly as in C. C
 /// `gzdopen` builds a `<fd:N>` path string and calls `gz_open`, which performs
 /// every mode-grammar rejection and its own `malloc` before it ever stores the
-/// descriptor in `state->fd` (`gzlib.c` L150-L197 and L206-L210 precede L263), so
+/// descriptor in `state->fd` (`gzlib.c` L108-L197 and L206-L210 precede L262), so
 /// no C failure path closes the caller's descriptor and a C caller may retry or
 /// `close(fd)` itself. This shim reproduces that contract on every failure path:
 ///
@@ -1619,7 +1619,7 @@ fn release_descriptor(released: crate::gz::ReleasedFile) {
 ///   the descriptor is never adopted;
 /// * an **invalid mode string** (`"r+"`, `"rT"`, `"wG"`, a string with no
 ///   `r`/`w`/`a`, …) is rejected by `crate::gz::validate_mode`, also before
-///   adoption — this is the check C performs at `gzlib.c` L150-L197; and
+///   adoption — this is the check C performs at `gzlib.c` L108-L197; and
 /// * an **unallocatable descriptor owner** (unix, unproven descriptor only) is
 ///   reported before the descriptor is owned at all; and
 /// * if the handle allocation fails after adoption, the descriptor is released
@@ -3061,8 +3061,8 @@ mod tests {
     /// * the stubs are inert — nothing is staged (`gztell` stays `0`) and the
     ///   handle's error state is untouched;
     /// * the handle survives and finalizes cleanly (`gzclose_w == Z_OK`);
-    /// * the finished member independently decodes to an **empty** payload, so
-    ///   no byte reached the file either.
+    /// * the finished member decodes to an **empty** payload, so no byte reached
+    ///   the file either.
     ///
     /// Its companion, [`idiomatic_printf_renders_through_the_same_handle`],
     /// proves the divergence is confined to the raw C-variadic ABI.
@@ -3360,21 +3360,24 @@ mod tests {
     //      the caller's handle stays live and closable  (`gzread.c` L650-L651,
     //      `gzwrite.c` L677-L678);
     //   2. no `gzdopen` failure closes the caller's descriptor
-    //      (`gzlib.c` L150-L197 and L206-L210 precede L263); and
+    //      (`gzlib.c` L108-L197 and L206-L210 precede L262); and
     //   3. a failing `close(2)` surfaces as Z_ERRNO
     //      (`gzread.c` L665-L667, `gzwrite.c` L695-L696).
     // =======================================================================
 
-    /// Decompresses `path` with the independent `flate2`/`miniz_oxide` decoder,
-    /// proving the gzip member is complete and well-formed.
+    /// Decompresses `path` with the crate's own inflate engine, proving the gzip
+    /// member is complete and well-formed.
+    ///
+    /// [`crate::gz::test_decode::gunzip`] demands `Z_STREAM_END`, so this rejects a
+    /// member whose final block is missing or whose CRC-32/ISIZE trailer disagrees
+    /// with the payload — the same verdict an independent decoder reaches. Decoding
+    /// in-crate is what AAP §0.5.2 requires: no `use` of `flate2`, `quickcheck`,
+    /// `rand`, or `criterion` may appear under `src/**`. The independent
+    /// cross-decoder check on these same emitted members lives outside the crate,
+    /// in `tests/gzip_compat.rs`.
     fn decode_gzip_file(path: &std::path::Path) -> std::vec::Vec<u8> {
-        use std::io::Read as _;
-        let f = std::fs::File::open(path).expect("open for verification");
-        let mut out = std::vec::Vec::new();
-        flate2::read::GzDecoder::new(f)
-            .read_to_end(&mut out)
-            .expect("stream decodes as gzip");
-        out
+        let bytes = std::fs::read(path).expect("read for verification");
+        crate::gz::test_decode::gunzip(&bytes)
     }
 
     /// A wrong-direction close is a **pure no-op**: it reports `Z_STREAM_ERROR`,
@@ -3574,7 +3577,7 @@ mod tests {
     /// A failed `gzdopen` must leave the caller's descriptor **open**.
     ///
     /// C validates the entire mode grammar before it stores the descriptor in
-    /// `state->fd` (`gzlib.c` L150-L197 precede L263), so a rejected `gzdopen`
+    /// `state->fd` (`gzlib.c` L108-L197 precede L262), so a rejected `gzdopen`
     /// never closes `fd` and the caller may retry or close it itself. Adopting the
     /// descriptor into a [`std::fs::File`] before validating would close it on the
     /// failure path, silently turning the caller's own later `close(fd)` into a
@@ -4062,7 +4065,7 @@ mod tests {
             );
         }
         // The member was finalized before the close was attempted, so it is
-        // complete and independently decodable despite the reported error.
+        // complete and decodable despite the reported error.
         assert_eq!(decode_gzip_file(&path), data.to_vec());
 
         unsafe {
@@ -4199,8 +4202,9 @@ mod tests {
     /// The round trip is written through a wide path holding non-ASCII code
     /// units, so `OsString::from_wide` has to reconstruct the name exactly; the
     /// file the wide units *name* is then confirmed to exist and to hold a
-    /// well-formed gzip member using `std` and the independent reference decoder,
-    /// i.e. without trusting `gzopen_w` to verify itself. The same wide path is
+    /// well-formed gzip member by reading it with `std` and decoding it with
+    /// [`decode_gzip_file`], i.e. without trusting `gzopen_w` to verify itself.
+    /// The same wide path is
     /// re-opened for reading and required to return the payload byte-for-byte
     /// with `gzerror` clean, EOF set, and a successful close in each direction.
     /// The null-argument guards are exercised last, because C's `gzopen_w` must

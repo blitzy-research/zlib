@@ -974,7 +974,7 @@ established by direct measurement instead:
 | Question a web lookup would have answered | Measured substitute |
 |-------------------------------------------|---------------------|
 | Is edition 2024 stable and safe to target? | `rustc --edition 2024` compiles successfully on the installed **stable** toolchain 1.97.1 (`8bab26f4f`, 2026-07-14, LLVM 22.1.6) |
-| Is the declared MSRV realistic? | `rustc 1.85.0` (`4d91de4e4`, 2025-02-17) is the repository-pinned toolchain; `cargo build --locked` and `cargo check --locked --all-targets` both exit 0 under it |
+| Is the declared MSRV realistic? | `rustc 1.85.0` (`4d91de4e4`, 2025-02-17) is the repository-pinned toolchain; `cargo build --locked` and `cargo check --locked --all-targets --all-features` both exit 0 under it, so the floor holds for every declared feature and not merely the default set |
 | Is the MSRV/edition pairing self-consistent? | 1.85.0 is precisely the release in which edition 2024 became available, making it the tightest possible MSRV for an edition-2024 crate |
 | Do the C-to-Rust translation choices actually preserve output? | 50/50 and 3,750/3,750 byte-identical results against a locally compiled reference C zlib ([§0.6.4](#064-bit-exact-wire-format)) |
 | Is the FFI boundary genuinely ABI-correct? | A C program linked statically and dynamically against the emitted artifacts round-trips 50,000 bytes byte-exactly and emits correct `1f 8b` gzip framing |
@@ -2716,7 +2716,7 @@ change no C caller can observe in reference zlib, it was outside the five this s
 been reverted. Four unit tests pin the restored shape — two asserting that a refusal moves the cursor by
 exactly zero, and two that a refusal mid-loop is invisible to the caller.
 
-**The boundary of this list.** Divergences 1–5 are exactly those a **C caller can observe**. The port also departs from C internally in ways that are **invisible at the C ABI**, and those are deliberately kept out of this register because each is strictly stricter or strictly safer than C while leaving the return-code set, the `#[repr(C)]` layouts, and the emitted bytes untouched: `HandleKind` / `HandleHeader` turn C's undefined cross-engine `End` call into a defined `Z_STREAM_ERROR`; indexing is bounds-checked, so a path that would corrupt memory in C aborts instead; and allocation is fallible with no global fallback, which states C's `ZALLOC` contract precisely. Moving any item from that class into this one is a breaking change to the drop-in contract and must be recorded as one.
+**The boundary of this list.** Divergences 1–5 are exactly those a **C caller can observe**. The port also departs from C internally in ways that are **invisible at the C ABI**, and those are deliberately kept out of this register because each is strictly stricter or strictly safer than C while leaving the return-code set, the `#[repr(C)]` layouts, and the emitted bytes untouched: `HandleKind` / `HandleHeader` turn C's undefined cross-engine `End` call into a defined `Z_STREAM_ERROR`; indexing is bounds-checked, so a path that would corrupt memory in C aborts instead; allocation is fallible with no global fallback, which states C's `ZALLOC` contract precisely; and an **accepted** `inflateBackInit_` zero-fills the caller's window, where C's `state->window = window;` (`infback.c` L59) is a bare pointer store that writes nothing. That last item is mandated by Rust's validity rules rather than chosen — the decoder addresses the window through slices, and a `&[u8]` / `&mut [u8]` over abstract-uninitialized bytes is undefined behaviour even when nothing reads it (CWE-457, CWE-908; tracked as SEC-FFI-01) — and three properties keep it in this class rather than the register above: it is the **last act of the accepting path**, so every refusing path and `inflateBackEnd` (which frees only the state, `infback.c` L572-L577) leave the caller's buffer byte-for-byte unchanged; `inflateBack` treats the window purely as its output buffer (`put = state->window; left = state->wsize;`, `infback.c` L222-L223, `state->whave = 0`) and zlib offers no way to seed `inflateBack` history, so the fill is unobservable; and it adds no failure mode, since every fallible step has already succeeded when it runs. Moving any item from that class into this one is a breaking change to the drop-in contract and must be recorded as one.
 
 ### 0.8.3 Performance Expectations
 
@@ -2976,7 +2976,8 @@ invocations, each reading the single job-scoped `STD_OFF_FLOOR`),
 and an anchored scan rejecting any real `#[ignore]` attribute),
 `docs` (`RUSTDOCFLAGS: -D warnings` over `cargo doc --locked --no-deps --all-features`, plus
 `mkdocs build --strict` in a version-pinned Python 3.12 environment),
-`msrv` (pinned 1.85.0 build and `check --all-targets`), `benches` (`cargo bench --locked --no-run`),
+`msrv` (pinned 1.85.0 build and `check --all-targets --all-features`, so the floor covers every declared
+feature), `benches` (`cargo bench --locked --no-run`),
 `build-script-tests`, `unsafe-boundary`, `c-abi-linkage` (4 feature rows),
 `cross-targets` (4 targets, each both `check`ed and Clippy-linted with `--all-targets --all-features`),
 `bare-metal-no-std`, and `package-verify` (17 must-ship patterns, then the unpacked archive runs its own

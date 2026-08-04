@@ -403,7 +403,7 @@ impl GzHeader {
 /// | C value | Meaning | Assigned at |
 /// |---------|---------|-------------|
 /// | `0` | not complete yet | `inflateGetHeader` registration (`inflate.c` L1228-L1229) |
-/// | `-1` | the stream carries **no** gzip header | the `HEAD` non-gzip branch (`inflate.c` L505-L506) |
+/// | `-1` | the stream carries **no** gzip header | the `HEAD` non-gzip branch (`inflate.c` L522-L523) |
 /// | `1` | the gzip header is complete | the `HCRC` state (`inflate.c` L686-L689) |
 ///
 /// All three C values are modelled, so the discriminant is a lossless mirror of
@@ -421,9 +421,9 @@ pub(crate) enum HeaderDone {
     /// C `head->done = -1`: the stream turned out not to carry a gzip header.
     ///
     /// Gated on the `gzip` feature because the C assignment is gated the same
-    /// way: `inflate.c` L505-L506 sits inside `#ifdef GUNZIP`, so a `libz` built
-    /// without gzip support cannot produce `-1` either. Mirroring the
-    /// preprocessor structure keeps the enum an exact model of the field in
+    /// way: `inflate.c` L522-L523 sits inside `#ifdef GUNZIP` (L512-L527), so a
+    /// `libz` built without gzip support cannot produce `-1` either. Mirroring
+    /// the preprocessor structure keeps the enum an exact model of the field in
     /// *every* configuration rather than a superset in one of them.
     #[cfg(feature = "gzip")]
     NotGzip = -1,
@@ -476,12 +476,12 @@ impl HeaderDone {
 pub(crate) struct HeaderPublication {
     /// `head->done`, when this call assigned it (`-1` in `HEAD`, `1` in `HCRC`).
     pub(crate) done: Option<HeaderDone>,
-    /// `FLAGS` assigned `head->text` (`inflate.c` L523-L524).
+    /// `FLAGS` assigned `head->text` (`inflate.c` L568-L569).
     pub(crate) text: bool,
-    /// `TIME` assigned `head->time` (`inflate.c` L531-L532).
+    /// `TIME` assigned `head->time` (`inflate.c` L577-L578).
     pub(crate) time: bool,
     /// `OS` assigned `head->xflags` **and** `head->os` — one C statement pair
-    /// under a single guard (`inflate.c` L539-L542).
+    /// under a single guard (`inflate.c` L586-L589).
     pub(crate) os: bool,
     /// `HCRC` assigned `head->hcrc` (`inflate.c` L686-L688).
     pub(crate) hcrc: bool,
@@ -497,20 +497,20 @@ pub(crate) struct HeaderPublication {
     /// (`inflate.c` L614-L621).
     pub(crate) extra_stored: usize,
     /// `NAME`'s no-`FNAME` branch assigned `head->name = Z_NULL`
-    /// (`inflate.c` L643-L644).
+    /// (`inflate.c` L650-L651).
     pub(crate) name_null: bool,
     /// Content bytes `NAME` appended to `head->name` during this call, excluding
-    /// the terminator (`inflate.c` L632-L637).
+    /// the terminator (`inflate.c` L639-L642).
     pub(crate) name_stored: usize,
     /// `NAME` stored the field's terminating NUL into `head->name`. C counts that
     /// NUL against `name_max` like any other byte, so a name that exactly fills
     /// the buffer is left **unterminated** and this stays `false`.
     pub(crate) name_terminated: bool,
     /// `COMMENT`'s no-`FCOMMENT` branch assigned `head->comment = Z_NULL`
-    /// (`inflate.c` L665-L666).
+    /// (`inflate.c` L672-L673).
     pub(crate) comment_null: bool,
     /// Content bytes `COMMENT` appended to `head->comment` during this call,
-    /// excluding the terminator (`inflate.c` L654-L659).
+    /// excluding the terminator (`inflate.c` L661-L664).
     pub(crate) comment_stored: usize,
     /// `COMMENT` stored the field's terminating NUL into `head->comment`, subject
     /// to the same `comm_max` accounting as
@@ -538,7 +538,7 @@ impl HeaderPublication {
     /// * The `*_null` flags stay `false` even for an absent field, so a bulk
     ///   publish never overwrites the C caller's `extra`/`name`/`comment` buffer
     ///   pointers with `Z_NULL`. Nulling is a *decoder* observation
-    ///   (`inflate.c` L605-L606, L643-L644, L665-L666) that the incremental
+    ///   (`inflate.c` L605-L606, L650-L651, L672-L673) that the incremental
     ///   publisher reports from parser state; inventing it here would destroy a
     ///   caller's buffer pointer.
     #[must_use]
@@ -831,7 +831,7 @@ impl<'a> HeaderFields<'a> {
 /// C's `inflate` never accumulates the header anywhere of its own: each decoded
 /// byte is stored straight into the caller's buffer through
 /// `state->head->name[state->length++]` and friends (`inflate.c` L614-L621,
-/// L632-L637, L654-L659), and the guards on those stores re-read the caller's
+/// L639-L642, L661-L664), and the guards on those stores re-read the caller's
 /// live `extra`/`name`/`comment` pointers *and* their live `extra_max`/
 /// `name_max`/`comm_max` capacities on **every** byte. Two consequences follow
 /// that a snapshot taken at `inflateGetHeader` time cannot reproduce:
@@ -884,10 +884,10 @@ pub struct ForeignGzHeaderSink<'a> {
     /// (`inflate.c` L614-L621).
     pub extra: Option<&'a mut dyn ForeignByteSink>,
     /// The caller's `name` buffer, bounded by its live `name_max`
-    /// (`inflate.c` L632-L637).
+    /// (`inflate.c` L639-L642).
     pub name: Option<&'a mut dyn ForeignByteSink>,
     /// The caller's `comment` buffer, bounded by its live `comm_max`
-    /// (`inflate.c` L654-L659).
+    /// (`inflate.c` L661-L664).
     pub comment: Option<&'a mut dyn ForeignByteSink>,
 }
 
@@ -1018,7 +1018,7 @@ impl<'a> ForeignGzHeaderSink<'a> {
     /// the index is within its live capacity, reporting whether it was stored.
     ///
     /// Reproduces C's `if (head != NULL && head->name != NULL && length <
-    /// head->name_max) head->name[length++] = byte;` (`inflate.c` L632-L637):
+    /// head->name_max) head->name[length++] = byte;` (`inflate.c` L639-L642):
     /// the index advances only on a store, so a name longer than the buffer is
     /// truncated and left unterminated exactly as in C.
     #[inline]
@@ -1027,7 +1027,7 @@ impl<'a> ForeignGzHeaderSink<'a> {
     }
 
     /// Stores `byte` at `index` in the `comment` buffer, bounded by its live
-    /// capacity. C `inflate.c` L654-L659; see [`store_name`](Self::store_name).
+    /// capacity. C `inflate.c` L661-L664; see [`store_name`](Self::store_name).
     #[inline]
     pub fn store_comment(&mut self, index: usize, byte: u8) -> bool {
         Self::store(self.comment.as_deref_mut(), index, byte)
@@ -1233,7 +1233,7 @@ mod tests {
     }
 
     /// `HeaderDone` is a lossless mirror of C's tri-state `head->done`, so its
-    /// discriminants must be exactly `-1`, `0` and `1` (`inflate.c` L505-L506,
+    /// discriminants must be exactly `-1`, `0` and `1` (`inflate.c` L522-L523,
     /// L1228-L1229, L686-L689). The FFI boundary publishes `as_c_int()` verbatim.
     #[test]
     fn header_done_discriminants_match_the_c_field() {

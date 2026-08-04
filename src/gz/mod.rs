@@ -240,7 +240,7 @@ pub(crate) use open::{gzopen_bytes, gzopen64_bytes};
 // than warning suppression.
 //
 // `validate_mode` exists so an invalid `gzdopen` mode is rejected *before* the
-// caller's descriptor is adopted (`gzlib.c` L150-L197 precede L263), which must
+// caller's descriptor is adopted (`gzlib.c` L108-L197 precede L262), which must
 // happen before any raw-descriptor ownership is taken; `gzdopen_adopted` is the
 // safe remainder of that adoption, `GzFile` is what the shim installs the adopted
 // descriptor into once allocation succeeds, and `RawFileIo` is the capability the
@@ -601,6 +601,178 @@ pub(crate) mod test_temp {
     impl AsRef<Path> for TempDir {
         fn as_ref(&self) -> &Path {
             &self.dir
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_decode {
+    //! In-crate stream decoding shared by every `gz`-family test module.
+    //!
+    //! # Why this module exists
+    //!
+    //! The write, close, and state test surfaces all have to answer the same
+    //! question about the bytes this layer emitted: *is that a well-formed gzip
+    //! member, and does it carry the payload back?* Each of them used to answer it
+    //! with `flate2`'s `GzDecoder`, which AAP §0.5.2 forbids — no `use` of
+    //! `flate2`, `quickcheck`, `rand`, or `criterion` may appear anywhere under
+    //! `src/**`, because those four are dev-only by contract and a `use` inside the
+    //! crate makes the tests unbuildable in any configuration that does not resolve
+    //! them. The crate's own inflate engine answers the same question with the same
+    //! strictness, so the dependency was never load-bearing: `crate::inflate`
+    //! validates the RFC 1952 header, decodes the DEFLATE payload, and verifies both
+    //! trailer fields (CRC-32 and ISIZE), rejecting a stream whose checksum or
+    //! length disagrees exactly as an independent decoder would.
+    //!
+    //! Independence is not lost, only relocated. The cross-decoder check — "another
+    //! implementation, written by other people, accepts what we emit" — belongs to
+    //! the integration suite, where `flate2` is a legitimate dev-dependency, and it
+    //! is already there: `tests/gzip_compat.rs` decodes this layer's output with
+    //! `flate2` across valid, flushed, item-API, seeked, and truncated members, and
+    //! `tests/interop.rs` does the same for the raw/zlib/gzip framings of the
+    //! engines underneath. What these unit tests need is the *strict* oracle, and
+    //! that is what this module is.
+    //!
+    //! # Why the verdict is an enum
+    //!
+    //! Most callers want "decode it and hand me the bytes", which is [`gunzip`].
+    //! One caller wants the opposite: `state.rs` asserts that a
+    //! writer abandoned **without** `gzclose_w` leaves a member that cannot be
+    //! decoded, which is the mechanical statement of the deliberate divergence that
+    //! [`GzState`]'s [`Drop`] performs no finishing work (AAP §0.8.2). A helper that
+    //! panics on failure cannot express that, and a `Result<Vec<u8>, ReturnCode>`
+    //! cannot distinguish the two failures that matter there — *ran out of input*
+    //! (truncated, which is what an unfinished member looks like) from *the decoder
+    //! refused these bytes* (corrupt, which would be a different bug). [`Decoded`]
+    //! names all three outcomes and carries the partial output with the failures, so
+    //! a test can assert on how far the decode got.
+
+    use crate::error::ReturnCode;
+    use crate::inflate::{inflate, inflate_end, inflate_init2};
+    use crate::stream::ZStream;
+
+    /// `windowBits` for a gzip-wrapped stream: the 15-bit window plus the `+16`
+    /// gzip-wrapper selector, the same value `crate::gz::read` passes when it
+    /// initializes a reader (`inflate_init2(&mut state.strm, 15 + 16)`).
+    pub(crate) const GZIP_WINDOW_BITS: i32 = 15 + 16;
+
+    /// Output granularity of the decode loop. Larger than any payload these tests
+    /// emit in the common case, so the typical decode is a single `inflate` call,
+    /// yet small enough that the multi-call path is genuinely exercised by the
+    /// large-input tests rather than left untested.
+    const CHUNK: usize = 8192;
+
+    /// What the decoder made of an input buffer.
+    ///
+    /// The partial output travels with both failure arms because "how far did it
+    /// get" is the assertion a truncation test needs: an abandoned writer must
+    /// leave *less* than the payload, and a decoder that returned everything
+    /// before failing would mean the member had in fact been finished.
+    #[derive(Debug)]
+    pub(crate) enum Decoded {
+        /// The decoder reached `Z_STREAM_END`: a complete member, header and
+        /// trailer included, with a checksum and length that both verified.
+        Complete(Vec<u8>),
+        /// The decoder ran out of input mid-stream and could make no further
+        /// progress. This is what an unfinished member looks like — the DEFLATE
+        /// stream never reached its final block, or the 8-byte gzip trailer is
+        /// absent or short.
+        Truncated(Vec<u8>),
+        /// The decoder rejected the bytes outright with this code — a bad header,
+        /// an invalid code length, or a trailer that disagrees with the payload.
+        Rejected(ReturnCode, Vec<u8>),
+    }
+
+    /// Decodes `input` with the crate's own inflate engine at `window_bits`,
+    /// reporting which of the three outcomes occurred.
+    ///
+    /// Decoding stops at the first `Z_STREAM_END`, so for concatenated members this
+    /// returns the first one — matching what a single-member reference decoder does
+    /// and what every caller here expects. `inflate_end` runs on all three paths.
+    ///
+    /// # Panics
+    /// Panics if `window_bits` is not a value [`inflate_init2`] accepts, or if
+    /// `inflate_end` rejects a stream this function itself initialized — both of
+    /// which would be defects in the test, not in the code under test.
+    pub(crate) fn decode(input: &[u8], window_bits: i32) -> Decoded {
+        let mut strm: ZStream = ZStream::new();
+        inflate_init2(&mut strm, window_bits).unwrap_or_else(|err| {
+            panic!("inflate_init2 must accept window_bits = {window_bits}: {err:?}")
+        });
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; CHUNK];
+        let mut read = 0usize;
+
+        let verdict = loop {
+            let outcome = inflate(
+                &mut strm,
+                &input[read..],
+                &mut chunk,
+                crate::constants::Z_NO_FLUSH,
+            );
+            read += outcome.consumed;
+            out.extend_from_slice(&chunk[..outcome.produced]);
+
+            match outcome.code {
+                ReturnCode::StreamEnd => break Verdict::Complete,
+                ReturnCode::Ok | ReturnCode::BufError => {
+                    // Neither a byte consumed nor a byte produced means the decoder
+                    // is stalled with its input exhausted, which is what an
+                    // unfinished member looks like. Reference zlib reports exactly
+                    // that condition as `Z_BUF_ERROR` rather than `Z_OK`
+                    // (`inflate.c`: `if (((in == 0 && out == 0) || flush ==
+                    // Z_FINISH) && ret == Z_OK) ret = Z_BUF_ERROR;`), so both codes
+                    // are handled here and the progress counters, not the code,
+                    // decide when to stop.
+                    if outcome.consumed == 0 && outcome.produced == 0 {
+                        break Verdict::Truncated;
+                    }
+                }
+                other => break Verdict::Rejected(other),
+            }
+        };
+
+        inflate_end(&mut strm).expect("inflate_end must accept a stream this helper initialized");
+
+        match verdict {
+            Verdict::Complete => Decoded::Complete(out),
+            Verdict::Truncated => Decoded::Truncated(out),
+            Verdict::Rejected(code) => Decoded::Rejected(code, out),
+        }
+    }
+
+    /// The loop's decision, kept separate from [`Decoded`] so the accumulated
+    /// output can be moved into the verdict exactly once, after `inflate_end`.
+    enum Verdict {
+        Complete,
+        Truncated,
+        Rejected(ReturnCode),
+    }
+
+    /// Decodes a **complete** gzip member and returns its payload.
+    ///
+    /// This is the strict form used by every round-trip assertion: it demands
+    /// `Z_STREAM_END`, so a member whose trailer is missing or whose CRC-32 or
+    /// ISIZE disagrees with the payload fails here rather than returning bytes.
+    ///
+    /// # Panics
+    /// Panics with the partial output length if the member is truncated or
+    /// rejected.
+    pub(crate) fn gunzip(compressed: &[u8]) -> Vec<u8> {
+        match decode(compressed, GZIP_WINDOW_BITS) {
+            Decoded::Complete(bytes) => bytes,
+            Decoded::Truncated(partial) => panic!(
+                "expected a complete gzip member, but the decoder exhausted its \
+                 input after {} recovered byte(s): the member is unfinished (no \
+                 final block, or a missing or short trailer)",
+                partial.len()
+            ),
+            Decoded::Rejected(code, partial) => panic!(
+                "expected a complete gzip member, but the decoder rejected it with \
+                 {code:?} after {} recovered byte(s)",
+                partial.len()
+            ),
         }
     }
 }

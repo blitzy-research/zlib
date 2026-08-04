@@ -1536,8 +1536,14 @@ pub unsafe extern "C" fn deflateCopy(dest: z_streamp, source: z_streamp) -> c_in
 // Phase 8 — Tests
 //
 // Exercised with the default feature set (`std` + `gzip` + `simd`), so the std
-// prelude and the `flate2` dev-dependency (pure-Rust `miniz_oxide` backend) are
-// available for byte-identity interop checks.
+// prelude is available. Emitted streams are decoded with the crate's own inflate
+// engine through [`inflate_stream`] below rather than with a third-party codec:
+// AAP §0.5.2 forbids any `use` of `flate2`, `quickcheck`, `rand`, or `criterion`
+// under `src/**`, and this module is compiled in *every* feature row — its
+// `#[cfg(test)]` carries no feature predicate — so it cannot reach the `gz`
+// layer's shared `test_decode` helper either, which exists only under `gz-io`.
+// It therefore owns its decode loop. The independent cross-decoder check on the
+// bytes these entry points emit lives outside the crate, in `tests/interop.rs`.
 // ===========================================================================
 #[cfg(test)]
 mod tests {
@@ -1548,7 +1554,6 @@ mod tests {
     use core::ffi::c_uchar;
     use core::ffi::c_void;
     use core::mem::size_of;
-    use std::io::Read;
     use std::vec::Vec;
 
     /// `Z_STREAM_END` — only referenced by the tests.
@@ -1568,12 +1573,55 @@ mod tests {
         unsafe { core::mem::zeroed() }
     }
 
+    /// Decompresses a **complete** stream with the crate's own inflate engine and
+    /// returns the payload.
+    ///
+    /// `window_bits` carries the wrapper selection exactly as `inflateInit2` does:
+    /// `15` for the RFC 1950 zlib wrapper, `15 + 16` for the RFC 1952 gzip
+    /// wrapper. `Z_STREAM_END` is required, so a stream whose final block is
+    /// missing, or whose trailer (Adler-32 for zlib, CRC-32 and ISIZE for gzip)
+    /// disagrees with the decoded bytes, fails here instead of quietly returning a
+    /// prefix — the same verdict an independent decoder reaches.
+    ///
+    /// # Panics
+    /// Panics if initialization is rejected, if the stream does not reach
+    /// `Z_STREAM_END`, or if the decoder stalls with input still unread.
+    fn inflate_stream(data: &[u8], window_bits: i32) -> Vec<u8> {
+        let mut strm: ZStream = ZStream::new();
+        crate::inflate::inflate_init2(&mut strm, window_bits)
+            .expect("inflate_init2 must accept these window bits");
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let mut read = 0usize;
+        loop {
+            let outcome = crate::inflate::inflate(&mut strm, &data[read..], &mut chunk, Z_NO_FLUSH);
+            read += outcome.consumed;
+            out.extend_from_slice(&chunk[..outcome.produced]);
+            match outcome.code {
+                ReturnCode::StreamEnd => break,
+                ReturnCode::Ok | ReturnCode::BufError => assert!(
+                    outcome.consumed != 0 || outcome.produced != 0,
+                    "the decoder stalled after {} of {} input byte(s) and {} output \
+                     byte(s): the emitted stream is incomplete",
+                    read,
+                    data.len(),
+                    out.len()
+                ),
+                other => panic!(
+                    "inflate rejected the emitted stream with {other:?} after {} \
+                     output byte(s)",
+                    out.len()
+                ),
+            }
+        }
+        crate::inflate::inflate_end(&mut strm).expect("inflate_end");
+        out
+    }
+
     /// zlib-decompress `data` (RFC 1950 wrapper) and return the bytes.
     fn zlib_inflate(data: &[u8]) -> Vec<u8> {
-        let mut dec = flate2::read::ZlibDecoder::new(data);
-        let mut out = Vec::new();
-        dec.read_to_end(&mut out).expect("zlib inflate failed");
-        out
+        inflate_stream(data, MAX_WBITS)
     }
 
     #[test]
@@ -3297,10 +3345,10 @@ mod tests {
         let n = strm.total_out as usize;
         assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
 
-        // Decode with a gzip reader to confirm RFC 1952 framing.
-        let mut dec = flate2::read::GzDecoder::new(&out[..n]);
-        let mut restored = Vec::new();
-        dec.read_to_end(&mut restored).expect("gzip inflate failed");
+        // Decode with the gzip wrapper (`windowBits` 31) to confirm RFC 1952
+        // framing: the header must parse and both trailer fields must verify, or
+        // `inflate_stream` never reaches `Z_STREAM_END`.
+        let restored = inflate_stream(&out[..n], MAX_WBITS + 16);
         assert_eq!(restored, input);
     }
 

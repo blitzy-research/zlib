@@ -522,7 +522,7 @@ impl TaggedHandle for InflateBackHandle {
     #[inline]
     fn engine_status_is_c_valid(&self) -> bool {
         // `infback.c` L208-L219 range-checks nothing: `inflateBack` overwrites
-        // `state->mode = TYPE` on entry (`infback.c` L221), so whatever mode the
+        // `state->mode = TYPE` on entry (`infback.c` L215), so whatever mode the
         // previous call left behind is irrelevant and C never rejects on it.
         // Reporting `true` unconditionally is therefore the faithful answer, and
         // it is only ever consulted if some future caller routes this handle
@@ -543,7 +543,7 @@ impl TaggedHandle for InflateBackHandle {
 ///   or `zfree` has been cleared; `inflateBack` does not, because it allocates
 ///   nothing during decode — the window is the caller's.
 /// * **No mode clause.** `inflateBack` assigns `state->mode = TYPE` on entry
-///   (`infback.c` L221), so the incoming mode cannot make the call invalid.
+///   (`infback.c` L215), so the incoming mode cannot make the call invalid.
 /// * **No owner clause.** `infback.c` never assigns `state->strm` at all, so
 ///   reference zlib has no owner recorded to compare against. Imposing one would
 ///   reject a `z_stream` the caller has *moved* since `inflateBackInit_` — which
@@ -720,7 +720,7 @@ struct CInFunc {
     in_desc: *mut c_void,
     /// Base of the stream's pre-buffered input (C `strm->next_in`), held raw.
     initial_ptr: *const c_uchar,
-    /// Its length (C `have` at `infback.c` L226-L231, already `0` when
+    /// Its length (C `have` at `infback.c` L219, already `0` when
     /// `next_in` is null).
     initial_len: usize,
     /// Whether the pre-buffered input has been taken into play.
@@ -1447,7 +1447,7 @@ pub unsafe extern "C" fn inflateBackInit_(
                 // Initialize the adopted region, once, now that every fallible step
                 // has succeeded and before anything can form a slice over it.
                 //
-                // C's L60 adoption is a bare pointer store, so the bytes arrive
+                // C's L59 adoption is a bare pointer store, so the bytes arrive
                 // abstract-uninitialized, and a `&[u8]`/`&mut [u8]` over such bytes
                 // is validity UB whether or not it is read — which the decoder,
                 // addressing the window through slices, would otherwise commit on
@@ -1665,7 +1665,7 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
         // Lend the decoder the caller's own gzip-header output buffers for the
         // duration of this call. C stores every decoded header byte straight into
         // them, re-reading `head->extra`/`name`/`comment` and their `*_max`
-        // capacities as it goes (`inflate.c` L614-L621, L632-L637, L654-L659);
+        // capacities as it goes (`inflate.c` L614-L621, L639-L642, L661-L664);
         // re-materializing the view here — rather than snapshotting it back at
         // `inflateGetHeader` time — is what makes a sink installed, resized or
         // withdrawn after registration behave as it does in C, and what keeps the
@@ -2459,8 +2459,8 @@ pub unsafe extern "C" fn inflateCodesUsed(strm: z_streamp) -> c_ulong {
 /// raw pointer, and [`inflate`] lends the decoder a borrowed view of those buffers
 /// on every call. Nothing about the header is read at registration time, matching
 /// C — which likewise consults `extra`/`name`/`comment` and their `*_max`
-/// capacities only later, live, from the parser (`inflate.c` L614-L621, L632-L637,
-/// L654-L659). A caller may therefore install or resize a sink *after* registering,
+/// capacities only later, live, from the parser (`inflate.c` L614-L621, L639-L642,
+/// L661-L664). A caller may therefore install or resize a sink *after* registering,
 /// exactly as it can in C, and the header path allocates nothing, so it cannot
 /// report the `Z_MEM_ERROR` C has no way to return.
 ///
@@ -2622,7 +2622,7 @@ pub unsafe extern "C" fn inflateBack(
         // C's `inflateBack` validates `strm` and `strm->state` (plus both
         // callbacks) as its first act (`infback.c` L208-L219) and only afterwards
         // copies `strm->next_in`/`avail_in` into its local `next`/`have`
-        // (`infback.c` L226-L231). Validating before the window is bridged
+        // (`infback.c` L219). Validating before the window is bridged
         // reproduces that order and keeps a stale `next_in` on a stream that was
         // never `inflateBackInit_`-ed from being turned into a slice.
         // SAFETY: `state`, when non-null, is a live tagged handle installed via
@@ -2639,7 +2639,7 @@ pub unsafe extern "C" fn inflateBack(
         // by publishing bounded segments, staged into private storage when the
         // ranges intersect.
         //
-        // The null-`next_in` clause is C's own: `infback.c` L226-L231 loads
+        // The null-`next_in` clause is C's own: `infback.c` L219 loads
         // `have = next != Z_NULL ? strm->avail_in : 0`, so a null pointer with a
         // nonzero count contributes no input rather than being dereferenced.
         let initial_ptr = sref.next_in;
@@ -4540,7 +4540,7 @@ mod tests {
     ///
     /// C writes into the caller's `gz_header` from inside `FLAGS` (`text`), `TIME`
     /// (`time`), `OS` (`xflags` and `os`, one statement pair under one guard) and
-    /// `HCRC` (`hcrc`, `done`) — `inflate.c` L523-L524, L531-L532, L539-L542,
+    /// `HCRC` (`hcrc`, `done`) — `inflate.c` L568-L569, L577-L578, L586-L589,
     /// L686-L689. A caller polling between calls therefore sees its own values in
     /// every field the stream has not reached yet, which is exactly what makes a
     /// sentinel-based "has this arrived?" test work in C.
@@ -4620,7 +4620,7 @@ mod tests {
     /// With auto-detect framing (`windowBits = 47`) the decoder does not know
     /// which wrapper it has until the first two bytes arrive. When they are not
     /// `1f 8b`, C's `HEAD` state runs `if (state->head != Z_NULL)
-    /// state->head->done = -1;` (`inflate.c` L505-L506) and proceeds as zlib.
+    /// state->head->done = -1;` (`inflate.c` L522-L523) and proceeds as zlib.
     /// That `-1` is the only way a caller can distinguish "there is no gzip header
     /// to wait for" from "the gzip header has not arrived yet"; collapsing it to
     /// `0` leaves such a caller polling forever.
@@ -4670,7 +4670,7 @@ mod tests {
     /// A name or comment still arriving stays **unterminated**.
     ///
     /// C stores the field's NUL only when it actually decodes that byte
-    /// (`inflate.c` L632-L637 / L654-L659), so a caller polling mid-field sees the
+    /// (`inflate.c` L639-L642 / L661-L664), so a caller polling mid-field sees the
     /// bytes delivered so far followed by its own memory. A boundary that mirrors
     /// an owned `Vec` as a C string instead writes a terminator after every call,
     /// which reads as "the name is complete" while more bytes are still coming.
@@ -4716,7 +4716,7 @@ mod tests {
     /// decoded byte, so a name that *exactly* fills the buffer is left
     /// unterminated.
     ///
-    /// `inflate.c` L632-L637 stores under `state->length < head->name_max` and
+    /// `inflate.c` L639-L642 stores under `state->length < head->name_max` and
     /// increments `state->length` for the NUL too. With a nine-byte name:
     /// `name_max == 9` stores nine content bytes and drops the NUL; `name_max ==
     /// 10` stores the NUL as the tenth byte; `name_max == 5` truncates the content
@@ -4761,7 +4761,7 @@ mod tests {
     /// buffer untouched.
     ///
     /// C assigns `head->extra = Z_NULL` (`inflate.c` L605-L606), `head->name =
-    /// Z_NULL` (L643-L644) and `head->comment = Z_NULL` (L665-L666) on the
+    /// Z_NULL` (L650-L651) and `head->comment = Z_NULL` (L672-L673) on the
     /// respective "flag not set" branches. That store is how a C caller tells "the
     /// header declared no such field" from "it declared one"; leaving a stale
     /// non-null pointer misreports an absent field as present. The buffer itself
@@ -6846,8 +6846,8 @@ mod tests {
     // C's `inflateGetHeader` stores the caller's pointer and clears `done`
     // (`inflate.c` L1228-L1229) — nothing else. Every one of `extra`, `name`,
     // `comment`, `extra_max`, `name_max` and `comm_max` is then re-read from the
-    // caller's struct on each stored byte (`inflate.c` L614-L621, L632-L637,
-    // L654-L659), so a sink installed, resized or withdrawn after registration
+    // caller's struct on each stored byte (`inflate.c` L614-L621, L639-L642,
+    // L661-L664), so a sink installed, resized or withdrawn after registration
     // takes effect, and the decoder allocates nothing for the header at all.
     // -----------------------------------------------------------------------
 
@@ -8747,7 +8747,7 @@ mod tests {
 
     /// A capacity **raised between calls** takes effect, as it does in C.
     ///
-    /// C re-reads `head->name_max` on every stored byte (`inflate.c` L632-L637) and
+    /// C re-reads `head->name_max` on every stored byte (`inflate.c` L639-L642) and
     /// advances `state->length` only when a byte is actually stored, so a caller that
     /// starts with a small buffer, sees it fill, and enlarges it mid-parse gets the
     /// remaining bytes at the right offsets. That is only reproducible because the

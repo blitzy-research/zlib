@@ -1434,9 +1434,9 @@ mod tests {
     ///
     /// Reference zlib establishes this order for every entry point that takes
     /// something alongside the stream: `deflateStateCheck(strm) || dictionary ==
-    /// Z_NULL` is a single expression (`deflate.c` L602-L603), `inflateSync`
+    /// Z_NULL` is a single expression (`deflate.c` L567-L568), `inflateSync`
     /// opens with `inflateStateCheck` before it reaches `strm->next_in`
-    /// (`inflate.c` L1349-L1351), `inflateGetHeader` writes `head->done` only
+    /// (`inflate.c` L1272-L1274), `inflateGetHeader` writes `head->done` only
     /// after both of its guards pass (`inflate.c` L1219-L1230), and
     /// `deflate`/`inflate` put the state clause first in their entry test
     /// (`deflate.c` L981-L1010, `inflate.c` L474).
@@ -1578,7 +1578,7 @@ mod tests {
     /// pointers, and `inflateGetHeader`'s contract (`zlib.h` L1076-L1085) places **no
     /// disjointness requirement** on them — nor between them and `strm->next_in`/
     /// `next_out`. Reference zlib is unbothered: its stores are plain indexed writes
-    /// through each pointer (`inflate.c` L614-L621, L632-L637, L654-L659). Rust is
+    /// through each pointer (`inflate.c` L614-L621, L639-L642, L661-L664). Rust is
     /// not: two `&mut [u8]` over overlapping ranges are undefined behaviour *at the
     /// moment they are created*, before any bounds test runs, and so is a
     /// `&mut gz_header` spanning a struct that a payload buffer lives inside.

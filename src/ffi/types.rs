@@ -2038,7 +2038,7 @@ impl CGzHeaderSource {
 /// C's `inflate` writes the header's three payloads through three independent
 /// caller pointers — `head->extra`, `head->name`, `head->comment` — and the API
 /// requires **no disjointness** between them or with `strm->next_out`
-/// (`inflate.c` L614-L621, L632-L637, L654-L659). Materializing them as three
+/// (`inflate.c` L614-L621, L639-L642, L661-L664). Materializing them as three
 /// `&mut [u8]` is undefined behaviour the instant any two overlap, and the
 /// violation is committed when the references are *created*: a bounds-checked
 /// write is already too late. Keeping the raw pointer and performing one isolated
@@ -2194,7 +2194,7 @@ impl CGzHeaderSinks {
 /// must be called immediately before each engine call rather than once at
 /// registration: C re-reads `head->extra`/`name`/`comment` and their
 /// `extra_max`/`name_max`/`comm_max` capacities on **every stored byte**
-/// (`inflate.c` L614-L621, L632-L637, L654-L659), so a caller may install,
+/// (`inflate.c` L614-L621, L639-L642, L661-L664), so a caller may install,
 /// replace, resize or withdraw a sink at any point before the bytes arrive and
 /// see it honored. Re-materializing per call reproduces that: a caller cannot
 /// mutate its header *during* a synchronous call, so per-call and per-byte
@@ -2449,7 +2449,7 @@ pub(crate) unsafe fn publish_gz_header(
         }
         if published.os {
             // C assigns `xflags` and `os` together under one guard (`inflate.c`
-            // L539-L542), so one flag covers both.
+            // L586-L589), so one flag covers both.
             ptr::addr_of_mut!((*head).xflags).write(src.xflags);
             ptr::addr_of_mut!((*head).os).write(src.os);
         }
@@ -2493,7 +2493,7 @@ pub(crate) unsafe fn publish_gz_header(
         // --- name ------------------------------------------------------------
         if published.name_null {
             // C's no-`FNAME` branch: `state->head->name = Z_NULL` (`inflate.c`
-            // L643-L644).
+            // L650-L651).
             ptr::addr_of_mut!((*head).name).write(ptr::null_mut());
         }
         if let Some(name) = &src.name {
@@ -2513,7 +2513,7 @@ pub(crate) unsafe fn publish_gz_header(
         // --- comment ---------------------------------------------------------
         if published.comment_null {
             // C's no-`FCOMMENT` branch: `state->head->comment = Z_NULL`
-            // (`inflate.c` L665-L666).
+            // (`inflate.c` L672-L673).
             ptr::addr_of_mut!((*head).comment).write(ptr::null_mut());
         }
         if let Some(comment) = &src.comment {
@@ -4432,7 +4432,7 @@ mod tests {
 
     /// The tri-state `done` reaches the C caller verbatim, including the `-1` that
     /// says "this stream carries no gzip header" and which a Rust [`bool`] cannot
-    /// represent (`inflate.c` L505-L506).
+    /// represent (`inflate.c` L522-L523).
     #[test]
     #[cfg(feature = "gzip")]
     fn publish_gz_header_publishes_the_tri_state_done_verbatim() {
@@ -4457,7 +4457,7 @@ mod tests {
     }
 
     /// The `*_null` flags publish C's `Z_NULL` assignments for an absent field
-    /// (`inflate.c` L605-L606, L643-L644, L665-L666) without touching the buffer
+    /// (`inflate.c` L605-L606, L650-L651, L672-L673) without touching the buffer
     /// the caller handed over.
     #[test]
     #[cfg(feature = "gzip")]

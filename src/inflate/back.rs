@@ -2032,7 +2032,7 @@ mod tests {
         assert!(
             !lent.get(),
             "the caller's window must not be borrowed at all once the state \
-             request has failed -- C never reaches infback.c L60"
+             request has failed -- C never reaches infback.c L59"
         );
     }
 }

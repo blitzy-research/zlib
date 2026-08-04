@@ -161,11 +161,11 @@ fn rle_match_length(window: &[u8], strstart: usize, lookahead: usize) -> usize {
         scan += 1;
     }
 
-    // deflate.c L2117: match_length = MAX_MATCH - (strend - scan). `scan` never
+    // deflate.c L2115: match_length = MAX_MATCH - (strend - scan). `scan` never
     // exceeds `strend`, so the inner subtraction cannot underflow.
     let mut len = MAX_MATCH - (strend - scan);
 
-    // deflate.c L2118-L2119: never claim more than the available lookahead.
+    // deflate.c L2116-L2117: never claim more than the available lookahead.
     if len > lookahead {
         len = lookahead;
     }

@@ -1158,11 +1158,11 @@ impl DeflateState {
         // allocated are released by their own `Drop` (C `deflateEnd(dest)`).
         //
         // The state-object reservation comes first, because that is the order C
-        // `deflateCopy` charges the destination state first (`deflate.c`
-        // L1330-L1333) and the working buffers after. That first request is the
-        // caller's — `try_copy_in` takes an `EngineReservation` before invoking
-        // this method — so what remains here are the four working buffers, in C
-        // `deflateCopy`'s order:
+        // `deflateCopy` charges: the destination state first (`deflate.c` L1335,
+        // published to `dest->state` at L1338) and the working buffers after.
+        // That first request is the caller's — `try_copy_in` takes an
+        // `EngineReservation` before invoking this method — so what remains here
+        // are the four working buffers, in C `deflateCopy`'s order:
         // window, prev, head, pending_buf (`deflate.c` L1341-L1345). The symbol
         // region needs no request of its own — it is overlaid inside
         // `pending_buf`, exactly as C re-derives `ds->sym_buf = ds->pending_buf +
@@ -1920,8 +1920,9 @@ impl DeflateState {
     /// caller-installed `zalloc`/`zfree` are honoured identically.
     #[must_use]
     pub(crate) fn try_copy_in<A: Allocator>(&self, alloc: &A) -> Option<BoxedEngine<DeflateState>> {
-        // C's order: the destination state first (`deflate.c` L1330-L1333), the
-        // working buffers after. Taking the reservation before the clone is what
+        // C's order: the destination state first (`deflate.c` L1335, published to
+        // `dest->state` at L1338), the working buffers after. Taking the
+        // reservation before the clone is what
         // makes a bounded destination allocator refuse at C's request, not a later
         // one; abandoning it on a clone failure releases it through `zfree`.
         let reservation = EngineReservation::<DeflateState>::take(alloc)?;
@@ -2062,17 +2063,17 @@ impl DeflateState {
         self.ins_h = 0;
     }
 
-    /// Reproduces C `CLEAR_HASH` (`deflate.h`): resets every hash-head entry to
-    /// [`NIL`]. C writes `head[hash_size - 1] = NIL` and zeroes the remainder;
-    /// because `NIL == 0` the net effect is that all entries become `NIL`, so a
-    /// single fill is equivalent. Also clears the [`slid`](DeflateState::slid)
-    /// flag.
+    /// Reproduces C `CLEAR_HASH` (`deflate.c` L170-L175): resets every hash-head
+    /// entry to [`NIL`]. C writes `head[hash_size - 1] = NIL` and zeroes the
+    /// remainder; because `NIL == 0` the net effect is that all entries become
+    /// `NIL`, so a single fill is equivalent. Also clears the
+    /// [`slid`](DeflateState::slid) flag.
     fn clear_hash(&mut self) {
         self.head.iter_mut().for_each(|h| *h = NIL);
         self.slid = false;
     }
 
-    /// Reproduces C `UPDATE_HASH` (`deflate.c` L154): rolls the byte `c` into
+    /// Reproduces C `UPDATE_HASH` (`deflate.c` L141): rolls the byte `c` into
     /// the running hash index `ins_h`, masked to the hash-table size.
     ///
     /// `ins_h` stays strictly below `hash_size` (`<= 2^15`) so the intermediate
@@ -2083,9 +2084,10 @@ impl DeflateState {
     }
 
     /// Reproduces the non-`FASTEST` C `INSERT_STRING` macro (`deflate.c`
-    /// L165-L179): rolls the byte at `str_idx + MIN_MATCH - 1` into the hash,
-    /// links the new string into the head of its hash chain, and returns the
-    /// previous chain head (the candidate `match_head`).
+    /// L160-L163, the `#else` arm of the `FASTEST` switch at L154-L164): rolls
+    /// the byte at `str_idx + MIN_MATCH - 1` into the hash, links the new string
+    /// into the head of its hash chain, and returns the previous chain head (the
+    /// candidate `match_head`).
     ///
     /// The caller must guarantee `str_idx + MIN_MATCH - 1` is a valid window
     /// index; [`fill_window`](Self::fill_window) upholds this by zero-filling
@@ -2099,7 +2101,7 @@ impl DeflateState {
         match_head
     }
 
-    /// Reproduces C `slide_hash` (`deflate.c` L217-L241): when the window
+    /// Reproduces C `slide_hash` (`deflate.c` L187-L210): when the window
     /// slides by `w_size`, every hash-table and chain entry is decremented by
     /// `w_size`, with entries that would go negative reset to [`NIL`].
     ///
@@ -2117,7 +2119,7 @@ impl DeflateState {
         self.slid = true;
     }
 
-    /// Fully-decomposed core of C `read_buf` (`deflate.c` L295-L322): copies up
+    /// Fully-decomposed core of C `read_buf` (`deflate.c` L219-L240): copies up
     /// to `dst.len()` bytes from `input[*next_in..]` into `dst`, updates the
     /// running checksum over the copied bytes according to `wrap`, and advances
     /// the input cursor/counter trio.
@@ -2189,7 +2191,7 @@ impl DeflateState {
         len
     }
 
-    /// Reproduces C `read_buf` (`deflate.c` L295-L322): reads up to `size`
+    /// Reproduces C `read_buf` (`deflate.c` L219-L240): reads up to `size`
     /// bytes of input into the window starting at `buf_start`, updating the
     /// checksum. Thin wrapper over [`read_buf_into`](Self::read_buf_into) that
     /// targets `self.window[buf_start..buf_start + size]`.

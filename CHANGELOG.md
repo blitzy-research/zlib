@@ -471,7 +471,10 @@ the security properties the initial release establishes.
   rather than inferred from the symbol table.
 - **MSRV `1.85.0`, verified rather than assumed.** On
   `rustc 1.85.0 (4d91de4e4 2025-02-17)` both `cargo build --locked` and
-  `cargo check --locked --all-targets` exit 0; the same tree builds and passes its
+  `cargo check --locked --all-targets --all-features` exit 0 — the second command
+  extending the floor's guarantee to every feature the manifest declares, the
+  optional `inflate_strict` and `c-oracle` rows included, which a default-feature
+  check never compiles; the same tree builds and passes its
   full suite on stable `rustc 1.97.1 (8bab26f4f 2026-07-14, LLVM 22.1.6)`. Edition
   **2024** — 1.85.0 is precisely the release in which edition 2024 became
   available, making it the tightest self-consistent floor an edition-2024 crate
@@ -572,8 +575,17 @@ departures that are invisible at the C ABI are tracked in
 rather than here, because each is strictly stricter or strictly safer than C while
 leaving the return-code set, the struct layout, and the emitted bytes untouched:
 opaque state is kind-tagged so a cross-engine `End` is a defined error rather than
-C's undefined reinterpretation; indexing is bounds-checked; and allocation is
-fallible with no global fallback. `deflateSetHeader` is **not** one of them — it
+C's undefined reinterpretation; indexing is bounds-checked; allocation is
+fallible with no global fallback; and an **accepted** `inflateBackInit_` zero-fills
+the caller's window, where C's `state->window = window;` (`infback.c` L59) writes
+nothing. That last one is required by Rust's validity rules rather than chosen — a
+`&[u8]` over abstract-uninitialized bytes is undefined behaviour even unread
+(CWE-457, CWE-908; SEC-FFI-01) — and it is bounded on all three sides that matter:
+it runs only as the last act of an accepting init, so every refusing path (and
+`inflateBackEnd`, which frees only the state) leaves the buffer byte-for-byte
+unchanged; `inflateBack` uses the window purely as its output buffer, so no
+conforming caller can read the fill; and it adds no failure mode, because every
+fallible step has already succeeded by the time it runs. `deflateSetHeader` is **not** one of them — it
 retains the caller's pointer exactly as C does, which is why the caller must keep
 the `gz_header` and its `extra` / `name` / `comment` buffers alive and unmodified
 until the header has been emitted (`zlib.h` L843-L847), and why the entry point

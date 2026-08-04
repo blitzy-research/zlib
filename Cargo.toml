@@ -259,12 +259,20 @@ no-std = []
 # braided scalar path whenever the probe is unavailable or negative.
 simd = ["dep:crc32fast"]
 #
-# `inflate_strict` below is an intentional, documented opt-in extra beyond the
-# AAP core set (`std`/`gzip`/`gz-io`/`no-std`/`simd`). It defaults to OFF and is
-# fully stable-buildable, so `cargo build --all-features` succeeds on the stable
-# toolchain. Whether the same holds on the pinned MSRV is a separate question with
-# its own evidence: the `msrv` job in `.github/workflows/ci.yml` builds and
-# `--all-targets` checks the crate on `rust-version` below, and stable success does
+# `inflate_strict` below is one of the feature rows the migration plan's feature
+# matrix enumerates in its own right — `std`/`gzip`/`gz-io`/`simd` default ON,
+# `no-std` and `inflate_strict` default OFF — not an extra bolted on beside that
+# set. Like every other row it has a C provenance (`INFLATE_STRICT`, 4 sites), and
+# its default-OFF state is a requirement rather than a preference: switching it on
+# changes which streams inflate accepts, so the DEFAULT build must leave it off to
+# stay byte-exact and acceptance-exact with reference zlib.
+#
+# It is fully stable-buildable, so `cargo build --all-features` succeeds on the
+# stable toolchain. Whether the same holds on the pinned MSRV is a separate
+# question with its own evidence: the `msrv` job in `.github/workflows/ci.yml`
+# builds the crate and then runs `check --locked --all-targets --all-features` on
+# `rust-version` below, so the MSRV verdict covers every feature this manifest
+# declares — `inflate_strict` and `c-oracle` included — and stable success does
 # not imply it. The feature is mirrored in the README feature table.
 #
 # The `gzprintf`/`gzvprintf` FFI symbols are always exported for ABI

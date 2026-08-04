@@ -244,7 +244,7 @@ impl InflateMode {
     /// magic, `FLAGS`/`TIME`/`OS`/`EXLEN` the fixed gzip fields, `EXTRA`/`NAME`/
     /// `COMMENT` the three variable-length payloads, and `HCRC` the optional header
     /// CRC. Every store into `head->extra`/`name`/`comment` happens inside that
-    /// span (`inflate.c` L614-L621, L632-L637, L654-L659), and none of those states
+    /// span (`inflate.c` L614-L621, L639-L642, L661-L664), and none of those states
     /// writes a decompressed byte.
     ///
     /// `DICTID`/`DICT` are excluded even though they precede the first block: they

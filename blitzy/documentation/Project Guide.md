@@ -29,7 +29,7 @@ This project migrates the zlib compression library (`1.3.2.1-motley`, `ZLIB_VERN
 
 The crate preserves byte-identical DEFLATE (RFC 1951), zlib (RFC 1950), and gzip (RFC 1952) wire formats and re-exposes the exact zlib C ABI through an `#[unsafe(no_mangle)] extern "C"` boundary — the edition-2024 spelling of the attribute — emitting `cdylib` and `staticlib` artifacts alongside the Rust `lib`. That enables drop-in substitution without recompiling consumers, while replacing all manual memory management with Rust ownership and borrowing.
 
-**Two version numbers, deliberately.** The Cargo package version is `1.3.2` because SemVer admits only three numeric components; the C API continues to report the full upstream identity `1.3.2.1-motley` from `zlibVersion()`, because a C consumer comparing version strings must see exactly what reference zlib would emit. The split is intentional and neither number may be "harmonised" into the other.
+**Two version numbers, deliberately.** The Cargo package version is `1.3.2`, because SemVer forbids the four-component upstream string. The C API continues to report the full upstream identity — `zlibVersion()` returns `"1.3.2.1-motley"` and `ZLIB_VERNUM` is `0x1321` — so a C consumer sees exactly what it saw before. Neither value is a bug to be "fixed"; the split is permanent and is recorded in `CHANGELOG.md`.
 
 **Architecture.** Fifteen flat C translation units became a seven-layer, forty-module Rust tree with a strictly acyclic dependency ordering that mirrors the C `#include` layering:
 
@@ -38,8 +38,6 @@ The crate preserves byte-identical DEFLATE (RFC 1951), zlib (RFC 1950), and gzip
 `ffi` is the only layer permitted to contain `unsafe`, and nothing below it may require `unsafe` to function. The decompressor's `switch`-with-fall-through mode field became `InflateMode`, an enum of exactly **32 variants** beginning at the C sentinel `Head = 16180`, so every state discriminant observable through the ABI is preserved value-for-value.
 
 Business impact: eliminates a class of memory-safety defects in a ubiquitous dependency without sacrificing wire-format compatibility or API/ABI equivalence.
-
-**Two version numbers, deliberately.** The Cargo package version is `1.3.2`, because SemVer forbids the four-component upstream string. The C API continues to report the full upstream identity — `zlibVersion()` returns `"1.3.2.1-motley"` and `ZLIB_VERNUM` is `0x1321` — so a C consumer sees exactly what it saw before. Neither value is a bug to be "fixed"; the split is permanent and is recorded in `CHANGELOG.md`.
 
 ### 1.2 Historical Effort Snapshot
 
@@ -281,7 +279,7 @@ There is consequently no screen inventory, no component tree, no design-token se
 | Zero `unsafe` in the compression/decompression core | ✅ Pass | Comment-excluded token scan returns zero across all eight core module groups; enforced by `#![deny(unsafe_code)]` (§5.2) |
 | `unsafe` isolated and `// SAFETY:`-documented | ✅ Pass | Confined to `src/ffi/**` plus the private no-`std` runtime block; see §5.2 for the distribution |
 | Test suite ported from official C drivers | ✅ Pass | `example.c`, `infcover.c`, `minigzip.c` — provenance table in §3 |
-| Rust edition 2024 / MSRV 1.85.0 | ✅ Pass | `cargo +1.85.0 build --locked` and `cargo +1.85.0 check --locked --all-targets` both exit 0; 1.85.0 is precisely the release in which edition 2024 became available, making the pairing the tightest self-consistent one |
+| Rust edition 2024 / MSRV 1.85.0 | ✅ Pass | `cargo +1.85.0 build --locked` and `cargo +1.85.0 check --locked --all-targets --all-features` both exit 0, so the floor covers every declared feature; 1.85.0 is precisely the release in which edition 2024 became available, making the pairing the tightest self-consistent one |
 | `no_std` via feature flag | ✅ Pass | Builds and links; 713 tests pass under `--no-default-features` |
 | Zero C dependency in the shipped artifact | ✅ Pass | Runtime closure is `cfg-if` plus optional `crc32fast`, both pure Rust; `flate2`/`miniz_oxide` are dev-only oracles |
 | clippy clean / `fmt` clean | ✅ Pass | `cargo clippy --locked --all-targets --all-features -- -D warnings` and `cargo fmt --all -- --check` both exit 0 |
@@ -541,7 +539,7 @@ cargo test --locked --all-features                 # 1028 pass (adds the 13 c_or
 cargo doc --locked --no-deps                                          # documentation gate
 cargo build --locked --release                                        # release build, all 3 crate types
 RUSTUP_TOOLCHAIN=1.85.0 cargo build --locked && \
-RUSTUP_TOOLCHAIN=1.85.0 cargo check --locked --all-targets            # MSRV gate
+RUSTUP_TOOLCHAIN=1.85.0 cargo check --locked --all-targets --all-features   # MSRV gate
 ```
 
 **Benchmark compilation** (a build check, not one of the nine gates):

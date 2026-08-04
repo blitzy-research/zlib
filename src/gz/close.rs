@@ -340,25 +340,28 @@ pub(crate) fn gzclose_release(file: Box<GzState>) -> (i32, Option<ReleasedFile>)
 mod tests {
     //! Unit tests for the close family: direction dispatch, the C return-code
     //! contract, and — for the write path — that the mandatory `Z_FINISH` flush
-    //! produces a complete, independently decodable gzip member.
+    //! produces a complete, well-formed gzip member.
     //!
     //! Write-path tests finalize a stream and then decompress the resulting file
-    //! with the reference `flate2` decoder (its pure-Rust `miniz_oxide` backend),
-    //! proving that valid gzip (RFC 1952) framing — header, DEFLATE body, and
-    //! CRC-32/ISIZE trailer — is emitted. All buffer handling here is safe Rust;
-    //! there is **zero `unsafe`** in this module.
+    //! with the crate's own inflate engine through
+    //! [`crate::gz::test_decode::gunzip`], proving that valid gzip (RFC 1952)
+    //! framing — header, DEFLATE body, and CRC-32/ISIZE trailer — is emitted: the
+    //! helper demands `Z_STREAM_END`, which the decoder reports only after both
+    //! trailer fields verify against the payload it recovered. Decoding in-crate
+    //! is what AAP §0.5.2 requires — no `use` of `flate2`, `quickcheck`, `rand`,
+    //! or `criterion` under `src/**` — and the independent cross-decoder check
+    //! against `flate2` lives in `tests/gzip_compat.rs`. All buffer handling here
+    //! is safe Rust; there is **zero `unsafe`** in this module.
 
     use super::*;
 
     use crate::gz::state::{GzFile, How};
+    use crate::gz::test_decode::gunzip;
     use crate::gz::test_temp::{TempFile, create_new_file};
     use crate::gz::write::gz_write;
     use crate::stream::ZStream;
     use std::fs::File;
-    use std::io::Read;
     use std::path::Path;
-
-    use flate2::read::GzDecoder;
 
     /// Names a temporary `.gz` file inside a freshly created, caller-private
     /// directory, removed together with that directory when the guard drops.
@@ -474,16 +477,6 @@ mod tests {
         std::fs::read(path).expect("read compressed output")
     }
 
-    /// Decompresses a complete gzip member with the reference `flate2` decoder.
-    fn gunzip(compressed: &[u8]) -> Vec<u8> {
-        let mut decoder = GzDecoder::new(compressed);
-        let mut out = Vec::new();
-        decoder
-            .read_to_end(&mut out)
-            .expect("output is a valid gzip member");
-        out
-    }
-
     #[test]
     fn gzclose_w_finalizes_empty_member() {
         // Closing a write handle that received no data must still emit a valid,
@@ -506,7 +499,8 @@ mod tests {
     #[test]
     fn gzclose_finalizes_written_data_via_dispatch() {
         // `gzclose` on a write handle must dispatch to `gzclose_w`, whose
-        // `Z_FINISH` flush yields a member decodable by an independent decoder.
+        // `Z_FINISH` flush yields a complete, decodable member — final block and
+        // verifying CRC-32/ISIZE trailer included.
         const DATA: &[u8] = b"The quick brown fox jumps over the lazy dog.\n";
         let path = temp_gz("data");
         let mut file = write_state(&path);

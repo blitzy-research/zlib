@@ -349,9 +349,23 @@ selector, and the difference is deliberate:
 
 | Workflow | Selector for the commands it runs | Measured |
 |----------|-----------------------------------|----------|
-| [`ci.yml`](.github/workflows/ci.yml) | Both: a `+stable` / `+1.85.0` prefix **and** a job-level `RUSTUP_TOOLCHAIN` | 27 prefixed commands, 12 job-level `env:` keys |
+| [`ci.yml`](.github/workflows/ci.yml) | Both: a `+stable` / `+1.85.0` prefix **and** a job-level `RUSTUP_TOOLCHAIN` | 30 prefixed `cargo` commands (28 `+stable`, 2 `+1.85.0`), 12 job-level `env:` keys |
 | [`audit.yml`](.github/workflows/audit.yml) | Both: a `+stable` prefix **and** a job-level `RUSTUP_TOOLCHAIN: stable` | 19 prefixed commands, 3 job-level `env:` keys |
 | [`fuzz.yml`](.github/workflows/fuzz.yml) | **Only** the job-level `RUSTUP_TOOLCHAIN: nightly-2026-08-01`; every command is deliberately **unprefixed** | 0 prefixed commands, 1 job-level `env:` key |
+
+**How the "Measured" column is counted**, so a re-derivation lands on the same numbers
+rather than on a plausible neighbour. A *prefixed command* is a `cargo +<toolchain>`
+invocation on a line that is not a YAML or shell comment; `ci.yml` additionally carries
+**three** `rustc +stable` probe invocations (the target-list and `-vV` checks), which are
+counted separately and are *not* included in the 30 — so the all-tools figure for that
+file is 33. A *job-level `env:` key* is a `RUSTUP_TOOLCHAIN:` entry in a job's own `env:`
+block, not a step-level one. Reproduce with:
+
+```sh
+grep -nE 'cargo \+(stable|1\.85\.0|nightly[^ ]*)' .github/workflows/ci.yml \
+  | grep -vE '^[0-9]+: *#' | wc -l      # 30
+grep -cE '^ +RUSTUP_TOOLCHAIN:' .github/workflows/ci.yml   # 12
+```
 
 `fuzz.yml` is the exception on purpose. The env var (rank 2) is inherited by the nested
 `cargo build` invocations `cargo-fuzz` spawns, which a per-command prefix is not; and
@@ -375,8 +389,13 @@ assumed**. Both of these must pass, and the CI `msrv` job runs exactly them:
 
 ```sh
 RUSTUP_TOOLCHAIN=1.85.0 cargo build --locked
-RUSTUP_TOOLCHAIN=1.85.0 cargo check --locked --all-targets
+RUSTUP_TOOLCHAIN=1.85.0 cargo check --locked --all-targets --all-features
 ```
+
+The `--all-features` on the second command is what makes the floor a claim about
+the **whole manifest**: the build step compiles the default set, and without that
+flag the optional rows — `inflate_strict`'s arms and the `c-oracle` `[[test]]`
+target — would never be compiled by the floor compiler at all.
 
 The declared MSRV is **1.85.0**, and the pairing with the crate's edition is forced
 rather than chosen: [`Cargo.toml`](Cargo.toml) declares `edition = "2024"`, and
@@ -1180,6 +1199,29 @@ just promoted it into the observable list.
   allocator. This is C's `ZALLOC` contract stated precisely, not a divergence from it —
   it is listed here only because a reader who knows the global allocator exists might
   reasonably expect a fallback that deliberately does not exist.
+- **An accepted `inflateBackInit_` zero-fills the caller's window.** C adopts the
+  buffer with a bare `state->window = window;` (`infback.c` L59) and writes nothing, so
+  the bytes stay whatever the caller left there. The shim instead zero-fills the whole
+  `1 << windowBits` region as the **last act of the accepting path**
+  ([`src/ffi/inflate.rs`](src/ffi/inflate.rs), the `ptr::write_bytes` call at the end of
+  `inflateBackInit_`). This is mandated by Rust's validity rules rather than chosen: the
+  decoder addresses the window through slices, and a `&[u8]` / `&mut [u8]` over
+  abstract-uninitialized bytes is undefined behaviour *even when nothing reads it*
+  (CWE-457 use of uninitialized variable, CWE-908 use of uninitialized resource; tracked
+  as SEC-FFI-01). Three properties keep it off the observable list. **Every refusing
+  path leaves the buffer byte-for-byte unchanged** — a rejected argument, an allocator
+  that turns C's single state request down, an exhausted Rust heap — and so does
+  `inflateBackEnd`, which frees only the state (`infback.c` L572-L577), so "refused"
+  and "accepted" remain distinguishable by the caller's own bytes exactly as against a
+  C build. **No conforming caller can observe it on the accepting path**, because
+  `inflateBack` treats the window purely as its output buffer (`put = state->window;
+  left = state->wsize;`, `infback.c` L222-L223, with `state->whave = 0`) and zlib offers
+  no way to seed `inflateBack` history. And **it is strictly safety-strengthening**: it
+  removes undefined behaviour without adding a failure mode, since the fill runs only
+  after every fallible step has already succeeded and therefore cannot itself fail. It
+  is placed at the end of init rather than inside `inflateBack` on purpose — a caller
+  may legally stage its compressed input *inside* the window, which a decode-time fill
+  would erase.
 
 
 ## Performance policy
@@ -1614,8 +1656,9 @@ Tick every line before you open the pull request.
       on it and nothing in this repository can suppress it, so do not treat it as a
       regression
 - [ ] `RUSTUP_TOOLCHAIN=1.85.0 cargo build --locked` and
-      `RUSTUP_TOOLCHAIN=1.85.0 cargo check --locked --all-targets` — exit 0
-      (MSRV is verified, not assumed)
+      `RUSTUP_TOOLCHAIN=1.85.0 cargo check --locked --all-targets --all-features` —
+      exit 0 (MSRV is verified, not assumed, and the `--all-features` is what makes
+      it a claim about the whole manifest rather than the default set)
 - [ ] Both `cargo-deny` invocations clean, run exactly as
       [Supply-chain gates](#supply-chain-gates) prints them — **every** `-A` allowance
       included, because each covers entries that cannot match on the graph being

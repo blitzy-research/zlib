@@ -94,8 +94,9 @@ Two things are worth saying plainly rather than implying otherwise:
 that stabilised edition 2024) and pins it for local builds through
 [`rust-toolchain.toml`](rust-toolchain.toml). Both the MSRV floor and current
 stable are exercised: `cargo +1.85.0 build --locked` and
-`cargo +1.85.0 check --locked --all-targets` both exit 0, and CI runs them as a
-blocking `msrv` job. **A security fix will not silently raise the MSRV** — an MSRV
+`cargo +1.85.0 check --locked --all-targets --all-features` both exit 0, and CI
+runs them as a blocking `msrv` job — the `--all-features` making the floor a claim
+about every feature the manifest declares, not just the default set. **A security fix will not silently raise the MSRV** — an MSRV
 change is a documented, `CHANGELOG.md`-recorded change like any other.
 
 ---
@@ -379,6 +380,25 @@ There is no sixth.
   destination that could genuinely accept nothing forever reports `EAGAIN` or
   `EWOULDBLOCK`, which **is** handled as a retryable `Z_ERRNO` with the caller's
   cursor and buffered input preserved.
+- **An accepted `inflateBackInit_` zero-fills the caller's window**, where C's
+  adoption is a bare `state->window = window;` (`infback.c` L59) that writes nothing.
+  This is a **hardening measure, not a behavioural change**, and it is listed here
+  rather than among the five observable divergences above because no conforming
+  caller can detect it. It exists because the decoder addresses the window through
+  slices, and a `&[u8]` / `&mut [u8]` over abstract-uninitialized bytes is undefined
+  behaviour *even when nothing reads it* — CWE-457 (use of uninitialized variable)
+  and CWE-908 (use of uninitialized resource), tracked as **SEC-FFI-01**. Three
+  properties bound it. It is the **last act of the accepting path**, so every
+  refusing path — rejected argument, an allocator that turns C's single state
+  request down, an exhausted Rust heap — and `inflateBackEnd`, which frees only the
+  state (`infback.c` L572-L577), all leave the caller's buffer byte-for-byte
+  untouched exactly as C leaves it. `inflateBack` treats the window purely as its
+  **output** buffer (`put = state->window; left = state->wsize;`, `infback.c`
+  L222-L223, with `state->whave = 0`), and zlib offers no way to seed `inflateBack`
+  history, so the fill is unobservable on the accepting path. And it **adds no
+  failure mode**, because it runs only once every fallible step has already
+  succeeded. Reporting it as a vulnerability is therefore out of scope; reporting a
+  path on which it *fails* to run before the first slice is formed is class 1 above.
 
 ---
 

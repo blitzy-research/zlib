@@ -458,7 +458,7 @@ mod fault {
 ///
 /// # A write that accepts nothing is retried in place
 ///
-/// C has exactly one success arm — `state->x.next += writ` (`gzwrite.c` L124) —
+/// C has exactly one success arm — `state->x.next += writ` (`gzwrite.c` L122) —
 /// so a `writ` of `0` advances nothing and the enclosing
 /// `while (strm->next_out > state->x.next)` re-issues the identical request. This
 /// loop reproduces that shape rather than special-casing `Ok(0)`: the cursor is
@@ -562,7 +562,7 @@ fn write_direct(state: &mut GzState, input: &[u8]) -> CompOutcome {
 
 /// Runs `deflate` over `input`, writing every produced byte to the file, until
 /// the engine has no more work for the requested `flush` — the compress loop of
-/// C `gz_comp` (`gzwrite.c` L109-L142).
+/// C `gz_comp` (`gzwrite.c` L65-L148, whose deflate loop is L104-L140).
 ///
 /// `input` must **not** alias any field of `state` (it is either an external
 /// caller slice or the `in_buf` moved out with [`core::mem::take`]), which is
@@ -574,7 +574,7 @@ fn write_direct(state: &mut GzState, input: &[u8]) -> CompOutcome {
 ///
 /// Compressed bytes accumulate in `out_buf` and are handed to the file at exactly
 /// C's two checkpoints, evaluated at the top of every iteration
-/// (`gzwrite.c` L112-L128):
+/// (`gzwrite.c` L108-L129):
 ///
 /// * the scratch area is **full** (`avail_out == 0`), or
 /// * the caller asked for a **flush** — but while finishing, not until `deflate`
@@ -601,8 +601,8 @@ fn write_direct(state: &mut GzState, input: &[u8]) -> CompOutcome {
 /// # Errors
 ///
 /// * [`ZlibError::StreamError`] if `deflate` reports a corrupt stream
-///   (C L136-L140) — fatal.
-/// * [`ZlibError::ErrNo`] on a file write error (C L119-L124), including a
+///   (C L134-L137) — fatal.
+/// * [`ZlibError::ErrNo`] on a file write error (C L116-L120), including a
 ///   non-blocking stall (which also sets [`GzState::again`](crate::gz::state::GzState)).
 ///
 /// Either way the returned [`CompOutcome::consumed`] is the true number of input
@@ -612,13 +612,13 @@ fn gz_deflate_loop(state: &mut GzState, input: &[u8], flush: FlushMode) -> CompO
     let size = state.size;
     let flush_i32 = flush.as_c_int();
     let mut consumed = 0usize;
-    // C seeds `ret = Z_OK` before the loop (`gzwrite.c` L109) purely so the
+    // C seeds `ret = Z_OK` before the loop (`gzwrite.c` L104) purely so the
     // `flush == Z_FINISH` arm of the write checkpoint below can ask whether the
     // *previous* `deflate` already reported `Z_STREAM_END`.
     let mut code = ReturnCode::Ok;
 
     loop {
-        // ---- C L112-L128: the write checkpoint. -------------------------------
+        // ---- C L108-L129: the write checkpoint. -------------------------------
         // Free space left in the scratch area — C's `strm->avail_out`. The
         // produced-bytes frontier (C's `next_out`) sits at
         // `out_start + out_pending`.
@@ -655,7 +655,7 @@ fn gz_deflate_loop(state: &mut GzState, input: &[u8], flush: FlushMode) -> CompO
             flush_i32,
         );
 
-        // A corrupt stream is fatal (C L136-L140).
+        // A corrupt stream is fatal (C L134-L137).
         if outcome.code == ReturnCode::StreamError {
             state.error(
                 ReturnCode::StreamError,
@@ -1472,23 +1472,26 @@ mod tests {
     //! Unit and round-trip tests for the gzip write side.
     //!
     //! The round-trip tests write data through the `gz*` API, finalize with
-    //! [`finish_write`], then decompress the resulting file with the reference
-    //! `flate2` decoder (its pure-Rust `miniz_oxide` backend), asserting the
-    //! recovered bytes equal the original. This validates both that valid gzip
-    //! (RFC 1952) framing is produced and that the output is decodable by an
-    //! independent implementation. All buffer handling here is safe Rust —
-    //! there is **zero `unsafe`** in this module.
+    //! [`finish_write`], then decompress the resulting file with the crate's own
+    //! inflate engine through [`crate::gz::test_decode::gunzip`], asserting the
+    //! recovered bytes equal the original. That validates the full RFC 1952
+    //! framing — header, DEFLATE payload, and both trailer fields — because the
+    //! helper demands `Z_STREAM_END`, which the decoder only reports once the
+    //! CRC-32 and ISIZE in the trailer agree with what it decoded. Decoding
+    //! in-crate is what AAP §0.5.2 requires: no `use` of `flate2`, `quickcheck`,
+    //! `rand`, or `criterion` may appear under `src/**`. The independent
+    //! cross-decoder check lives in `tests/gzip_compat.rs`, which decodes this
+    //! layer's output with `flate2` from outside the crate. All buffer handling
+    //! here is safe Rust — there is **zero `unsafe`** in this module.
 
     use super::*;
 
     use crate::gz::state::How;
+    use crate::gz::test_decode::gunzip;
     use crate::stream::ZStream;
     use std::fs::{File, OpenOptions};
-    use std::io::Read;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
-
-    use flate2::read::GzDecoder;
 
     /// `Z_SYNC_FLUSH` numeric flush code (mirrors `FlushMode::SyncFlush`).
     const Z_SYNC_FLUSH: i32 = 2;
@@ -1655,16 +1658,6 @@ mod tests {
         }
     }
 
-    /// Decompresses a complete gzip member with the reference `flate2` decoder.
-    fn gunzip(compressed: &[u8]) -> Vec<u8> {
-        let mut decoder = GzDecoder::new(compressed);
-        let mut out = Vec::new();
-        decoder
-            .read_to_end(&mut out)
-            .expect("output is a valid gzip member");
-        out
-    }
-
     /// Reads the whole file at `path`.
     ///
     /// Deliberately does **not** remove anything: cleanup belongs to the
@@ -1727,7 +1720,7 @@ mod tests {
         // `want = 64` keeps the scratch area small, so the first block the engine
         // emits overflows it. The payload has to be large enough to *reach* that
         // block: produced bytes leave the area only when it fills or a flush
-        // arrives (`gzwrite.c` L112-L114), and a `Z_NO_FLUSH` `deflate` holds its
+        // arrives (`gzwrite.c` L108-L109), and a `Z_NO_FLUSH` `deflate` holds its
         // symbols until the symbol buffer is full — so a 4 KiB write to a
         // destination that rejects every `write(2)` still succeeds, in reference
         // zlib exactly as here. 64 KiB crosses the boundary with room to spare.
@@ -1783,7 +1776,7 @@ mod tests {
         let wedged = TempFile::new("afdefect2");
         // Large enough that `deflate` emits a block and overflows the 64-byte
         // scratch area, which is the only thing that makes a `Z_NO_FLUSH` step
-        // touch the destination at all (`gzwrite.c` L112-L114).
+        // touch the destination at all (`gzwrite.c` L108-L109).
         let data = corpus(65536);
 
         let mut state = new_write_state(&wedged, 64, 6, 0, 0);
@@ -1834,7 +1827,7 @@ mod tests {
     ///
     /// The flush is `Z_FINISH` rather than `Z_NO_FLUSH` because that is what makes
     /// the destination be touched at all: produced bytes leave the scratch area
-    /// only when the area fills or a flush arrives (`gzwrite.c` L112-L114), and
+    /// only when the area fills or a flush arrives (`gzwrite.c` L108-L109), and
     /// 100 bytes of `Z_NO_FLUSH` input fill nothing. The bookkeeping under test is
     /// identical on either path — what fails is the write, not the flush code.
     #[test]
@@ -1884,7 +1877,7 @@ mod tests {
     /// Compaction is what turns a run of short writes into quadratic copying
     /// (CWE-400): delivering an `N`-byte window one byte at a time would move
     /// `(N-1) + (N-2) + … + 1` bytes, where C's `state->x.next += writ`
-    /// (`gzwrite.c` L124) moves none. The discriminating observation is the buffer
+    /// (`gzwrite.c` L122) moves none. The discriminating observation is the buffer
     /// itself — after the cursor advances, every byte of the window is still at the
     /// index `deflate` wrote it to.
     #[test]
@@ -2541,7 +2534,7 @@ mod tests {
     /// # Reaching a stall inside a `Z_NO_FLUSH` fill
     ///
     /// `gz_zero` only ever asks for `Z_NO_FLUSH`, so the destination is touched
-    /// exactly when the scratch area fills (`gzwrite.c` L112-L114) — never merely
+    /// exactly when the scratch area fills (`gzwrite.c` L108-L109) — never merely
     /// because a `deflate` call produced something. Zeros produce nothing at all
     /// until a block boundary, so the fill has to run long enough to reach one.
     /// `Z_HUFFMAN_ONLY` makes that affordable: with string matching disabled every

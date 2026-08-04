@@ -918,7 +918,7 @@ pub(crate) fn inflate_tracked_lending<A: Allocator>(
                         continue 'inf_leave;
                     }
                     // C `if (state->head != Z_NULL) state->head->done = -1;`
-                    // (`inflate.c` L505-L506): the stream carries no gzip header,
+                    // (`inflate.c` L522-L523): the stream carries no gzip header,
                     // so a registered header is marked "not gzip" rather than
                     // merely "not finished". The idiomatic `done` is a `bool` and
                     // stays `false`; the `-1` travels to the C caller through the
@@ -1203,7 +1203,7 @@ pub(crate) fn inflate_tracked_lending<A: Allocator>(
                         // C stores every byte it reads — the terminating NUL
                         // included — into `head->name[state->length++]` while
                         // `state->length < head->name_max` (`inflate.c`
-                        // L632-L637). The owned `Vec` keeps only the content bytes
+                        // L639-L642). The owned `Vec` keeps only the content bytes
                         // (this type documents "no trailing NUL"), so `Vec::len()`
                         // *is* C's `state->length` and the terminator is recorded
                         // as a flag for the boundary to write. A name that exactly
@@ -1212,7 +1212,7 @@ pub(crate) fn inflate_tracked_lending<A: Allocator>(
                             // C ABI path: `head->name[state->length++] = byte`
                             // straight into the caller's buffer, bounded by the
                             // live `name_max`, with the index advancing only on a
-                            // store (`inflate.c` L632-L637). The terminating NUL
+                            // store (`inflate.c` L639-L642). The terminating NUL
                             // is one of those bytes, so a name that exactly fills
                             // the buffer stays unterminated — no separate
                             // `name_terminated` publication is needed, and
@@ -1279,12 +1279,12 @@ pub(crate) fn inflate_tracked_lending<A: Allocator>(
                         copy += 1;
                         // Same accounting as `NAME` above: the terminating NUL is
                         // one of C's counted bytes against `comm_max`
-                        // (`inflate.c` L654-L659), so it is recorded as a flag
+                        // (`inflate.c` L661-L664), so it is recorded as a flag
                         // rather than pushed into the content `Vec`.
                         if state.head_foreign {
                             // C ABI path: `head->comment[state->length++]`
                             // straight into the caller's buffer, bounded by the
-                            // live `comm_max` (`inflate.c` L654-L659). Same
+                            // live `comm_max` (`inflate.c` L661-L664). Same
                             // accounting as `NAME` above; allocation-free.
                             if state.head.is_some() {
                                 if let Some(sk) = sink.as_deref_mut() {

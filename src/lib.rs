@@ -1280,13 +1280,6 @@ mod tests {
         ("ffi", 8),
     ];
 
-    /// The complete set of `(from, to, why)` module references that are permitted
-    /// **only** inside `#[cfg(test)]` code, and never in the shipped library.
-    ///
-    /// Every entry must be exercised — a stale one fails
-    /// [`the_module_graph_has_no_upward_edges`](fn@the_module_graph_has_no_upward_edges)
-    /// just as loudly as an unlisted one — so this list cannot drift away from
-    /// the code it describes.
     /// The complete set of `(from, to, why)` module references that shipped code
     /// may hold **only** in the form `pub use crate::<to>::…;` — a re-export of a
     /// *name*, never an import that creates a code dependency.
@@ -1349,6 +1342,13 @@ mod tests {
         head.trim_end().ends_with("pub use")
     }
 
+    /// The complete set of `(from, to, why)` module references that are permitted
+    /// **only** inside `#[cfg(test)]` code, and never in the shipped library.
+    ///
+    /// Every entry must be exercised — a stale one fails
+    /// [`the_module_graph_has_no_upward_edges`](fn@the_module_graph_has_no_upward_edges)
+    /// just as loudly as an unlisted one — so this list cannot drift away from
+    /// the code it describes.
     const TEST_ONLY_CROSS_LAYER_EXCEPTIONS: [(&str, &str, &str); 3] = [
         (
             "stream",

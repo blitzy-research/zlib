@@ -1597,8 +1597,19 @@ jobs:
     # break behind a resolution nobody ships.
     - name: Build with MSRV
       run: cargo +1.85.0 build --locked --verbose
-    - name: Check all targets with MSRV
-      run: cargo +1.85.0 check --locked --verbose --all-targets
+    # `--all-features` is what makes this job's verdict cover the WHOLE manifest.
+    # The build step above compiles the default feature set; without this flag the
+    # optional rows would never see the floor compiler, and `Cargo.toml` would be
+    # claiming MSRV evidence for features nothing on 1.85.0 had ever compiled:
+    # `inflate_strict`'s arms in `src/inflate/{fast,mod}.rs` and the `c-oracle`
+    # `[[test]]` target (`tests/c_oracle.rs`, `required-features = ["c-oracle"]`)
+    # are both invisible to a default-feature check. `--all-targets` widens the
+    # same check to the test, bench and example targets, so the two flags are
+    # complementary rather than redundant. What neither can reach is the
+    # freestanding `no_std_support` block, whose predicate needs
+    # `not(feature = "std")`; the std-off rows own that surface.
+    - name: Check all targets and all features with MSRV
+      run: cargo +1.85.0 check --locked --verbose --all-targets --all-features
     - name: Assert Cargo.lock is unchanged
       if: ${{ !cancelled() }}
       run: |

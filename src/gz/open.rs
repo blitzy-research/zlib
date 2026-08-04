@@ -395,7 +395,7 @@ const _: () = {
 };
 
 /// The descriptor-level flags a `gz*` mode string asks for, which the C code
-/// expresses as `oflag` bits (`gzlib.c` L134-L138 for `'e'`, L162-L167 for
+/// expresses as `oflag` bits (`gzlib.c` L134-L138 for `'e'`, L159-L163 for
 /// `'N'`) and which therefore cannot all be reproduced through
 /// [`std::fs::OpenOptions`].
 ///
@@ -471,7 +471,7 @@ pub(crate) fn descriptor_request(mode: &[u8]) -> DescriptorRequest {
         match byte {
             // `case 'e': oflag |= O_CLOEXEC;` (gzlib.c L134-L138).
             b'e' => cloexec = true,
-            // `case 'N': oflag |= O_NONBLOCK;` (gzlib.c L162-L167).
+            // `case 'N': oflag |= O_NONBLOCK;` (gzlib.c L160-L161).
             b'N' => nonblock = true,
             _ => {}
         }
@@ -647,7 +647,7 @@ fn parse_mode(mode: &[u8]) -> Result<ParsedMode, ReturnCode> {
 ///
 /// This exists for one reason: C `gz_open` performs every mode-grammar rejection
 /// **before** it stores the caller's descriptor in `state->fd`
-/// (`gzlib.c` L150-L197 precede L263), so a rejected `gzdopen` leaves the
+/// (`gzlib.c` L108-L197 precede L262), so a rejected `gzdopen` leaves the
 /// caller's descriptor open and reusable. The C-ABI `gzdopen` shim in
 /// `src/ffi/gz.rs` must therefore decide whether the mode is acceptable *before*
 /// it wraps the raw `fd` in a [`File`], because a [`File`] closes its descriptor
@@ -1937,7 +1937,7 @@ mod tests {
     ///
     /// The C-ABI `gzdopen` shim relies on this to decide whether a mode is usable
     /// *before* it wraps the caller's raw descriptor in a [`File`], reproducing C's
-    /// ordering (`gzlib.c` L150-L197 precede L263) so that a rejected `gzdopen`
+    /// ordering (`gzlib.c` L108-L197 precede L262) so that a rejected `gzdopen`
     /// never closes the caller's descriptor. Any divergence between the two would
     /// either close a descriptor C leaves open or adopt one C would have refused.
     #[test]

@@ -106,7 +106,11 @@ C ABI**, because each is strictly stricter or strictly safer than C while leavin
 layout, and the emitted bytes untouched. Opaque state carries a kind tag, so handing a deflate
 stream to `inflateEnd` is a defined `Z_STREAM_ERROR` rather than C's undefined reinterpretation. Indexing is
 bounds-checked, so a path that would corrupt memory in C aborts instead. Allocation is fallible with no global
-fallback, which is C's `ZALLOC` contract stated precisely. Full reasoning lives in the repository's
+fallback, which is C's `ZALLOC` contract stated precisely. And an **accepted** `inflateBackInit_` zero-fills the
+caller's window, where C's `state->window = window;` writes nothing — required by Rust's validity rules, since a
+slice over abstract-uninitialized bytes is undefined behaviour even unread (CWE-457, CWE-908), and unobservable
+because it is the last act of an accepting init and `inflateBack` uses the window purely as its output buffer.
+Full reasoning lives in the repository's
 `CONTRIBUTING.md`, under *Internal divergences that are invisible at the C ABI*.
 
 ## Verified platforms

@@ -121,7 +121,7 @@ and `RUSTUP_TOOLCHAIN=stable` because `rust-toolchain.toml` pins the tree to MSR
 | **Linting** | ✅ PASS | `RUSTUP_TOOLCHAIN=stable cargo clippy --locked --all-targets --all-features -- -D warnings` — 0 lints. `-D warnings` promotes `missing_docs` and `undocumented_unsafe_blocks` to errors |
 | **Formatting** | ✅ PASS | `RUSTUP_TOOLCHAIN=stable cargo fmt --all -- --check` — no output |
 | **Tests** | ✅ PASS | **1015** passed, 0 failed, **0 ignored** (default row); **1028** with `--all-features`; **713** in each `no_std` row |
-| **MSRV** | ✅ PASS | `RUSTUP_TOOLCHAIN=1.85.0 cargo build --locked` and `cargo check --locked --all-targets` |
+| **MSRV** | ✅ PASS | `RUSTUP_TOOLCHAIN=1.85.0 cargo build --locked` and `cargo check --locked --all-targets --all-features` — 0 errors, 0 warnings, so the floor covers every declared feature |
 | **Docs** | ✅ PASS | `RUSTUP_TOOLCHAIN=stable cargo doc --locked` |
 | **Supply chain** | ✅ PASS | Both `cargo deny` invocations exactly as printed in §6.6 — the root graph and the detached fuzz graph — each reporting advisories, bans, licenses and sources ok. The `--config deny.toml` and `-A` arguments are not optional: without them the root run emits two warnings and the fuzz run **fails** on `license-not-encountered` |
 | **Packaging** | ✅ PASS | `cargo package --locked --list` — 75 entries, zero C-baseline leakage |
@@ -396,9 +396,11 @@ RUSTUP_TOOLCHAIN=stable cargo bench --locked --no-run
 # deflate_bench, inflate_bench) plus `benches src/lib.rs` — the lib's own
 # implicit bench target, which exists because `[lib] bench` is not disabled.
 
-# MSRV verification, mirroring the ci.yml `msrv` job.
+# MSRV verification, mirroring the ci.yml `msrv` job. The `--all-features` on the
+# check is what extends the floor's guarantee to the optional feature rows
+# (`inflate_strict`, `c-oracle`), which a default-feature check never compiles.
 RUSTUP_TOOLCHAIN=1.85.0 cargo build --locked
-RUSTUP_TOOLCHAIN=1.85.0 cargo check --locked --all-targets
+RUSTUP_TOOLCHAIN=1.85.0 cargo check --locked --all-targets --all-features
 ```
 
 > **`target/release/libzlib_rs.{a,so,rlib}` is one shared path across every feature row** — the last
@@ -475,7 +477,7 @@ cargo audit --deny warnings
 cargo audit --deny warnings --file fuzz/Cargo.lock
 ```
 
-`clippy.toml` and `rustfmt.toml` pin the tool configuration so behaviour does not depend on unpinned defaults (gap **D11**), and `rustfmt.toml` sets `style_edition = 2024` to match the crate's edition. Both the `lint` and `msrv` jobs additionally assert that `rustup show active-toolchain` resolved to the channel they asked for, because `rust-toolchain.toml` otherwise wins; `msrv` pins `dtolnay/rust-toolchain@1.85.0` and runs `cargo +1.85.0 build --verbose` plus `cargo +1.85.0 check --verbose --all-targets`.
+`clippy.toml` and `rustfmt.toml` pin the tool configuration so behaviour does not depend on unpinned defaults (gap **D11**), and `rustfmt.toml` sets `style_edition = 2024` to match the crate's edition. Both the `lint` and `msrv` jobs additionally assert that `rustup show active-toolchain` resolved to the channel they asked for, because `rust-toolchain.toml` otherwise wins; `msrv` pins `dtolnay/rust-toolchain@1.85.0` and runs `cargo +1.85.0 build --locked --verbose` plus `cargo +1.85.0 check --locked --verbose --all-targets --all-features`, so the floor is proven for every feature the manifest declares rather than for the default set alone.
 
 ### 6.7 Running Benchmarks
 
@@ -506,7 +508,7 @@ The repository's blocking gates, in the order CI runs them. All eight must pass.
 4. **Clippy** — `RUSTUP_TOOLCHAIN=stable cargo clippy --locked --all-targets --all-features -- -D warnings`: 0 lints
 5. **Formatting** — `RUSTUP_TOOLCHAIN=stable cargo fmt --all -- --check`: no output
 6. **Docs** — `RUSTUP_TOOLCHAIN=stable cargo doc --locked`: exit 0
-7. **MSRV** — `RUSTUP_TOOLCHAIN=1.85.0 cargo build --locked` and `cargo check --locked --all-targets`
+7. **MSRV** — `RUSTUP_TOOLCHAIN=1.85.0 cargo build --locked` and `cargo check --locked --all-targets --all-features`
 8. **Supply chain** — both `cargo deny` invocations exactly as printed in §6.6 (root graph, then `--manifest-path fuzz/Cargo.toml`): advisories, bans, licenses, sources all ok. Copy them verbatim — dropping `--config deny.toml` or the `-A` codes changes the result
 
 No warning may be downgraded, no lint `allow`-ed, and no test `#[ignore]`d to make a change land.
@@ -915,4 +917,4 @@ merely selects four of the seven. Reproduce with
 5. **A gzip handle's `Drop` is intentionally empty of finishing logic**, so `gzclose` / `gzclose_w` remain mandatory. A destructor cannot surface a deferred compression or I/O error, and silently discarding a write failure during unwinding would be strictly worse than matching C's explicit-close contract. Do not "improve" it into an auto-finishing destructor.
 There is no sixth. In particular, a gzip destination that accepts nothing is **retried in place**, exactly as C retries it: C's two `gz_comp` write loops have a single success arm each — `state->x.next += writ` and `strm->next_in += writ` (`gzwrite.c` L76-L90, L112-L124) — so a `write(2)` returning `0` for a non-empty request advances no cursor and the enclosing `while` re-issues the identical request. Both loops in `src/gz/write.rs` reproduce that shape rather than special-casing it, so `gzwrite`'s count and `gzerror`'s code are C's. An earlier revision reported it as a *retryable* `Z_ERRNO` and listed it as a sixth divergence; that was a behavioural change no C caller can observe in reference zlib and has been reverted. The retry is bounded for the same reason C's is — POSIX permits a `0` return only for a zero-length request, and neither loop ever issues one.
 
-All five are divergences a **C caller can observe**. A separate class exists and is deliberately not folded into that list: internal departures that are **invisible at the C ABI**, because each is strictly stricter or strictly safer than C while leaving the return-code set, the struct layout, and the emitted bytes untouched — kind-tagged opaque state turning C's undefined cross-engine `End` into a defined `Z_STREAM_ERROR`, bounds-checked indexing, and fallible allocation with no global fallback. Promoting any of them into the observable list would be a breaking change to the drop-in contract. `CONTRIBUTING.md` carries the full reasoning.
+All five are divergences a **C caller can observe**. A separate class exists and is deliberately not folded into that list: internal departures that are **invisible at the C ABI**, because each is strictly stricter or strictly safer than C while leaving the return-code set, the struct layout, and the emitted bytes untouched — kind-tagged opaque state turning C's undefined cross-engine `End` into a defined `Z_STREAM_ERROR`, bounds-checked indexing, fallible allocation with no global fallback, and an **accepted** `inflateBackInit_` zero-filling the caller's window where C's `state->window = window;` (`infback.c` L59) writes nothing. The last of those is required by Rust's validity rules rather than chosen — a `&[u8]` over abstract-uninitialized bytes is undefined behaviour even unread (CWE-457, CWE-908; SEC-FFI-01) — and it stays in this class because it is the last act of an accepting init, so every refusing path and `inflateBackEnd` leave the buffer byte-for-byte unchanged, `inflateBack` uses the window purely as its output buffer, and no new failure mode is introduced. Promoting any of them into the observable list would be a breaking change to the drop-in contract. `CONTRIBUTING.md` carries the full reasoning.

@@ -92,7 +92,7 @@ except the two MSRV rows.
 | API docs | `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features` | exit 0, 0 warnings |
 | Published docs | `mkdocs build --strict --site-dir "$(mktemp -d)/site"` | exit 0, 0 strict diagnostics (see note) |
 | MSRV build | `cargo +1.85.0 build --locked` | exit 0 |
-| MSRV type-check | `cargo +1.85.0 check --locked --all-targets` | exit 0 |
+| MSRV type-check | `cargo +1.85.0 check --locked --all-targets --all-features` | exit 0, 0 warnings |
 | Exported C symbols | `nm -D --defined-only target/release/libzlib_rs.so` | **95**, all type `T` |
 | Packaged crate | `cargo package --locked --list` | **75** files; the unpacked archive re-runs its own suite at 1015 |
 | Live byte-identity sweep | `cargo test --locked --features c-oracle --test c_oracle` | **3750/3750** and **50/50** byte-identical |
@@ -230,8 +230,10 @@ newer stable toolchain also works.
 
 That floor is **verified, not assumed**. On `rustc 1.85.0 (4d91de4e4 2025-02-17)`
 both `cargo +1.85.0 build --locked` and `cargo +1.85.0 check --locked
---all-targets` exit 0, reproducing CI's `msrv` job locally; the same tree also
-builds and passes its full suite on current stable
+--all-targets --all-features` exit 0, reproducing CI's `msrv` job locally — and
+because the second command carries `--all-features`, the floor is proven for the
+optional rows (`inflate_strict`, `c-oracle`) too, not only for the default set.
+The same tree also builds and passes its full suite on current stable
 `rustc 1.97.1 (8bab26f4f 2026-07-14, LLVM 22.1.6)`.
 
 A root [`rust-toolchain.toml`](rust-toolchain.toml) pins `channel = "1.85.0"`
