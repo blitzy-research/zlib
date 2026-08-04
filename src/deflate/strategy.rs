@@ -175,15 +175,15 @@ pub const CONFIGURATION_TABLE: [Config; 10] = [
 /// (`deflate.c` L107-L110). `FASTEST` forces the compression level to 1 and
 /// maintains no hash chains, trading ratio for raw speed.
 ///
-/// **There is no consumer of this table today.** No Cargo feature selects it
-/// and no code in `src/deflate/**` reads it; every reference is confined to this
-/// module and its unit tests. It is retained purely as C-provenance and test
-/// reference material, so that the `FASTEST` rows of `configuration_table` are
-/// auditable against `deflate.c` and so that a future `FASTEST` feature has an
-/// already-verified starting point. The standard build — the only build that
-/// exists — uses [`CONFIGURATION_TABLE`]. Its two rows are identical to levels 0
-/// and 1 of [`CONFIGURATION_TABLE`], which is itself a fact worth asserting
-/// rather than assuming, and the tests below do assert it.
+/// **This table has no consumer.** No Cargo feature selects it and no code in
+/// `src/deflate/**` reads it; every reference is confined to this module and its
+/// unit tests, because the driver always resolves through
+/// [`CONFIGURATION_TABLE`]. It exists as C-provenance and reference material, so
+/// the `FASTEST` rows stay auditable against `deflate.c` and a `FASTEST` feature
+/// would begin from verified values rather than a fresh transcription. Its two
+/// rows must equal levels 0 and 1 of [`CONFIGURATION_TABLE`]; the tests below
+/// assert that equality rather than leaving it to inspection, since a table
+/// nothing reads is exactly the kind that drifts unnoticed.
 #[rustfmt::skip]
 pub const FASTEST_TABLE: [Config; 2] = [
     Config { good_length: 0, max_lazy: 0, nice_length: 0, max_chain: 0, func: CompressFunc::Stored }, // 0 store only

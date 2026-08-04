@@ -116,20 +116,18 @@ path = ".."
 #     `std::io`), so `fuzz_gzip.rs`'s `use zlib_rs::gz::{gzopen, gzread,
 #     gzwrite, gzclose_r, gzclose_w}` resolves only when `gz-io` is on.
 #
-# Forwarding only `gzip` left that second capability merely INHERITED from the
-# path dependency's own defaults rather than guaranteed by this manifest: the
-# gz-file legs happened to compile, but nothing in the feature graph said they
-# had to, so a future `default-features = false` on the dependency (or a change
-# to `zlib-rs`'s default set) would have broken them at a distance. Naming both
-# closes that gap. `gz-io` already expands to `["std", "gzip"]` upstream, so the
-# two entries overlap by design — `gzip` stays listed explicitly so the framing
-# capability remains guaranteed independently of how `gz-io` is defined.
+# Both are named so that neither capability is merely INHERITED from the path
+# dependency's own defaults. Inheritance would leave the gz-file legs compiling
+# without anything in the feature graph requiring them to, so a `default-features
+# = false` on the dependency — or a change to `zlib-rs`'s default set — would
+# break them at a distance. `gz-io` already expands to `["std", "gzip"]` upstream,
+# so the two entries overlap by design: `gzip` stays listed explicitly so the
+# framing capability is guaranteed independently of how `gz-io` is defined.
 #
-# It is ON by default, so a plain `cargo fuzz build|run` under the pinned
-# nightly keeps the full gzip coverage. `--no-default-features` compiles the
-# gzip-specific legs out
-# while every `fuzz_target!` — and therefore every `main` — stays unconditional,
-# so all five `[[bin]]` targets still link.
+# It is ON by default, so a plain `cargo fuzz build|run` under the pinned nightly
+# keeps the full gzip coverage. `--no-default-features` compiles the gzip-specific
+# legs out while every `fuzz_target!` — and therefore every `main` — stays
+# unconditional, so all five `[[bin]]` targets still link.
 #
 # This adds no package to the dependency graph: a lockfile records packages and
 # versions, not feature selections, so `fuzz/Cargo.lock` is unaffected.

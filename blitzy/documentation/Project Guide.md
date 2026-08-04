@@ -77,7 +77,7 @@ pie showData title Historical AAP-Scoped Effort Estimate — 89.9% of Estimated 
 
 ### 1.3 Key Accomplishments
 
-- [x] **Full C→Rust source rewrite** — 40 modules under `src/` (78,386 lines today; AAP baseline: 32,354 LOC) covering deflate, inflate, checksum, gz file I/O, one-call wrappers, the public API surface, and the FFI boundary, plus 7 integration suites (six default, plus the opt-in C-oracle harness), 3 Criterion benches, and 5 fuzz targets. No `todo!()`, `unimplemented!()`, `TODO`, `FIXME`, or `XXX` anywhere in `src/`.
+- [x] **Full C→Rust source rewrite** — 40 modules under `src/` (78,457 lines today; AAP baseline: 32,354 LOC) covering deflate, inflate, checksum, gz file I/O, one-call wrappers, the public API surface, and the FFI boundary, plus 7 integration suites (six default, plus the opt-in C-oracle harness), 3 Criterion benches, and 5 fuzz targets. No `todo!()`, `unimplemented!()`, `TODO`, `FIXME`, or `XXX` anywhere in `src/`.
 - [x] **C-ABI drop-in verified by linking and running** — `#[repr(C)]` `z_stream` (14 fields) and `gz_header` (13 fields) mirrors plus `extern "C"` shims. The fail-closed C harness in §9.6, compiled against the retained `zlib.h` and linked **statically** against `libzlib_rs.a`, prints `version=1.3.2.1-motley roundtrip=OK bound=58 crc32=0xcbf43926 adler32=0x091e01de`; linked **dynamically** against `libzlib_rs.so` it prints the same line and additionally round-trips 50,000 bytes byte-exactly with correct `1f 8b` gzip framing at `windowBits=31`.
 - [x] **Verified numeric values (AAP §0.6.6)** — `crc32("123456789") = 0xcbf43926`, `adler32("123456789") = 0x091e01de`, the exact `compressBound` term-for-term formula with `compressBound(9) = 22`, and `ENOUGH = 1444` (`ENOUGH_LENS 852` + `ENOUGH_DISTS 592`).
 - [x] **Full feature parity** — 10 compression levels, 5 strategies, 7 flush modes, preset dictionaries, `inflateBack`, and the overloaded `windowBits` contract (raw `-8..-15`, zlib `8..15`, gzip `+16`, auto-detect `+32`) resolved in a single `constants::parse_window_bits`.
@@ -107,7 +107,7 @@ No defect blocks the build, and no test fails or is ignored. The items below are
 
 ### 1.6 Recommended Next Steps
 
-1. **[High]** Conduct formal human code review & sign-off of the migration (78,386 lines across the 40 `src/` modules today; AAP baseline 32,354 LOC), focusing on the `unsafe` FFI boundary and its `// SAFETY:` justifications (~16h). This is the one item that cannot be automated away.
+1. **[High]** Conduct formal human code review & sign-off of the migration (78,457 lines across the 40 `src/` modules today; AAP baseline 32,354 LOC), focusing on the `unsafe` FFI boundary and its `// SAFETY:` justifications (~16h). This is the one item that cannot be automated away.
 2. **[High]** Obtain an actual security & supply-chain **audit result** over the 102-package governed closure, and reconcile it with the landed `deny.toml` policy and `audit.yml` workflow (~8h).
 3. **[Medium]** Observe the expanded CI matrix through real runs, and close the gap that big-endian (`s390x-unknown-linux-gnu`) is currently type-checked rather than executed (~6h).
 4. **[Medium]** Validate the `no_std` build on real embedded hardware, not only as a bare-metal compile (~5h).
@@ -143,7 +143,7 @@ No defect blocks the build, and no test fails or is ignored. The items below are
 
 | Category | Hours | Priority | Gap ID | Current state |
 |---|---:|---|---|---|
-| Human code review & sign-off of the safety-critical migration (78,386 lines today; AAP baseline 32,354 LOC) | 16 | High | — | Outstanding; cannot be automated away |
+| Human code review & sign-off of the safety-critical migration (78,457 lines today; AAP baseline 32,354 LOC) | 16 | High | — | Outstanding; cannot be automated away |
 | Security & supply-chain **audit result** (`cargo audit` / `cargo deny` + manual `unsafe`/FFI review) | 8 | High | D1, D2 | Policy and workflow landed; no audit result observed |
 | Cross-platform CI matrix (Windows / macOS / aarch64 / 32-bit / big-endian) | 6 | Medium | D3 | Landed; big-endian is type-checked, not executed; no run observed here |
 | crates.io packaging & release governance | 3 | Medium | D12 | Package-content check landed; publish pipeline still absent |
@@ -413,7 +413,7 @@ Severities are fixed by the AAP's authoritative register. Three identifier corre
 
 | Risk | Category | Severity | Probability | Mitigation | Status |
 |---|---|---|---|---|---|
-| No formal human code review or sign-off across the migration surface (78,386 lines today; AAP baseline 32,354 LOC) | Governance | High | High | Human review of the `unsafe` FFI boundary and its `// SAFETY:` justifications; cannot be automated away | Open |
+| No formal human code review or sign-off across the migration surface (78,457 lines today; AAP baseline 32,354 LOC) | Governance | High | High | Human review of the `unsafe` FFI boundary and its `// SAFETY:` justifications; cannot be automated away | Open |
 | No observed security / supply-chain **audit result** | Security | High | Medium | `deny.toml` (D1) and the `audit.yml` workflow (D2) have landed and govern the 102-package closure; a landed policy is **not** an audit finding, so this stays open until an actual result exists | Open — policy landing only |
 | `unsafe` at the FFI boundary — UB if a C caller passes invalid pointers | Security | Medium | Low | Confinement to `src/ffi/**` enforced by `#![deny(unsafe_code)]` with two scoped carve-outs; mandatory `// SAFETY:` justifications; null and wrong-engine guards tested; a dedicated FFI round-trip fuzz target covering the `deflateCopy`/`Reset`/`ResetKeep` and `inflateCopy`/`Reset`/`Reset2`/`ResetKeep` lifecycle and its misuse paths | Mitigated (audit pending) |
 | Compression below C throughput (aggregate ≈85%, attributed) | Technical | Low | Medium | Tuning is outstanding and strictly gated on byte-identity: any candidate speed-up must pass the identity gate before it is viable, and the tuning values themselves are off limits. Note the axis: the C-relative headroom sits on the **compressible** profiles (≈58–64%), while incompressible input — the slowest in absolute bytes per second — is the *closest* to C (≈82–86%). See §5.6 | Open (tracked) |

@@ -967,7 +967,9 @@ pub(crate) fn inflate_tracked_lending<A: Allocator>(
                 // `strm->adler` assignments is individually placed and guarded,
                 // and reproducing them one-for-one is what lets the epilogue
                 // carry C's own `(wrap & 4) && out` guard instead of writing
-                // unconditionally (AAP §0.6.2 ABI field fidelity).
+                // unconditionally. `adler` is a public `z_stream` field, so where
+                // and whether it is written is observable behaviour a caller can
+                // depend on (AAP §0.8.1 D-4, §0.7.2 standard S5).
                 state.check = ADLER32_INIT;
                 strm.adler = state.check;
                 state.mode = if (io.hold & 0x200) != 0 {
@@ -2126,7 +2128,7 @@ pub(crate) fn inflate_tracked_lending<A: Allocator>(
                 // so `next_in`/`avail_in`/`next_out`/`avail_out` are already
                 // committed and the caller keeps every byte decoded during this
                 // call — the window allocation failed, not the decode. Reporting
-                // `0`/`0` here used to silently discard that output.
+                // `0`/`0` here would discard that output silently.
                 consumed: io.next,
                 produced: io.put,
             },
@@ -2151,11 +2153,12 @@ pub(crate) fn inflate_tracked_lending<A: Allocator>(
         state.check = update_check(state.flags, state.check, &io.output[start..io.put]);
         // C publishes the check mirror *inside* this guard (`inflate.c`
         // L1144-L1146: `if ((state->wrap & 4) && out) strm->adler = state->check
-        // = UPDATE_CHECK(...)`). The write used to sit below, unguarded, which
-        // clobbered `strm->adler` on exactly the paths where C leaves it alone —
-        // raw framing (`wrap == 0`, where C's `inflateResetKeep` deliberately
-        // skips the field per its "ill-conceived Java test suite" comment at
-        // `inflate.c` L108-L109) and early-error paths that produce no output.
+        // = UPDATE_CHECK(...)`). The guard is what the placement is for: an
+        // unguarded write below would clobber `strm->adler` on exactly the paths
+        // where C leaves it alone — raw framing (`wrap == 0`, where C's
+        // `inflateResetKeep` deliberately skips the field per its
+        // "ill-conceived Java test suite" comment at `inflate.c` L108-L109) and
+        // early-error paths that produce no output.
         strm.adler = state.check;
     }
 

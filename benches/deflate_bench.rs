@@ -113,8 +113,8 @@ const SIZE: usize = 64 * 1024;
 /// Held as a constant because it is used twice — once to build the profile list
 /// and once to decide that profile's measurement policy — and the two uses must
 /// not be allowed to drift apart. If they did, the long-running case would
-/// silently fall back to Criterion's defaults and the warning F-3 removed would
-/// return.
+/// silently fall back to Criterion's defaults and reinstate its "Unable to
+/// complete 100 samples" warning.
 const INCOMPRESSIBLE_PROFILE: &str = "incompressible";
 
 /// Noise threshold for the sub-millisecond cases: every `deflate_levels/*` id
@@ -268,8 +268,9 @@ fn bench_profiles(c: &mut Criterion) {
         //
         // Criterion snapshots the group configuration when each case is
         // REGISTERED — `run_bench` calls `partial_config.to_complete(..)` per
-        // case (`src/benchmark_group.rs`) — so a setting applied here binds only
-        // to the case registered on the next statement. That is what makes a
+        // case, in criterion 0.5.1's own `src/benchmark_group.rs` rather than any
+        // file in this repository — so a setting applied here binds only to the
+        // case registered on the next statement. That is what makes a
         // per-case policy possible, but it also means the settings PERSIST into
         // the following iteration: `incompressible` is registered second, so
         // leaving the fast arm implicit would silently leak Flat sampling and the
@@ -337,8 +338,9 @@ fn bench_profiles(c: &mut Criterion) {
 /// change. A faster match finder that emits different tokens is a REGRESSION,
 /// not an improvement, no matter what this benchmark says (AAP 0.8.3). The very
 /// heuristics that cost throughput are the ones that determine the emitted
-/// bytes: the chain-length halving at `good_match`, the `nice_match` early
-/// break, and the `TOO_FAR` lazy-match filter. Any candidate speed-up must
+/// bytes: the chain-length quartering at `good_match` (`chain_length >>= 2`, at
+/// `deflate.c` L1424 and `src/deflate/state.rs`), the `nice_match` early break,
+/// and the `TOO_FAR` lazy-match filter. Any candidate speed-up must
 /// therefore be validated against the byte-identity gate in `tests/interop.rs`,
 /// which owns that property exclusively, BEFORE it is considered viable.
 /// Permissible optimisation is limited to work that provably cannot change the

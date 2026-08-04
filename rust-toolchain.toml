@@ -1,291 +1,179 @@
 # rust-toolchain.toml — the Rust toolchain contract for the `zlib-rs` crate.
 #
 # `rustup` reads this file whenever one of its proxies (`cargo`, `rustc`,
-# `rustdoc`, `cargo-fmt`, `cargo-clippy`, …) is invoked from this directory or
-# any subdirectory, and selects the toolchain named below — installing it, and
-# the listed components, on first use.
+# `rustdoc`, `cargo-fmt`, `cargo-clippy`, …) is invoked from this directory or any
+# subdirectory, and selects the toolchain named below — installing it, and the
+# listed components, on first use.
 #
-# It is the companion to `Cargo.toml`'s `rust-version = "1.85.0"`, and the two
-# keys do different jobs: `rust-version` DECLARES the MSRV (Cargo checks it
-# during dependency resolution but never chooses a compiler), while this file
-# SELECTS the compiler. Without it, "the MSRV" is an assertion no local build
-# actually tests — the drift that migration gap D4 exists to close.
+# It is the companion to `Cargo.toml`'s `rust-version = "1.85.0"`, and the two keys
+# do different jobs: `rust-version` DECLARES the MSRV (Cargo checks it during
+# dependency resolution but never chooses a compiler), while this file SELECTS the
+# compiler. Without it, "the MSRV" is an assertion no local build tests — the drift
+# migration gap D4 exists to close.
 #
 #
 # WHY THE FLOOR, AND WHY 1.85.0
 # =============================
-# Pinning `"stable"` would reproduce that drift: "stable" names a moving target,
-# so two contributors weeks apart get two different compilers and neither
-# exercises the MSRV. The floor is the only value that makes the declared MSRV a
-# tested property.
+# `"stable"` names a moving target, so it would leave two contributors weeks apart
+# on two different compilers with neither exercising the MSRV. The floor is the only
+# value that makes the declared MSRV a tested property.
 #
 # 1.85.0 specifically, because the pairing is forced: `Cargo.toml` declares
 # `edition = "2024"`, and 1.85.0 is the release in which edition 2024 became
-# available. It is therefore the tightest self-consistent MSRV an edition-2024
-# crate can declare — no older toolchain can compile this crate at all, and any
-# newer floor would be an arbitrary restriction. The full three-component form
-# is used so a mechanical diff against `Cargo.toml`'s `rust-version` is possible.
+# available. It is therefore the tightest self-consistent MSRV an edition-2024 crate
+# can declare — no older toolchain compiles this crate at all, and a newer floor
+# would be an arbitrary restriction. The full three-component form makes a
+# mechanical diff against `Cargo.toml`'s `rust-version` possible.
 #
 #
 # THIS FILE IS NOT A STRAITJACKET
 # ==============================
 # `rustup` resolves a toolchain by precedence, highest first: (1) a `+toolchain`
-# shorthand on the command line, (2) the `RUSTUP_TOOLCHAIN` environment
-# variable, (3) a `rustup override` set for the directory, (4) THIS FILE, and
-# (5) `rustup default`. Ranks 1-3 all beat it, so any single command, shell, or
-# CI step can opt out without editing anything here:
+# shorthand on the command line, (2) the `RUSTUP_TOOLCHAIN` environment variable,
+# (3) a `rustup override` for the directory, (4) THIS FILE, (5) `rustup default`.
+# Ranks 1-3 all beat it, so any single command, shell, or CI step opts out without
+# editing anything here:
 #
 #     cargo +stable test                 # one command, current stable
 #     RUSTUP_TOOLCHAIN=stable cargo test # one shell / one CI step
 #
-# Two consequences follow, and both matter:
+# The consequence that matters for CI is rank 4 beating rank 5, because rank 5 is
+# what the toolchain action sets: `dtolnay/rust-toolchain` runs
+# `rustup toolchain install <ref> … --profile minimal --no-self-update` followed by
+# `rustup default <ref>`, and exports no `RUSTUP_TOOLCHAIN`. Its `@<channel>` label
+# therefore does NOT select the compiler in this directory tree. A job that must run
+# on a channel other than the floor has to say so at rank 1 or 2, and every job that
+# runs Rust tooling does, through a job-level `env: RUSTUP_TOOLCHAIN:`. Keep it that
+# way when adding a job.
 #
-# (a) Ranks 1-3 beating rank 4 is what the two commands above rely on, so the
-#     pin costs a contributor nothing when they need another channel.
+# That rule is scoped to jobs that run Rust tooling, not to every job: `audit.yml`'s
+# `policy-integrity` runs no Rust binary at all — it is a pure `python3` structural
+# check over `deny.toml` and the workflow files — so it correctly sets no
+# `RUSTUP_TOOLCHAIN`, and adding one would imply a dependency it does not have. The
+# channels themselves are declared in the workflows rather than duplicated here; the
+# only one worth naming is `fuzz.yml`'s date-pinned `nightly-2026-08-01`, because
+# `cargo-fuzz` needs nightly for the `-Z` sanitizer and coverage instrumentation it
+# injects, and it resolves its toolchain from the repository root, so this file
+# reaches the detached `fuzz/` workspace too. Without that override `cargo fuzz build`
+# fails with `error: 1 nightly option were parsed` before any harness is produced;
+# locally, name it explicitly as `cargo +nightly-2026-08-01 fuzz …` or
+# `RUSTUP_TOOLCHAIN=nightly-2026-08-01 cargo fuzz build`.
 #
-#     Verified in this working tree: with this file present,
-#     `rustup show active-toolchain` reports
-#     `1.85.0-x86_64-unknown-linux-gnu (overridden by '…/rust-toolchain.toml')`
-#     while `rustup default` still reports `stable-x86_64-unknown-linux-gnu`.
-#     Rank 4 beating rank 5 is observable, not theoretical.
+# The override is set at JOB level (rank 2) rather than as a `+toolchain` prefix
+# (rank 1) wherever a nested `cargo` invocation is involved: a rank-1 prefix governs
+# only the process it is written on and is not inherited by a child, whereas the
+# environment variable is. `cargo fuzz` shells out to `cargo build` per harness, so
+# prefixing it would pin the wrapper and leave the builds it spawns to resolve on
+# their own. Where a job additionally spells a `+stable` / `+1.85.0` shorthand, keep
+# the shorthand in step with the `@<ref>` the job installs.
 #
-# (b) This file DOES outrank `rustup default` (rank 5) — and `rustup default`
-#     is exactly what the CI toolchain action sets. Verified against the
-#     action's own `action.yml`: `dtolnay/rust-toolchain` runs
-#     `rustup toolchain install <ref> … --profile minimal --no-self-update`
-#     followed by `rustup default <ref>`; it does NOT export
-#     `RUSTUP_TOOLCHAIN`. So a workflow job that must run on a channel OTHER
-#     than the pin below has to say so at rank 1 or 2 — and EVERY JOB THAT RUNS
-#     RUST TOOLING does, via a job-level `env: RUSTUP_TOOLCHAIN:`. Keep it that
-#     way when adding a job: the action's `@<channel>` label alone does NOT
-#     select the compiler here.
+# Each of those jobs also ASSERTS its active toolchain before doing any work, with a
+# `case "$(rustup show active-toolchain)"` guard that exits 1 on a mismatch. Those
+# assertion steps use BARE `rustc` and `rustup`, never a `+toolchain` shorthand,
+# because their purpose is to observe the AMBIENT resolution — prefixing them would
+# make the check vacuous. Together that turns a future precedence change from a
+# silent substitution into a loud CI failure.
 #
-#     The scope of that claim is deliberately "every job that runs Rust tooling",
-#     not "every job". Of the 17 jobs across the three workflows, 16 invoke
-#     `cargo`/`rustc`/`rustup` and all 16 carry the override; the seventeenth,
-#     `audit.yml`'s `policy-integrity`, runs no Rust binary at all — it is a pure
-#     `python3` structural check over `deny.toml` and the workflow files, which also
-#     asserts that the policy has not gone missing and that no SECOND policy file
-#     has appeared anywhere in the tree, and it
-#     installs no toolchain. It therefore correctly sets no
-#     `RUSTUP_TOOLCHAIN`, and adding one would imply a dependency it does not have.
-#
-#       * `.github/workflows/ci.yml` `msrv` — `RUSTUP_TOOLCHAIN: 1.85.0`. It
-#         agrees with this file, but is stated anyway: the job's guarantee is
-#         "builds on exactly the declared MSRV", so the version it runs belongs
-#         in the job, not inherited from a file it does not own.
-#       * `.github/workflows/ci.yml` `build-test`, `no-std-tests`, `lint`,
-#         `docs`, `benches`, `build-script-tests`, `unsafe-boundary`,
-#         `c-abi-linkage`, `cross-targets`, `bare-metal-no-std`,
-#         `package-verify` — the other eleven
-#         of ci.yml's twelve jobs, all `RUSTUP_TOOLCHAIN: stable`. Without it each
-#         of them resolves to the pin: most would still PASS (the crate is
-#         MSRV-clean — see the measured results below) while silently ceasing to
-#         cover current stable, and `lint` would run the floor's clippy instead of
-#         stable's, which is strictly weaker. See "THE LINT GATE RUNS AT CURRENT
-#         STABLE". Each of those jobs also asserts its resolved toolchain with
-#         `rustc --version --verbose` plus `rustup show active-toolchain` and
-#         exits 1 on a mismatch, so losing an override fails the job loudly
-#         instead of quietly downgrading a gate.
-#       * `.github/workflows/audit.yml` `cargo-audit`, `cargo-deny`,
-#         `cargo-deny-fuzz` — `RUSTUP_TOOLCHAIN: stable`. Each builds its tool
-#         from source with `cargo install <tool> --locked`, and neither
-#         `cargo-audit` nor `cargo-deny` is guaranteed to compile on the MSRV
-#         floor, so the pin is what they must NOT inherit.
-#       * `.github/workflows/fuzz.yml` `cargo-fuzz` —
-#         `RUSTUP_TOOLCHAIN: nightly-2026-08-01`, a DATE-PINNED nightly rather
-#         than the floating `nightly` channel. `cargo-fuzz` needs nightly for the
-#         `-Z` sanitizer/coverage instrumentation it injects, and it resolves its
-#         toolchain from the repository root, so this file reaches the detached
-#         `fuzz/` workspace too. Without the override, `cargo install
-#         cargo-fuzz`, `cargo fuzz build`, and `cargo fuzz run` all execute on
-#         the pin and fail with "1 nightly option were parsed". Locally, name it
-#         explicitly: `cargo +nightly-2026-08-01 fuzz …`, or
-#         `RUSTUP_TOOLCHAIN=nightly-2026-08-01 cargo fuzz build`.
-#         Measured, from the repository root: a bare `cargo fuzz build` fails
-#         with `error: 1 nightly option were parsed` before any harness is
-#         produced, while naming that nightly explicitly succeeds.
-#         That job is the ONLY job in `fuzz.yml`; supply-chain policy over the
-#         fuzz graph lives in `audit.yml`'s `cargo-deny-fuzz`, not there.
-#
-#     Each of those jobs states its channel TWICE, and the two can never
-#     disagree because they name the same value. The job-level `RUSTUP_TOOLCHAIN`
-#     (rank 2) is what reaches NESTED cargo invocations — a subcommand that
-#     shells out to `cargo`, as `cargo-fuzz` does, inherits it — and it governs
-#     the `rustup` and bare-`rustc` calls that carry no shorthand, so a step
-#     added later cannot quietly fall back to this pin.
-#
-#     `ci.yml` and `audit.yml` additionally spell a `+stable` / `+1.85.0`
-#     shorthand on their `cargo` and `rustc` calls, which is RANK 1 — the highest
-#     precedence there is, beating this file, any directory override, and
-#     `RUSTUP_TOOLCHAIN` itself — and which is visible in the CI log beside the
-#     command it governs. Where a job states its channel that way, keep the
-#     shorthand in step with the `@<ref>` the job installs.
-#
-#     `fuzz.yml` deliberately does NOT, and the asymmetry is the point rather than
-#     an oversight. `cargo fuzz` SHELLS OUT to `cargo build` for each harness, and
-#     a rank-1 prefix governs only the process it is written on — it is not
-#     inherited by that nested child, whereas the rank-2 `RUSTUP_TOOLCHAIN` env var
-#     is. Prefixing `cargo fuzz` would therefore pin the wrapper while leaving the
-#     builds it spawns to resolve on their own, which is the failure the env var
-#     already prevents. So that workflow relies on the job-level override alone and
-#     proves it held with the assertion step described below.
-#
-#     Each job also ASSERTS its active toolchain before doing any work, with a
-#     `case "$(rustup show active-toolchain)"` guard that fails the job on a
-#     mismatch. Those assertion steps deliberately use BARE `rustc` and `rustup`,
-#     never a `+toolchain` shorthand, because their purpose is to observe the
-#     AMBIENT resolution; prefixing them would make the check vacuous. Together
-#     that converts a future precedence change from a silent substitution into a
-#     loud CI failure.
-#
-# Do NOT "fix" any of that by deleting the pin or by pointing `channel` at
-# `nightly`/`stable` — that re-opens D4 and, for nightly, would silently make
-# every contributor build the crate on an unstable compiler.
+# Do NOT "fix" any of that by deleting the pin or pointing `channel` at
+# `nightly`/`stable`: that re-opens D4 and, for nightly, silently puts every
+# contributor on an unstable compiler.
 #
 #
 # MSRV IS VERIFIED, NOT ASSUMED
 # =============================
-# The floor below is a measured property of this crate, not a guess. On
-# `rustc 1.85.0 (4d91de4e4 2025-02-17)` / `cargo 1.85.0 (d73d2caf9
-# 2024-12-31)`, each of the following was observed to succeed:
+# The floor is a measured property of this crate. On `rustc 1.85.0` / `cargo 1.85.0`
+# each of the following succeeds: `cargo build` and `cargo check --all-targets` with
+# zero warnings (exactly the CI `msrv` job, reproduced locally); `cargo test`,
+# `cargo test --all-features`, `cargo test --no-default-features` and
+# `cargo test --no-default-features --features no-std`; `cargo fmt --all -- --check`;
+# `cargo clippy --all-targets [--all-features] -- -D warnings`; `cargo doc
+# --no-deps` and `cargo bench --no-run` with zero warnings; and `cargo build
+# --release`, emitting all three artifacts. The same set succeeds on current stable.
 #
-#   - `cargo build` and `cargo check --all-targets`, zero warnings — this is
-#     exactly the CI `msrv` job, reproduced locally;
-#   - `cargo test`, `cargo test --all-features`,
-#     `cargo test --no-default-features` and
-#     `cargo test --no-default-features --features no-std` — every row 0 failed
-#     and 0 ignored. Absolute counts are deliberately not recorded here: they
-#     move with every added test, and a number in a comment only goes stale.
-#     `0 failed, 0 ignored` is the invariant that matters (AAP D-5);
-#   - `cargo fmt --all -- --check`;
-#   - `cargo clippy --all-targets [--all-features] -- -D warnings` — see the
-#     next section for why this one is nonetheless run on stable in CI;
-#   - `cargo doc --no-deps` and `cargo bench --no-run`, zero warnings;
-#   - `cargo build --release`, emitting all three artifacts
-#     (`libzlib_rs.rlib` 2.3 MB, `libzlib_rs.so` 589 KB, `libzlib_rs.a`
-#     20 MB).
-#
-# The same set was re-verified on current stable, `rustc 1.97.1 (8bab26f4f
-# 2026-07-14, LLVM 22.1.6)`: every test row agrees between the two toolchains,
-# each with 0 failed and 0 ignored, and the release artifacts come out
-# marginally larger (a newer LLVM). Per the policy stated above, the row totals
-# are deliberately not written down here — they change every time a test is
-# added, and tests are only ever added (AAP D-5). The pin therefore narrows
-# nothing: it selects a floor that is known good, out of a supported range that
-# is known good at both ends.
-#
-# The artifact sizes above are likewise a dated measurement, not a budget: they
-# are a property of the toolchain and the code rather than a contract, no gate
-# asserts any of them, and they will drift with the next compiler release.
+# Absolute test counts and artifact sizes are deliberately NOT recorded here. They
+# move with every added test and every compiler release, so a number in a comment
+# only goes stale; `0 failed, 0 ignored` on every row is the invariant that matters
+# (AAP D-5). The pin therefore narrows nothing: it selects a floor that is known
+# good, out of a supported range that is known good at both ends.
 #
 #
 # THE LINT GATE RUNS AT CURRENT STABLE — AND MUST BE ASKED FOR EXPLICITLY
 # =======================================================================
-# `cargo clippy --all-targets -- -D warnings` is a CURRENT-STABLE gate. Run it
-# as `cargo +stable clippy …` (or with `RUSTUP_TOOLCHAIN=stable`), which is what
-# the CI `lint` job now does explicitly; an unqualified `cargo clippy` in this
-# repository resolves to the pinned floor, because that is what rank 4 above
-# means.
+# `cargo clippy --all-targets -- -D warnings` is a CURRENT-STABLE gate. Run it as
+# `cargo +stable clippy …`, or with `RUSTUP_TOOLCHAIN=stable`, which is what the CI
+# `lint` job does; an unqualified `cargo clippy` in this repository resolves to the
+# pinned floor, because that is what rank 4 above means. Without an explicit
+# override the job would merely ASK the action for stable while executing the
+# floor's clippy, turning a current-stable gate into an MSRV one.
 #
-# Measured on the current tree, it is clean on BOTH ends — `clippy 0.1.97` and
-# the `clippy 0.1.85` that ships with the pinned floor — with and without
-# `--all-features`, zero warnings in all four combinations. Two 0.1.85-specific
-# diagnostics are worth naming, because staying clean on the floor means
-# continuing to avoid the constructs that trigger them:
-# `clippy::duplicated_attributes`, which fires on an inner
-# `#![cfg(feature = "gz-io")]` restating the `#[cfg(…)]` on `pub mod gz;` (see the
-# note in `src/ffi/gz.rs`), and `undocumented_unsafe_blocks`, which fires when
-# `rustfmt` separates a `// SAFETY:` comment from its `unsafe` token. Neither
-# construct is present: there is no inner `cfg` attribute, and every `unsafe`
-# block in the crate AND in the integration tests carries a `// SAFETY:` comment
-# adjacent to the `unsafe` token, verified with an explicit
-# `-W clippy::undocumented_unsafe_blocks` sweep over `--all-targets` on both
-# toolchains (zero findings).
+# Stable is the right end to gate on because clippy's lint SET grows between
+# releases: a diagnostic that does not exist on the floor's clippy can exist on
+# stable's, so only the newer linter can catch it — `clippy::manual_div_ceil`, which
+# fires on 0.1.97 and does not exist on 0.1.85, is a concrete instance. The floor is
+# a COMPILER contract, not a LINTER contract; pinning the linter to it would
+# eventually mean editing correct, test-covered code to satisfy a withdrawn lint.
 #
-# The gate nevertheless stays on stable, and that is a durable decision rather
-# than a reaction to any particular diagnostic: clippy's lint SET is not stable
-# across releases, so `-D warnings` on an old clippy can reintroduce
-# diagnostics upstream has already withdrawn, and pinning the linter to the
-# MSRV would eventually mean editing correct, test-covered code to satisfy an
-# obsolete lint. The floor is a COMPILER contract, not a LINTER contract.
+# Staying clean on the floor as well means continuing to avoid the two constructs
+# that trigger 0.1.85-specific diagnostics: `clippy::duplicated_attributes`, which
+# fires on an inner `#![cfg(feature = "gz-io")]` restating the `#[cfg(…)]` on
+# `pub mod gz;` (see the note in `src/ffi/gz.rs`), and `undocumented_unsafe_blocks`,
+# which fires when `rustfmt` separates a `// SAFETY:` comment from its `unsafe`
+# token. Neither construct is present.
 #
-# BOTH ends are clean, so nothing here is "deliberately unpinned" to dodge a
-# failure. The reason the gate is nevertheless specified at current stable is
-# that clippy's lint SET GROWS between releases: a diagnostic that does not exist
-# on 0.1.85 can exist on 0.1.97, so only the newer linter can catch it. That is
-# not hypothetical — `clippy::manual_div_ceil` fires on 0.1.97 and does not exist
-# on 0.1.85, so a `(x + 1) / 2 + 1` expression passed the floor's linter and
-# failed stable's.
+# MEASURED STATUS — the gate is clean on BOTH ends of the supported range, with and
+# without `--all-features`. Recorded so it can be re-run rather than trusted:
 #
-# The direction of that asymmetry is why the CI `lint` job must state its
-# toolchain rather than inherit it. Without an explicit override the job merely
-# ASKS `dtolnay/rust-toolchain` for stable while actually executing the pinned
-# floor's clippy — the action sets `rustup default`, which this file outranks —
-# so the "current stable lint" gate becomes an MSRV lint gate, and a stable-only
-# diagnostic reaches the default branch unnoticed. Every job in
-# `.github/workflows/ci.yml` and `.github/workflows/fuzz.yml` therefore sets
-# `RUSTUP_TOOLCHAIN` at job level (rank 2), so the label and the compiler agree.
+#     clippy 0.1.97 (8bab26f4f6 2026-07-14)  — exit 0, zero diagnostics
+#     clippy 0.1.85 (4d91de4e48 2025-02-17)  — exit 0, zero diagnostics
 #
-# Re-verify BOTH ends whenever a dependency or a language feature is added — the
-# floor for the MSRV contract, stable for the lint contract:
+# Because both ends pass, do not add an `#[allow(…)]` or any other suppression for a
+# floor-clippy failure, and do not record a claim that one exists. Re-verify both
+# ends whenever a dependency or a language feature is added:
 #
 #     cargo check --all-targets                          # the pinned floor
 #     cargo clippy --all-targets -- -D warnings          # the floor's linter
 #     cargo +stable clippy --all-targets -- -D warnings  # the lint gate
 #
-# MEASURED STATUS — the lint gate passes on BOTH ends of the supported range,
-# with and without `--all-features`. The measurement is recorded here instead of
-# a bare assertion, so it can be re-run rather than trusted:
-#
-#     clippy 0.1.97 (8bab26f4f6 2026-07-14)  — exit 0, zero diagnostics
-#     clippy 0.1.85 (4d91de4e48 2025-02-17)  — exit 0, zero diagnostics
-#
-# Do NOT introduce a claim that the floor's clippy fails, and do not add an
-# `#[allow(…)]` or any other suppression for a failure that does not exist.
-#
 #
 # MAINTENANCE RULES
 # =================
 # * RAISING THE MSRV IS A THREE-PLACE CHANGE, IN ONE COMMIT: `channel` here,
-#   `rust-version` in `Cargo.toml`, and the `dtolnay/rust-toolchain@<ref>` pin in
-#   the CI `msrv` job. They are the same fact stated three times; if they drift,
-#   two of them are lying.
-# * TO TEST ON A DIFFERENT COMPILER, DON'T EDIT THIS FILE. Use `cargo +stable …`
-#   / `cargo +nightly …`, or export `RUSTUP_TOOLCHAIN`. Editing the pin changes
-#   it for everyone.
+#   `rust-version` in `Cargo.toml`, and the `dtolnay/rust-toolchain@<ref>` pin in the
+#   CI `msrv` job. They are the same fact stated three times; if they drift, two of
+#   them are lying.
+# * TO TEST ON A DIFFERENT COMPILER, DON'T EDIT THIS FILE. Use `cargo +stable …` /
+#   `cargo +nightly-2026-08-01 …`, or export `RUSTUP_TOOLCHAIN`. Editing the pin
+#   changes it for everyone.
 # * FUZZING IS ALWAYS EXPLICITLY NIGHTLY, AND DATE-PINNED:
 #   `cargo +nightly-2026-08-01 fuzz build`,
 #   `cargo +nightly-2026-08-01 fuzz run <target>` -- the same nightly
 #   `.github/workflows/fuzz.yml` pins and asserts. `cargo-fuzz` is a nightly-only,
-#   CI-installed tool and deliberately never a manifest dependency, so the
-#   default toolchain must never be nightly. Note that this file reaches the
-#   detached `fuzz/` workspace too, since `rustup` discovers it by walking up.
+#   CI-installed tool and deliberately never a manifest dependency, so the default
+#   toolchain must never be nightly.
 # * KEEP THIS FILE TO THE `[toolchain]` TABLE. `rustup` accepts only `channel`,
-#   `components`, `targets`, `profile`, and `path`, and it ERRORS on an
-#   unrecognised key — which would break every local build. Build flags,
-#   `RUSTFLAGS`, link arguments, and per-target settings belong in
-#   `.cargo/config.toml`.
+#   `components`, `targets`, `profile`, and `path`, and it ERRORS on an unrecognised
+#   key — which would break every local build. Build flags, `RUSTFLAGS`, link
+#   arguments, and per-target settings belong in `.cargo/config.toml`.
 
 [toolchain]
 # The MSRV floor, kept byte-identical to `Cargo.toml`'s `rust-version`.
 channel = "1.85.0"
 
 # `rustfmt` and `clippy` are NOT optional: `cargo fmt --all -- --check` and
-# `cargo clippy --all-targets [--all-features] -- -D warnings` are blocking
-# quality gates, and a `minimal` install ships only `cargo`, `rustc`, and
-# `rust-std` — so without this line `cargo fmt` fails with "'cargo-fmt' is not
-# installed for the toolchain".
+# `cargo clippy --all-targets [--all-features] -- -D warnings` are blocking quality
+# gates, and a `minimal` install ships only `cargo`, `rustc`, and `rust-std` — so
+# without this line `cargo fmt` fails with "'cargo-fmt' is not installed for the
+# toolchain".
 components = ["rustfmt", "clippy"]
 
-# `minimal` = `rustc` + `rust-std` + `cargo`, with `rustfmt` and `clippy` added
-# back above, so a contributor's first install stays small and nothing this
-# project needs is lost. This also matches how CI installs the toolchain.
+# `minimal` = `rustc` + `rust-std` + `cargo`, with `rustfmt` and `clippy` added back
+# above, so a contributor's first install stays small and nothing this project needs
+# is lost. It also matches how CI installs the toolchain.
 profile = "minimal"
 
-# `targets` is deliberately OMITTED. The host target is installed automatically,
-# and listing a cross-compilation or bare-metal target here would force every
-# contributor to download it before their first build could start — and would
-# hard-fail for anyone whose platform cannot install it. Cross-platform and
-# bare-metal `no_std` coverage is a CI concern, configured through the `targets:`
-# input of the workflow's toolchain action.
+# `targets` is deliberately OMITTED. The host target is installed automatically, and
+# listing a cross-compilation or bare-metal target here would force every contributor
+# to download it before their first build could start — and would hard-fail for anyone
+# whose platform cannot install it. Cross-platform and bare-metal `no_std` coverage is
+# a CI concern, configured through the `targets:` input of the workflow's toolchain
+# action.

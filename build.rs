@@ -1,15 +1,16 @@
-//! Cargo build script for the `zlib-rs` crate. It has two jobs, and the second
-//! is off unless it is asked for: it regenerates the CRC-32 lookup tables at
-//! build time, always; and when `ZLIB_RS_VERSION_SCRIPT` is set to a truthy
-//! value it applies the retained C baseline's `zlib.map` symbol-version script to
-//! the emitted `cdylib`. With that variable unset — the default everywhere,
-//! including every CI job — it writes nothing outside `${OUT_DIR}`, emits no link
-//! argument, and produces artifacts identical to a build with no such capability
-//! at all. See "Optional cdylib symbol versioning" below.
+//! Cargo build script for the `zlib-rs` crate.
 //!
-//! # Why this exists
+//! It has two jobs. The first always runs: it regenerates the CRC-32 lookup
+//! tables into `${OUT_DIR}`. The second is opt-in: when `ZLIB_RS_VERSION_SCRIPT`
+//! is set to a truthy value it applies the retained C baseline's `zlib.map`
+//! symbol-version script to the emitted `cdylib`. With that variable unset this
+//! script writes nothing outside `${OUT_DIR}`, emits no link argument, and
+//! produces artifacts identical to a build with no such capability at all. See
+//! "Optional cdylib symbol versioning" below.
 //!
-//! In the C zlib baseline the header `crc32.h` (~9,400 lines) is a checked-in,
+//! # Why the tables are generated rather than checked in
+//!
+//! In the C baseline the header `crc32.h` (~9,400 lines) is a checked-in,
 //! machine-generated set of CRC-32 lookup tables produced by the
 //! `make_crc_table()` routine in `crc32.c`. Rather than ship a giant literal
 //! table file, this build script reimplements `make_crc_table()` in safe,
@@ -29,11 +30,8 @@
 //! # Emitted contract
 //!
 //! The generated `${OUT_DIR}/crc32_tables.rs` defines exactly the seven items
-//! below. The names and shapes are a stable contract; do not rename one without
-//! updating `src/checksum/crc32.rs`.
-//!
-//! `src/checksum/crc32.rs` is the sole consumer; the table below records each
-//! item's shape alongside the C artifact it reproduces.
+//! below, and `src/checksum/crc32.rs` is their sole consumer. The names and
+//! shapes are a stable contract: do not rename one without updating that module.
 //!
 //! | Symbol                 | Type                 | Consumed by / C counterpart                                          |
 //! |------------------------|----------------------|----------------------------------------------------------------------|
@@ -53,8 +51,8 @@
 //! it grants the allowance only in the `simd` configuration, where the braided
 //! path is not compiled because the hot loop is `crc32fast`'s. Consequently a
 //! `--no-default-features` build **proves** every generated artifact is
-//! consumed: dropping one produces a warning, which CI's `-D warnings` promotes
-//! to an error.
+//! consumed: dropping one produces a warning, which the `-D warnings` gate
+//! promotes to an error.
 //!
 //! Emitting all seven keeps this script a complete, auditable port of C
 //! `make_crc_table()` — every table the C header contains is reproduced and can
@@ -68,28 +66,24 @@
 //! (the zlib default for 64-bit targets) and generates both braid tables
 //! unconditionally, so its output is byte-for-byte identical on every build and
 //! every platform. Endianness is therefore not a *generation-time* concern: both
-//! braid variants are always emitted, and the choice between them is made at
-//! *consumption* time by `crc32.rs` with `cfg!(target_endian)`. The byte-wise
-//! `CRC_TABLE` is endianness- and word-size-independent, so it needs no variant.
+//! braid variants are always emitted, and the choice between them is made by
+//! `crc32.rs` with `cfg!(target_endian)`, a compile-time constant for the target
+//! being built. The byte-wise `CRC_TABLE` is endianness- and
+//! word-size-independent, so it needs no variant.
 //!
-//! That claim is about this script's *output*, and it carries through to the
-//! shipped artifacts: two clean release builds of one source tree into two
-//! different target directories produce a bit-identical `libzlib_rs.a` and
-//! `libzlib_rs.so`. It does **not** extend to `libzlib_rs.rlib`. That archive's
-//! `lib.rmeta` member records the absolute path of the file this script
-//! generates — `${OUT_DIR}/crc32_tables.rs`, pulled in by the
-//! `include!(concat!(env!("OUT_DIR"), …))` in `src/checksum/crc32.rs` — so two
-//! such builds differ inside `lib.rmeta` in exactly the bytes that spell that
-//! path (measured: 33 differing bytes for one pair of equal-length target
-//! directories) while the rlib's compiled object member is bit-identical. An
-//! rlib is a Rust-internal intermediate rather than a C-consumer artifact, so
-//! the difference is inert. A consumer who needs identical metadata as well can
-//! normalise it with `--remap-path-prefix`: measured, two builds whose target
-//! directories differ produce a bit-identical rlib once both prefixes are mapped
-//! to the same replacement. Both mappings must be present in *one* flag string
-//! used by both builds, because `RUSTFLAGS` itself feeds Cargo's unit hash — and
-//! that is precisely why this stays a consumer-side rustflag and is not baked in
-//! here, for the reasons `.cargo/config.toml` gives.
+//! That determinism carries through to the artifacts a C consumer links against:
+//! two clean release builds of one source tree into different target directories
+//! produce a bit-identical `libzlib_rs.a` and `libzlib_rs.so`. It does **not**
+//! extend to `libzlib_rs.rlib`, whose `lib.rmeta` member records the absolute
+//! path of the file this script generates — `${OUT_DIR}/crc32_tables.rs`, named
+//! by the `include!` above — so two such builds differ there in exactly the bytes
+//! that spell that path while the compiled object member stays bit-identical. An
+//! rlib is a Rust-internal intermediate rather than a C-consumer artifact, so the
+//! difference is inert; a consumer who needs identical metadata too can normalise
+//! it with a `--remap-path-prefix` that maps both directories to one replacement.
+//! That belongs on the consumer's side rather than being baked in here, because
+//! `RUSTFLAGS` itself feeds Cargo's unit hash — `.cargo/config.toml` gives the
+//! reasoning.
 //!
 //! # Optional cdylib symbol versioning (AAP §0.8.2 Divergence 4 / gap D8)
 //!
@@ -100,26 +94,22 @@
 //!
 //! ## Off by default, and neutral when off
 //!
-//! With `ZLIB_RS_VERSION_SCRIPT` unset — the default, and what every CI row and
-//! every ordinary `cargo build` sees — the emitted `cdylib` carries an
+//! With `ZLIB_RS_VERSION_SCRIPT` unset the emitted `cdylib` carries an
 //! unversioned symbol table, which is precisely the state AAP §0.8.2 records as
-//! Divergence 4 and instructs be *kept* rather than "fixed":
-//!
-//! > cdylib symbol versioning is not applied. […] The symbol *set* is exactly
-//! > right (96 declared, 1 platform-gated, 95 emitted, 54/54 global coverage,
-//! > 0/10 local leakage); only the version tags are absent. […] it is correctly
-//! > ranked Low because a drop-in replacement links successfully without it, and
-//! > the change carries linker-portability risk that must be gated behind the
-//! > expanded CI matrix (D3).
+//! Divergence 4 and instructs be *kept* rather than "fixed": the symbol *set* is
+//! exactly right — 54/54 `global:` coverage, 0/10 `local:` leakage — and only the
+//! version tags are absent. AAP §0.10.1 ranks the gap **Low** because a drop-in
+//! replacement links successfully without the tags, while applying them carries
+//! linker-portability risk that belongs behind the expanded CI matrix (gap D3).
 //!
 //! Neutrality is a contract, not an intention. When the variable is unset this
 //! script emits exactly the two [`unconditional_directives`] and nothing else: no
 //! link argument, no `cargo:warning`, no additional `rerun-if-changed`. It writes
 //! nothing into `OUT_DIR` beyond the byte-for-byte identical `crc32_tables.rs`,
-//! and reads nothing from the filesystem. Nothing is lost by that default: all 54
-//! `global:` names in `zlib.map` are already exported and all 10 `local:` names
-//! are already hidden, and an unversioned symbol table satisfies ordinary
-//! linking, `pkg-config` consumption and `LD_PRELOAD` injection alike — see the
+//! and reads nothing from the filesystem. Nothing is lost by that default: every
+//! `global:` name in `zlib.map` is already exported and every `local:` name is
+//! already hidden, and an unversioned symbol table satisfies ordinary linking,
+//! `pkg-config` consumption and `LD_PRELOAD` injection alike — see the
 //! "`zlib.map` symbol-versioning contract" section of `src/ffi/mod.rs`.
 //!
 //! ## Turning it on
@@ -142,19 +132,11 @@
 //! `#[unsafe(no_mangle)]` shims, and that script uses an **anonymous** version
 //! node — `{ global: …; local: *; };`. Build-script link arguments land *after*
 //! `rustc`'s own, so a second script can neither replace nor outrank the first.
-//! Measured, that naive route is *either* fatal *or* ineffective, depending only
-//! on which linker the active toolchain drives:
-//!
-//! * On the pinned MSRV, `rustc 1.85.0`, which links through GNU `ld` 2.45, the
-//!   build **fails outright**: `ld` reports "anonymous version tag cannot be
-//!   combined with other version tags" together with "unable to find version
-//!   dependency `ZLIB_1.2.3.5`" for each inherited node, and `collect2` exits
-//!   non-zero.
-//! * On `rustc 1.97.1`, whose default linker for `x86_64-unknown-linux-gnu` is
-//!   `rust-lld`, the link succeeds and achieves nothing measurable: the sixteen
-//!   `ZLIB_*` definitions appear in `.gnu.version_d`, but
-//!   `nm -D --defined-only libzlib_rs.so | grep -c @` returns **0** — not one
-//!   symbol is tagged.
+//! Adding one is therefore not a route to versioned symbols, and which way it
+//! goes wrong depends only on the linker the active toolchain drives: GNU `ld`
+//! refuses an anonymous version tag combined with named ones and fails the link
+//! outright, while a linker that accepts the pair emits the `ZLIB_*` definitions
+//! into `.gnu.version_d` and binds no symbol to any of them.
 //!
 //! So the linker has to be made to see exactly *one* script, and that script has
 //! to be ours. Three things are therefore produced inside `${OUT_DIR}` when the
@@ -176,29 +158,21 @@
 //! 3. The `cdylib`-scoped link arguments `-B<OUT_DIR>/zlib_rs_version_script` and
 //!    `-fuse-ld=bfd`. `-B` is how a `cc`/`clang` driver is told where to find its
 //!    subprograms; the flavour flag is what stops a toolchain whose default is
-//!    `rust-lld` from never consulting the shim at all — on stable, `rustc`
-//!    itself passes `-fuse-ld=lld`, and the driver takes the last one it is
-//!    given. Both use `rustc-cdylib-link-arg`, never the unscoped
-//!    `rustc-link-arg`, so no test or bench binary is affected.
+//!    `rust-lld` from never consulting the shim at all, since `rustc` may pass
+//!    `-fuse-ld=lld` itself and the driver takes the last one it is given. Both
+//!    use `rustc-cdylib-link-arg`, never the unscoped `rustc-link-arg`, so no test
+//!    or bench binary is affected.
 //!
-//! ## Measured result
-//!
-//! On `x86_64-unknown-linux-gnu` for both the pinned MSRV 1.85.0 and stable
-//! 1.97.1: the build exits 0 with no warnings under `-D warnings`;
-//! `nm -D --defined-only` reports the same **95** exported `T` symbols as a
-//! default build, name for name; `readelf --version-info` shows all **16**
-//! `ZLIB_*` definitions with the inheritance chain from `ZLIB_1.2.0` intact; and
-//! exactly **54** symbols carry an `@@ZLIB_x.y.z` tag — the 54 `global:` names,
-//! with no spurious tags — while the remaining 41 stay unversioned-global, which
-//! is how a distribution `libz.so.1` built from the same script behaves. A C
-//! consumer linked against the result records `ZLIB_1.2.0` and `ZLIB_1.2.0.2` in
-//! its own `.gnu.version_r`, so the versioning is functionally real and not
-//! merely present in the section headers. With the opt-in off, the same
-//! inspection reports 95 `T` symbols and **0** tags.
+//! With the opt-in on the exported symbol set is unchanged name for name, all
+//! sixteen `ZLIB_*` definitions appear with the inheritance chain from
+//! `ZLIB_1.2.0` intact, and exactly the `global:` names carry an `@@ZLIB_x.y.z`
+//! tag while the rest stay unversioned-global — which is how a distribution
+//! `libz.so.1` built from the same script behaves, down to what a linked C
+//! consumer records in its own `.gnu.version_r`.
 //!
 //! ## Four details that are easy to get wrong
 //!
-//! * Substituting `zlib.map` wholesale exports **96** symbols, not 95.
+//! * Substituting `zlib.map` wholesale exports one symbol too many.
 //!   `zlib.map`'s only wildcard is `local: _*;`, which hides Rust's mangled names
 //!   (`_ZN…`, `_R…`) and the `__rust_*` hooks but not `rust_eh_personality`. (A
 //!   `panic = "unwind"` build would also leak `rust_begin_unwind` and
@@ -209,34 +183,34 @@
 //!   `adler32`, `crc32` or 35 other entry points at all, so a catch-all would
 //!   hide every one of them.
 //! * A `local:` section may not precede `global:` inside a version node — GNU
-//!   `ld` 2.45 reports `syntax error in VERSION script` — so the pattern has to
-//!   be inserted into the existing `local:` list. A brand-new trailing node
-//!   holding only a `local:` list does parse, but adds a seventeenth version
-//!   definition that `zlib.map` does not declare, so `.gnu.version_d` would no
-//!   longer match a distribution `libz.so.1`.
+//!   `ld` reports a syntax error in the script — so the pattern has to be
+//!   inserted into the existing `local:` list. A brand-new trailing node holding
+//!   only a `local:` list does parse, but adds a seventeenth version definition
+//!   that `zlib.map` does not declare, so `.gnu.version_d` would no longer match
+//!   a distribution `libz.so.1`.
 //! * `--undefined-version` is required, though not for the obvious reason. With
 //!   `--no-undefined-version` left in place the **default** feature row links
-//!   perfectly well, because all 54 `global:` names are defined. The row that
-//!   fails is `--no-default-features`, where the fifteen `gz*` entry points are
-//!   feature-gated away and `ld` rejects `gzungetc: undefined version:
-//!   ZLIB_1.2.0.2` and fourteen more. With the rewrite that row links cleanly and
-//!   yields 63 `T` symbols with 39 tags — the 39 globals that exist in it.
+//!   perfectly well, because every `global:` name is defined. The row that fails
+//!   is `--no-default-features`, where the `gz*` entry points are feature-gated
+//!   away and `ld` rejects each name the script versions but that build does not
+//!   define. With the rewrite that row links cleanly and versions the globals it
+//!   does have.
 //! * The capability must tolerate `zlib.map` being absent. `Cargo.toml`'s
 //!   `exclude` list contains `*.map`, so the file is not in the published
 //!   `.crate` at all; that case prints a notice and links unversioned.
 //!
 //! ## Supported targets, and what happens elsewhere
 //!
-//! The opt-in applies only where it was measured to work: a Unix host, a
+//! The opt-in applies only where it is established to work, and every clause is
+//! checked rather than inferred from a neighbouring one: a Unix host, a
 //! `target_os` of `linux` or `android`, `target_env` of `gnu`, host triple equal
 //! to target triple, an `ld.bfd` discoverable on `PATH`, and a readable
-//! `zlib.map` carrying a `local:` list. Every clause is checked, none is inferred
-//! — inference is exactly what an earlier attempt got wrong, concluding from
-//! `target_os` alone that a linker was capable when the same `target_os` gave
-//! opposite outcomes on two toolchains. `musl` is excluded because it emits no
-//! shared object here at all, so there is nothing to version; Mach-O wants
-//! `-exported_symbols_list` and MSVC wants a `.def` file, neither of which a
-//! version script can express.
+//! `zlib.map` carrying a `local:` list. `target_os` alone is not sufficient
+//! evidence that a linker is capable, because the same `target_os` gives opposite
+//! outcomes on toolchains that default to different linkers. `musl` is excluded
+//! because it emits no shared object here at all, so there is nothing to version;
+//! Mach-O wants `-exported_symbols_list` and MSVC wants a `.def` file, neither of
+//! which a version script can express.
 //!
 //! When any clause fails the capability is **inert**: it prints a
 //! `cargo:warning` naming the clause and the build continues, unversioned. It
@@ -246,11 +220,10 @@
 //! exactly as `write_tables` treats it — if Cargo's own scratch directory cannot
 //! be written to, the generated CRC tables are already in doubt.
 //!
-//! Because no CI row exercises this path today, it stays off in CI too; landing a
-//! row that links and inspects the versioned artifact belongs with gap D3, the
-//! cross-platform matrix. `.cargo/config.toml` states the companion half of the
-//! boundary: the wiring lives here, in one tested place, and not in ambient
-//! global rustflags.
+//! The capability stays off in CI, and landing a row that links and inspects the
+//! versioned artifact belongs with gap D3, the cross-platform matrix.
+//! `.cargo/config.toml` states the companion half of the boundary: the wiring
+//! lives here, in one tested place, and not in ambient global rustflags.
 //!
 //! # Constraints
 //!
@@ -762,8 +735,8 @@ exec "$real" "$@"
 /// Unset, empty, and the four falsey spellings mean off. The four truthy
 /// spellings mean on. **Anything else is an error**, not a quiet "off": silently
 /// ignoring a typo in an opt-in is how a build ends up not doing what its
-/// operator believes it is doing, and that was a real defect in the earlier
-/// revision of this capability.
+/// operator believes it is doing, and an operator who asked for versioned symbols
+/// has no other signal that they did not get them.
 fn parse_opt_in(raw: Option<&str>) -> Result<bool, String> {
     let Some(raw) = raw else {
         return Ok(false);
@@ -786,19 +759,18 @@ fn parse_opt_in(raw: Option<&str>) -> Result<bool, String> {
 /// Explain why this build cannot apply the version script, or [`None`] when it
 /// can.
 ///
-/// Every clause was settled by measurement rather than inference, because
-/// inference is exactly what the earlier revision of this capability got wrong:
-/// it read `target_os` and `target_env` and concluded a linker was capable, when
-/// in fact the same `target_os` produced a hard failure on one toolchain and a
-/// silent no-op on another.
+/// Each clause is checked on its own rather than inferred from a neighbouring
+/// one. `target_os` in particular is not sufficient evidence that a linker can
+/// apply a version script: the same `target_os` yields opposite outcomes on
+/// toolchains that default to different linkers, one failing the link outright
+/// and the other binding no symbol at all.
 ///
 /// * The host must be Unix, because the shim is a `sh` script.
 /// * `target_os` must be `linux` or `android`, and `target_env` must be `gnu`.
 ///   `macos`/`ios` want `-exported_symbols_list` and `windows`/MSVC wants a
 ///   `.def` file, neither of which a version script can express. `musl` is
-///   excluded because it emits no shared object here at all — a plain
-///   `--target x86_64-unknown-linux-musl` release build succeeds and produces no
-///   `.so`, so there is nothing to version.
+///   excluded because it emits no shared object here at all, so there is nothing
+///   to version.
 /// * Host and target triples must match. The shim resolves `ld.bfd` from the
 ///   *build host's* `PATH`, so a cross build would hand the wrong linker a
 ///   correctly derived script.

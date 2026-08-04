@@ -2014,9 +2014,9 @@ mod tests {
         );
 
         // Now wire up honest buffers and prove the *last* accepted change really
-        // took effect, so the fix cannot have been "ignore the call entirely":
-        // the stream must emit exactly what a level-6 / default-strategy stream
-        // emits from the start.
+        // took effect, so that rejecting a bad call cannot be confused with ignoring
+        // every call: the stream must emit exactly what a level-6 / default-strategy
+        // stream emits from the start.
         let corpus: Vec<u8> = (0..20_000u32).map(|i| b'a' + (i % 5) as u8).collect();
         let mut produced = std::vec![0u8; 64 * 1024];
         strm.next_in = corpus.as_ptr();
@@ -3974,7 +3974,7 @@ mod tests {
     }
 
     // =======================================================================
-    // Owner-bound handles (S7-02) and validation-before-borrow (S7-01)
+    // Owner-bound handles and validation-before-borrow
     // =======================================================================
 
     /// A byte-copied `z_stream` must not be able to drive or reclaim the
@@ -3987,11 +3987,10 @@ mod tests {
     /// reference build from this repository's own C sources: `deflateEnd(&copy)`
     /// returns `-2` and the subsequent `deflateEnd(&strm)` returns `0`.
     ///
-    /// Without the owner clause the Rust port inverted that: the copy reclaimed
-    /// and freed the box, and the original was then left reading freed memory —
-    /// a genuine use-after-free reachable from safe C usage. This test pins the
-    /// fix, and asserts the *order* too: the original must still be able to
-    /// finish its work afterwards.
+    /// Without the owner clause a port would let the copy reclaim and free the box,
+    /// leaving the original reading freed memory — a use-after-free reachable from
+    /// ordinary C usage. This test pins the refusal, and asserts the *order* too:
+    /// the original must still be able to finish its work afterwards.
     #[test]
     fn a_byte_copied_z_stream_can_neither_drive_nor_reclaim_the_originals_state() {
         let mut strm = zeroed_stream();
@@ -4114,7 +4113,7 @@ mod tests {
     }
 
     /// A stateless stream is refused by every auxiliary-pointer entry point
-    /// *without* the auxiliary pointer being bridged (S7-01).
+    /// *without* the auxiliary pointer being bridged.
     ///
     /// C reaches its verdict from `deflateStateCheck(strm)` alone and never reads
     /// the `dictionary`, `head`, `next_in` or `next_out` it was handed
@@ -4574,8 +4573,8 @@ mod tests {
         assert!(wrong.state.is_null());
     }
     // -----------------------------------------------------------------------
-    // SEC-FFI-05 / SEC-DEF-11 — a live foreign gzip header that overlaps the
-    // output window, and one whose declared lengths shrink between calls.
+    // A live foreign gzip header that overlaps the output window, and one whose
+    // declared lengths shrink between calls.
     //
     // `zlib.h` L843-L847 places no disjointness requirement on `head->extra`,
     // `head->name`, `head->comment` or `strm->next_out`, so every placement
@@ -4863,18 +4862,18 @@ mod tests {
         assert_eq!(rc, Z_OK, "gzip deflateInit2_ must succeed");
     }
 
-    /// **SEC-DEF-11.** Shrinking a live `extra_len` after the `Extra` phase has
-    /// already copied part of the field is rejected with `Z_STREAM_ERROR` instead
-    /// of aborting the process, and the stream stays usable if the caller puts the
-    /// length back.
+    /// Shrinking a live `extra_len` after the `Extra` phase has already copied part
+    /// of the field is rejected with `Z_STREAM_ERROR` instead of aborting the
+    /// process, and the stream stays usable if the caller puts the length back.
     ///
     /// C computes `ulg left = (extra_len & 0xffff) - s->gzindex` (`deflate.c` L1120)
     /// on an unsigned type: the subtraction wraps to a near-`ULONG_MAX` count and
     /// the copy loop reads far past the caller's buffer, so there is no C behaviour
     /// to preserve — only a choice between a defined rejection and an over-read.
-    /// Both shipped profiles set `panic = "abort"`, so the pre-fix underflow (or the
-    /// slice bound check that follows it in release) took the whole host process
-    /// down.
+    /// A defined rejection is the only viable choice here: both shipped profiles set
+    /// `panic = "abort"`, so letting the subtraction underflow into a slice bound
+    /// check would take the whole host process down rather than return an error the
+    /// caller can act on.
     #[test]
     #[cfg(feature = "gzip")]
     fn shrinking_a_live_extra_len_between_calls_is_a_stream_error() {
@@ -4943,7 +4942,10 @@ mod tests {
 
         // The rejection leaves the phase untouched, so restoring the length lets the
         // stream finish normally — proving nothing was corrupted on the way out.
-        // SAFETY: as above.
+        // SAFETY: `head` is the `gz_header` this test allocated, it is still live and
+        // still registered on `strm`, and this scope holds the only pointer to it.
+        // `extra_len` is a plain `Copy` scalar, so the write needs no initialization
+        // of anything else.
         unsafe { (*head).extra_len = FULL };
         let rc = unsafe { deflate(&mut strm, Z_FINISH) };
         assert_eq!(rc, Z_STREAM_END, "restoring the length must resume cleanly");

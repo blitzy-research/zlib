@@ -52,12 +52,13 @@
 //! `cfg!(target_feature = ...)` test. On a stock `x86_64` target only `sse2` is
 //! baseline, so the compile-time test fails, `State::new` returns `None`, and
 //! `crc32fast` silently falls back to its own software table — which is slower
-//! than the braided path in this module. Selecting `crc32fast` unconditionally
-//! from the `simd` feature alone therefore made enabling `simd` a *pessimization*
-//! for the shipped library, while `cargo test`/`cargo bench` hid the defect
-//! because their dev-dependency graph unified `crc32fast/std` on.
+//! than the braided path in this module. Treating the `simd` feature as the
+//! selector on its own would therefore make enabling `simd` a *pessimization* for
+//! the shipped library, and neither `cargo test` nor `cargo bench` would show it:
+//! their dev-dependency graph unifies `crc32fast/std` on, so the gate those runs
+//! measure is not the one a std-off consumer gets.
 //!
-//! Two changes close that gap and are load-bearing together:
+//! Two arrangements prevent that, and they are load-bearing together:
 //!
 //! 1. `Cargo.toml` forwards the crate's own `std` feature to `crc32fast?/std`,
 //!    so a std build of this crate gives `crc32fast` its run-time probe (and a
@@ -65,14 +66,15 @@
 //! 2. This module tests reachability itself, mirroring `crc32fast`'s own gate
 //!    conditions, and keeps the braid whenever the accelerated path would not be
 //!    selected — including on architectures for which `crc32fast` has no
-//!    specialized backend at all. That is what stops `simd` from silently
-//!    substituting `crc32fast`'s software table for this module's braid.
+//!    specialized backend at all. That is what stops `simd` from substituting
+//!    `crc32fast`'s software table for this module's braid.
 //!
 //! Which backend a given build actually runs is reported by [`crc32_backend`].
 //! That reachability test is a run-time CPU probe on x86, x86-64 and AArch64, and
 //! the bulk dispatcher consults it on every call, so its answer — which is
 //! immutable for the lifetime of the process — is resolved once and cached
 //! thereafter rather than re-probed per call.
+//!
 //! Relative throughput is a property of the target and the CPU, so compare the
 //! two feature rows with `benches/checksum_bench.rs` on the machine that matters
 //! rather than assuming an ordering.
@@ -94,17 +96,17 @@
 // `${OUT_DIR}/crc32_tables.rs`; the values are bit-identical to the checked-in
 // C header `crc32.h`.
 //
-// NO `dead_code` allowance is granted, in ANY configuration, and that is a
-// deliberate strengthening rather than an omission. The braided path below is
-// now compiled unconditionally — with `simd` on it is the fallback taken
-// whenever `crc32fast`'s hardware backend is unreachable — so all SEVEN
-// generated artifacts are consumed in every feature row: `CRC_TABLE` and
+// NO `dead_code` allowance is granted, in ANY configuration, and none is needed.
+// The braided path below is compiled unconditionally — with `simd` on it is the
+// fallback taken whenever `crc32fast`'s hardware backend is unreachable — so all
+// SEVEN generated artifacts are consumed in every feature row: `CRC_TABLE` and
 // `X2N_TABLE` here, and `CRC_BRAID_N`, `CRC_BRAID_W`, `CRC_BIG_TABLE`,
-// `CRC_BRAID_TABLE`, `CRC_BRAID_BIG_TABLE` in `braid`. The compiler therefore
-// proves, in every configuration, that nothing `build.rs` emits has gone unused
-// — which is exactly the producer/consumer drift signal an `allow(dead_code)`
-// would have suppressed. `the_generated_contract_cannot_be_silently_weakened`
-// pins that no suppression reappears.
+// `CRC_BRAID_TABLE`, `CRC_BRAID_BIG_TABLE` in `braid`. Withholding the allowance
+// is what makes the compiler prove, in every configuration, that nothing
+// `build.rs` emits has gone unused: an unconsumed table is producer/consumer
+// drift, and `allow(dead_code)` silences precisely that signal.
+// `the_generated_contract_cannot_be_silently_weakened` pins that no suppression
+// reappears.
 mod tables {
     include!(concat!(env!("OUT_DIR"), "/crc32_tables.rs"));
 }

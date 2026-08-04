@@ -45,7 +45,7 @@
 //! window reset, or up to seven deliberately withheld bits — and each interacts
 //! with the `last_flush`/`rank` bookkeeping that decides whether a repeated call
 //! is a useful continuation or a duplicate. Sending only `Z_NO_FLUSH` and
-//! `Z_FINISH`, as this harness previously did, left all of that unreached. The
+//! `Z_FINISH` would leave all of that unreached. The
 //! rotation advances only after a flush has *completed*, because zlib requires a
 //! call that returns with `avail_out == 0` to be repeated with the same flush
 //! value; see [`Config::non_final_flush`].
@@ -72,23 +72,23 @@
 //! Unlike a test, a fuzz target is fed arbitrary bytes, so a rejection can be a
 //! legitimate outcome. Every fuzzer-derived parameter is therefore clamped into
 //! the exact domain C `deflateInit2_` accepts *before* the call. What that
-//! clamping buys is the right to be strict afterwards, and this harness now takes
-//! it: because every parameter is in range and every output buffer is grown on
-//! demand, a producing leg either drives its stream to `Z_STREAM_END` or panics.
+//! clamping buys is the right to be strict afterwards, and this harness exercises
+//! that right: because every parameter is in range and every output buffer is grown
+//! on demand, a producing leg either drives its stream to `Z_STREAM_END` or panics.
 //!
 //! The **one** exit that is not a completed stream is a refused state
 //! reservation, isolated by exact code (`Z_MEM_ERROR`), because libFuzzer runs
 //! under an `-rss_limit_mb` ceiling and a host allocation failure is not a
-//! library defect. Everything a caller previously could not distinguish from it —
-//! a spent pass budget, a recoverable `Z_BUF_ERROR` from `deflate_params`, the
-//! output-growth ceiling, a pass that made no progress — is now either recovered
-//! from or asserted, so those cases can no longer silently skip the round-trip
-//! comparison that is the whole point of the leg.
+//! library defect. Every other condition that could be mistaken for it — a spent
+//! pass budget, a recoverable `Z_BUF_ERROR` from `deflate_params`, the
+//! output-growth ceiling, a pass that made no progress — is either recovered from
+//! or asserted, so none of them silently skips the round-trip comparison that is
+//! the whole point of the leg.
 //!
-//! Every loop is still explicitly bounded, because a hang is as much a finding as
-//! a crash — but the bound is now an assertion rather than a quiet exit, since an
-//! unbounded *harness* loop would be a harness bug while a library that cannot
-//! finish inside a generous budget is a library bug.
+//! Every loop is explicitly bounded, because a hang is as much a finding as a
+//! crash, and each bound is an assertion rather than a quiet exit: an unbounded
+//! *harness* loop would be a harness bug, while a library that cannot finish
+//! inside a generous budget is a library bug.
 
 use libfuzzer_sys::fuzz_target;
 
@@ -135,8 +135,7 @@ const HEADER_LEN: usize = 9;
 /// `00 00 ff ff`, `Z_FULL_FLUSH` does that and additionally resets the window so
 /// decoding can restart from the marker, and `Z_BLOCK` closes the block while
 /// deliberately withholding up to seven bits. The round trip must survive all of
-/// them, in any order, which is what this harness now checks and previously did
-/// not: only `Z_NO_FLUSH` and `Z_FINISH` were ever sent.
+/// them, in any order, which is what rotating through this table checks.
 const NON_FINAL_FLUSHES: [i32; 5] = [
     Z_NO_FLUSH,
     Z_PARTIAL_FLUSH,
@@ -152,9 +151,8 @@ const NON_FINAL_FLUSHES: [i32; 5] = [
 /// buffer, and growth doubles, so reaching the 4 MiB
 /// [`OUTPUT_GROWTH_LIMIT`] from any starting capacity takes at most about twenty
 /// doublings. This budget is comfortably above that, so exhausting it means the
-/// engine is stuck for a reason more room cannot fix — which is exactly the
-/// condition the harness used to answer by returning `None` and skipping every
-/// assertion that followed.
+/// engine is stuck for a reason more room cannot fix, which is a finding rather
+/// than a reason to stop asserting.
 const MAX_STALLED_PASSES: u32 = 32;
 
 /// Per-input-byte output allowance added to the chunked leg's starting capacity.
@@ -617,15 +615,15 @@ fn grow_output(output: &mut Vec<u8>, ceiling: usize, out_pos: usize, why: &str, 
 /// compress its own valid configuration is a library defect however arbitrary the
 /// payload bytes were.
 ///
-/// It previously had four more `None` exits: a spent pass budget, a `Z_BUF_ERROR`
-/// from `deflate_params`, the output-growth ceiling, and a pass that made no
-/// progress. Every one of them was indistinguishable to the caller from the
-/// allocation case, and the caller answered all five by skipping
-/// `assert_round_trip` entirely — so a configuration that could not be driven to
-/// completion was recorded as a pass having compared nothing. A build in which
-/// every `deflate` call stalled forever would have burned its whole pass budget on
-/// every execution and still reported success. They are now handled properly
-/// instead of reported identically:
+/// Four further conditions could each be surfaced as another `None` exit: a spent
+/// pass budget, a `Z_BUF_ERROR` from `deflate_params`, the output-growth ceiling,
+/// and a pass that made no progress. Reporting any of them the way the allocation
+/// case is reported would be indistinguishable to the caller, which answers a
+/// `None` by skipping `assert_round_trip` entirely — so a configuration that could
+/// not be driven to completion would be recorded as a pass having compared nothing,
+/// and a build in which every `deflate` call stalled forever would burn its whole
+/// pass budget on every execution and still report success. Each is therefore
+/// handled on its own terms rather than collapsed into one signal:
 ///
 /// * `Z_BUF_ERROR` from `deflate_params` is **recoverable and retried**. `zlib.h`
 ///   says so directly — the parameters are left unchanged and the call may be
@@ -636,7 +634,7 @@ fn grow_output(output: &mut Vec<u8>, ceiling: usize, out_pos: usize, why: &str, 
 ///   room than the tail of the buffer offers. That is also answered by growing,
 ///   and only a run of [`MAX_STALLED_PASSES`] consecutive stalls — which more room
 ///   provably cannot fix — is reported.
-/// * The pass budget and the output ceiling are now assertions. Both are sized far
+/// * The pass budget and the output ceiling are assertions. Both are sized far
 ///   above anything a `-max_len=65536` input can legitimately need, so reaching
 ///   either is a finding rather than a reason to stop looking.
 fn deflate_stream(

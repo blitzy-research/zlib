@@ -297,10 +297,10 @@ mod tests {
 
     #[test]
     fn empty_slice_normalizes_arbitrary_seed_like_zlib() {
-        // Regression test for the byte-exact parity fix: an empty (non-null)
-        // update must take reference zlib's zero-length path, which reduces
-        // each 16-bit half modulo BASE, rather than echoing an unreduced seed.
-        // Expected values are from reference zlib (`zlib.adler32(b"", seed)`).
+        // An empty (non-null) update takes reference zlib's zero-length path,
+        // which reduces each 16-bit half modulo BASE rather than echoing the seed
+        // back unreduced. Expected values are from reference zlib
+        // (`zlib.adler32(b"", seed)`).
         assert_eq!(adler32(0xffff_ffff, b""), 0x000e_000e);
         assert_eq!(adler32(0x0000_ffff, b""), 0x0000_000e);
         assert_eq!(adler32(0xffff_0000, b""), 0x000e_0000);

@@ -365,18 +365,18 @@ mod tests {
     ///
     /// # Why not a bare path in the shared temporary directory
     ///
-    /// The previous helper returned `temp_dir()/blitzy_adhoc_test_gzclose_<tag>_<pid>_<n>.gz`
-    /// and the state builders below then opened it with a truncating
-    /// [`File::create`]. Both halves are computable by any other user on the host,
-    /// and `File::create` opens `O_CREAT | O_TRUNC` *without* `O_EXCL`, following a
-    /// final-component symlink — so a link planted at the predicted name redirects
-    /// the finalized gzip member to a target of the planter's choosing and truncates
-    /// it first (CWE-377, CWE-59). The trailing `remove_file` calls made it worse
-    /// rather than better: a failing assertion unwinds straight past them, leaving
-    /// the name in place for the next run to reuse.
+    /// A path such as `temp_dir()/<tag>_<pid>_<n>.gz`, opened by the state builders
+    /// below with a truncating [`File::create`], is computable by any other user on
+    /// the host in both halves — and `File::create` opens `O_CREAT | O_TRUNC`
+    /// *without* `O_EXCL`, following a final-component symlink. A link planted at
+    /// the predicted name would therefore redirect the finalized gzip member to a
+    /// target of the planter's choosing and truncate it first (CWE-377, CWE-59).
+    /// Trailing `remove_file` calls make that worse rather than better: a failing
+    /// assertion unwinds straight past them, leaving the name in place for the next
+    /// run to reuse.
     ///
-    /// Uniqueness now rides on a directory created with `mkdir(2)` create-new
-    /// semantics — atomic, never following a symlink, and skipping rather than
+    /// Uniqueness therefore rides on a directory created with `mkdir(2)` create-new
+    /// semantics — atomic, never following a symlink, and failing rather than
     /// adopting or deleting an occupied name — with [`Drop`]-owned cleanup that also
     /// runs while unwinding. See [`crate::gz::test_temp`] for the full rationale.
     ///

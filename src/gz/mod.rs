@@ -799,8 +799,6 @@ mod tests {
                 "exclusive creation must report AlreadyExists"
             );
 
-            // `create_dir_all`, by contrast, happily adopts it — which is exactly
-            // the defect this helper exists to remove.
             assert!(
                 std::fs::create_dir_all(dir.path()).is_ok(),
                 "create_dir_all adopts an existing directory, so it cannot be used here"

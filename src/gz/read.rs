@@ -88,14 +88,14 @@ const OS_ERROR_TEXT_CAP: usize = 192;
 /// A fixed-capacity stack buffer that renders a value's
 /// [`core::fmt::Display`] text **without allocating**.
 ///
-/// This exists so that reporting an ordinary OS read failure cannot itself fail
-/// (finding M4-12). `ToString::to_string` allocates through the global
-/// allocator, which is *infallible*: an allocation failure there calls
-/// `handle_alloc_error` and aborts the process. Aborting is not an outcome a C
-/// caller can intercept, and it is not what reference zlib does — C reports
-/// `Z_ERRNO` with a static `strerror` string and leaves the stream usable, and
-/// even its own message *store* downgrades an allocation failure to
-/// `Z_MEM_ERROR` rather than dying (`gzlib.c` L540-L585). Rendering into this
+/// This exists so that reporting an ordinary OS read failure cannot itself fail.
+/// `ToString::to_string` allocates through the global allocator, which is
+/// *infallible*: an allocation failure there calls `handle_alloc_error` and
+/// aborts the process. Aborting is not an outcome a C caller can intercept, and
+/// it is not what reference zlib does — C reports `Z_ERRNO` with a static
+/// `strerror` string and leaves the stream usable, and even its own message
+/// *store* downgrades an allocation failure to `Z_MEM_ERROR` rather than dying
+/// (`gzlib.c` L555-L590, `gz_error`). Rendering into this
 /// buffer keeps the whole path allocation-free up to
 /// [`GzState::error`](crate::gz::state::GzState::error), which is already fully
 /// fallible.
@@ -227,7 +227,7 @@ pub(crate) fn gz_load(
                 // *reporting* an ordinary read error would abort the process,
                 // where C reports `Z_ERRNO` with a static `strerror` string and
                 // carries on (`gzread.c` L41-L42, `gzguts.h` L126-L137). See
-                // `os_error_text` (finding M4-12).
+                // `os_error_text`.
                 let text = os_error_text(&e);
                 state.error(ReturnCode::ErrNo, Some(text.as_str()));
                 return Err(ZlibError::ErrNo);
@@ -1169,19 +1169,20 @@ mod tests {
     ///
     /// # Why a guard rather than a bare `PathBuf`
     ///
-    /// The previous helper named `temp_dir()/blitzy_adhoc_test_gzread_<tag>_<pid>_<n>`
-    /// — fully computable by any other user on the host — and materialized it with
-    /// [`File::create`], which opens `O_CREAT | O_TRUNC` *without* `O_EXCL` and
-    /// follows a final-component symlink. A link planted at the predicted name
-    /// therefore redirected the fixture write to a target of the planter's choosing
-    /// and truncated it on the way (CWE-377 insecure temporary file, CWE-59 link
-    /// following). The per-test `remove_file(&path).ok()` calls did not help: a
-    /// failing assertion unwinds straight past them.
+    /// A name built from `temp_dir()`, a tag, the pid and a counter is fully
+    /// computable by any other user on the host, and [`File::create`] materializes
+    /// it with `O_CREAT | O_TRUNC` but *without* `O_EXCL`, following a
+    /// final-component symlink. A link planted at the predicted name would
+    /// therefore redirect the fixture write to a target of the planter's choosing
+    /// and truncate it on the way (CWE-377 insecure temporary file, CWE-59 link
+    /// following). A trailing `remove_file(&path).ok()` is no answer either: a
+    /// failing assertion unwinds straight past it.
     ///
-    /// [`TempFile`] moves the uniqueness onto a directory created with `mkdir(2)`
-    /// create-new semantics — which skips rather than adopts or deletes an occupied
-    /// name — writes the payload with `create_new`, and removes the whole directory
-    /// from [`Drop`], including while unwinding. See [`crate::gz::test_temp`].
+    /// [`TempFile`] puts the uniqueness on a directory created with `mkdir(2)`
+    /// create-new semantics — which fails rather than adopting or deleting an
+    /// occupied name — writes the payload with `create_new`, and removes the whole
+    /// directory from [`Drop`], including while unwinding. See
+    /// [`crate::gz::test_temp`].
     ///
     /// The returned guard must stay bound for as long as the fixture is read.
     fn write_temp(tag: &str, bytes: &[u8]) -> TempFile {
@@ -1247,9 +1248,9 @@ mod tests {
         out
     }
 
-    /// [`os_error_text`] reproduces exactly the text an infallible
-    /// `to_string()` would have produced for a real OS error, so replacing the
-    /// allocation changed nothing a caller can observe (finding M4-12).
+    /// [`os_error_text`] renders exactly the text an infallible `to_string()`
+    /// would produce for a real OS error, so the bounded buffer costs a caller
+    /// nothing observable.
     #[test]
     fn os_error_text_matches_the_allocating_rendering() {
         // ENOENT (2) is the one raw errno value with the same meaning on every
@@ -1269,7 +1270,7 @@ mod tests {
 
     /// Rendering never overflows the stack buffer, and a message longer than
     /// the buffer is cut on a `char` boundary so [`OsErrorText::as_str`] stays
-    /// valid UTF-8 (finding M4-12).
+    /// valid UTF-8.
     #[test]
     fn os_error_text_truncates_on_a_char_boundary() {
         use core::fmt::Write as _;
@@ -1321,8 +1322,8 @@ mod tests {
 
     /// The OS-error path of [`gz_load`] must not reach the global allocator: an
     /// allocation failure while reporting an ordinary read error would abort the
-    /// process, where C reports `Z_ERRNO` with a static `strerror` string
-    /// (finding M4-12).
+    /// process, where C reports `Z_ERRNO` with a static `strerror` string and
+    /// leaves the stream usable.
     ///
     /// Enforced structurally because the failure it guards against is an abort,
     /// which no runtime assertion can observe. Only `gz_load`'s own body is

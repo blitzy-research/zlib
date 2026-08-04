@@ -2999,11 +2999,10 @@ mod tests {
     /// [`BoundedWriter`] accepts fragments while they fit and refuses the first
     /// one that does not, leaving the accepted prefix intact.
     ///
-    /// This is the property that makes [`gzvprintf`] allocation-free and bounded
-    /// (finding M6-06): the sink stands in for C's
-    /// `vsnprintf(next, state->size, …)` (`gzwrite.c` L467) and cannot be driven
-    /// past the region it was handed, so a caller-controlled format string can
-    /// neither reallocate nor overrun.
+    /// This is the property that makes [`gzvprintf`] allocation-free and bounded:
+    /// the sink stands in for C's `vsnprintf(next, state->size, …)`
+    /// (`gzwrite.c` L467) and cannot be driven past the region it was handed, so a
+    /// caller-controlled format string can neither reallocate nor overrun.
     #[test]
     fn bounded_writer_stops_at_its_capacity_without_growing() {
         use core::fmt::Write as _;
@@ -3037,7 +3036,7 @@ mod tests {
 
     /// `gzprintf` reproduces C's effective capacity of `size - 1` and reports
     /// `0` — never a truncated write, never an allocation — when the formatted
-    /// result does not fit (finding M6-06).
+    /// result does not fit.
     ///
     /// The expected values are the ones a reference C zlib produces with
     /// `gzbuffer(file, 64)`, measured through the C ABI: `"hello"` → 5, a
@@ -3096,8 +3095,8 @@ mod tests {
 
     /// The formatted text is rendered *into* the preallocated gzip input buffer
     /// rather than into a temporary allocation, so it is already staged for
-    /// compression the moment formatting ends (finding M6-06; C L450-L453
-    /// formats at `state->in + avail_in`).
+    /// compression the moment formatting ends (`gzwrite.c` L450-L453 likewise
+    /// formats at `state->in + (next_in - in) + avail_in`).
     #[test]
     fn gzprintf_renders_directly_into_the_preallocated_input_buffer() {
         let path = TempFile::new("printf_inplace");

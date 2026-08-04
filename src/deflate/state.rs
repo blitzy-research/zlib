@@ -3736,11 +3736,12 @@ mod tests {
     /// There is exactly **one** copy of C's `configuration_table`
     /// (`deflate.c` L112-L124) in this crate: `crate::deflate::strategy`'s
     /// `CONFIGURATION_TABLE`, which this module imports (see the module's `use`
-    /// list) and [`DeflateState::lm_init`] reads. A private duplicate used to live
-    /// here and was removed precisely because two copies can diverge silently —
-    /// see `lm_init_loads_every_level_from_the_authoritative_table`. Single
-    /// sourcing means a cross-table comparison would compare a value with itself
-    /// and prove nothing, so this guard asserts the three things that *can* drift:
+    /// list) and [`DeflateState::lm_init`] reads. Holding it in exactly one place
+    /// is deliberate: two copies can diverge silently, and
+    /// `lm_init_loads_every_level_from_the_authoritative_table` is what pins the
+    /// reader to that one place. Single sourcing also means a cross-table
+    /// comparison would compare a value with itself and prove nothing, so this
+    /// guard asserts the three things that *can* drift:
     ///
     /// 1. every one of the five columns equals an independent transcription of the
     ///    C row — including `func`, the block producer, which neither of this

@@ -308,7 +308,7 @@ jobs:
         #               a platform proves nothing unless the platform is asserted.
         #               Without this a silent label remap turns the two native
         #               rows into duplicate coverage of a third platform while
-        #               still reporting green (finding TEST-03).
+        #               still reporting green.
         #   arch:       the `runner.arch` value GitHub reports (X64 / ARM64). It
         #               is an INDEPENDENT witness of the same fact: `host:` is
         #               what the compiler believes, `arch:` is what the runner
@@ -319,8 +319,7 @@ jobs:
         #               `#[cfg]` that stops matching, an integration target
         #               dropped from the build - and AAP directive D-5 fixes the
         #               suite at "preserved and only ever increased, zero
-        #               ignored", so the count is asserted rather than assumed
-        #               (finding TEST-08).
+        #               ignored", so the count is asserted rather than assumed.
         #
         # THE FLOORS ARE NOT ALL EXACT, ON PURPOSE. The five ubuntu rows carry
         # their exact measured totals, because they are reproducible on the
@@ -332,19 +331,19 @@ jobs:
         # tests are absent; and the build-only row carries 0 because it runs no
         # test step at all.
         #
-        # The two native rows carry a deliberately conservative 988, below the
-        # Linux total, because their totals differ from it by
-        # platform-conditional tests (every `#[cfg(unix)]` test is absent on
-        # Windows; `#[cfg(windows)]` adds the `gzopen_w` round trip plus its
-        # guards) and CANNOT be measured from a Linux host, so an exact floor
-        # there would be a guess that breaks the build. The value is DERIVED
-        # rather than guessed: it is the 944 previously carried plus the 44 of
-        # the 56 tests added since that carry no `#[cfg(unix)]` gate and
-        # therefore run on every platform - the remaining 12 are
-        # `#[cfg(unix)]`-gated, so Windows cannot run them and macOS runs more
-        # than the shared floor demands. 988 still catches the failure this gate
-        # exists for: a whole target or suite disappearing. Raise any floor when
-        # the suite grows; never lower one to make a red row green.
+        # The two native rows carry a deliberately CONSERVATIVE floor, below the
+        # Linux total, and it is arrived at by subtraction rather than by guess.
+        # Their totals differ from the Linux one by platform-conditional tests -
+        # every `#[cfg(unix)]` test is absent on Windows, while `#[cfg(windows)]`
+        # adds the `gzopen_w` round trip plus its guards - and that difference
+        # CANNOT be measured from a Linux host, so an exact floor there would be a
+        # guess that breaks the build. The floor is therefore the Linux total less
+        # every `#[cfg(unix)]`-gated test, which is a quantity a Linux host CAN
+        # count; Windows cannot run those, and macOS runs more than the shared
+        # floor demands. It still catches the failure this gate exists for: a
+        # whole target or suite disappearing. When the suite grows, recount the
+        # `#[cfg(unix)]` gates and raise the floor; never lower one to make a red
+        # row green.
         include:
           # Default feature set: std + gzip + gz-io + simd.
           - name: Default features
@@ -375,7 +374,7 @@ jobs:
           # rather than a second copy of another one: `Default features` already
           # resolves to std + gzip + gz-io + simd, so a row selecting the same four
           # features by name would repeat this job's debug build, release build and
-          # both test runs while covering nothing new (finding PERF-03). Dropping
+          # both test runs while covering nothing new. Dropping
           # `gzip`/`gz-io` here is the only place the suite runs with `crc32fast`
           # compiled in and no gzip consumer of CRC-32 present, which is what pins
           # `simd` as independent of `gzip` - the checksum surface
@@ -453,22 +452,21 @@ jobs:
           # actually opened, written, reopened and read back through `gzopen_w`.
           # The dedicated step after the test steps below runs it BY NAME, so the
           # coverage claim is visible in the log instead of being inferred from a
-          # total (finding TEST-01).
+          # total.
           - name: Windows x86_64 (native, default features)
             os: windows-latest
             host: x86_64-pc-windows-msvc
             arch: X64
             features: ''
             test: true
-            # 988 = the 944 previously carried on this row plus the 44
-            # platform-unconditional tests added since. Of the 56 tests added, 44
-            # carry no `#[cfg(unix)]` gate - 25 are gated only on
-            # `feature = "gzip"`, which this row's default feature set enables, and
-            # 19 carry no platform or feature gate at all - so every row that runs
-            # the suite gains the same 44. The other 12 are `#[cfg(unix)]`-gated
-            # and cannot run here. The row stays BELOW the ubuntu floor on
-            # purpose. If a future change legitimately excludes a test here, lower
-            # THIS row with a note rather than loosening the ubuntu rows.
+            # The floor is the ubuntu default-features total less every
+            # `#[cfg(unix)]`-gated test, since those cannot run here. Tests gated
+            # only on `feature = "gzip"` DO run, because this row's default feature
+            # set enables it, as do ungated ones - so this row gains whatever the
+            # ubuntu rows gain except the unix-gated part. It stays BELOW the
+            # ubuntu floor on purpose. If a future change legitimately excludes a
+            # test here, lower THIS row with a note rather than loosening the
+            # ubuntu rows.
             min_tests: 988
           # Native macOS: builds for the runner's own triple and, unlike a cross
           # row, EXECUTES the suite. This row PINS both that triple
@@ -502,15 +500,18 @@ jobs:
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
-    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
-    # commit, and a log that does not name that commit is unattributable evidence:
-    # it cannot be told apart from a run against a different tree, a different
-    # clone, or artifacts that predate the commit under review. That is not
-    # hypothetical - a checkpoint review found the retained runtime logs for this
-    # project pointing at another clone, which left the commit actually under
-    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
-    # (finding M8-01). Naming the commit FIRST is what makes every line that
-    # follows self-describing.
+    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. This contract is stated once, here,
+    # and it governs ALL TWELVE jobs in this file: each one checks out the
+    # repository and then immediately records the commit it is judging, and
+    # `src/lib.rs`'s `every_ci_job_records_the_commit_it_is_judging` asserts that
+    # ordering and the exact witnesses below for every job.
+    #
+    # Every verdict in this file describes ONE commit, and a log that does not name
+    # that commit is unattributable evidence: it cannot be told apart from a run
+    # against a different tree, a different clone, or artifacts that predate the
+    # commit under review. Naming the commit FIRST is what makes every line that
+    # follows self-describing, and emitting it as the SECOND step - before any gate
+    # - is what makes a job that fails early still leave attributable evidence.
     #
     # THREE WITNESSES, deliberately, because they can disagree and each
     # disagreement means something different. `github.sha` is what the EVENT
@@ -562,9 +563,9 @@ jobs:
     # ran on. Both are needed, and neither implies the other: the toolchain check
     # is satisfied by stable on any host, so on its own it cannot tell that a
     # runner label was remapped underneath a row named after a platform. That is
-    # not hypothetical - `macos-latest` moved from x86_64 to aarch64, and had this
-    # matrix existed then, the "macOS aarch64" row would have been silently
-    # covering x86_64 while reporting green (finding TEST-03).
+    # not hypothetical: `macos-latest` has moved from x86_64 to aarch64, and any
+    # such remap would leave a row named "macOS aarch64" silently covering another
+    # architecture while reporting green.
     #
     # TWO INDEPENDENT WITNESSES, deliberately. `rustc -vV`'s `host:` line is what
     # the COMPILER resolved; `runner.arch` is what the RUNNER platform reports.
@@ -634,7 +635,7 @@ jobs:
     - name: Clippy (warnings denied, native non-Linux row)
       if: ${{ runner.os != 'Linux' }}
       run: cargo +stable clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
-    # THE TEST COUNT IS ASSERTED, NOT ASSUMED (finding TEST-08).
+    # THE TEST COUNT IS ASSERTED, NOT ASSUMED.
     #
     # `cargo test` exits 0 when tests are silently LOST. A `#[cfg]` predicate that
     # stops matching, an integration target dropped from the build, a
@@ -694,7 +695,7 @@ jobs:
         [ "$2" -ge ${{ matrix.min_tests }} ] || { echo "::error::only $2 tests ran on row"\
           " '${{ matrix.name }}', below its floor of ${{ matrix.min_tests }} - tests were"\
           " lost, not merely skipped"; exit 1; }
-    # The Windows row's reason for existing, run BY NAME (finding TEST-01).
+    # The Windows row's reason for existing, run BY NAME.
     #
     # `gzopen_w` is the only platform-gated exported C symbol in the crate, and
     # `ffi::gz::tests::wide_path_open_round_trip` is the only test that calls it:
@@ -780,10 +781,10 @@ jobs:
     # STD_OFF_FLOOR is the SINGLE SOURCE OF TRUTH for all four std-off test steps
     # below: each one interpolates it into the summary it logs, the comparison it
     # enforces, and the message it prints on failure. It is declared here, once, at
-    # job scope because the floor is the same for every one of the four - and because
-    # the alternative had already failed: the steps used to log `floor=633` while
-    # enforcing `-ge 629`, with the error text saying 629 twice and 633 twice, so
-    # four tests could disappear with CI green and the log reassuring (P3-F1).
+    # job scope because the floor is the same for all four, and because a
+    # per-step literal is a shape that can disagree with itself - a step logging
+    # one number while enforcing another lets tests disappear with CI green and the
+    # log reassuring. One variable in all three places makes that impossible, and
     # `the_ci_test_floors_are_internally_consistent` in `src/lib.rs` asserts that no
     # bare numeric floor comes back.
     env:
@@ -794,28 +795,6 @@ jobs:
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
-    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
-    # commit, and a log that does not name that commit is unattributable evidence:
-    # it cannot be told apart from a run against a different tree, a different
-    # clone, or artifacts that predate the commit under review. That is not
-    # hypothetical - a checkpoint review found the retained runtime logs for this
-    # project pointing at another clone, which left the commit actually under
-    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
-    # (finding M8-01). Naming the commit FIRST is what makes every line that
-    # follows self-describing.
-    #
-    # THREE WITNESSES, deliberately, because they can disagree and each
-    # disagreement means something different. `github.sha` is what the EVENT
-    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
-    # hash is what the FILES actually contain. Only the tree hash moves if a later
-    # step edits the working tree, and only the first two can reveal a checkout
-    # that resolved somewhere else entirely.
-    #
-    # The assertion accepts the pull-request head sha as well as `github.sha`,
-    # because on a `pull_request` event the two legitimately differ: `github.sha`
-    # names the ephemeral merge commit, so a checkout configured for the branch
-    # tip would land on the head sha instead. Both are attributable. A third
-    # value is not, and is what fails the job.
     - name: Record the commit under test
       run: |
         set -euo pipefail
@@ -851,9 +830,9 @@ jobs:
     # Each of the four std-off runs asserts its own count, for the reason spelled
     # out above the `build-test` job's `Test` step: `cargo test` exits 0 when
     # tests are silently lost, and AAP directive D-5 fixes the suite at
-    # "preserved and only ever increased, zero ignored" (finding TEST-08).
+    # "preserved and only ever increased, zero ignored".
     #
-    # The floor is STD_OFF_FLOOR (713) on all four, the measured std-off total. It is
+    # The floor is STD_OFF_FLOOR on all four, the measured std-off total. It is
     # LOWER than the default-feature total by design: `gz-io` is off, so the
     # `tests/gzip_compat.rs` target contributes nothing and several
     # `cfg(feature = "gz-io")` unit tests do not exist. That gap is the reason
@@ -861,11 +840,11 @@ jobs:
     #
     # THE FLOOR IS NAMED ONCE FOR ALL FOUR BRANCHES, in the job-scoped
     # `STD_OFF_FLOOR` above, which the summary line, the predicate and the failure
-    # diagnostic of every branch all read. That is not style. When the number is
-    # typed out three times per branch a branch can - and did - end up announcing
-    # one floor while enforcing a lower one, which is strictly worse than having no
-    # floor at all: the log looks like a gate and the predicate is not one. One
-    # declaration makes the announced floor and the enforced floor the same value by
+    # diagnostic of every branch all read. That is not style. A number typed out
+    # three times per branch is a shape in which a branch can announce one floor
+    # while enforcing a lower one, which is strictly worse than having no floor at
+    # all: the log looks like a gate and the predicate is not one. One declaration
+    # makes the announced floor and the enforced floor the same value by
     # construction, for every branch at once, and `package-verify` follows the same
     # rule with its own `PACKAGED_FLOOR`.
     - name: Test (no default features)
@@ -981,28 +960,6 @@ jobs:
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
-    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
-    # commit, and a log that does not name that commit is unattributable evidence:
-    # it cannot be told apart from a run against a different tree, a different
-    # clone, or artifacts that predate the commit under review. That is not
-    # hypothetical - a checkpoint review found the retained runtime logs for this
-    # project pointing at another clone, which left the commit actually under
-    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
-    # (finding M8-01). Naming the commit FIRST is what makes every line that
-    # follows self-describing.
-    #
-    # THREE WITNESSES, deliberately, because they can disagree and each
-    # disagreement means something different. `github.sha` is what the EVENT
-    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
-    # hash is what the FILES actually contain. Only the tree hash moves if a later
-    # step edits the working tree, and only the first two can reveal a checkout
-    # that resolved somewhere else entirely.
-    #
-    # The assertion accepts the pull-request head sha as well as `github.sha`,
-    # because on a `pull_request` event the two legitimately differ: `github.sha`
-    # names the ephemeral merge commit, so a checkout configured for the branch
-    # tip would land on the head sha instead. Both are attributable. A third
-    # value is not, and is what fails the job.
     - name: Record the commit under test
       run: |
         set -euo pipefail
@@ -1066,7 +1023,7 @@ jobs:
     # together by construction.
     - name: Clippy
       run: cargo +stable clippy --locked --all-targets --all-features -- -D warnings
-    # ZERO IGNORED TESTS, ENFORCED AT THE SOURCE (finding TEST-08).
+    # ZERO IGNORED TESTS, ENFORCED AT THE SOURCE.
     #
     # The count assertions on the test jobs catch an `#[ignore]` only where the
     # ignored test would otherwise have run: `ignored=0` is read from a summary
@@ -1085,16 +1042,14 @@ jobs:
     # inside a doc comment or a string is not.
     #
     # `cfg_attr` CANNOT BE CHECKED WITH A GREP, and is delegated to the crate in
-    # the step below. `#[cfg_attr(<pred>, ignore)]` is an `#[ignore]` that only
-    # shows itself under one configuration - the exact failure mode the
-    # summary-line check cannot see - but a line-oriented regex cannot recognise
-    # it. The pattern used here previously,
-    # `#\[[[:space:]]*cfg_attr\([^)]*[^a-z_]ignore`, missed the two forms most
-    # likely to be written by accident, and both were verified to slip through:
+    # the step below. `#[cfg_attr(<pred>, ignore)]` is an attribute that disables a
+    # test under one configuration only - the exact failure mode the summary-line
+    # check cannot see - and a line-oriented regex cannot recognise it. Two forms
+    # defeat any such pattern, and both are easy to write by accident:
     #
-    #   * a NESTED predicate. `[^)]*` cannot cross a `)`, so in
-    #     `cfg_attr(all(unix, target_pointer_width = "64"), ignore)` the class
-    #     stops at the `)` closing `all(..)` and never reaches the `ignore`.
+    #   * a NESTED predicate. A `[^)]*` class cannot cross a `)`, so in
+    #     `cfg_attr(all(unix, target_pointer_width = "64"), ignore)` it stops at
+    #     the `)` closing `all(..)` and never reaches the `ignore`.
     #   * a MULTILINE attribute, which rustfmt produces whenever the predicate is
     #     long. `grep` matches within one line and cannot see it at all.
     #
@@ -1152,12 +1107,12 @@ jobs:
         fi
         echo "conditional-ignore scan: $1 passed, 0 failed, 0 ignored"
 
-  # Documentation gates (finding TEST-02). README.md, CONTRIBUTING.md and
+  # Documentation gates. README.md, CONTRIBUTING.md and
   # `doc/technical-specifications.md` all describe rustdoc-with-warnings-denied
-  # and `mkdocs build --strict` as BLOCKING gates of this project, and until this
-  # job existed neither was run anywhere in CI - the claim rested entirely on
-  # someone remembering to run both locally. AAP standard S10 requires the
-  # documented gates to be the gates that actually run.
+  # and `mkdocs build --strict` as BLOCKING gates of this project, and AAP standard
+  # S10 requires the documented gates to be the gates that actually run. Without
+  # this job that claim would rest entirely on someone remembering to run both
+  # locally.
   #
   # TWO GATES, ONE JOB, because they fail for unrelated reasons and both are
   # cheap. Keeping them in one job means the "documentation is broken" signal is
@@ -1181,10 +1136,9 @@ jobs:
   #            documentation is not this repository's defect and must not be
   #            able to fail its CI.
   #   MkDocs   `--strict` turns a nav entry pointing at a missing page, a broken
-  #            relative link and an unrecognised config key into errors. That is
-  #            the check that would have caught `docs/index.md` being orphaned
-  #            from the published site, and it is the only gate here that reads
-  #            `mkdocs.yml` at all.
+  #            relative link and an unrecognised config key into errors - which is
+  #            what catches a page orphaned from the published site. It is the only
+  #            gate here that reads `mkdocs.yml` at all.
   #
   # THE PYTHON SIDE IS PINNED, exactly like the cargo-deny and cargo-fuzz pins in
   # the other two workflows: an unpinned `pip install mkdocs` would let an
@@ -1224,28 +1178,6 @@ jobs:
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
-    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
-    # commit, and a log that does not name that commit is unattributable evidence:
-    # it cannot be told apart from a run against a different tree, a different
-    # clone, or artifacts that predate the commit under review. That is not
-    # hypothetical - a checkpoint review found the retained runtime logs for this
-    # project pointing at another clone, which left the commit actually under
-    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
-    # (finding M8-01). Naming the commit FIRST is what makes every line that
-    # follows self-describing.
-    #
-    # THREE WITNESSES, deliberately, because they can disagree and each
-    # disagreement means something different. `github.sha` is what the EVENT
-    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
-    # hash is what the FILES actually contain. Only the tree hash moves if a later
-    # step edits the working tree, and only the first two can reveal a checkout
-    # that resolved somewhere else entirely.
-    #
-    # The assertion accepts the pull-request head sha as well as `github.sha`,
-    # because on a `pull_request` event the two legitimately differ: `github.sha`
-    # names the ephemeral merge commit, so a checkout configured for the branch
-    # tip would land on the head sha instead. Both are attributable. A third
-    # value is not, and is what fails the job.
     - name: Record the commit under test
       run: |
         set -euo pipefail
@@ -1361,7 +1293,7 @@ jobs:
     #   2. Record the sha256 digests PyPI publishes for each resolved name's
     #      CPython-3.12-compatible wheels (`pip hash <file>` also works on the
     #      downloaded artifacts).
-    #   3. Verify, which must exit 0 — extract the heredoc below to a file first:
+    #   3. Verify, which must exit 0 - extract the heredoc below to a file first:
     #        python -m pip download -d /tmp/docs-verify --require-hashes \
     #          --only-binary=:all: --python-version 3.12 --implementation cp \
     #          --abi cp312 --platform manylinux_2_17_x86_64 \
@@ -1627,28 +1559,6 @@ jobs:
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
-    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
-    # commit, and a log that does not name that commit is unattributable evidence:
-    # it cannot be told apart from a run against a different tree, a different
-    # clone, or artifacts that predate the commit under review. That is not
-    # hypothetical - a checkpoint review found the retained runtime logs for this
-    # project pointing at another clone, which left the commit actually under
-    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
-    # (finding M8-01). Naming the commit FIRST is what makes every line that
-    # follows self-describing.
-    #
-    # THREE WITNESSES, deliberately, because they can disagree and each
-    # disagreement means something different. `github.sha` is what the EVENT
-    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
-    # hash is what the FILES actually contain. Only the tree hash moves if a later
-    # step edits the working tree, and only the first two can reveal a checkout
-    # that resolved somewhere else entirely.
-    #
-    # The assertion accepts the pull-request head sha as well as `github.sha`,
-    # because on a `pull_request` event the two legitimately differ: `github.sha`
-    # names the ephemeral merge commit, so a checkout configured for the branch
-    # tip would land on the head sha instead. Both are attributable. A third
-    # value is not, and is what fails the job.
     - name: Record the commit under test
       run: |
         set -euo pipefail
@@ -1717,28 +1627,6 @@ jobs:
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
-    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
-    # commit, and a log that does not name that commit is unattributable evidence:
-    # it cannot be told apart from a run against a different tree, a different
-    # clone, or artifacts that predate the commit under review. That is not
-    # hypothetical - a checkpoint review found the retained runtime logs for this
-    # project pointing at another clone, which left the commit actually under
-    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
-    # (finding M8-01). Naming the commit FIRST is what makes every line that
-    # follows self-describing.
-    #
-    # THREE WITNESSES, deliberately, because they can disagree and each
-    # disagreement means something different. `github.sha` is what the EVENT
-    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
-    # hash is what the FILES actually contain. Only the tree hash moves if a later
-    # step edits the working tree, and only the first two can reveal a checkout
-    # that resolved somewhere else entirely.
-    #
-    # The assertion accepts the pull-request head sha as well as `github.sha`,
-    # because on a `pull_request` event the two legitimately differ: `github.sha`
-    # names the ephemeral merge commit, so a checkout configured for the branch
-    # tip would land on the head sha instead. Both are attributable. A third
-    # value is not, and is what fails the job.
     - name: Record the commit under test
       run: |
         set -euo pipefail
@@ -1806,28 +1694,6 @@ jobs:
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
-    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
-    # commit, and a log that does not name that commit is unattributable evidence:
-    # it cannot be told apart from a run against a different tree, a different
-    # clone, or artifacts that predate the commit under review. That is not
-    # hypothetical - a checkpoint review found the retained runtime logs for this
-    # project pointing at another clone, which left the commit actually under
-    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
-    # (finding M8-01). Naming the commit FIRST is what makes every line that
-    # follows self-describing.
-    #
-    # THREE WITNESSES, deliberately, because they can disagree and each
-    # disagreement means something different. `github.sha` is what the EVENT
-    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
-    # hash is what the FILES actually contain. Only the tree hash moves if a later
-    # step edits the working tree, and only the first two can reveal a checkout
-    # that resolved somewhere else entirely.
-    #
-    # The assertion accepts the pull-request head sha as well as `github.sha`,
-    # because on a `pull_request` event the two legitimately differ: `github.sha`
-    # names the ephemeral merge commit, so a checkout configured for the branch
-    # tip would land on the head sha instead. Both are attributable. A third
-    # value is not, and is what fails the job.
     - name: Record the commit under test
       run: |
         set -euo pipefail
@@ -2061,28 +1927,6 @@ jobs:
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
-    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
-    # commit, and a log that does not name that commit is unattributable evidence:
-    # it cannot be told apart from a run against a different tree, a different
-    # clone, or artifacts that predate the commit under review. That is not
-    # hypothetical - a checkpoint review found the retained runtime logs for this
-    # project pointing at another clone, which left the commit actually under
-    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
-    # (finding M8-01). Naming the commit FIRST is what makes every line that
-    # follows self-describing.
-    #
-    # THREE WITNESSES, deliberately, because they can disagree and each
-    # disagreement means something different. `github.sha` is what the EVENT
-    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
-    # hash is what the FILES actually contain. Only the tree hash moves if a later
-    # step edits the working tree, and only the first two can reveal a checkout
-    # that resolved somewhere else entirely.
-    #
-    # The assertion accepts the pull-request head sha as well as `github.sha`,
-    # because on a `pull_request` event the two legitimately differ: `github.sha`
-    # names the ephemeral merge commit, so a checkout configured for the branch
-    # tip would land on the head sha instead. Both are attributable. A third
-    # value is not, and is what fails the job.
     - name: Record the commit under test
       run: |
         set -euo pipefail
@@ -2265,28 +2109,6 @@ jobs:
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
-    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
-    # commit, and a log that does not name that commit is unattributable evidence:
-    # it cannot be told apart from a run against a different tree, a different
-    # clone, or artifacts that predate the commit under review. That is not
-    # hypothetical - a checkpoint review found the retained runtime logs for this
-    # project pointing at another clone, which left the commit actually under
-    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
-    # (finding M8-01). Naming the commit FIRST is what makes every line that
-    # follows self-describing.
-    #
-    # THREE WITNESSES, deliberately, because they can disagree and each
-    # disagreement means something different. `github.sha` is what the EVENT
-    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
-    # hash is what the FILES actually contain. Only the tree hash moves if a later
-    # step edits the working tree, and only the first two can reveal a checkout
-    # that resolved somewhere else entirely.
-    #
-    # The assertion accepts the pull-request head sha as well as `github.sha`,
-    # because on a `pull_request` event the two legitimately differ: `github.sha`
-    # names the ephemeral merge commit, so a checkout configured for the branch
-    # tip would land on the head sha instead. Both are attributable. A third
-    # value is not, and is what fails the job.
     - name: Record the commit under test
       run: |
         set -euo pipefail
@@ -2575,27 +2397,27 @@ jobs:
   #     `deny.toml` is NOT part of that asymmetry and must not be added to it.
   #     Its `[graph] targets` is deliberately EMPTY, which in cargo-deny means
   #     "no target filter": every package in the graph is evaluated on every
-  #     platform, s390x included, with nothing pruned (`deny.toml` L253-L309
-  #     records the measurement - 89 of 89 packages governed with an empty list
-  #     versus 86 of 89 with the nine triples it used to carry). There is
-  #     therefore no s390x-shaped hole in the supply-chain policy to align, and
-  #     adding triples back to that key would REOPEN one.
+  #     platform, s390x included, with nothing pruned. That key's own `[graph]`
+  #     section records the measured cost of every alternative - an empty list
+  #     governs the whole graph, while any non-empty list prunes packages that a
+  #     triple it omits would have reached. There is therefore no s390x-shaped hole
+  #     in the supply-chain policy to align, and adding triples back to that key
+  #     would OPEN one.
   #   * x86_64-pc-windows-msvc - the whole `cfg(windows)` surface, cross-checked
   #     FROM Linux, which is why no MSVC linker is needed to reach it. Its
   #     rationale runs longer than a bullet and is stated on the matrix entry
   #     itself, beside the row it justifies.
   #
-  # `--all-features` IS PART OF THAT CLAIM, not decoration (finding TEST-11).
-  # `--all-targets` alone silently omits `tests/c_oracle.rs`, which declares
-  # `required-features = ["c-oracle"]`, and the `inflate_strict` arms - so the
-  # sentence "the whole test/bench surface" was false by exactly the targets most
-  # likely to carry an endian or pointer-width assumption. Measured on this tree,
-  # with `--all-features` the i686 check compiles `c_oracle` (it appears in
-  # `--verbose` output), without it that target is skipped entirely. Enabling
-  # `c-oracle` costs nothing here because `cargo check` never links and the oracle
-  # harness shells out to a C compiler at RUN time only; all FOUR triples were
-  # measured exit 0 with zero warnings under the widened spelling, for `check` and
-  # for `clippy -D warnings` alike.
+  # `--all-features` IS PART OF THAT CLAIM, not decoration. `--all-targets` alone
+  # silently omits `tests/c_oracle.rs`, which declares
+  # `required-features = ["c-oracle"]`, and the `inflate_strict` arms - which would
+  # make the phrase "the whole test/bench surface" false by exactly the targets most
+  # likely to carry an endian or pointer-width assumption. With `--all-features` the
+  # cross checks compile `c_oracle` (it appears in `--verbose` output); without it
+  # that target is skipped entirely. Enabling `c-oracle` costs nothing here because
+  # `cargo check` never links and the oracle harness shells out to a C compiler at
+  # RUN time only, so all four triples stay clean under both `check` and
+  # `clippy -D warnings`.
   #
   # A NOTE ON THE 2-SPACE COMMENT LINES IN THIS FILE. `src/lib.rs` locates a job
   # block by scanning for the next line indented exactly two spaces and ending in a
@@ -2641,28 +2463,6 @@ jobs:
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
-    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
-    # commit, and a log that does not name that commit is unattributable evidence:
-    # it cannot be told apart from a run against a different tree, a different
-    # clone, or artifacts that predate the commit under review. That is not
-    # hypothetical - a checkpoint review found the retained runtime logs for this
-    # project pointing at another clone, which left the commit actually under
-    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
-    # (finding M8-01). Naming the commit FIRST is what makes every line that
-    # follows self-describing.
-    #
-    # THREE WITNESSES, deliberately, because they can disagree and each
-    # disagreement means something different. `github.sha` is what the EVENT
-    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
-    # hash is what the FILES actually contain. Only the tree hash moves if a later
-    # step edits the working tree, and only the first two can reveal a checkout
-    # that resolved somewhere else entirely.
-    #
-    # The assertion accepts the pull-request head sha as well as `github.sha`,
-    # because on a `pull_request` event the two legitimately differ: `github.sha`
-    # names the ephemeral merge commit, so a checkout configured for the branch
-    # tip would land on the head sha instead. Both are attributable. A third
-    # value is not, and is what fails the job.
     - name: Record the commit under test
       run: |
         set -euo pipefail
@@ -2803,28 +2603,6 @@ jobs:
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
-    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
-    # commit, and a log that does not name that commit is unattributable evidence:
-    # it cannot be told apart from a run against a different tree, a different
-    # clone, or artifacts that predate the commit under review. That is not
-    # hypothetical - a checkpoint review found the retained runtime logs for this
-    # project pointing at another clone, which left the commit actually under
-    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
-    # (finding M8-01). Naming the commit FIRST is what makes every line that
-    # follows self-describing.
-    #
-    # THREE WITNESSES, deliberately, because they can disagree and each
-    # disagreement means something different. `github.sha` is what the EVENT
-    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
-    # hash is what the FILES actually contain. Only the tree hash moves if a later
-    # step edits the working tree, and only the first two can reveal a checkout
-    # that resolved somewhere else entirely.
-    #
-    # The assertion accepts the pull-request head sha as well as `github.sha`,
-    # because on a `pull_request` event the two legitimately differ: `github.sha`
-    # names the ephemeral merge commit, so a checkout configured for the branch
-    # tip would land on the head sha instead. Both are attributable. A third
-    # value is not, and is what fails the job.
     - name: Record the commit under test
       run: |
         set -euo pipefail
@@ -2997,11 +2775,13 @@ jobs:
     #
     # PACKAGED_FLOOR is the SINGLE SOURCE OF TRUTH for the packaged suite's count,
     # interpolated into the logged summary, the enforced comparison and the failure
-    # message alike. It previously logged 859 while enforcing 845, so fourteen tests
-    # could vanish from the published archive with the row green (P3-F1). The value is
-    # the measured default-feature total, because a packaged `cargo test` runs exactly
-    # the default features - `tests/c_oracle.rs` ships in the archive but contributes
-    # nothing, since `c-oracle` is not a default feature.
+    # message alike - for the same reason `no-std-tests` declares `STD_OFF_FLOOR`
+    # once: a number typed out separately in each of those three places can
+    # disagree with itself, and a row that logs one floor while enforcing a lower
+    # one lets tests vanish from the published archive while reporting green. The
+    # value is the measured default-feature total, because a packaged `cargo test`
+    # runs exactly the default features - `tests/c_oracle.rs` ships in the archive
+    # but contributes nothing, since `c-oracle` is not a default feature.
     env:
       RUSTUP_TOOLCHAIN: stable
       PACKAGED_FLOOR: 1015
@@ -3010,28 +2790,6 @@ jobs:
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         persist-credentials: false
-    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. Every verdict below describes ONE
-    # commit, and a log that does not name that commit is unattributable evidence:
-    # it cannot be told apart from a run against a different tree, a different
-    # clone, or artifacts that predate the commit under review. That is not
-    # hypothetical - a checkpoint review found the retained runtime logs for this
-    # project pointing at another clone, which left the commit actually under
-    # assessment with no build, test, lint, MSRV, symbol or oracle proof at all
-    # (finding M8-01). Naming the commit FIRST is what makes every line that
-    # follows self-describing.
-    #
-    # THREE WITNESSES, deliberately, because they can disagree and each
-    # disagreement means something different. `github.sha` is what the EVENT
-    # named; `git rev-parse HEAD` is what the CHECKOUT actually produced; the tree
-    # hash is what the FILES actually contain. Only the tree hash moves if a later
-    # step edits the working tree, and only the first two can reveal a checkout
-    # that resolved somewhere else entirely.
-    #
-    # The assertion accepts the pull-request head sha as well as `github.sha`,
-    # because on a `pull_request` event the two legitimately differ: `github.sha`
-    # names the ephemeral merge commit, so a checkout configured for the branch
-    # tip would land on the head sha instead. Both are attributable. A third
-    # value is not, and is what fails the job.
     - name: Record the commit under test
       run: |
         set -euo pipefail
@@ -3120,12 +2878,11 @@ jobs:
         # list. Directory entries are prefix-matched because the listing is
         # per-file.
         #
-        # THE SECOND GROUP IS NOT DOCUMENTATION POLISH (finding TEST-12). Every
-        # entry there is load-bearing for the packaged crate, and the two steps
-        # after this one are what make that concrete: they unpack the archive and
-        # run its OWN `cargo test`, so a file this crate's tests read has to be
-        # inside the archive or that run fails on a missing path rather than on a
-        # defect.
+        # THE SECOND GROUP IS NOT DOCUMENTATION POLISH. Every entry there is
+        # load-bearing for the packaged crate, and the two steps after this one are
+        # what make that concrete: they unpack the archive and run its OWN
+        # `cargo test`, so a file this crate's tests read has to be inside the
+        # archive or that run fails on a missing path rather than on a defect.
         #
         #   rust-toolchain.toml   read by `the_toolchain_pin_documents_no_clippy_
         #                         failure_that_does_not_exist`, and it is what
@@ -3243,23 +3000,20 @@ jobs:
 
         cd "$root"
         # The consumer gate: every suite, zero failures, zero ignored, and the
-        # count read rather than assumed - the packaged suite is exactly where a
-        # lost target is hardest to notice, because an `exclude` entry can delete
-        # a whole fixture and `cargo test` will still report `ok` over what
-        # remains (finding TEST-08). The floor is PACKAGED_FLOOR, declared once at
-        # job scope; `tests/c_oracle.rs` contributes nothing to it by design, since
-        # `c-oracle` is not a default feature. Not `--no-fail-fast`; a single failure here is
-        # a broken published crate.
+        # count read rather than assumed. The packaged suite is exactly where a lost
+        # target is hardest to notice, because an `exclude` entry can delete a whole
+        # fixture and `cargo test` will still report `ok` over what remains. Not
+        # `--no-fail-fast`; a single failure here is a broken published crate.
+        #
         # The floor is the measured default-feature total, which is exactly what the
         # unpacked archive runs - `.github/workflows/*.yml` IS packaged, so even the
         # workflow-parsing tests are present and the packaged count equals the
-        # `Default features` row rather than sitting below it. Both the
-        # summary echoed below and the predicate that enforces it read THIS
-        # variable - the job-scoped `PACKAGED_FLOOR` declared once in this job's
-        # `env:`. Written out twice they drifted - in an earlier revision the
-        # summary advertised 859 while the predicate accepted 845, so fourteen
-        # tests could vanish from the published archive and this job would still
-        # report the higher number. The `no-std-tests` job's four branches follow the
+        # `Default features` row rather than sitting below it. `tests/c_oracle.rs`
+        # contributes nothing to it by design, since `c-oracle` is not a default
+        # feature. Both the summary echoed below and the predicate that enforces it
+        # read THIS variable, the job-scoped `PACKAGED_FLOOR` declared once in this
+        # job's `env:`, so the announced floor and the enforced floor are the same
+        # value by construction. The `no-std-tests` job's four branches follow the
         # same single-source rule, for the same reason: a gate that announces one
         # floor while enforcing a lower one reads as a gate in the log without
         # being one, which is worse than no floor at all.

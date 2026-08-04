@@ -229,16 +229,17 @@ fn create_first_free(parent: &Path, stem: &str) -> PathBuf {
 /// # Why creation is create-new rather than create-if-absent
 ///
 /// This guard's [`Drop`] removes the directory **recursively**, so a directory it
-/// did not itself create is not safe for it to own. The previous implementation
-/// called [`fs::create_dir_all`], which succeeds when the path already exists — as a
-/// directory *or as a symlink to one* — so on a shared, world-writable
-/// [`std::env::temp_dir`] it could adopt a tree another user had planted at the
-/// predicted name, write fixtures through it, truncate whatever was already inside,
-/// and then recursively delete the lot (CWE-377 insecure temporary file, CWE-59 link
-/// following, CWE-367 time-of-check/time-of-use).
+/// did not itself create is not safe for it to own. A create-if-absent primitive
+/// such as [`fs::create_dir_all`] cannot supply that guarantee, because it succeeds
+/// when the path already exists — as a directory *or as a symlink to one*. On a
+/// shared, world-writable [`std::env::temp_dir`] that would let the guard adopt a
+/// tree another user had planted at the predicted name, write fixtures through it,
+/// truncate whatever was already inside, and then recursively delete the lot
+/// (CWE-377 insecure temporary file, CWE-59 link following, CWE-367
+/// time-of-check/time-of-use).
 ///
-/// [`create_private_dir`] removes all of that: a single `mkdir(2)` is atomic, never
-/// follows a final-component symlink, and reports [`AlreadyExists`] instead of
+/// [`create_private_dir`] forecloses all of that: a single `mkdir(2)` is atomic,
+/// never follows a final-component symlink, and reports [`AlreadyExists`] instead of
 /// adopting. An occupied candidate is **skipped, never deleted**, so a planted name
 /// is neither followed nor destroyed. Children are created with
 /// [`create_new_file`], which cannot truncate and cannot follow a link.

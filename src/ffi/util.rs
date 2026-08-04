@@ -1726,8 +1726,8 @@ mod tests {
     /// change through that path either.
     ///
     /// The sentinel capacity here is deliberately smaller than the buffer and
-    /// distinct from both zero and the buffer length, so a spurious
-    /// `*destLen = 0` — the defect this test guards — is unmistakable.
+    /// distinct from both zero and the buffer length, so that a spurious
+    /// `*destLen = 0` cannot be mistaken for the value the caller passed in.
     #[test]
     fn uncompress_leaves_both_counts_untouched_when_engine_init_fails() {
         const CAP_SENTINEL: usize = 17;

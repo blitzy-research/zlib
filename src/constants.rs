@@ -377,11 +377,13 @@ pub const DEF_WBITS: i32 = MAX_WBITS;
 /// #endif
 /// ```
 ///
-/// `MAXSEG_64K` is a 16-bit / segmented-memory (MS-DOS) build constraint whose
-/// platform support is explicitly **out of scope** for this migration (see AAP
-/// §0.2.2, which excludes `msdos/`, 16-bit, and Windows CE targets). On every
-/// in-scope modern platform the C library therefore defines `MAX_MEM_LEVEL` as
-/// `9`, and `deflateInit2()` accepts `memLevel` in `1..=9` (`deflate.c` L434:
+/// `MAXSEG_64K` is a 16-bit / segmented-memory build constraint, defined by
+/// `zconf.h` L205-L207 whenever `SYS16BIT` is. AAP §0.4.2 B4 lists `SYS16BIT`
+/// among the C macros deliberately left unreferenced by this migration — legacy
+/// 16-bit accommodations with no Rust analogue — and AAP §0.2.2 places the
+/// `msdos/` build tree out of scope. On every in-scope platform the C library
+/// therefore defines `MAX_MEM_LEVEL` as `9`, and `deflateInit2()` accepts
+/// `memLevel` in `1..=9` (`deflate.c` L434:
 /// `if (memLevel < 1 || memLevel > MAX_MEM_LEVEL ...) return Z_STREAM_ERROR;`).
 /// This crate uses `9` so its accepted-`memLevel` range is byte-for-byte
 /// identical to the reference C build (the default remains

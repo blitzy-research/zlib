@@ -424,11 +424,12 @@ pub(crate) struct DescriptorRequest {
     /// `true` when the mode contained `'e'`, i.e. C put `O_CLOEXEC` into `oflag`.
     ///
     /// When this is `false` the descriptor must **not** be close-on-exec, which
-    /// is the one case that needs an explicit `fcntl` because a Rust [`File`] is
-    /// close-on-exec by default (finding M6-02).
+    /// is the one case that needs an explicit `fcntl`: a Rust [`File`] is
+    /// close-on-exec by default, so the absence of `'e'` has to be applied, not
+    /// merely not-applied.
     pub(crate) cloexec: bool,
     /// `true` when the mode contained `'N'`, i.e. C put `O_NONBLOCK` into
-    /// `oflag` (finding M6-03).
+    /// `oflag`.
     pub(crate) nonblock: bool,
 }
 
@@ -981,15 +982,15 @@ fn abandon_adopted(mut file: Option<GzFile>, code: ReturnCode) -> ReturnCode {
 /// snprintf(state->path, len + 1, "%s", path);
 /// ```
 ///
-/// (`gzlib.c` L196-L203.) Those exact bytes are what `gzerror` hands back inside
+/// (`gzlib.c` L199-L222.) Those exact bytes are what `gzerror` hands back inside
 /// `"{path}: {message}"`, so on unix — where a path is an arbitrary byte string
 /// that need not be UTF-8 — decoding them into a Rust [`String`] would replace
 /// each maximal invalid subsequence with U+FFFD and change the bytes a C caller
 /// reads. This function therefore keeps the raw bytes
 /// ([`std::ffi::OsStr::as_encoded_bytes`], which on unix *is* the path), and the
 /// lossy decoding happens only where a Rust [`String`] is genuinely required —
-/// [`GzState::msg`](crate::gz::state::GzState), whose C mirror
-/// `msg_c` is built from these raw bytes instead (finding M6-07).
+/// [`GzState::msg`](crate::gz::state::GzState). Its C mirror `msg_c` is built
+/// from these raw bytes, so the two views can differ without the C one drifting.
 ///
 /// # Why not `path.display().to_string()`
 ///
@@ -2410,8 +2411,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// `try_path_bytes` retains the path **verbatim**, exactly as C's
-    /// `snprintf(state->path, len + 1, "%s", path)` does (`gzlib.c` L196-L203),
-    /// because those bytes are what `gzerror` reports (finding M6-07).
+    /// `snprintf(state->path, len + 1, "%s", path)` does (`gzlib.c` L222), because
+    /// those bytes are what `gzerror` reports.
     ///
     /// A UTF-8 path is trivially unchanged. The load-bearing cases are on unix,
     /// where a path is an arbitrary byte string: the retained bytes must be the
@@ -2464,7 +2465,7 @@ mod tests {
 
     /// A real `gzopen` of a path whose bytes are not valid UTF-8 retains those
     /// bytes on the state, end to end, so the C `gzerror` message built from them
-    /// is byte-identical to reference zlib's (finding M6-07).
+    /// is byte-identical to reference zlib's.
     ///
     /// Unix only: on other platforms a path is not an arbitrary byte string, so
     /// there is nothing to lose.
@@ -2595,22 +2596,21 @@ mod tests {
     /// an existing file cannot destroy its contents before those allocations have
     /// succeeded.
     ///
-    /// The ordering itself is what protects the file (an out-of-memory condition
-    /// cannot be forced deterministically without an allocator hook), so this test
-    /// pins the two observable consequences of the reordering: the success path
-    /// still truncates exactly as before, and a *pre-open* rejection leaves the
-    /// existing contents completely intact.
+    /// The ordering itself is what protects the file, and an out-of-memory
+    /// condition cannot be forced deterministically without an allocator hook, so
+    /// this test pins the two consequences of that ordering that *are* observable:
+    /// the success path truncates, and a *pre-open* rejection leaves the existing
+    /// contents completely intact.
     #[test]
     fn a_pre_open_failure_leaves_an_existing_file_untouched() {
         // A caller-private directory created with `create_dir` (never
         // `create_dir_all`): it fails rather than adopting a name another user may
         // have planted, and on unix it is mode 0700 from the instant it exists, so
         // there is no window in which the payload below could be enumerated or
-        // replaced (CWE-377/CWE-59/CWE-367). The shared guard now supplies that
-        // discipline, and adds the part the hand-rolled version lacked: cleanup is
-        // owned by [`Drop`], so it runs when one of the assertions below unwinds
-        // rather than being skipped by the `remove_dir_all` that used to sit at the
-        // end of this function.
+        // replaced (CWE-377/CWE-59/CWE-367). The shared guard supplies that
+        // discipline and owns cleanup through [`Drop`], so the directory is removed
+        // even when one of the assertions below unwinds — which a `remove_dir_all`
+        // at the end of this function would not be.
         let dir = TempDir::new("gzopen_order");
         let path = dir.write_child("payload.gz", b"PRECIOUS");
 
@@ -2637,7 +2637,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Platform descriptor-flag table (findings SEC-GZ-08 / SEC-GZ-09)
+    // Platform descriptor-flag table
     // ---------------------------------------------------------------------
 
     /// Independent mirror of the `O_NONBLOCK` selection, written with raw

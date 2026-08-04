@@ -1108,8 +1108,8 @@ fn probe_round_trip(data: &[u8], level: i32) {
 /// `deflate_set_dictionary` / `inflate_set_dictionary` are the `FDICT` path, and
 /// nothing else in this harness reaches it. It is a four-byte field in the zlib
 /// header plus one extra decoder mode, and it is the only place `inflate` returns
-/// `Z_NEED_DICT` — a code the harness was previously willing to accept from any
-/// call while never once producing it deliberately. A `Z_NEED_DICT` that never
+/// `Z_NEED_DICT`. Without this probe that code would be admissible from any call
+/// while never being deliberately produced anywhere. A `Z_NEED_DICT` that never
 /// arrives, or that arrives carrying the wrong identifier, is a wire-format
 /// defect that no dictionary-free round trip can see, because both halves would
 /// simply agree to skip the field.

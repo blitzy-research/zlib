@@ -947,7 +947,7 @@ impl InflateState {
     /// | Caller | Caller-hook requests, in order |
     /// |--------|--------------------------------|
     /// | [`crate::inflate::inflate_init2`] (reached from FFI `inflateInit2_`) | one for the state itself; the window comes later, lazily, from `updatewindow` — C's schedule exactly (`inflate.c` L198, L261) |
-    /// | `crate::inflate::back::inflate_back_init_borrowed_window` (reached from FFI `inflateBackInit_`) | one for the state and nothing else — the window is the ABI caller's own buffer, lent rather than allocated (`infback.c` L51, L60) |
+    /// | `crate::inflate::back::inflate_back_init_borrowed_window` (reached from FFI `inflateBackInit_`) | one for the state and nothing else — the window is the ABI caller's own buffer, lent rather than allocated (`infback.c` L51, L59) |
     /// | [`crate::inflate::inflate_copy`] | one for the destination state (`inflate.c` L1340), then one for its window when the source had one (L1346) |
     ///
     /// Each of those paths charges the hook only when its

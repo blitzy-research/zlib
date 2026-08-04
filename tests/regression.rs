@@ -684,23 +684,23 @@ fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
 /// A temporary `.gz` fixture inside its own exclusively created private
 /// directory, both removed when the guard drops.
 ///
-/// # Why the path alone was not enough
+/// # Why a unique file name is not sufficient
 ///
-/// The previous helper returned a bare
-/// `temp_dir()/zlibrs_<tag>_<pid>_<clone>_<nanos>.gz`. Every component of that name
-/// is public information, and [`test_gzio`] then handed it to `gzopen(&path, "wb")`
-/// — which resolves it with `O_CREAT | O_TRUNC` and *without* `O_EXCL*, following a
-/// final-component symlink. A link planted at the predicted name therefore
-/// redirected the whole gzip member to a target of the planter's choosing and
-/// truncated it first (CWE-377 insecure temporary file, CWE-59 link following). A
-/// timestamp makes a collision unlikely, but *unlikely* is not a security property
-/// when the name is guessable and the system temporary directory is world-writable.
-/// The trailing best-effort `remove_file` did not close the hole either: a failing
-/// assertion unwinds straight past it, leaving the name for the next run.
+/// Every component of a bare
+/// `temp_dir()/zlibrs_<tag>_<pid>_<clone>_<nanos>.gz` is public information, and
+/// [`test_gzio`] hands its path to `gzopen(&path, "wb")` — which resolves it with
+/// `O_CREAT | O_TRUNC` and *without* `O_EXCL*, following a final-component
+/// symlink. A link planted at a predicted name would therefore redirect the whole
+/// gzip member to a target of the planter's choosing and truncate it first
+/// (CWE-377 insecure temporary file, CWE-59 link following). A timestamp makes a
+/// collision unlikely, but *unlikely* is not a security property when the name is
+/// guessable and the system temporary directory is world-writable. A trailing
+/// best-effort `remove_file` would not close the hole either: a failing assertion
+/// unwinds straight past it, leaving the name for the next run.
 ///
-/// # What replaces it
+/// # How exclusivity is obtained
 ///
-/// Uniqueness and exclusivity move onto a **directory** created by
+/// Uniqueness and exclusivity rest on a **directory** created by
 /// [`create_private_dir`]: one atomic `mkdir(2)`, owner-only on Unix from the
 /// instant it exists, which reports [`AlreadyExists`] instead of adopting an
 /// occupied name. An occupied candidate is *skipped, never deleted*, so a planted

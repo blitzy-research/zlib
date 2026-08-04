@@ -3309,13 +3309,13 @@ mod tests {
     // =======================================================================
     // Shared `zutil.h` constants — engine-side cross-checks
     //
-    // Relocated from `crate::util`'s own test module: `util` is layer 3 and may
-    // not name an engine, not even under `cfg(test)` (AAP §0.3.1, §0.4.2 B2,
-    // enforced by `the_module_graph_has_no_upward_edges` in `src/lib.rs`). The
-    // assertions themselves are unchanged — they check that this module's
-    // differently-typed aliases still agree with `util`'s canonical values, and
-    // that the gzip header this module emits carries the one platform-selected
-    // `OS_CODE`.
+    // These belong to the engine side, not to `crate::util`'s own test module:
+    // `util` is layer 3 and may not name an engine, not even under `cfg(test)`
+    // (AAP §0.3.1, §0.4.2 B2, enforced by `the_module_graph_has_no_upward_edges`
+    // in `src/lib.rs`). The dependency has to run this way round, so the
+    // assertions live here — checking that this module's differently-typed
+    // aliases still agree with `util`'s canonical values, and that the gzip
+    // header this module emits carries the one platform-selected `OS_CODE`.
     // =======================================================================
 
     #[cfg(feature = "gzip")]

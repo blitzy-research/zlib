@@ -110,26 +110,29 @@
 //     but documents intent and guards custom profiles.
 #![cfg_attr(all(not(feature = "std"), not(test), panic = "abort"), no_std)]
 // Every public item in the crate must be documented (AAP: "document all public
-// items"). This is a `warn`, never a `deny`, so it can never break the build.
+// items"). The level is `warn` rather than `deny` so that a plain `cargo build`
+// stays usable while an item is being written, but the CI lint gate runs
+// `cargo clippy --locked --all-targets --all-features -- -D warnings`, which
+// promotes this lint to an error. An undocumented public item therefore cannot
+// land, even though it does not break a local build.
 #![warn(missing_docs)]
 // Every `unsafe` block in SHIPPED crate code must carry an immediately-adjacent
-// `// SAFETY:` justification (AAP §0.7.2 standard S2 / User Constraint 3). Like
-// `missing_docs` this is a `warn` (never a `deny`) so it cannot break a plain
-// build, but the CI `-D warnings` gate promotes it to an error for the
-// production library target, so every `unsafe` block crossing the FFI boundary
-// carries its justification where a reader will meet it. The lint is relaxed to
-// `allow` under `cfg(test)` so it governs only the shipped
-// `cdylib`/`staticlib`/`rlib` (whose `unsafe` lives in `src/ffi/**` and in the
-// private `no_std_support` block below), not the crate's inline `#[cfg(test)]`
-// unit tests.
+// `// SAFETY:` justification (AAP §0.7.2 standard S2, serving User Constraint 3).
+// The level is `warn` for the same reason as `missing_docs` above, and the same
+// `-D warnings` CI gate promotes it to an error, so an unjustified `unsafe` block
+// cannot reach the shipped library. The next line relaxes the lint to `allow`
+// under `cfg(test)`, which scopes it to the emitted
+// `cdylib`/`staticlib`/`rlib` — whose `unsafe` lives in `src/ffi/**` and in the
+// private `no_std_support` block below — rather than to the crate's inline
+// `#[cfg(test)]` unit tests.
 #![warn(clippy::undocumented_unsafe_blocks)]
 #![cfg_attr(test, allow(clippy::undocumented_unsafe_blocks))]
-// `unsafe` is DENIED crate-wide, converting the migration's unsafe-containment
-// strategy (AAP §0.3.2 pattern C7 / §0.6.2 / §0.7.2 standard S2, satisfying User
-// Constraint 3 "zero unsafe blocks in core compression logic") from an
-// architectural convention plus a lint-assisted review check into a HARD COMPILE
-// ERROR. A stray `unsafe` block, `unsafe fn`, `unsafe impl`, or `unsafe extern`
-// anywhere in `src/deflate/**`, `src/inflate/**`, `src/checksum/**`,
+// `unsafe` is DENIED crate-wide, which makes the migration's unsafe-containment
+// boundary (AAP §0.3.2 pattern C7 / §0.6.2 / §0.7.2 standard S2, serving User
+// Constraint 3 "zero unsafe blocks in core compression logic") a HARD COMPILE
+// ERROR rather than a convention a reader has to police. A stray `unsafe` block,
+// `unsafe fn`, `unsafe impl`, or `unsafe extern` anywhere in
+// `src/deflate/**`, `src/inflate/**`, `src/checksum/**`,
 // `src/gz/**`, `src/util/**`, `src/stream.rs`, `src/error.rs`,
 // `src/constants.rs`, or `src/gz_header.rs` fails the build outright.
 //
@@ -1550,11 +1553,11 @@ mod tests {
     /// allocation, exactly as `infback.c` allocates only inside
     /// `inflateBackInit_` (its one `ZALLOC`, L51) and nothing thereafter.
     ///
-    /// A previous shape copied every provider chunk into an infallibly growing
-    /// `Vec`, which turned a caller-driven input pattern into caller-driven heap
-    /// pressure and, on the `no_std` `cdylib`, into `malloc` traffic during
-    /// decode. The two-method [`crate::inflate::InFunc`] split removed the buffer
-    /// entirely; this is the mechanical guard that keeps it removed, because a
+    /// Copying each provider chunk into an infallibly growing `Vec` would satisfy
+    /// every behavioural test while turning a caller-driven input pattern into
+    /// caller-driven heap pressure and, on the `no_std` `cdylib`, into `malloc`
+    /// traffic during decode. The two-method [`crate::inflate::InFunc`] split is
+    /// what makes such a buffer unnecessary; the guard is mechanical because a
     /// behavioural test cannot see an allocation that merely *could* happen on a
     /// larger input.
     ///
@@ -2204,14 +2207,13 @@ mod tests {
     /// Every `ci.yml` job must name the commit it is judging, before it judges it.
     ///
     /// A green verdict is only evidence if the log says which commit it describes.
-    /// A checkpoint review of this project found the retained runtime artifacts and
-    /// C-oracle logs pointing at a DIFFERENT clone, which left the commit actually
-    /// under assessment with no build, test, lint, MSRV, symbol or oracle proof at
-    /// all — the reviewer could not attribute a single passing gate to the tree
-    /// being reviewed (finding M8-01). Prose cannot fix that, because the defect is
-    /// the absence of an identifier in the log itself. So the remedy is structural:
-    /// every job emits its commit identity as its FIRST act after checkout, which
-    /// makes every line that follows self-describing.
+    /// A retained build, test, lint, MSRV, symbol or oracle log that names no
+    /// commit cannot be attributed to the tree it was meant to prove, and it is
+    /// indistinguishable from one produced against a different clone entirely.
+    /// Prose cannot close that gap, because the defect is the absence of an
+    /// identifier in the log itself. So the remedy is structural: every job emits
+    /// its commit identity as its FIRST act after checkout, which makes every line
+    /// that follows self-describing.
     ///
     /// ORDER IS THE WHOLE POINT, and is asserted rather than assumed. Provenance
     /// printed at the END of a job is worthless precisely when it matters most —
@@ -2219,11 +2221,12 @@ mod tests {
     /// commit. Hence the check is positional: checkout first, provenance second,
     /// gates afterwards.
     ///
-    /// SCOPED TO `ci.yml` DELIBERATELY. These twelve jobs are exactly the ones
-    /// whose missing proof the finding enumerates. `audit.yml` and `fuzz.yml`
-    /// number their steps in prose comments (`# 2.`, `# 3.`, …), so inserting a
-    /// step there would mean renumbering commentary unrelated to this contract —
-    /// churn that buys no additional attributability for the gates named.
+    /// SCOPED TO `ci.yml` DELIBERATELY. These twelve jobs are the ones whose
+    /// output a reader attributes to a commit — the build, test, lint, MSRV,
+    /// symbol and oracle gates. `audit.yml` and `fuzz.yml` number their steps in
+    /// prose comments (`# 2.`, `# 3.`, …), so inserting a step there would mean
+    /// renumbering commentary unrelated to this contract — churn that buys no
+    /// additional attributability for the gates named.
     ///
     /// The job list is read from the file, not hard-coded, so a newly added job
     /// cannot escape the requirement by not being mentioned here.
@@ -2339,12 +2342,11 @@ mod tests {
     /// The action census, per workflow: `(workflow, checkout, toolchain, cache,
     /// upload-artifact)`.
     ///
-    /// `audit.yml`'s header states these totals in prose, and a hand-maintained
-    /// tally is exactly what went stale before (it claimed 13 checkout and 12
-    /// toolchain uses against an actual 17 and 16). Asserting the numbers here
-    /// means the prose cannot drift again without a red test, and it also catches
-    /// the quieter direction of drift: an action added to a job that nobody
-    /// reviewed as an action change.
+    /// `audit.yml`'s header states these totals in prose, where nothing holds them
+    /// to the files they describe. Asserting the numbers here means the prose
+    /// cannot drift without a red test, and it also catches the quieter direction
+    /// of drift: an action added to a job that nobody reviewed as an action
+    /// change.
     const ACTION_CENSUS: [(&str, usize, usize, usize, usize); 3] = [
         (".github/workflows/audit.yml", 4, 3, 0, 0),
         (".github/workflows/ci.yml", 12, 12, 0, 1),
@@ -2355,9 +2357,9 @@ mod tests {
     ///
     /// These are executables that run with full access to the checked-out tree, so
     /// they are dependencies in every sense that matters even though no manifest
-    /// mentions them. `cargo-fuzz` is listed because it must stay pinned: it was
-    /// previously installed unversioned, which meant every run built and executed
-    /// whatever crates.io served at that moment.
+    /// mentions them. `cargo-fuzz` is listed for the same reason as the other two:
+    /// installed without a version, `cargo install` builds and executes whatever
+    /// crates.io serves at that moment.
     const CI_INSTALLED_TOOLS: [(&str, &str); 3] = [
         ("cargo-audit", "0.22.2"),
         ("cargo-deny", "0.20.2"),
@@ -3398,13 +3400,13 @@ mod tests {
     /// Every CI test-count floor is declared once and used consistently.
     ///
     /// This is the mechanical form of the rule that a floor's DECLARATION, the value
-    /// it LOGS, and the value it ENFORCES must be the same number. They had drifted
-    /// in two places at once: the four `no-std-tests` steps logged `floor=633` while
-    /// enforcing `-ge 629` (four tests could vanish), and `package-verify` logged 859
-    /// while enforcing 845 (fourteen could). In both cases the log was reassuring and
-    /// the gate was not, which is worse than having no floor at all.
+    /// it LOGS, and the value it ENFORCES must be the same number. Spelled as three
+    /// separate literals they can disagree, and the disagreement is silent in the
+    /// worst possible direction: the log reads reassuring while the comparison
+    /// accepts fewer tests than it advertises, which is worse than carrying no floor
+    /// at all.
     ///
-    /// The fix was to route each floor through one variable — `matrix.min_tests` for
+    /// Each floor therefore routes through one variable — `matrix.min_tests` for
     /// the `build-test` rows, and job-scoped `STD_OFF_FLOOR` / `PACKAGED_FLOOR` for
     /// the other two jobs — so the three uses cannot disagree. This test asserts that
     /// property directly: it fails if any count-enforcing comparison comes back as a
@@ -3641,13 +3643,24 @@ mod tests {
     ///
     /// # Why this is a source-text guard
     ///
-    /// The Windows half of the defect cannot be executed anywhere in this
-    /// environment: every CI job and every local run is Linux, so a
-    /// `#[cfg(windows)]` body is compiled at most (by `cargo check --target`) and
-    /// never run. That is precisely how the defect survived review — the code that
-    /// double-owned the CRT handle was invisible to every executed test. Pinning
-    /// the *shape* of the fix in text is therefore the only mechanism that can hold
-    /// it, and it holds on every host.
+    /// The platform matrix reaches Windows; it does not reach this property.
+    /// `ci.yml`'s `build-test` matrix carries native `windows-latest` and
+    /// `macos-latest` rows alongside its five `ubuntu-latest` ones, and
+    /// `cross-targets` type-checks `x86_64-pc-windows-msvc`, so a
+    /// `#[cfg(windows)]` body is compiled by CI and, on the native row, executed.
+    /// What no execution can observe is double ownership itself. A second owner of
+    /// a lent CRT handle misbehaves only at the second close, which either reports
+    /// `EBADF` into a value nobody inspects or — once the descriptor table has
+    /// recycled the slot — closes an unrelated file belonging to another part of
+    /// the process. Neither outcome fails an assertion, so a passing suite is not
+    /// evidence either way.
+    ///
+    /// This guard is therefore supplementary rather than a substitute: the native
+    /// `windows-latest` row runs the suite against a compiled `#[cfg(windows)]`
+    /// body, and pinning the *shape* in text covers the one property that run
+    /// cannot fail on. Unlike either, the text check also holds where the arm is
+    /// never compiled at all — every Linux job but `cross-targets`, and any Linux
+    /// developer checkout.
     ///
     /// What is pinned:
     ///
@@ -3781,9 +3794,10 @@ mod tests {
     /// divergence, because that host does not build the target the divergence
     /// appears on. Counting declarations does, from any host, whichever platforms
     /// CI happens to run.
-    /// The platform descriptor-flag and `fcntl` command cascades must degrade to
-    /// "do nothing" on an unrecognised platform, never to a borrowed value
-    /// (findings SEC-GZ-08 and SEC-GZ-09).
+    ///
+    /// The same test carries a second, related contract: the platform
+    /// descriptor-flag and `fcntl` command cascades must degrade to "do nothing" on
+    /// an unrecognised platform, never to a value borrowed from a neighbouring one.
     ///
     /// # Why this is a source-text test
     ///

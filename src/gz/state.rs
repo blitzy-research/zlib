@@ -503,12 +503,13 @@ pub struct GzState {
     /// Held as **raw bytes**, not a [`String`], because these bytes are handed
     /// back verbatim through the C `gzerror` message. On unix a path is an
     /// arbitrary byte string that need not be UTF-8, and C stores it with no
-    /// transformation at all (`gzlib.c` L196-L203: `malloc(len + 1)` plus a
-    /// `snprintf(..., "%s", path)`). Decoding it into a [`String`] would replace
-    /// every invalid subsequence with U+FFFD and therefore change the bytes a C
-    /// caller reads out of `gzerror` (finding M6-07). The lossy rendering still
-    /// exists — [`error`](Self::error) produces it for the idiomatic
-    /// [`msg`](Self::msg) — but it is no longer what the C mirror is built from.
+    /// transformation at all (`gzlib.c` L199-L222: `malloc(len + 1)` at L206 and
+    /// `snprintf(state->path, len + 1, "%s", path)` at L222). Decoding it into a
+    /// [`String`] would replace every invalid subsequence with U+FFFD and
+    /// therefore change the bytes a C caller reads out of `gzerror`. The lossy
+    /// rendering still exists — [`error`](Self::error) produces it for the
+    /// idiomatic [`msg`](Self::msg) — but the C mirror is built from these raw
+    /// bytes, never from it.
     pub(crate) path: Vec<u8>,
 
     /// The size of each allocated I/O buffer, or `0` when the buffers have not
@@ -875,24 +876,26 @@ impl GzState {
         //            return;
         //        }
         //
-        //    (`gzlib.c`, `gz_error`.) `format!` would instead terminate the
-        //    process, which would be a particularly poor failure mode here: this
-        //    is the function every other error path calls to *report* itself, so
-        //    an abort would replace a diagnosable error with process death at the
-        //    exact moment the caller was about to be told what went wrong.
+        //    (`gzlib.c` L576-L581, in `gz_error`.) `format!` would instead
+        //    terminate the process, which would be a particularly poor failure
+        //    mode here: this is the function every other error path calls to
+        //    *report* itself, so an abort would replace a diagnosable error with
+        //    process death at the exact moment the caller was about to be told
+        //    what went wrong.
         //
         //    C's request is `strlen(path) + strlen(msg) + 3` — the two strings
-        //    plus `": "` plus the NUL. A Rust `String` carries no NUL, so the
-        //    exact requirement is two fewer than C's by one byte for the
-        //    terminator; `msg_c` below reserves that byte separately.
+        //    plus `": "` plus the NUL. `detail_len` below is that figure minus the
+        //    NUL, because a Rust `String` carries none; the reservation adds the
+        //    byte back so the total matches C's exactly.
+        //
         //    The C-facing bytes are assembled first, from the **raw** path, so
         //    that `gzerror` reports exactly what C reports even when the path is
-        //    not valid UTF-8 (finding M6-07). A real gzip path and error detail
-        //    contain no interior NUL, so `CString::new` succeeds; were one ever
-        //    present, `.ok()` yields `None` and the FFI `gzerror` falls back to
-        //    the empty string rather than exposing a truncated pointer.
+        //    not valid UTF-8. A real gzip path and error detail contain no
+        //    interior NUL, so `CString::new` succeeds; were one ever present,
+        //    `.ok()` yields `None` and the FFI `gzerror` falls back to the empty
+        //    string rather than exposing a truncated pointer.
         //
-        //    The byte buffer is reserved with room for the terminator, so
+        //    `c_bytes` is reserved with room for that terminator, so
         //    `CString::new` — which appends the NUL to the `Vec` it is given —
         //    does not reallocate and cannot abort.
         let detail_len = self.path.len() + 2 + msg.len();
@@ -1071,13 +1074,13 @@ mod tests {
     }
 
     /// The C-facing message is assembled from the **raw** path bytes, so a path
-    /// that is not valid UTF-8 reaches `gzerror` unchanged (finding M6-07).
+    /// that is not valid UTF-8 reaches `gzerror` unchanged.
     ///
-    /// C stores the path verbatim (`gzlib.c` L196-L203) and renders the message
-    /// with `snprintf(..., "%s%s%s", path, ": ", msg)`, so the bytes a C caller
-    /// reads back are the caller's own. Decoding the path into a Rust `String`
-    /// first would replace each invalid run with U+FFFD (`ef bf bd`) and change
-    /// those bytes.
+    /// C stores the path verbatim (`gzlib.c` L199-L222) and renders the message
+    /// with `snprintf(..., "%s%s%s", state->path, ": ", msg)` (L583-L584), so the
+    /// bytes a C caller reads back are the caller's own. Decoding the path into a
+    /// Rust `String` first would replace each invalid run with U+FFFD
+    /// (`ef bf bd`) and change those bytes.
     #[test]
     fn the_c_message_carries_the_raw_path_bytes() {
         let mut s = test_state("placeholder");

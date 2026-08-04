@@ -56,7 +56,7 @@ Know the scale of what you are touching:
 
 | Quantity | Measured value | How it was measured |
 |----------|----------------|---------------------|
-| Rust modules under `src/` | **40 files**, **78,386 lines** (2026-08-04) | `find src -name '*.rs' -print0 \| xargs -0 wc -l` — the `total` row, with the file count from the same listing |
+| Rust modules under `src/` | **40 files**, **78,457 lines** (2026-08-04) | `find src -name '*.rs' -print0 \| xargs -0 wc -l` — the `total` row, with the file count from the same listing |
 | Retained C baseline | **23,107 lines** across 26 root translation units and headers | `cat` of the 26 files piped to `wc -l` |
 | Public C entry points the baseline declares | **119** `ZEXTERN` declarations in `zlib.h` | the retained header |
 | Exported C symbols this crate emits | **95**, all type `T` | `nm -D --defined-only target/release/libzlib_rs.so` |
@@ -856,15 +856,18 @@ for f in src/ffi/*.rs src/lib.rs src/stream.rs; do
       "$(grep -v '^[[:space:]]*//' "$f" | sed 's://.*::' | grep -cE '\bunsafe\b')" "$f"
 done
 cat src/ffi/*.rs | grep -v '^[[:space:]]*//' | sed 's://.*::' \
-    | grep -cE '\bunsafe\b'                                              # 1497
+    | grep -cE '\bunsafe\b'                                              # 1662
 cat src/{deflate,inflate,checksum,gz,util}/*.rs src/{error,constants,gz_header}.rs \
     | grep -v '^[[:space:]]*//' | sed 's://.*::' | grep -cE '\bunsafe\b'   # 0
 ```
 
-Dropping only the whole-line comments and skipping the second step yields 49 for
-[`src/lib.rs`](src/lib.rs) instead of 47. The two extra lines are not code: they
-are the string literals `"// unsafe\n"` and `"//! unsafe\n"`, test fixtures that
-feed the comment-stripping logic itself. The canonical form above is what
+Dropping only the whole-line comments and skipping the second step yields 51 for
+[`src/lib.rs`](src/lib.rs) instead of 49. The two extra lines are the string literals
+`"// unsafe\n"` and `"//! unsafe\n"` — test fixtures that feed the comment-stripping
+logic itself. They are executable Rust, and `sed 's://.*::'` blanks them because it
+cannot tell a string literal from a trailing comment. The two readings agree exactly on
+every `src/ffi/**` row, so the divergence is confined to that one row; the table below
+carries 51 there, the same figure
 [`doc/technical-specifications.md` §0.6.2](doc/technical-specifications.md#062-unsafe-code-boundary)
 reports, so the two documents report the same numbers.
 
@@ -878,7 +881,7 @@ reports, so the two documents report the same numbers.
 | `src/ffi/mod.rs` | 113 | wiring plus the ABI-drift guard |
 | `src/ffi/alloc.rs` | 54 | the `zcalloc` / `zcfree` bridge |
 | **`src/ffi/**` total** | **1,662** | the designated boundary |
-| `src/lib.rs` | 51 | the freestanding runtime block described above (**22** of the 51, `mod no_std_support` at L207-L422) plus the **29** in the in-crate boundary tests that police it |
+| `src/lib.rs` | 51 | the freestanding runtime block described above (**22** of the 51, `mod no_std_support` at L210-L425) plus the **29** in the in-crate boundary tests that police it |
 | `src/stream.rs` | 2 | **type aliases only** |
 | All eight core module groups | **0** | — |
 
@@ -888,11 +891,12 @@ hook signatures the crate must interoperate with. `grep -c "unsafe {"` on that f
 returns **0**: there is no executable `unsafe` block in it.
 
 `src/lib.rs` is worth calling out for the opposite reason. A looser scan that drops
-only *whole-line* comments reports **49** rather than 47, and the two extra lines are
-neither code nor a discrepancy: they are the string-literal fixtures `"// unsafe\n"`
-and `"//! unsafe\n"` inside the boundary test that checks the classifier ignores
-comments. Use the canonical scan above — and note that the crate does not rely on
-either count for enforcement. `#![deny(unsafe_code)]` and the in-crate boundary tests
+only *whole-line* comments reports **51** rather than the canonical **49**, and the two
+extra lines are neither a discrepancy nor a comment: they are the string-literal fixtures
+`"// unsafe\n"` and `"//! unsafe\n"` inside the boundary test that checks the classifier
+ignores comments. The table carries 51 for that row because those two lines are
+executable Rust — and note that the crate does not rely on either count for
+enforcement. `#![deny(unsafe_code)]` and the in-crate boundary tests
 do that; the table is evidence about shape, not the gate.
 
 ### How containment is enforced — four independent ways
@@ -1295,13 +1299,13 @@ sideways edges. `deflate` and `inflate` are strict peers — neither names the o
 and two design decisions are what keep the graph one-way:
 
 - `src/stream.rs` owns the engine state as an opaque `Box<dyn EngineState>`
-  (`stream.rs:1599` declares the trait, `:1647` holds the boxed value) and so names
+  (`stream.rs:1577` declares the trait, `:1625` holds the boxed value) and so names
   neither `DeflateState` nor `InflateState`.
 - The one-call façades are split rather than layered upward: the C driver loops stay
   at layer 3 behind the `OneCallDeflate` / `OneCallInflate` port traits
   (`src/util/compress.rs:145`, `src/util/uncompress.rs:67`), and the engine-owning
-  entry points sit at layer 6 and implement them (`src/deflate/mod.rs:1770`,
-  `src/inflate/mod.rs:2951`) — mirroring how `compress.c` and `uncompr.c` *include*
+  entry points sit at layer 6 and implement them (`src/deflate/mod.rs:1818`,
+  `src/inflate/mod.rs:2954`) — mirroring how `compress.c` and `uncompr.c` *include*
   `zlib.h` and drive the engine rather than being part of it.
 
 ```sh

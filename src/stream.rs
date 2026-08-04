@@ -589,7 +589,7 @@ pub trait ForeignBuffer<T: Copy + Default + ZeroValid> {
     /// [`AllocBuffer::len`](AllocBuffer::len) forwards here rather than measuring
     /// `as_slice().len()`, and the distinction is a soundness requirement, not a
     /// micro-optimization. One foreign region — the caller-supplied `inflateBack`
-    /// window, adopted by a bare pointer store exactly as `infback.c` L60 does —
+    /// window, adopted by a bare pointer store exactly as `infback.c` L59 does —
     /// is *not* initialized at adoption time. A length query that reached for
     /// `as_slice()` would create a `&[T]` over abstract-uninitialized bytes before
     /// anything had written them, which is validity UB regardless of whether the
@@ -1155,7 +1155,7 @@ impl<T: Copy + Default + ZeroValid> AllocBuffer<T> {
         match self {
             AllocBuffer::Owned(v) => v.len(),
             // `ForeignBuffer::len`, never `as_slice().len()`: the caller-supplied
-            // `inflateBack` window is adopted uninitialized (C `infback.c` L60 is
+            // `inflateBack` window is adopted uninitialized (C `infback.c` L59 is
             // a bare pointer store), so measuring it through a slice would form a
             // reference over uninitialized bytes.
             AllocBuffer::Foreign(b) => b.len(),

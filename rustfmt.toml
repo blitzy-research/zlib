@@ -1,81 +1,68 @@
 # rustfmt.toml — the source-formatting contract for the `zlib-rs` crate.
 #
-# Governs every Rust source in the crate: the modules under `src/`, the
-# integration tests under `tests/`, the criterion benches under `benches/`, and
-# `build.rs`. It owns the formatting half of migration gap D11 ("lint and format
-# behavior currently depends on unpinned tool defaults"); `clippy.toml` owns the
-# lint half, and the pair closes D11. Both files are packaged with the crate (see
-# the `exclude` notes in `Cargo.toml`), and both pin values the tree already
-# satisfies, as THE GOVERNING RULE below requires.
+# Governs every Rust source in the crate: the modules under `src/`, the integration
+# tests under `tests/`, the criterion benches under `benches/`, and `build.rs`. It
+# owns the formatting half of migration gap D11 ("lint and format behavior depends on
+# unpinned tool defaults") and `clippy.toml` owns the lint half.
 #
-# The defect this addresses is drift, not style: without a pinned configuration
-# the repository's formatting is whatever a contributor's rustfmt happens to
-# think it should be. That is harmless right up to the release in which rustfmt
-# changes a default — at which point the next `cargo fmt` rewrites tens of
-# thousands of lines and the blocking `lint` gate fails on code nobody touched.
-#
+# The defect it addresses is drift, not style: without a pinned configuration the
+# repository's formatting is whatever a contributor's rustfmt happens to think it
+# should be. That is harmless right up to the release in which rustfmt changes a
+# default — at which point the next `cargo fmt` rewrites tens of thousands of lines
+# and the blocking `lint` gate fails on code nobody touched.
 #
 # THE GOVERNING RULE — READ BEFORE ADDING ANYTHING
 # ================================================
-# Every option here pins a value the tree ALREADY satisfies. This file FREEZES
-# the current style; it does not impose a new one. Because
-# `cargo fmt --all -- --check` is a BLOCKING gate, a single non-default option
-# added here breaks the build for everyone until every affected file is
-# rewritten. Changing the house style is a deliberate, standalone, whole-tree
-# commit — never a drive-by line in this file.
+# Every option here pins a value the tree ALREADY satisfies. This file FREEZES the
+# current style; it does not impose a new one. Because `cargo fmt --all -- --check` is
+# a BLOCKING gate, one non-default option added here breaks the build for everyone
+# until every affected file is rewritten. Changing the house style is a deliberate,
+# standalone, whole-tree commit — never a drive-by line in this file.
 #
 # The authoring procedure follows directly: add ONE key, run
-# `cargo fmt --all -- --check`, and observe the exit code. If it is not 0, the
-# value you chose is not the current default — DELETE THE KEY rather than
-# reformatting the tree to satisfy it.
-#
+# `cargo fmt --all -- --check`, and observe the exit code. If it is not 0, the value
+# you chose is not the current default — DELETE THE KEY rather than reformatting the
+# tree to satisfy it.
 #
 # THE SUPPORTED TOOLCHAIN RANGE IS PART OF THE CONTRACT
 # =====================================================
-# The crate's range runs from `Cargo.toml`'s `rust-version = "1.85.0"` (pinned
-# locally by `rust-toolchain.toml`, and by the CI `msrv` job) up to current
-# stable, plus the nightly that `cargo-fuzz` requires — and `rustup` discovery
-# walks up from `fuzz/` to this same file. A config that is clean at one end and
-# noisy at the other is worse than none, so every key here must be accepted with
-# NO DIAGNOSTIC across that whole range. In particular, no unstable option may
-# appear: on a stable rustfmt an unstable key is a WARNING, not an error, so the
-# run still exits 0 while the option does nothing. A silently ignored option is a
-# lie in the configuration, which is why the acceptance test for each key below
-# was "empty stderr", not merely "exit 0".
+# The range runs from `Cargo.toml`'s `rust-version = "1.85.0"` (pinned locally by
+# `rust-toolchain.toml`, and by the CI `msrv` job) up to current stable, plus the
+# nightly `cargo-fuzz` requires — and `rustup` discovery walks up from `fuzz/` to this
+# same file. A config that is clean at one end and noisy at the other is worse than
+# none, so every key must be accepted with NO DIAGNOSTIC across the whole range. No
+# unstable option may appear: on a stable rustfmt an unstable key is a WARNING rather
+# than an error, so the run still exits 0 while the option does nothing, and a
+# silently ignored option is a lie in the configuration. The acceptance test for a key
+# is therefore empty stderr, not merely exit 0:
 #
+#       cargo fmt --all -- --check                      # the pinned MSRV floor
+#       cargo +stable fmt --all -- --check              # what the CI `lint` job runs
+#       cargo +nightly-2026-08-01 fmt --all -- --check  # what `cargo-fuzz` uses
 #
-# MAINTENANCE RULES
-# =================
-# * THE EDITION HERE MUST MATCH `Cargo.toml`. It is the same fact stated twice;
-#   if the two drift, one is lying. An edition bump is a multi-file change
-#   (`Cargo.toml`, this file, `rust-toolchain.toml`'s floor, the CI `msrv` pin) in
-#   one commit.
-# * NEVER ADD A KEY WITHOUT RUNNING THE GATE ON EVERY TOOLCHAIN THAT READS THIS
-#   FILE, and read stderr — an unstable or misspelled key only warns:
-#
-#       cargo fmt --all -- --check           # the pinned MSRV floor
-#       cargo +stable fmt --all -- --check   # what the CI `lint` job runs
-#       cargo +nightly-2026-08-01 fmt --all -- --check  # what `cargo-fuzz` contributors get
-#
-# * TO CHECK A VALUE AGAINST THE TOOL'S OWN DEFAULTS, ask rustfmt, not the docs:
+# To check a value against the tool's own defaults, ask rustfmt rather than the docs:
 #
 #       rustfmt --print-config default src/lib.rs
 #       rustfmt --edition 2024 --print-config current src/lib.rs
 #
+# MAINTENANCE RULES
+# =================
+# * THE EDITION HERE MUST MATCH `Cargo.toml`. It is the same fact stated twice; if the
+#   two drift, one is lying. An edition bump is a multi-file change (`Cargo.toml`,
+#   this file, `rust-toolchain.toml`'s floor, the CI `msrv` pin) in one commit.
 # * NEVER ENABLE THE COMMENT-REWRITING FAMILY (`wrap_comments`, `comment_width`,
-#   `normalize_comments`, `format_code_in_doc_comments`,
-#   `normalize_doc_attributes`). Every module in this crate carries a
-#   documentation header that cites its C provenance line by line and quotes C
-#   macro bodies verbatim; reflowing that prose would rewrite every module to no
-#   benefit and corrupt exactly the citations the port is audited against. (They
-#   are unstable today, so they would be silently ignored — that is not a reason
-#   to add them.)
+#   `normalize_comments`, `format_code_in_doc_comments`, `normalize_doc_attributes`).
+#   Every module in this crate carries a documentation header that cites its C
+#   provenance line by line and quotes C macro bodies verbatim; reflowing that prose
+#   would rewrite every module to no benefit and corrupt exactly the citations the
+#   port is audited against. They are unstable today, so they would be silently
+#   ignored — which is not a reason to add them.
 # * DO NOT WEAKEN THE GATE'S REACH. `disable_all_formatting`, `skip_children`,
 #   `format_generated_files = false`, and `ignore` all exist to stop rustfmt from
-#   looking at code. None belongs in a repository whose formatting gate is
-#   blocking and green. `fuzz/` needs no `ignore` entry: it is a detached
-#   workspace, so a root `cargo fmt --all` never reaches it, and running
-#   `cargo fmt` from inside it finds this file by walking up.
+#   looking at code. None belongs in a repository whose formatting gate is blocking
+#   and green. `fuzz/` needs no `ignore` entry: it is a detached workspace, so a root
+#   `cargo fmt --all` never reaches it, and running `cargo fmt` from inside it finds
+#   this file by walking up.
 
 
 # ---------------------------------------------------------------------------

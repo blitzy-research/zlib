@@ -736,7 +736,7 @@ sits here:
   has been validated on a hosted target and compile-verified for bare metal; it
   has not been exercised on real embedded hardware.** 713 passing hosted tests do
   not prove an embedded target works.
-- **Human code review across the full Rust surface — 78,386 lines across 40 files
+- **Human code review across the full Rust surface — 78,457 lines across 40 files
   under `src/`, measured on 2026-08-04 with
   `find src -name '*.rs' -print0 | xargs -0 wc -l` — is outstanding**, and it is
   the highest-severity remaining hardening item

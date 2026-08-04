@@ -474,21 +474,19 @@ fn shape_constant(len: usize) -> Vec<u8> {
 /// whole reason this shape is in the grid — it reaches encoder paths the other
 /// four corpora never take.
 ///
-/// Do NOT restate this shape as the profile with the largest throughput gap
-/// against C — an earlier revision of this comment did, and the measurement says
-/// the reverse. A per-profile comparison inverts the intuition: incompressible
-/// input is the profile *closest* to C, at roughly 82%–86%, because the match
-/// finder fails fast (`longest_match`'s two-byte prefilter rejects nearly every
-/// candidate) and block-type selection falls back to stored blocks, so both
-/// implementations do similarly little work per byte.
-/// The *compressible* profiles are the furthest, at roughly 58%–64%, where hash
-/// chains are genuinely walked and Huffman trees built. The aggregate
-/// "compression ≈ 85%, decompression 107%–127%" figure is the one AAP §0.8.3
-/// records, and it is attributed context rather than anything re-derived here.
+/// This shape is NOT the profile with the largest throughput gap against C, which
+/// is the intuitive but incorrect reading. A per-profile comparison inverts that
+/// intuition: incompressible input is the profile *closest* to C, at roughly
+/// 82%–86%, because the match finder fails fast (`longest_match`'s two-byte
+/// prefilter rejects nearly every candidate) and block-type selection falls back to
+/// stored blocks, so both implementations do similarly little work per byte. The
+/// *compressible* profiles are the furthest, at roughly 58%–64%, where hash chains
+/// are genuinely walked and Huffman trees built. The aggregate "compression ≈ 85%,
+/// decompression 107%–127%" figure is the one AAP §0.8.3 records, and it is
+/// attributed context rather than anything re-derived here.
 ///
-/// All of which this harness neither measures nor cares about: it compares bytes
-/// and never time. The note exists only so the comment cannot be mistaken for a
-/// performance claim that the benchmarks contradict.
+/// None of which this harness measures: it compares bytes and never time, so
+/// nothing here is a performance claim.
 fn shape_incompressible(len: usize) -> Vec<u8> {
     let mut rng = XorShift64::new(0x9E37_79B9_7F4A_7C15);
     (0..len).map(|_| rng.next_byte()).collect()
@@ -707,11 +705,11 @@ fn temp_root() -> PathBuf {
 /// down to nothing becomes `x`, so the caller always receives a usable
 /// component.
 ///
-/// Applied to the work-directory tag. Today every tag is an in-file literal, so
-/// this is defence in depth rather than a live exploit path — but it makes the
-/// containment structural instead of a property one has to re-derive by
-/// inspecting call sites, which is the only form of it that survives a future
-/// caller passing something less trustworthy.
+/// Applied to the work-directory tag. While every tag in this file is an in-file
+/// literal, this is defence in depth rather than a live exploit path — but it makes
+/// the containment structural instead of a property one has to re-derive by
+/// inspecting call sites, which is the only form of it that survives a caller
+/// passing something less trustworthy.
 fn safe_component(raw: &str) -> String {
     let filtered: String = raw
         .chars()
@@ -3006,9 +3004,10 @@ fn safe_component_neutralizes_traversal_and_separators() {
 /// must never follow a symbolic link planted at that name.
 ///
 /// The contrast with `create_dir_all` is asserted explicitly, because that is the
-/// whole substance of the fix: `create_dir_all` reports *success* for both of
-/// these inputs, which is how a directory nobody in this file created comes to
-/// hold C sources, an archive, an executed binary — and then a recursive delete.
+/// entire distinction the helper exists to draw: `create_dir_all` reports *success*
+/// for both of these inputs, which is how a directory nobody in this file created
+/// comes to hold C sources, an archive, an executed binary — and then a recursive
+/// delete.
 #[test]
 fn create_private_dir_refuses_an_occupied_name_and_never_follows_a_symlink() {
     let work = WorkDir::new("selftest_private");
@@ -3124,8 +3123,8 @@ fn work_dir_is_a_fresh_private_child_of_the_temp_dir_and_is_removed_on_drop() {
 
 /// A tag that tries to escape must land inside the temporary directory anyway.
 ///
-/// Every tag in this file is a literal today, so this is the property that keeps
-/// it that way structurally rather than by review.
+/// Every tag in this file is a literal, and this is the property that keeps the
+/// containment structural rather than dependent on review.
 #[test]
 fn work_dir_contains_a_hostile_tag_inside_the_temp_dir() {
     let base = temp_root();

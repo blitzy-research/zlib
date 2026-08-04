@@ -19,12 +19,10 @@
 //!
 //! Run them in that order and criterion reports the second against the first,
 //! because the group ids below are stable. Both paths return bit-identical
-//! checksums for every input, so only the timing differs; no figure for that
-//! difference is quoted anywhere in this file, because it is CPU- and
-//! build-dependent and the re-runnable commands above are the evidence rather
-//! than a constant baked into a comment. A benchmark result is likewise never on
-//! its own a licence to change `src/`: this folder measures, it does not
-//! authorise.
+//! checksums for every input, so only the timing differs, and the size of that
+//! difference is CPU- and build-dependent — the re-runnable commands above are
+//! the evidence for it. A benchmark result is never on its own a licence to
+//! change `src/`: this folder measures, it does not authorise.
 //!
 //! The distinction is CRC-32-only. `src/checksum/crc32.rs` dispatches its private
 //! `crc32_bulk` helper to `crc32fast::Hasher` or to the braided, word-at-a-time
@@ -96,7 +94,7 @@ const SIZES: [usize; 3] = [1 << 10, 1 << 14, 1 << 18];
 /// (measured run-to-run median spread under 0.3%), but the threshold is what
 /// makes a *verdict* trustworthy rather than the measurement, and a real CRC-32
 /// regression — a backend silently reverting to the software table, which is what
-/// `crc32_backend()` above now makes visible — is several hundred percent, not
+/// `crc32_backend()` above makes visible — is several hundred percent, not
 /// five. The measured change percentage is always printed regardless, so raising
 /// the threshold suppresses false verdicts without hiding data.
 const NOISE_THRESHOLD: f64 = 0.05;

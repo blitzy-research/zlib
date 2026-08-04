@@ -891,11 +891,11 @@ mod tests {
     // Guarded-name inventory — makes an omitted guard fail automatically
     // =======================================================================
     //
-    // The signature guards above are exhaustive today, but exhaustiveness that
-    // depends on someone remembering to extend a list decays on the first
-    // commit that adds an export. The three tests below close that loop by
-    // re-deriving the authoritative symbol sets from their sources at test time
-    // and diffing them against the names actually bound above:
+    // The signature guards above are exhaustive, but exhaustiveness that depends
+    // on someone remembering to extend a list decays on the first commit that
+    // adds an export. The three tests below close that loop by re-deriving the
+    // authoritative symbol sets from their sources at test time and diffing them
+    // against the names actually bound above:
     //
     //   * `zlib.map` — the linker version script, authoritative for the
     //     `global:` (exported) / `local:` (hidden) partition.
@@ -1730,7 +1730,7 @@ mod tests {
     /// `gzdirect`, `gzfread`, `gzfwrite`, `gzgetc_`, `gzoffset`, `gzoffset64`,
     /// `gzopen64`, `gzseek64`, `gztell64`, `gzungetc`, `gzvprintf`) would be an
     /// unlinkable artifact, not a smaller one. Because `cargo test` runs this
-    /// module once per feature row, every row now carries its own proof.
+    /// module once per feature row, each row carries its own proof.
     ///
     /// Distinctness is asserted as well as non-nullness: two names collapsing to
     /// one address would mean a shim had been aliased to another (for example by

@@ -2655,7 +2655,8 @@ fn compress_at(payload: &[u8], window_bits: i32) -> Vec<u8> {
 /// gzip and auto-detect framings. The stakes on these combinations are high: a
 /// fast loop that asserted C's prose-only `bits < 8` entry claim, or that handed
 /// back bytes it never pulled, would fail a `debug_assert!` under
-/// `panic = "abort"` (set for **both** profiles, `Cargo.toml` L173-L205), and
+/// `panic = "abort"` (set for **both** `Cargo.toml` profiles, `[profile.release]`
+/// and `[profile.dev]`), and
 /// across the C ABI that is an unrecoverable `SIGABRT` rather than an error
 /// return.
 #[test]
@@ -3475,10 +3476,10 @@ fn gzip_header_metadata_is_retrievable_by_a_safe_rust_consumer() {
 /// An [`Allocator`] that serves **only** the `(items, item_size)` pairs
 /// reference zlib is known to ask for, and refuses everything else.
 ///
-/// This models the allocator the review scenario describes: one written against
-/// reference zlib, sized from `sizeof(deflate_state)` / `sizeof(struct
-/// inflate_state)` and C's buffer arithmetic, which therefore rejects any request
-/// whose shape it does not recognise. A drop-in replacement must be served by it
+/// This models a host allocator written against reference zlib: sized from
+/// `sizeof(deflate_state)` / `sizeof(struct inflate_state)` and C's buffer
+/// arithmetic, and therefore rejecting any request whose shape it does not
+/// recognise. A drop-in replacement must be served by it
 /// exactly as reference zlib is (AAP §0.6.5).
 struct SchedulingAllocator {
     /// The request shapes this allocator recognises.
@@ -3632,7 +3633,7 @@ fn a_c_sized_allocator_initializes_every_engine() {
     // crate-private borrowed-window entry point the FFI shim drives — the public
     // Rust `inflate_back_init_with` allocates its own window and boxes the state
     // globally, since C has no such variant (`inflateBackInit_` receives the window
-    // from the caller, `infback.c` L60). Its geometry is pinned by
+    // from the caller, `infback.c` L59). Its geometry is pinned by
     // `crate::inflate::back`'s `borrowed_window_init_makes_only_the_state_request`
     // and, end to end through the C ABI, by
     // `crate::ffi::inflate`'s `a_c_sized_zalloc_initializes_inflate_and_inflate_back`.

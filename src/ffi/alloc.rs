@@ -226,7 +226,7 @@ impl<T: Copy + Default + ZeroValid> Drop for CForeignBuffer<T> {
 /// state = ZALLOC(strm, 1, sizeof(struct inflate_state));  /* infback.c L51 */
 /// if (state == Z_NULL) return Z_MEM_ERROR;
 /// ...
-/// state->window = window;                                 /* infback.c L60 */
+/// state->window = window;                                 /* infback.c L59 */
 /// ```
 ///
 /// and `inflateBackEnd` frees only the state (`infback.c` L572-L577) — never the
@@ -255,7 +255,7 @@ impl<T: Copy + Default + ZeroValid> Drop for CForeignBuffer<T> {
 /// # Initialization is a caller-of-this-type obligation
 ///
 /// The bytes are **not** initialized at adoption: `borrow_caller_window` writes
-/// nothing, because C's `state->window = window;` (`infback.c` L60) is a bare
+/// nothing, because C's `state->window = window;` (`infback.c` L59) is a bare
 /// pointer store and matching it is what leaves a caller's pre-filled buffer
 /// byte-for-byte intact across `inflateBackInit_` *and* `inflateBackEnd`.
 ///
@@ -358,7 +358,7 @@ impl ForeignBuffer<u8> for CBorrowedBuffer {
 ///
 /// # The region is adopted, never initialized
 ///
-/// C stores the pointer and nothing else — `infback.c` L60 is a bare
+/// C stores the pointer and nothing else — `infback.c` L59 is a bare
 /// `state->window = window;` — so this function writes **no** bytes to it
 /// either. That parity is directly observable: a caller who pre-fills its window
 /// and then makes an `inflateBackInit_` call that **fails** — a rejected argument,
@@ -402,7 +402,7 @@ pub(crate) unsafe fn borrow_caller_window(
     }
 
     // No write of any kind happens here: C's `state->window = window;`
-    // (`infback.c` L60) copies a pointer, and matching it is what keeps a
+    // (`infback.c` L59) copies a pointer, and matching it is what keeps a
     // caller's pre-filled buffer intact across every refused init and across
     // `inflateBackEnd`. Initialization — required before any slice over the region
     // may exist — is performed by `inflateBackInit_` once its accepting path is
@@ -1330,7 +1330,10 @@ pub(crate) mod test_hook {
         if address.is_null() {
             return;
         }
-        // SAFETY: as in `counted_zalloc`.
+        // SAFETY: `opaque` is the cookie `HookStats::hook` installed alongside
+        // this hook pair, so it points at a `HookStats` that outlives every buffer
+        // allocated through the pair — including the one being freed here. That is
+        // exactly `stats`' documented precondition.
         let stats = unsafe { stats(opaque) };
         let payload = address.cast::<u8>();
 
@@ -2311,7 +2314,10 @@ mod foreign_alloc_tests {
         // return a one-byte region) and exceeds `isize::MAX`; on a 32-bit host the
         // `usize` product overflows as well. Both clauses of the guard reject it,
         // so every supported width answers null.
-        // SAFETY: as in `builtin_hooks_round_trip_a_region`.
+        // SAFETY: `default_zalloc` never dereferences `opaque`, so the null cookie
+        // is inert, and `items`/`size` are plain `c_uint` values with no validity
+        // requirement. The call reports an unserviceable request by returning null
+        // rather than by producing a region, so nothing here is dereferenced.
         let raw = unsafe {
             default_zalloc(
                 black_box(core::ptr::null_mut()),
@@ -2330,7 +2336,9 @@ mod foreign_alloc_tests {
         // forward it to `malloc`; on a 32-bit `usize` the multiplication itself
         // overflows and `checked_mul` rejects it first. Either way the request must
         // fail, which is what the assertion below requires.
-        // SAFETY: as above.
+        // SAFETY: as for the call above — the null `opaque` is never dereferenced,
+        // the two `c_uint` arguments carry no validity obligation, and the result is
+        // only tested for nullness, never read through.
         let over = unsafe {
             default_zalloc(
                 black_box(core::ptr::null_mut()),
@@ -2346,7 +2354,10 @@ mod foreign_alloc_tests {
         // The refinement must not spill onto serviceable requests: the same
         // function, called through the same optimization-opaque path, still
         // serves a real one.
-        // SAFETY: as above.
+        // SAFETY: the null `opaque` is never dereferenced and the two `c_uint`
+        // arguments carry no validity obligation. This request is serviceable, so
+        // the returned pointer is released by the matching `default_zfree` below and
+        // by nothing else.
         let fine = unsafe {
             default_zalloc(
                 black_box(core::ptr::null_mut()),

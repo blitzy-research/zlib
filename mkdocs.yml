@@ -1,106 +1,43 @@
 # MkDocs configuration for the zlib-rs documentation site.
 #
-# ---------------------------------------------------------------------------
-# `docs_dir: doc` IS CANONICAL -- AND IT IS LOAD-BEARING, NOT A TYPO
-# ---------------------------------------------------------------------------
-# MkDocs defaults `docs_dir` to `docs/`. This project deliberately overrides it
-# to the singular `doc/`, because `doc/` is where the documentation actually
-# lives: it is the directory the retained C baseline already shipped, holding the
-# normative format specifications this rewrite implements -- `rfc1950.txt`
-# (zlib), `rfc1951.txt` (DEFLATE), `rfc1952.txt` (gzip), plus `algorithm.txt` and
-# `txtvsbin.txt`. Keeping the authored pages beside the specifications they
-# implement is the point; splitting them across two directories was the defect.
+# `docs_dir` overrides the MkDocs default of `docs/` with the singular `doc/`,
+# because `doc/` is where the documentation lives: it is the directory the
+# retained C baseline ships, holding the normative format specifications this
+# rewrite implements (`rfc1950.txt`, `rfc1951.txt`, `rfc1952.txt`,
+# `algorithm.txt`, `txtvsbin.txt`), and the authored pages sit beside them.
 #
-# Every path in `nav` below resolves relative to `docs_dir`, so `index.md` means
-# `doc/index.md`, and so on. Backstage TechDocs builds through this same file --
-# `catalog-info.yaml` sets `backstage.io/techdocs-ref: dir:.` -- so both the
-# MkDocs site and the TechDocs component publish `doc/`, from one source of
-# truth. Repointing `docs_dir` at `docs/` would silently drop all three authored
-# pages AND orphan the RFC texts.
+# The override is load-bearing. `project-guide.md` and
+# `technical-specifications.md` exist only under `doc/`, so repointing this key
+# at `docs/` unpublishes the two largest documents in the repository and orphans
+# the RFC texts. It would also contradict `Cargo.toml`'s `exclude` commentary,
+# which records that this site builds exactly `doc/index.md`,
+# `doc/project-guide.md`, and `doc/technical-specifications.md`. Backstage
+# TechDocs builds through this same file -- `catalog-info.yaml` sets
+# `backstage.io/techdocs-ref: dir:.` -- so the MkDocs site and the TechDocs
+# component publish `doc/` from one source.
 #
-# Flipping this value looks like a one-word tidy-up and is not.
-# `project-guide.md` and `technical-specifications.md` exist ONLY under `doc/`,
-# so pointing at `docs/` would unpublish the two largest documents in the
-# repository in order to rescue a small stub -- trading one orphan for two far
-# worse ones. It would also silently contradict `Cargo.toml`, whose `exclude`
-# commentary records that this site builds exactly `doc/index.md`,
-# `doc/project-guide.md`, and `doc/technical-specifications.md`.
+# A second, single-file `docs/` directory holds only `index.md`. It is a signpost
+# that names `doc/` as the published root and links to `doc/index.md`: it carries
+# no project substance, is unreachable from either build, and is absent from
+# `nav` deliberately, so that anyone landing on the conventional `docs/` path is
+# redirected rather than meeting a dead end. Adding it to `nav`, repointing
+# `docs_dir` at `docs`, or restoring project detail to it each recreate a second
+# landing page that can drift from the canonical one.
 #
-# ---------------------------------------------------------------------------
-# WHY `docs/index.md` EXISTS AND IS NOT IN `nav`
-# ---------------------------------------------------------------------------
-# There is a second, single-file `docs/` directory containing only `index.md`.
-# Its absence from `nav` is intentional and must stay that way: no file under
-# `docs/` is reachable from either the MkDocs or the TechDocs build.
-#
-# That page used to carry its own copy of the project description, which
-# duplicated `doc/index.md` -- and the two copies had already drifted apart.
-# The duplication was resolved by making `docs/index.md` a pure signpost: it now
-# holds no project detail of its own, states that `doc/` is the published root,
-# and links to `doc/index.md` as canonical. With nothing duplicated there, there
-# is nothing left to drift.
-#
-# It is kept rather than deleted so that anyone landing on the conventional
-# `docs/` path -- from a tool, a stale link, or habit -- is redirected instead of
-# meeting a dead end. Two rules follow, and both matter:
-#
-#   1. Do NOT add `docs/index.md` to `nav`, and do NOT change `docs_dir` to
-#      `docs`. Either change resurrects the two-landing-page split this
-#      arrangement exists to prevent.
-#   2. Do NOT restore project substance to `docs/index.md`. Documentation
-#      changes belong in `doc/`, next to the page they affect.
-#
-# ---------------------------------------------------------------------------
-# `site_url` IS DELIBERATELY UNSET -- AND THAT IS A DECISION, NOT AN OMISSION
-# ---------------------------------------------------------------------------
-# There is no `site_url` key below. The consequences were measured, not assumed,
-# by building this exact configuration three times with `--strict` (all three
-# exit 0 with zero warnings) and diffing the output:
-#
-#   unset (shipped)              sitemap.xml 109 B, 0 <url> entries; the three
-#                                content pages carry 0 absolute references and
-#                                use correct relative paths; no <link canonical>.
-#   site_url: <host>/zlib-rs/    sitemap.xml 487 B, 3 <url> entries; each content
-#                                page gains EXACTLY ONE line, a <link canonical>
-#                                (+78/+92/+89 bytes); still 0 absolute refs and
-#                                not one relative path rewritten; `404.html`'s
-#                                root-absolute refs gain the `/zlib-rs` prefix.
-#   site_url: <host>/            same, with the prefix at the root.
-#
-# So setting it would NOT break relative linking or sub-path hosting -- the usual
-# worry -- and the only blocker is the one that matters: THIS PROJECT HAS NO
-# PUBLISHED DOCUMENTATION URL. Nothing in the repository names one; there is no
-# GitHub Pages job in `.github/workflows/`, no `gh-pages` branch reference, and
-# no such address in `README.md`, `catalog-info.yaml`, or any page under `doc/`.
-# The site is published through Backstage TechDocs (`catalog-info.yaml` sets
-# `backstage.io/techdocs-ref: dir:.`), which serves it under a route derived from
-# the component identity at request time, not a URL knowable at build time.
-#
-# Writing a concrete value here would therefore invent a fact, and it would do so
-# in the worst available form: a `<link rel="canonical">` on all three content
-# pages pointing at an address that does not resolve. A canonical link to a
-# nonexistent URL is strictly worse than no canonical link -- it tells crawlers to
-# attribute the content to a dead address, and it would be actively wrong once
-# TechDocs serves the same pages at their real route. The empty `<urlset>` is
-# stock upstream MkDocs behaviour, is benign, and is the honest output for a site
-# whose address is unknown.
-#
-# IF a canonical URL ever exists, this becomes a one-line change: add
-# `site_url: https://<host>/<path>/` beside `docs_dir` below (it must be a real
-# top-level key -- note that the literal text `docs_dir: doc` also appears inside
-# the comment block above, so an unanchored search-and-replace will silently bury
-# the new key in a comment and it will have no effect), rebuild with `--strict`,
-# and assert `sitemap.xml` contains 3 `<url>` entries and each content page one
-# `<link rel="canonical">`. Do not add it speculatively.
-#
-# ---------------------------------------------------------------------------
-# THE KEYS BELOW ARE INTENTIONALLY UNCHANGED
-# ---------------------------------------------------------------------------
-# `docs_dir`, `nav`, and `plugins` are already correct and are deliberately left
-# byte-for-byte as they were. `techdocs-core` supplies the Backstage-compatible
-# theme and Markdown extension set; `mermaid2` renders the architecture and
-# layering diagrams embedded in the pages below -- the module dependency graph in
-# particular -- so removing it degrades those pages to raw fenced code.
+# There is deliberately no `site_url` key: this project has no published
+# documentation URL. Nothing in the repository names one -- no GitHub Pages job,
+# no `gh-pages` reference, and no such address in `README.md`,
+# `catalog-info.yaml`, or any page under `doc/`. TechDocs serves the site under a
+# route derived from the component identity at request time, which is not
+# knowable at build time. Setting a value would put a `<link rel="canonical">` on
+# every content page pointing at an address that does not resolve, which is worse
+# than none; the empty `<urlset>` in `sitemap.xml` is stock MkDocs behaviour and
+# is the honest output for a site whose address is unknown. Relative linking and
+# sub-path hosting work either way, so the missing URL is the only blocker. If
+# one ever exists, add `site_url: https://<host>/<path>/` beside `docs_dir` as a
+# real top-level key -- the literal text `docs_dir: doc` also appears in this
+# comment block, so an unanchored search-and-replace buries the new key in a
+# comment where it has no effect.
 docs_dir: doc
 
 # Must stay equal to `catalog-info.yaml`'s `metadata.name`. Renaming it breaks
@@ -108,69 +45,49 @@ docs_dir: doc
 site_name: 'blitzy-zlib'
 site_description: 'zlib-rs — a memory-safe, idiomatic Rust rewrite of the zlib 1.3.2.1 compression library with a C-compatible FFI drop-in layer'
 
-# ANTI-ORPHAN INVARIANT: every Markdown file inside `docs_dir` MUST appear in
-# `nav`, and every `nav` entry MUST resolve to a file that exists under
-# `docs_dir`. A page missing from `nav` is still built, but it is then
-# reachable only by guessing its URL — precisely the defect that once left a
-# second landing page stranded outside the build root. MkDocs reports that
-# omission at INFO level, so `--strict` will NOT catch it for you; keep the two
-# sides equal by hand whenever a page is added, renamed, or removed. `doc/`
-# currently holds three Markdown files and `nav` lists three.
+# ANTI-ORPHAN INVARIANT: every Markdown file under `docs_dir` must appear in
+# `nav`, and every `nav` entry must resolve to a file that exists there. A page
+# missing from `nav` is still built but is then reachable only by guessing its
+# URL, and MkDocs reports that omission at INFO level, so `--strict` does not
+# catch it. `doc/` holds three Markdown files and `nav` lists three; keep the two
+# sides equal by hand whenever a page is added, renamed, or removed.
 #
-# The canonical landing page is `doc/index.md`. `docs/index.md` is deliberately
-# retained as a redirect stub pointing at it, is not a second copy, and must
-# never regain project substance.
-#
-# Paths are relative to `docs_dir`, so `index.md` resolves to `doc/index.md`.
-# The normative wire-format references that ship beside those pages —
-# `rfc1950.txt`, `rfc1951.txt`, `rfc1952.txt`, `algorithm.txt`, `txtvsbin.txt`,
-# and `crc-doc.1.0.pdf` — are read-only reference inputs, are never edited, and
-# are deliberately absent from `nav`: MkDocs navigation covers Markdown pages,
-# and these are copied verbatim into the built site as static files.
+# Paths are relative to `docs_dir`, so `index.md` resolves to `doc/index.md`. The
+# wire-format references that ship beside those pages -- `rfc1950.txt`,
+# `rfc1951.txt`, `rfc1952.txt`, `algorithm.txt`, `txtvsbin.txt`, and
+# `crc-doc.1.0.pdf` -- are read-only inputs that are never edited and are absent
+# from `nav` because MkDocs navigation covers Markdown pages; they are copied
+# verbatim into the built site as static files.
 nav:
   - Home: index.md
   - Project Guide: project-guide.md
   - Technical Specifications: technical-specifications.md
 
-# `techdocs-core` is required by Backstage and supplies the theme, the Markdown
-# extension set, and the search plugin — which is why no `theme:` and no
-# `markdown_extensions:` block is declared here. `techdocs-core` replaces a
-# foreign `theme:` outright, resets the palette, and merely logs when overridden
-# theme settings are in use, so declaring either block competes with the preset
-# and is a known way to break TechDocs rendering.
+# `techdocs-core` supplies the Backstage-compatible theme, the Markdown extension
+# set, and search, which is why no `theme:` and no `markdown_extensions:` block
+# appears here: the preset replaces a foreign `theme:` outright, resets the
+# palette, and merely logs when overridden theme settings are in use, so
+# declaring either block competes with it and is a known way to break TechDocs
+# rendering.
 #
-# `mermaid2` is required: `project-guide.md` and `technical-specifications.md`
-# each carry two `mermaid` fenced diagrams. Because no `pymdownx.superfences`
-# custom fence routes those fences to the plugin, and the `techdocs-core`
-# preset declares none, a local `mkdocs build` publishes them as highlighted
-# source rather than as rendered diagrams. That is accepted deliberately and is
-# recorded in `technical-specifications.md`: the fenced form is the portable
+# `mermaid2` is declared, so `mkdocs build --strict` needs the
+# `mkdocs-mermaid2-plugin` package installed -- ci.yml's `docs` job pins it at
+# 1.2.3 -- but the plugin renders nothing on the built site, and that is
+# accepted. No `pymdownx.superfences` custom fence routes `mermaid` fences to it
+# and the `techdocs-core` preset declares none, so those fences are lexed as
+# plain text and publish as highlighted source. The fenced form is the portable
 # one that GitHub and Backstage TechDocs render natively, and declaring the
-# custom fence here would mean overriding the `techdocs-core` extension set to
-# gain nothing on the published site.
+# custom fence here would mean overriding the preset's extension set to gain
+# nothing on the published site.
 #
-# DO NOT READ THE BUILD LOG AS EVIDENCE THAT RENDERING IS ACTIVE. Every
-# `mkdocs build` prints, unconditionally and at CONFIGURATION time:
-#
-#     MERMAID2 - Using javascript library (10.4.0):
-#        https://unpkg.com/mermaid@10.4.0/dist/mermaid.esm.min.mjs
-#
-# That line describes the library the plugin WOULD use. The published page never
-# requests it. Verified in a real browser against a `--strict` build, on both
-# pages: `.mermaid` elements 0, `pre.mermaid` 0, `typeof window.mermaid`
-# "undefined", no `<script>` src matching mermaid, no `<svg>` inside the content
-# `<article>`, and zero network requests matching `mermaid` or `unpkg`. It is
-# not a connectivity failure - the same pages fetch Google Fonts over the same
-# connection with HTTP 200, and the logged URL returns HTTP 200 when fetched
-# directly. The runtime is simply never asked for, because the fence is lexed as
-# plain text, so no `<pre>` carries a class, so the theme's `pre.mermaid`
-# renderer binding matches nothing while `pre:not(.mermaid) > code` claims every
-# fence. Note also that the theme's own lazy fetch targets `mermaid@11` as UMD
-# while this plugin logs `mermaid@10.4.0` as ESM - different version and
-# different module format, neither of which is ever loaded.
-#
-# So: if you enable rendering here, do not judge success by the log line above.
-# Assert `document.querySelectorAll('pre.mermaid').length > 0` on a built page.
+# The build log is not evidence that rendering is active: every `mkdocs build`
+# prints `MERMAID2 - Using javascript library (10.4.0)` with an unpkg URL at
+# configuration time, describing the library the plugin would use, and the
+# published page never requests it. A browser inspection of a `--strict` build
+# finds zero `pre.mermaid` elements, `typeof window.mermaid` "undefined", and no
+# network request matching mermaid, on both diagram pages. Judge any future
+# change here by asserting `document.querySelectorAll('pre.mermaid').length > 0`
+# on a built page, never by that log line.
 plugins:
   - techdocs-core
   - mermaid2

@@ -49,8 +49,8 @@
 //! * **Arbitrary gzip / auto-detect input across the ABI** — `inflateInit2_(47)`
 //!   driven with the unmodified fuzz bytes, so the RFC 1952 header parser is
 //!   reached through the C ABI and not only through the safe API. Every other leg
-//!   here is zlib- or raw-framed, and the sibling `fuzz_gzip` target now drives
-//!   gzip exclusively through the safe streaming engine, so without this probe no
+//!   here is zlib- or raw-framed, and the sibling `fuzz_gzip` target drives gzip
+//!   exclusively through the safe streaming engine, so without this probe no
 //!   target would cover `40..=47` at the boundary at all. See
 //!   [`probe_raw_gzip_autodetect`].
 //!
@@ -1187,9 +1187,9 @@ fn probe_null_and_stateless_calls() {
 ///
 /// Both handles are built from in-range parameters with a valid version pair, so
 /// initialisation is *required* to succeed rather than used as a gate: wrapping
-/// the body in `if init == Z_OK` — as this probe used to — means a regression
-/// that broke valid `deflateInit2_`/`inflateInit2_` would skip every assertion
-/// below and report a clean run. Every outcome here is likewise pinned to its
+/// the body in `if init == Z_OK` would let a regression that broke valid
+/// `deflateInit2_`/`inflateInit2_` skip every assertion below and report a clean
+/// run. Every outcome here is likewise pinned to its
 /// exact code, including the two that are easy to leave open: the first
 /// productive `deflate` call publishes the RFC 1950 header and returns `Z_OK`,
 /// and `deflateEnd` on the abandoned stream reports `Z_DATA_ERROR`.
@@ -1258,12 +1258,12 @@ fn probe_buffer_validation() {
         "deflate given a positive avail_in with a null next_in",
     );
 
-    // `avail_in == 0` with a null `next_in` is legal: nothing is read. The
-    // outcome is not open either, and it used to be left that way. Both
-    // rejections above are refused in the prologue, so `last_flush` still holds
-    // its post-reset sentinel and C's `RANK(flush) <= RANK(old_flush)` guard does
-    // not fire; the stream is zlib-wrapped and still in `INIT_STATE`, so this
-    // call publishes the two-byte RFC 1950 header and returns `Z_OK`.
+    // `avail_in == 0` with a null `next_in` is legal: nothing is read. The exact
+    // outcome is determined rather than open, so it is pinned. Both rejections
+    // above are refused in the prologue, so `last_flush` still holds its
+    // post-reset sentinel and C's `RANK(flush) <= RANK(old_flush)` guard does not
+    // fire; the stream is zlib-wrapped and still in `INIT_STATE`, so this call
+    // publishes the two-byte RFC 1950 header and returns `Z_OK`.
     ds.avail_in = 0;
     // SAFETY: an empty input window with a live output window is a valid,
     // documented call shape.
@@ -1534,9 +1534,10 @@ fn probe_sync_recovery(data: &[u8]) {
 ///
 /// `window_bits` is steered by the fuzz input so successive executions build
 /// handles of different geometry; every value passed in is a legal one, so all
-/// three `*Init*_` calls are *required* to succeed. They used to gate their own
-/// blocks, which meant a regression that broke any one of them would take this —
-/// the file's most valuable probe — offline without a single assertion firing.
+/// three `*Init*_` calls are *required* to succeed, and are asserted rather than
+/// used as conditions. Letting each one gate its own block would mean a regression
+/// that broke any of them takes this — the file's most valuable probe — offline
+/// without a single assertion firing.
 fn probe_handle_tag_misuse(window_bits: c_int) {
     let good = version_ok();
     let size = stream_size_ok();
@@ -1957,10 +1958,10 @@ fn probe_allocator_failure_timing(data: &[u8]) {
     // SAFETY: `next_in`/`next_out` address the live `comp`/`back` buffers with
     // matching `avail_*` counts, and `produced <= comp.len()`.
     let ret = unsafe { inflate(&mut is, Z_NO_FLUSH) };
-    // The window request is now mandatory, so its refusal is asserted rather than
-    // tested for. Accepting `refused == 0` — as this probe used to — meant a
-    // decode that never reached the deferred allocation still passed, which made
-    // the whole timing assertion below optional.
+    // The window request is mandatory, so its refusal is asserted rather than
+    // merely tested for. Accepting `refused == 0` would let a decode that never
+    // reached the deferred allocation pass, which would make the whole timing
+    // assertion below optional.
     assert_eq!(
         starved_window.refused.get(),
         1,
@@ -2008,10 +2009,10 @@ fn probe_allocator_failure_timing(data: &[u8]) {
 /// reach `Z_STREAM_END`; the byte count must be positive; and `deflateEnd` must
 /// report `Z_OK`, since a completed stream has nothing buffered to discard.
 ///
-/// Returning [`Option`] instead — as this helper used to — made its sole caller,
-/// the deferred-allocation probe, skip itself whenever any of that went wrong.
-/// A regression in valid raw-deflate initialisation would therefore have silently
-/// disabled the only test of inflate's allocation *timing*.
+/// Returning [`Option`] instead would make its sole caller, the
+/// deferred-allocation probe, skip itself whenever any of that went wrong, so a
+/// regression in valid raw-deflate initialisation would silently disable the only
+/// test of inflate's allocation *timing*.
 ///
 /// Runs on the global allocator so it cannot disturb the hook accounting of the
 /// probe that calls it.
@@ -3351,14 +3352,12 @@ fn probe_copy_and_reset_misuse() {
 ///
 /// # Why this leg belongs here
 ///
-/// The sibling `fuzz_gzip` target used to reach the RFC 1952 header parser
-/// through exactly these three `extern "C"` symbols. It was migrated to the safe
-/// streaming API — correctly, because a harness has no business on the `unsafe`
-/// side of the boundary unless probing the boundary *is* its remit — but that
-/// left no target driving arbitrary gzip or auto-detect bytes through the C ABI
-/// at all. Probing the C ABI is this target's remit, so the leg is restored here
-/// rather than lost: the safe harness keeps its expanded gzip coverage and the
-/// raw-ABI route is additive to it, not a replacement for it.
+/// The sibling `fuzz_gzip` target reaches the RFC 1952 header parser through the
+/// safe streaming API, which is the right place for it: a harness has no business
+/// on the `unsafe` side of the boundary unless probing the boundary *is* its remit.
+/// That leaves arbitrary gzip and auto-detect bytes uncovered across the C ABI, and
+/// probing the C ABI *is* this target's remit — so this leg covers that route,
+/// additive to the safe harness's gzip coverage rather than a replacement for it.
 ///
 /// It is a genuinely distinct path. The round trip above and every probe below
 /// are zlib-framed or raw-framed, so none of them exercises `inflateInit2_`'s

@@ -24,15 +24,13 @@
 # the jobs below, exactly as `fuzz.yml` installs `cargo-fuzz`. This file owns the
 # supply-chain gate over both PROJECT graphs, and is the sole home of that gate.
 #
-# `cargo-deny` is not unique to this file, and saying otherwise would misdescribe
-# `fuzz.yml`. That workflow also installs cargo-deny, asserts the SAME 0.20.2
-# pin, and runs `check advisories` against the dependency graph of the
-# `cargo-fuzz` TOOL before installing it from source. That is a third, disjoint
-# graph - a build tool's own closure, not this project's - so it belongs beside
-# that install rather than here. The two version pins must never diverge.
-# `fuzz.yml` additionally runs its own `fmt`, two Clippy gates and a
-# no-default-features build over the detached harnesses, because workspace-scoped
-# root gates cannot reach them.
+# `fuzz.yml` also installs cargo-deny, asserts the SAME 0.20.2 pin, and runs
+# `check advisories` against the dependency graph of the `cargo-fuzz` TOOL before
+# installing it from source. That is a third, disjoint graph - a build tool's own
+# closure, not this project's - so it belongs beside that install rather than
+# here. The two version pins must never diverge. `fuzz.yml` additionally runs its
+# own `fmt`, two Clippy gates and a no-default-features build over the detached
+# harnesses, because workspace-scoped root gates cannot reach them.
 #
 # Every job and step here is BLOCKING and none may be marked advisory: a gate that
 # reports without failing is indistinguishable from no gate. Nothing here suppresses
@@ -57,7 +55,6 @@
 # parallel and a red build points at one tool, one policy, or one graph without
 # waiting on the others.
 #
-# Every action is pinned to a verified commit SHA; see "ACTION PINNING" below.
 # No native toolchain is required: both tools resolve a dependency graph and
 # read lockfiles, and neither compiles this crate or any C source. No step in
 # this file reads, writes, moves or compiles the retained C baseline (`*.c`,
@@ -73,10 +70,9 @@
 #
 # The BODY follows `fuzz.yml`: blank lines between top-level keys, a
 # `# Triggers:` index, `concurrency:`, and numbered `# 1.` step comments over a
-# six-space step-sequence indent. `ci.yml` now carries `concurrency:` too, but has no
+# six-space step-sequence indent. `ci.yml` carries `concurrency:` too, but has no
 # `schedule:` trigger to copy from, and it indents step sequences at four spaces
-# rather than six. (`permissions: contents: read` is now common to all three
-# files; it was absent from `ci.yml` when this note was first written.)
+# rather than six.
 #
 # The two parents genuinely disagree on those points, so the split is recorded
 # here on purpose rather than left to be rediscovered. Do not "normalise" this
@@ -118,26 +114,12 @@
 # it that way carries no configuration-resolution question.
 #
 # POLICY over the fuzz graph is covered by the `cargo-deny-fuzz` job, which aims
-# the SAME root `deny.toml` at that graph. That works because the root policy does
-# not ban the fuzz graph's C-toolchain chain outright: it SCOPES the `cc` ban with
-# `wrappers = ["libfuzzer-sys"]` and grants NCSA to `libfuzzer-sys` through a
-# crate-scoped `[[licenses.exceptions]]` entry. One boundary, written once, correct
-# on both graphs.
-#
-# TWO GRAPHS, ONE POLICY FILE, ONE WORKFLOW. The 89-package root graph and the
-# 13-package detached fuzz graph are both governed by `deny.toml`, and both are
-# evaluated here - by the `cargo-deny` and `cargo-deny-fuzz` jobs respectively.
-# cargo-deny resolves one graph per invocation, so there are two invocations; there
-# is only ever one rulebook. Each invocation names it with an explicit
-# `--config deny.toml`, which is MANDATORY on both: cargo-deny resolves its
-# configuration from the TARGET manifest's workspace root and falls back to
-# BUILT-IN DEFAULTS, silently, when it finds nothing there - a result
-# indistinguishable from a pass. The fuzz invocation is exactly that hazard, since
-# `fuzz/` is a detached workspace holding no policy of its own. Naming the path
-# turns "which policy governed this verdict" from a property of cargo-deny's search
-# order into an assertion. `-L info` then prints the configuration path that was
-# actually used, which is the positive evidence that the named policy - not a
-# default - was in force.
+# the SAME root `deny.toml` at that graph, and which therefore has SOLE ownership
+# of that graph's licence, ban and source evaluation. That works because the root
+# policy does not ban the fuzz graph's C-toolchain chain outright: it SCOPES the
+# `cc` ban with `wrappers = ["libfuzzer-sys"]` and grants NCSA to `libfuzzer-sys`
+# through a crate-scoped `[[licenses.exceptions]]` entry. One boundary, written
+# once, correct on both graphs.
 #
 # WHY ONE POLICY, NOT ONE PER GRAPH. AAP gap D1 asks for "a `cargo-deny` policy
 # over the 102-package closure" - singular - and the singular form is the stronger
@@ -148,45 +130,40 @@
 # `policy-integrity` below can assert that the tree contains exactly ONE policy -
 # so a graph cannot quietly acquire its own.
 #
-# WHAT ONE POLICY COSTS, AND WHY IT IS CHEAP. A single file spanning two closures
-# necessarily holds entries that are load-bearing on one graph and inert on the
-# other, and cargo-deny reports each inert entry as SHAPE noise. That cost is paid
-# in five narrow, enumerated `-A` codes - two on the root invocation, three on the
-# fuzz invocation - each downgraded only on the graph where the entry it covers
-# CANNOT match. No code is waved off on a graph where it could report something
-# real, so all four categories still run at full effective severity over all 102
-# packages. Measured on this tree: `advisories ok, bans ok, licenses ok, sources
-# ok` on both invocations, zero errors and zero warnings.
+# Each invocation names that policy with an explicit `--config deny.toml`, which is
+# MANDATORY on both: cargo-deny resolves its configuration from the TARGET
+# manifest's workspace root and falls back to BUILT-IN DEFAULTS, silently, when it
+# finds nothing there - a result indistinguishable from a pass. The fuzz invocation
+# is exactly that hazard, since `fuzz/` is a detached workspace holding no policy of
+# its own. Naming the path turns "which policy governed this verdict" from a
+# property of cargo-deny's search order into an assertion. `-L info` then prints the
+# configuration path that was actually used, which is the positive evidence that the
+# named policy - not a default - was in force.
 #
-# Why BOTH jobs have to live HERE, and only here: THIS FILE IS THE SUPPLY-CHAIN
-# GATE. One policy file, one evaluator, one workflow. An earlier revision of
-# `fuzz.yml` carried its own `cargo-deny` job over the fuzz graph; it has been
-# removed, because a second copy of the GATE is not defence in depth but a second
-# place for the tool pin, the `--locked` discipline and the lockfile assertion to
-# drift out of step. `fuzz.yml` builds and fuzzes and nothing else, and it must not
-# reacquire a policy job.
+# WHAT ONE POLICY COSTS. A single file spanning two closures necessarily holds
+# entries that are load-bearing on one graph and inert on the other, and cargo-deny
+# reports each inert entry as SHAPE noise. That cost is paid in five narrow,
+# enumerated `-A` codes - two on the root invocation, three on the fuzz invocation -
+# each downgraded only on the graph where the entry it covers CANNOT match. No code
+# is waved off on a graph where it could report something real, so all four
+# categories run at full effective severity over all 102 packages.
 #
-# `cargo-deny-fuzz` therefore has SOLE ownership of the fuzz graph's licence, ban
-# and source evaluation, and its trigger surface strictly contains the one the
-# removed job had:
-#
-#   * this job          - push, PR, DAILY 05:00, manual.
-#   * the removed job   - PR, WEEKLY (Mondays 03:00), manual. No `push` trigger
-#                         at all, so a direct push touching `fuzz/Cargo.toml` or
-#                         `fuzz/Cargo.lock` got advisory
-#                         coverage from the `--file fuzz/Cargo.lock` step above
-#                         and NO licence, ban or source evaluation for up to
-#                         seven days.
-#
-# The one thing genuinely given up is intra-run SEQUENCING: `fuzz.yml`'s
-# `cargo-fuzz` job can no longer `needs:` the policy verdict, because a job in
-# another workflow cannot be a `needs:` predecessor. That is a deliberate,
-# recorded trade. Both checks are blocking and both run on every pull request, so
-# a policy regression still fails the same PR - it fails as a sibling check
-# rather than as an upstream job. Do NOT "restore the sequencing" by adding a
-# policy job back to `fuzz.yml`, and do NOT give `fuzz.yml` a `push:` trigger to
-# compensate: a fuzzing campaign is a ~50-minute affair that has no business
-# running on every branch push, for a verdict this job produces in under a minute.
+# WHY THE POLICY GATE LIVES ONLY HERE. One policy file, one evaluator, one
+# workflow. A second copy of the GATE is not defence in depth but a second place
+# for the tool pin, the `--locked` discipline and the lockfile assertion to drift
+# out of step. `fuzz.yml` builds and fuzzes and nothing else, and it must not
+# acquire a policy job. The one thing that costs is intra-run SEQUENCING:
+# `fuzz.yml`'s `cargo-fuzz` job cannot `needs:` the policy verdict, because a job
+# in another workflow cannot be a `needs:` predecessor. That is a deliberate,
+# recorded trade, and this job's trigger surface is the broader one - push, PR,
+# daily 05:00, manual - so a direct push touching `fuzz/Cargo.toml` or
+# `fuzz/Cargo.lock` gets licence, ban and source evaluation as it lands. Both
+# checks are blocking and both run on every pull request, so a policy regression
+# still fails the same PR; it fails as a sibling check rather than as an upstream
+# job. Do NOT "restore the sequencing" by adding a policy job to `fuzz.yml`, and do
+# NOT give `fuzz.yml` a `push:` trigger to compensate: a fuzzing campaign is a
+# ~50-minute affair that has no business running on every branch push, for a
+# verdict this job produces in under a minute.
 #
 # WHAT A FAILURE HERE MEANS
 # =========================
@@ -257,9 +234,9 @@
 #   different interpretation of the same policy text. Every install below names
 #   an exact version and the following step ASSERTS what resolved:
 #
-#       cargo-deny   0.20.2   <- the version the policy file was authored
-#                                and probed against
-#       cargo-audit  0.22.2   <- current at the time this gate was validated
+#       cargo-deny   0.20.2   <- the release the policy file is authored and
+#                                probed against
+#       cargo-audit  0.22.2   <- the release this gate is validated against
 #
 #   WHAT BYTES. The tarball is fetched from static.crates.io by hand, so Cargo's
 #   internal registry-checksum verification does not apply. Each install
@@ -268,20 +245,17 @@
 #   scanner installed on trust-on-first-use would undercut every verdict below.
 #
 #   WHICH DEPENDENCY GRAPH GETS BUILT. This is the property that `--version` plus
-#   `--locked` does NOT give, and the one that was missing. cargo-audit 0.22.2's
-#   PUBLISHED lockfile fails its own advisory policy - measured here as
-#   `2 vulnerabilities found! 2 denied warnings found!`, from quinn-proto
-#   (RUSTSEC-2026-0185), anyhow 1.0.102 (RUSTSEC-2026-0190), memmap2 0.9.10
-#   (RUSTSEC-2026-0186) and crossbeam-epoch 0.9.18 (RUSTSEC-2026-0204). A plain
-#   `--locked` install thus BUILT a vulnerable scanner in order to look for
-#   vulnerabilities, and since 0.22.2 is the newest published release there is no
-#   version bump that fixes it. The remedy is a fixed, annotated list of
-#   `--precise` dependency overrides applied to the verified tree, followed by
-#   `cargo install --path ... --locked` so the audited resolution is the built
-#   one. `--precise` rather than a blanket `cargo update`, because the latter
-#   resolves against whatever the registry serves at that instant and is neither
-#   reviewable nor reproducible. cargo-deny 0.20.2's published lock is clean and
-#   needs no override.
+#   `--locked` does NOT give. A scanner's PUBLISHED lockfile can itself fail that
+#   scanner's own advisory policy, in which case a plain `--locked` install builds
+#   a vulnerable scanner in order to look for vulnerabilities - and when the
+#   affected release is the newest published one, no version bump fixes it. The
+#   remedy is a fixed, annotated list of `--precise` dependency overrides applied
+#   to the verified tree, followed by `cargo install --path ... --locked` so the
+#   audited resolution is the built one. `--precise` rather than a blanket
+#   `cargo update`, because the latter resolves against whatever the registry
+#   serves at that instant and is neither reviewable nor reproducible. Each
+#   override is annotated at its use site with the advisory it answers; a release
+#   whose published lock is clean carries no overrides.
 #
 #   Each job then makes its scanner audit ITS OWN graph before that scanner's
 #   verdict on this project is trusted. That step is what keeps the override
@@ -300,7 +274,7 @@
 #      READ STDERR even when both exit 0, because a new major can deprecate or
 #      re-scope a key while still accepting the file. Do not drop `--config
 #      deny.toml` from the fuzz invocation to save typing: discovery from
-#      `fuzz/` does reach the root policy today, but naming it is what keeps the
+#      `fuzz/` does reach the root policy, but naming it is what keeps the
 #      local probe and the CI gate the same command,
 #   3. update `deny.toml`'s SCHEMA VERSION note to the version you validated,
 #   4. keep the install pins here and that note in step. A pin that disagrees
@@ -359,14 +333,14 @@
 # job).
 #
 # THOSE FIGURES ARE ASSERTED, NOT ASSERTED-TO. Counts written into a comment rot
-# the moment a job is added or removed, and this paragraph had in fact already
-# rotted once. The `policy-integrity` job below therefore RE-DERIVES the census
-# from the three workflow files on every run and fails if it disagrees with the
-# numbers above, so the prose cannot silently drift from the tree again. If you
-# add or remove a job, update both the sentence and that job's expectation table
-# in the same reviewable diff - which is the point.
+# the moment a job is added or removed. The `policy-integrity` job below therefore
+# RE-DERIVES the census from the three workflow files on every run and fails if it
+# disagrees with the numbers above and with the table below, so the prose cannot
+# silently drift from the tree. If you add or remove a job, update both the
+# sentence and that job's expectation table in the same reviewable diff - which is
+# the point.
 #
-# The conversion was made across all three files in one change because a partial
+# The convention has to hold across all three files at once, because a partial
 # conversion does not work:
 #
 #   * `dtolnay/rust-toolchain` derives its DEFAULT toolchain from
@@ -377,13 +351,14 @@
 #     channel, and every toolchain-sensitive job additionally ASSERTS the resolved
 #     channel via `rustup show active-toolchain` (the three jobs here pin
 #     `stable`).
-#   * Every SHA was verified against the upstream repository at the moment of
+#   * Every SHA is verified against the upstream repository at the moment of
 #     pinning. A SHA copied from anywhere else is a worse trust root than the tag
 #     it replaces, because it looks authoritative and cannot be eyeballed.
 #
 # The pins in force across the three workflows, with their use counts. These are
 # the same figures the sentence above quotes and the same ones `policy-integrity`
-# re-derives, so all three must be changed together or not at all:
+# re-derives - it parses the rows below directly - so all three must be changed
+# together or not at all:
 #
 #   actions/checkout         11d5960a326750d5838078e36cf38b85af677262  v4.4.0  17x
 #   dtolnay/rust-toolchain   2c7215f132e9ebf062739d9130488b56d53c060c  master  16x
@@ -795,8 +770,8 @@ jobs:
           # named `deny.toml` (or `.deny.toml`, or `.cargo/deny.toml`) relative to
           # the manifest it is pointed at, so those are the names that can become a
           # second rulebook by accident. `fuzz/deny.toml` is called out by name
-          # because it is the one that previously existed and is the one a future
-          # change is most likely to recreate.
+          # because a detached workspace is the place a per-graph policy is most
+          # likely to be added.
           #
           # Walked rather than probed at fixed paths: a policy added under a
           # directory nobody thought to list would otherwise go unnoticed. `target/`
@@ -1461,8 +1436,7 @@ jobs:
 
   # Policy evaluation over the DETACHED fuzz crate graph, against the SAME root
   # `deny.toml` the job above uses. THIS IS THE ONLY JOB IN THE REPOSITORY THAT
-  # EVALUATES THE FUZZ GRAPH AGAINST A POLICY, and it exists because of a
-  # trigger-coverage gap it has since closed.
+  # EVALUATES THE FUZZ GRAPH AGAINST A POLICY.
   #
   # `--config deny.toml` is MANDATORY on this invocation, not stylistic. `fuzz/` is
   # a detached workspace that holds no policy of its own, so without the flag
@@ -1471,23 +1445,22 @@ jobs:
   # had reviewed. `-L info` prints the configuration path actually used, which is
   # the positive evidence that this file - not a default - was in force.
   #
-  # `fuzz.yml` USED TO CARRY a `supply-chain` job running the same command, but it
-  # ran only on pull_request, the weekly cron and manual dispatch - never on a
-  # direct push - so a push touching `fuzz/Cargo.toml` or `fuzz/Cargo.lock` got
-  # advisory coverage from the cargo-audit job above and NO licence, ban or source
-  # evaluation for up to seven days. That job was REMOVED rather than kept
-  # alongside this one: `fuzz.yml` today declares a single job, `cargo-fuzz`, and
-  # runs no cargo-deny and no cargo-audit at all. Two copies of one gate is not
-  # defence in depth - it is a second place for the tool pin, the `--locked`
-  # discipline and the lockfile assertion to drift.
+  # THE TRIGGER SURFACE IS THE POINT. This job runs on `push`, `pull_request`, a
+  # daily 05:00 cron and `workflow_dispatch`, and is blocking on all of them. A
+  # policy job living in `fuzz.yml` instead would inherit that file's triggers -
+  # pull_request, a weekly cron and manual dispatch, with no `push` at all - so a
+  # push touching `fuzz/Cargo.toml` or `fuzz/Cargo.lock` would get advisory
+  # coverage from the cargo-audit job above and NO licence, ban or source
+  # evaluation for up to seven days.
   #
-  # What that traded away, and what it bought, are both recorded in `fuzz.yml`'s
-  # "SUPPLY-CHAIN POLICY - OWNED BY `audit.yml`, NOT BY THIS FILE" header: the
-  # intra-run SEQUENCING is gone (a job in another workflow cannot be a `needs:`
-  # predecessor of `cargo-fuzz`), and in exchange this job runs on `push`,
-  # `pull_request`, a daily 05:00 cron and `workflow_dispatch` - a superset of the
-  # removed job's triggers - and is blocking on all of them. See "SCOPE" in the
-  # header. Do NOT re-add a policy job to `fuzz.yml` to "restore the sequencing".
+  # `fuzz.yml` therefore declares a single job, `cargo-fuzz`, and runs no
+  # cargo-deny and no cargo-audit over a PROJECT graph at all. Two copies of one
+  # gate is not defence in depth - it is a second place for the tool pin, the
+  # `--locked` discipline and the lockfile assertion to drift. What that costs is
+  # recorded in `fuzz.yml`'s "SUPPLY-CHAIN POLICY - OWNED BY `audit.yml`, NOT BY
+  # THIS FILE" header: intra-run SEQUENCING, because a job in another workflow
+  # cannot be a `needs:` predecessor of `cargo-fuzz`. See "SCOPE" in the header.
+  # Do NOT add a policy job to `fuzz.yml` to "restore the sequencing".
   cargo-deny-fuzz:
     name: cargo-deny (fuzz graph, deny.toml)
     runs-on: ubuntu-latest

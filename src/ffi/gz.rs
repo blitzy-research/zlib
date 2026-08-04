@@ -935,15 +935,15 @@ const _: () = {
 /// then calls `open(path, oflag, 0666)`, so without `'e'` the descriptor is
 /// **not** close-on-exec and survives an `exec`. A Rust [`std::fs::File`] is
 /// close-on-exec unconditionally, so the divergence is in the *absence* of the
-/// flag, and matching C means clearing `FD_CLOEXEC` here (finding M6-02).
+/// flag, and matching C means clearing `FD_CLOEXEC` here.
 ///
 /// `O_NONBLOCK` needs nothing on this path: it *is* expressible as an open flag
 /// and `crate::gz` already passes it through `OpenOptionsExt::custom_flags`.
 ///
 /// A failing `fcntl` is ignored, exactly as C ignores its own `fcntl` results.
 /// The consequence of an ignored failure is a descriptor that is close-on-exec
-/// when C's would not have been — the pre-existing behaviour, never anything
-/// less safe.
+/// when C's would not have been — a stricter descriptor than C's, never a laxer
+/// one.
 ///
 /// This applies to the **C ABI only**. The idiomatic `crate::gz::gzopen` keeps
 /// the standard library's always-close-on-exec descriptors, which is strictly
@@ -1013,7 +1013,7 @@ fn reconcile_opened_descriptor(state: &GzState, mode: &[u8]) {
 /// nothing at all. Measured against reference zlib: an adopted descriptor that
 /// started *without* close-on-exec still has none after `gzdopen(fd, "wbe")`,
 /// and one that started *with* it keeps it. Reproducing the no-op would mean
-/// setting close-on-exec where C does not (finding M6-03).
+/// setting close-on-exec where C does not.
 ///
 /// A failing `fcntl` is ignored, as in C.
 #[cfg(feature = "gz-io")]
@@ -1480,7 +1480,9 @@ impl Drop for CrtDescriptor {
     /// discards it.
     fn drop(&mut self) {
         if let Some(fd) = self.fd.take() {
-            // SAFETY: as in `close` above.
+            // SAFETY: `gzdopen`'s contract transferred ownership of `fd` to this
+            // owner, and `take` leaves `self.fd` empty, so this runs at most once on
+            // it whether the drop follows a `close`/`relinquish` or replaces one.
             let _ = unsafe { crt_close(fd) };
         }
     }
@@ -2889,10 +2891,10 @@ mod tests {
     /// time-of-check/time-of-use race no retry loop can close: the probe reports
     /// closed, another thread opens a file into that slot, and the test then
     /// adopts — and on `gzclose_r` CLOSES — a descriptor belonging to another
-    /// test. That is not hypothetical. An earlier revision of
-    /// `gzdopen_adopts_a_closed_descriptor_and_defers` did exactly that and broke
-    /// two unrelated `gz` tests in the `std,gzip,gz-io` feature row while passing
-    /// on every other row, because the interleaving differs per feature set.
+    /// test. The failure that produces is also among the hardest to attribute,
+    /// because it lands in whichever unrelated test lost its descriptor and it
+    /// appears only on the feature rows whose thread interleaving happens to hit
+    /// the window.
     ///
     /// A high number is race-free by construction instead: nothing in the process
     /// can be handed it while the harness's own descriptor use stays orders of
@@ -3697,10 +3699,16 @@ mod tests {
             // SAFETY: `gz` is live and `buf` is valid for `buf.len()` bytes.
             let got = unsafe { gzread(gz, buf.as_mut_ptr() as voidp, buf.len() as c_uint) };
             assert_eq!(got, -1, "the deferred read must fail");
-            // SAFETY: as above.
+            // SAFETY: a failed `gzread` reports through the handle rather than
+            // consuming it, so `gz` is still the live open reader opened above, and
+            // `errnum` is a live, initialized `c_int` this frame owns exclusively.
             let msg = unsafe { gzerror(gz, &raw mut errnum) };
             assert_eq!(errnum, Z_ERRNO, "the deferred failure is an OS error");
-            // SAFETY: as above.
+            // SAFETY: `gzerror` returns null only for a null handle or one that is
+            // neither an open reader nor writer; `gz` is an open reader, so `msg` is
+            // its own NUL-terminated message mirror. That mirror stays valid until
+            // the next `gz*` call records a new error, and the borrow ends inside
+            // this assertion, before the `gzclose_r` below.
             assert!(
                 !unsafe { CStr::from_ptr(msg) }.to_bytes().is_empty(),
                 "a failed read must leave a message"
@@ -3722,8 +3730,8 @@ mod tests {
     /// C walks the mode one byte at a time and its `switch` ends in
     /// `default: /* could consider as an error, but just ignore */ ;`
     /// (`gzlib.c` L113-L170), so `"rb\xff"` is `"rb"` with one ignored byte.
-    /// Requiring UTF-8 at the shim would reject a mode reference zlib accepts —
-    /// measured as six divergent probe lines before this fix.
+    /// Requiring UTF-8 at the shim would reject a mode reference zlib accepts, and
+    /// diverge on six of this test's probe lines.
     #[test]
     fn a_non_utf8_mode_opens_exactly_what_its_recognised_bytes_describe() {
         let (path, cpath) = unique_path("modebytes");
@@ -4339,7 +4347,7 @@ mod tests {
     }
 
     /// A descriptor `gzopen`ed **without** mode `e` must not be close-on-exec, and
-    /// one opened **with** `e` must be (finding M6-02).
+    /// one opened **with** `e` must be.
     ///
     /// C accumulates `oflag` in its mode loop and adds `O_CLOEXEC` only for `'e'`
     /// (`gzlib.c` L134-L138), then calls `open(path, oflag, 0666)`. Reference zlib
@@ -4414,8 +4422,7 @@ mod tests {
     }
 
     /// `gzdopen` must apply `O_NONBLOCK` for mode `N` and must leave the adopted
-    /// descriptor's close-on-exec state exactly as the caller left it
-    /// (finding M6-03).
+    /// descriptor's close-on-exec state exactly as the caller left it.
     ///
     /// C has no `open` call on this path, so it reconciles with `fcntl`
     /// (`gzlib.c` L253-L263):
@@ -4495,10 +4502,14 @@ mod tests {
             // ---- mode `e` without `N`: neither flag moves, because C's
             //      O_CLOEXEC `fcntl` is the proven no-op.
             let fd = fresh(started_cloexec);
-            // SAFETY: as above.
+            // SAFETY: `fd` was just produced by `fresh`, which hands over the only
+            // copy of it, and the mode is a `'static` NUL-terminated C string
+            // literal. Ownership of `fd` passes to the returned handle, which the
+            // `gzclose_r` below closes exactly once.
             let f = unsafe { gzdopen(fd, c"rbe".as_ptr()) };
             assert!(!f.is_null(), "gzdopen \"rbe\" must succeed");
-            // SAFETY: as above.
+            // SAFETY: `f` is non-null per the assertion above and has not been
+            // closed, which is exactly `handle_fd`'s precondition.
             let adopted = unsafe { handle_fd(f) };
             assert!(
                 !fd_nonblock(adopted),
@@ -4510,15 +4521,19 @@ mod tests {
                 "C's O_CLOEXEC fcntl is a no-op, so \"e\" must change nothing \
                  (started {started_cloexec})"
             );
-            // SAFETY: as above.
+            // SAFETY: `f` is the live reader handle from the `gzdopen` above and is
+            // consumed here exactly once; nothing reads it afterwards.
             assert_eq!(unsafe { gzclose_r(f) }, Z_OK);
 
             // ---- no flags at all: still nothing moves.
             let fd = fresh(started_cloexec);
-            // SAFETY: as above.
+            // SAFETY: `fd` is a fresh descriptor `fresh` has just handed over, the
+            // mode is a `'static` NUL-terminated C string literal, and ownership of
+            // `fd` passes to the handle the `gzclose_r` below closes exactly once.
             let f = unsafe { gzdopen(fd, c"rb".as_ptr()) };
             assert!(!f.is_null(), "gzdopen \"rb\" must succeed");
-            // SAFETY: as above.
+            // SAFETY: `f` is non-null per the assertion above and still open, which
+            // is exactly `handle_fd`'s precondition.
             let adopted = unsafe { handle_fd(f) };
             assert!(!fd_nonblock(adopted), "plain \"rb\" stays blocking");
             assert_eq!(
@@ -4526,7 +4541,8 @@ mod tests {
                 started_cloexec,
                 "plain \"rb\" must not change close-on-exec (started {started_cloexec})"
             );
-            // SAFETY: as above.
+            // SAFETY: `f` is the live reader handle from the `gzdopen` above and is
+            // consumed here exactly once; nothing reads it afterwards.
             assert_eq!(unsafe { gzclose_r(f) }, Z_OK);
         }
 
@@ -4534,7 +4550,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // fcntl command table (finding SEC-GZ-09)
+    // fcntl command table
     // ---------------------------------------------------------------------
 
     /// Every entry of the `fcntl` command table matches its platform's headers,
@@ -4591,9 +4607,9 @@ mod tests {
         );
     }
 
-    /// The precise hazard SEC-GZ-09 describes: on Haiku the POSIX `F_GETFD` value
-    /// `1` is `F_DUPFD`, a **variadic** command that would duplicate and leak the
-    /// descriptor instead of reading its flags.
+    /// Why per-platform numbering is not optional: on Haiku the POSIX `F_GETFD`
+    /// value `1` is `F_DUPFD`, a **variadic** command that would duplicate and leak
+    /// the descriptor instead of reading its flags.
     ///
     /// Asserted as a property of the table rather than as prose, so that a future
     /// change which reintroduced POSIX numbering for Haiku fails here.
@@ -4687,17 +4703,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // SEC-GZ-10 — `gzdopen` descriptor ownership
+    // `gzdopen` descriptor ownership
     //
-    // The defect this covers: a caller-supplied `int` was wrapped straight into a
-    // `std::fs::File` with `from_raw_fd` / `_get_osfhandle` + `from_raw_handle`.
-    // Both are unsound for the descriptors `gzdopen` is *required* to accept —
-    // `from_raw_fd` demands an open descriptor and `zlib.h` L1422-L1426 demands
-    // that anything except `-1` be accepted, while `_get_osfhandle` only *lends*
-    // the Windows handle the CRT still owns, so a `File` built from it becomes a
-    // second owner and a later double close.
+    // A caller-supplied `int` cannot be wrapped straight into a `std::fs::File`.
+    // Neither `from_raw_fd` nor `_get_osfhandle` + `from_raw_handle` is sound for
+    // the descriptors `gzdopen` is *required* to accept: `from_raw_fd` demands an
+    // open descriptor while `zlib.h` L1422-L1426 demands that anything except `-1`
+    // be accepted, and `_get_osfhandle` only *lends* the Windows handle the CRT
+    // still owns, so a `File` built from it becomes a second owner and a later
+    // double close.
     //
-    // The fix moves the ownership decision to the boundary: a descriptor proven
+    // The ownership decision therefore belongs at the boundary: a descriptor proven
     // open becomes a `File`, anything else is owned raw. These tests pin the
     // decision, the probe that drives it, and the lifecycle either way.
     // -----------------------------------------------------------------------
@@ -4907,10 +4923,15 @@ mod tests {
             -1,
             "the first read is where an invalid descriptor shows up"
         );
-        // SAFETY: as above.
+        // SAFETY: the failing `gzread` reported through the handle rather than
+        // consuming it, so `gz` is still the live open reader adopted above, and
+        // `errnum` is a live, initialized `c_int` this frame owns exclusively.
         let msg = unsafe { gzerror(gz, &raw mut errnum) };
         assert_eq!(errnum, Z_ERRNO, "the deferred failure is an OS error");
-        // SAFETY: as above.
+        // SAFETY: `gzerror` returns null only for a null handle or one that is
+        // neither an open reader nor writer; `gz` is an open reader, so `msg` is its
+        // own NUL-terminated message mirror, valid until the next `gz*` call records
+        // a new error. The borrow ends inside this assertion, before `gzclose_r`.
         assert!(
             !unsafe { CStr::from_ptr(msg) }.to_bytes().is_empty(),
             "the OS error message must be reported, not swallowed"

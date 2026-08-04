@@ -44,13 +44,13 @@ categories = ["compression", "no-std", "encoding", "api-bindings"]
 # `build.rs` regenerates the CRC-32 lookup tables into `OUT_DIR` at build time,
 # replacing the checked-in `crc32.h` tables from the C baseline.
 build = "build.rs"
-# The C baseline co-exists in this repository during the migration but must not
-# ship inside the published crate. Keep the C sources/headers, the contributed
-# subtrees, the legacy platform directories, the C build/packaging files, the
-# upstream C documentation, and the migration engagement material out of the
-# packaged `.crate`. (`exclude` only affects `cargo package`/`publish`; it never
-# affects `cargo build`/`test`/`bench` in the workspace, so the retained C tree
-# stays fully available in-repository as the cross-validation oracle.)
+# The retained C baseline lives beside the Rust crate in this repository but must
+# not ship inside the published archive: the C sources and headers, the contributed
+# subtrees, the legacy platform directories, the C build and packaging files, the
+# upstream C documentation, and the engagement material all stay out of the packaged
+# `.crate`. `exclude` affects only `cargo package`/`publish`, never
+# `cargo build`/`test`/`bench`, so the C tree remains fully available in-repository
+# as the cross-validation oracle.
 #
 # GLOB SUBTLETY — do NOT "simplify" the suffix patterns below. Cargo matches
 # `exclude` entries with gitignore semantics, so a `*.<suffix>` pattern matches
@@ -61,37 +61,34 @@ build = "build.rs"
 # component at any depth, which is why `README.md` (the `readme = ` target) is
 # unaffected by it.
 #
-# ACCEPTANCE GATE for this list is AUTOMATED, not a manual habit. The
-# `package-verify` job in `.github/workflows/ci.yml` runs
-# `cargo +stable package --locked --list` and then asserts BOTH directions
-# against that listing: 19 anchored MUST-NOT-SHIP patterns (no
-# `*.c`/`*.h`/`*.map`/`*.in`/`*.cmakein`, no upstream C docs, no legacy platform
+# THE ACCEPTANCE GATE FOR THIS LIST IS AUTOMATED. The `package-verify` job in
+# `.github/workflows/ci.yml` runs `cargo +stable package --locked --list` and
+# asserts both directions against that listing: 19 anchored MUST-NOT-SHIP patterns
+# (no `*.c`/`*.h`/`*.map`/`*.in`/`*.cmakein`, no upstream C docs, no legacy platform
 # tree, no `contrib`/`examples`/`test` directory, no engagement material) and 17
-# MUST-SHIP patterns. It then packages for real and runs the UNPACKED archive's
-# own `cargo test`, so an `exclude` entry that removes something the crate reads
-# fails there rather than in a consumer's build. Still run `cargo package --list`
-# locally after ANY edit here — but the listing is now checked for you, which is
-# what keeps this list from silently regressing.
+# MUST-SHIP patterns. It then packages for real and runs the UNPACKED archive's own
+# `cargo test`, so an `exclude` entry that removes something the crate reads fails
+# there rather than in a consumer's build. Run `cargo package --list` locally after
+# any edit here as well.
 #
-# NEVER add to this list — these ARE the crate, and every one of them is an
-# asserted MUST-SHIP pattern in that job: `src/**`, `tests/**`, `benches/**`,
-# `build.rs`, `Cargo.toml`, `Cargo.lock`, `README.md`, `LICENSE`, `deny.toml`,
-# `clippy.toml`, `rustfmt.toml`, `rust-toolchain.toml`, `.cargo/config.toml`,
+# NEVER add to this list — these ARE the crate, and every one is an asserted
+# MUST-SHIP pattern in that job: `src/**`, `tests/**`, `benches/**`, `build.rs`,
+# `Cargo.toml`, `Cargo.lock`, `README.md`, `LICENSE`, `deny.toml`, `clippy.toml`,
+# `rustfmt.toml`, `rust-toolchain.toml`, `.cargo/config.toml`,
 # `.github/workflows/ci.yml`, `CHANGELOG.md`, `SECURITY.md`, `CONTRIBUTING.md`.
 #
-# The last five of those are not documentation polish. `.cargo/config.toml`,
-# `.github/workflows/ci.yml` and `rust-toolchain.toml` are read by the packaged
-# crate's OWN test suite (`the_lint_job_runs_the_documented_clippy_gate`,
+# The non-source entries in that list are not documentation polish.
+# `.cargo/config.toml`, `.github/workflows/ci.yml` and `rust-toolchain.toml` are
+# read by the packaged crate's OWN test suite
+# (`the_lint_job_runs_the_documented_clippy_gate`,
 # `every_toolchain_specific_ci_job_pins_and_asserts_its_toolchain`,
 # `every_graph_resolving_ci_command_is_locked`, and the toolchain-pin test), so
 # excluding one turns that suite red on a missing path; `clippy.toml` and
 # `rustfmt.toml` are what make a downstream `-D warnings` run the same gate this
-# repository passes; and `deny.toml` is what lets an auditor reproduce the
-# supply-chain verdict from the crate alone. `CHANGELOG.md`, `SECURITY.md` and
-# `CONTRIBUTING.md` all exist in this tree and ship today (they closed AAP gaps
-# D5 and D6); they must never be added below, and `cargo package --list`
-# confirms all three are present in the archive -- the `package-verify` CI job
-# is what keeps that true.
+# repository passes; `deny.toml` lets an auditor reproduce the supply-chain verdict
+# from the crate alone; and `CHANGELOG.md`, `SECURITY.md` and `CONTRIBUTING.md`
+# supply the release history, disclosure policy and contribution contract a
+# consumer of a memory-safety replacement for `libz` needs (AAP gaps D5 and D6).
 #
 # Note especially that the `test/**` entry below is the *C driver* directory
 # (`test/example.c`, `test/infcover.c`, `test/minigzip.c`) and is a DIFFERENT
@@ -125,19 +122,16 @@ exclude = [
     "MODULE.bazel",
     # CMake's own formatter config — tooling for the retained C build only.
     ".cmake-format.yaml",
-    # Upstream C documentation. `README.md` — this crate's `readme = ` target —
-    # is deliberately NOT in this group: the bare `README` and `ChangeLog` names
-    # below are the *upstream C* files, and a bare name matches a path component
-    # without matching a `.md` suffix. That distinction is load-bearing now that
-    # the Rust-facing `CHANGELOG.md` exists: it is the crate's own release
-    # history (AAP gap D5, closed), it supersedes `ChangeLog` for crate
-    # consumers, and it must stay OUT of this group -- which the bare `ChangeLog`
-    # entry below already guarantees, since it cannot match a `.md` suffix. It is
-    # also an asserted MUST-SHIP pattern in the `package-verify` job, so a
-    # regression that excluded it would fail CI rather than ship quietly. The two
-    # files coexist: `ChangeLog` is the C baseline's history and is excluded,
-    # `CHANGELOG.md` is this crate's and is shipped. Adding a `*.md` pattern or a
-    # `CHANGELOG*` entry to this group would remove the wrong one of the pair.
+    # Upstream C documentation. The bare `README` and `ChangeLog` names below are
+    # the *upstream C* files, and a bare name matches a path component without
+    # matching a `.md` suffix — which is why this group leaves the two Rust-facing
+    # documents alone: `README.md` (this crate's `readme = ` target) and
+    # `CHANGELOG.md` (the crate's own release history, which supersedes `ChangeLog`
+    # for crate consumers). Both are asserted MUST-SHIP patterns in the
+    # `package-verify` job, so excluding either fails CI rather than shipping
+    # quietly. The pairs coexist deliberately: `ChangeLog` is the C baseline's
+    # history and is excluded, `CHANGELOG.md` is this crate's and ships. Adding a
+    # `*.md` pattern or a `CHANGELOG*` entry to this group removes the wrong one.
     "ChangeLog",
     "FAQ",
     "INDEX",
@@ -268,8 +262,10 @@ simd = ["dep:crc32fast"]
 # `inflate_strict` below is an intentional, documented opt-in extra beyond the
 # AAP core set (`std`/`gzip`/`gz-io`/`no-std`/`simd`). It defaults to OFF and is
 # fully stable-buildable, so `cargo build --all-features` succeeds on the stable
-# toolchain (and thus on the pinned MSRV). It is mirrored in the README feature
-# table.
+# toolchain. Whether the same holds on the pinned MSRV is a separate question with
+# its own evidence: the `msrv` job in `.github/workflows/ci.yml` builds and
+# `--all-targets` checks the crate on `rust-version` below, and stable success does
+# not imply it. The feature is mirrored in the README feature table.
 #
 # The `gzprintf`/`gzvprintf` FFI symbols are always exported for ABI
 # completeness, but — because rendering a C `va_list` requires the unstable
@@ -402,29 +398,27 @@ panic = "abort"
 
 # `target_os = "cygwin"` IS A REAL VALUE THAT THE MSRV COMPILER HAS NOT HEARD OF.
 #
-# The platform-constant cascades added for the `gzdopen` flag work name every unix
-# family explicitly rather than guessing: `src/gz/open.rs` places cygwin in the
-# newlib `O_NONBLOCK` family (`0x4000`) and the POSIX `FD_CLOEXEC` family (`1`),
-# and `src/ffi/gz.rs` places it in the POSIX `fcntl` command family. Those three
-# arms are load-bearing — delete them and cygwin falls through to the terminal
-# "do not guess" arm, which is safe but silently stops requesting the nonblocking
-# open that mode `"rbN"` asked for.
+# The platform-constant cascades name every unix family explicitly rather than
+# guessing: `src/gz/open.rs` places cygwin in the newlib `O_NONBLOCK` family
+# (`0x4000`) and the POSIX `FD_CLOEXEC` family (`1`), and `src/ffi/gz.rs` places it
+# in the POSIX `fcntl` command family. Those three arms are load-bearing — delete
+# them and cygwin falls through to the terminal "do not guess" arm, which is safe
+# but silently stops requesting the nonblocking open that mode `"rbN"` asked for.
 #
 # `cygwin` became a known `target_os` after 1.85.0, the MSRV this crate declares
-# and CI pins. So current stable compiles those arms silently while 1.85.0 emits
+# and CI pins, so current stable compiles those arms silently while 1.85.0 emits
 # three `unexpected_cfgs` warnings for a value that is entirely correct. Declaring
-# the value here is the narrow fix: it teaches the lint this ONE extra `target_os`
-# and nothing else.
+# the value here is the narrowest possible answer: it teaches the lint this ONE
+# extra `target_os` and nothing else.
 #
-# What this deliberately does NOT do is switch the lint off. `level = "warn"`
-# keeps it at its default severity, so `-D warnings` in the `lint` and
-# `cross-targets` jobs still promotes it to an error, and every OTHER unknown
-# `cfg` value is still reported. That distinction is load-bearing: this exact lint
-# is what caught `target_arch = "hppa"` and `target_arch = "alpha"` — two values
-# that do not exist — during the same platform work. An
-# `#[allow(unexpected_cfgs)]` on the cascades would have silenced those typos
-# along with this legitimate value, which is precisely the safety net worth
-# keeping. Verify with `RUSTUP_TOOLCHAIN=1.85.0 cargo check --locked
+# What it deliberately does NOT do is switch the lint off. `level = "warn"` keeps
+# the lint at its default severity, so `-D warnings` in the `lint` and
+# `cross-targets` jobs still promotes it to an error and every OTHER unknown `cfg`
+# value is still reported. That distinction is what makes the lint worth keeping:
+# it is the only mechanism that rejects a misspelled `target_os`/`target_arch`,
+# whose arm would otherwise compile silently and simply never be taken. An
+# `#[allow(unexpected_cfgs)]` on the cascades would silence such a typo along with
+# this legitimate value. Verify with `RUSTUP_TOOLCHAIN=1.85.0 cargo check --locked
 # --all-targets`, which must report zero warnings.
 [lints.rust.unexpected_cfgs]
 level = "warn"

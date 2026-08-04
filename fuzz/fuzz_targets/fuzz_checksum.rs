@@ -144,12 +144,12 @@ const LONG_TAIL: usize = 16;
 /// amount, which is what makes this a property of the *input*, not a defect in
 /// either implementation.
 ///
-/// Normalising therefore does not weaken the varied-seed contract: it is still
-/// re-proved for an arbitrary *starting checksum*, which remains strictly
-/// stronger than the RFC identity-seed form, but it is now asserted over the set
-/// of seeds for which the algebra is actually defined. The *un*-normalised word
-/// keeps its own dedicated coverage in [`assert_empty_update`], which is
-/// deliberately handed the raw seed precisely so this reduction stays observable.
+/// Normalising therefore does not weaken the varied-seed contract: it holds for an
+/// arbitrary *starting checksum*, which is strictly stronger than the RFC
+/// identity-seed form, and it is asserted over exactly the set of seeds for which
+/// the algebra is defined. The *un*-normalised word has its own dedicated coverage
+/// in [`assert_empty_update`], which is deliberately handed the raw seed precisely
+/// so this reduction stays observable.
 fn adler_normalised(seed: u32) -> u32 {
     let low = seed & 0xFFFF;
     let high = (seed >> 16) & 0xFFFF;

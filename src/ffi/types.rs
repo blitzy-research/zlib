@@ -2754,9 +2754,9 @@ pub(crate) fn guard_void(f: impl FnOnce() + core::panic::UnwindSafe) {
 // --- Shared test utility for the panic guards ------------------------------
 //
 // Declared at module scope (not inside `mod tests`) and `pub(crate)` so the
-// sibling shim files' test modules reach the same serialization primitive: every
-// guard now lives in this module, but each shim file still tests the guards IT
-// uses from its own test module. Without a single shared lock, two test modules
+// sibling shim files' test modules reach the same serialization primitive. The
+// guards themselves all live in this module, but each shim file tests the ones IT
+// uses from its own test module, and without a single shared lock two test modules
 // swapping the process-global panic hook concurrently can interleave.
 
 /// Serializes every test that installs a scoped panic hook.
@@ -3263,8 +3263,8 @@ mod tests {
         );
         // SAFETY: as above.
         assert!(unsafe { deflate_state(&mut strm) }.is_none());
-        // SAFETY: as above — and this is the assertion that pins the fix: a
-        // wrong-owner reclaim must NOT reconstitute the box.
+        // SAFETY: as above — and this is the assertion the ownership tag exists
+        // for: a wrong-owner reclaim must NOT reconstitute the box.
         assert!(unsafe { deflate_take(&mut strm) }.is_none());
         assert!(
             !strm.state.is_null(),
@@ -5022,7 +5022,10 @@ mod tests {
         let mut strm = zeroed_stream();
         strm.zalloc = Some(caller_zalloc);
         strm.opaque = cookie;
-        // SAFETY: as above.
+        // SAFETY: `strm` is a freshly built, live, exclusively-owned `z_stream` and
+        // the prologue only reads and writes its plain `Copy` fields — including the
+        // `zalloc`/`zfree`/`opaque` fields set just above, which are a function
+        // pointer and a raw cookie the prologue never calls or dereferences.
         let alloc = unsafe { init_allocator_prologue(&mut strm) };
         assert!(strm.zfree.is_some(), "the missing `zfree` is substituted");
         assert!(
@@ -5041,7 +5044,10 @@ mod tests {
         let mut strm = zeroed_stream();
         strm.zfree = Some(caller_zfree);
         strm.opaque = cookie;
-        // SAFETY: as above.
+        // SAFETY: `strm` is a freshly built, live, exclusively-owned `z_stream` and
+        // the prologue only reads and writes its plain `Copy` fields — including the
+        // `zalloc`/`zfree`/`opaque` fields set just above, which are a function
+        // pointer and a raw cookie the prologue never calls or dereferences.
         let alloc = unsafe { init_allocator_prologue(&mut strm) };
         assert!(strm.zalloc.is_some(), "the missing `zalloc` is substituted");
         assert!(
@@ -5057,7 +5063,10 @@ mod tests {
         strm.zalloc = Some(caller_zalloc);
         strm.zfree = Some(caller_zfree);
         strm.opaque = cookie;
-        // SAFETY: as above.
+        // SAFETY: `strm` is a freshly built, live, exclusively-owned `z_stream` and
+        // the prologue only reads and writes its plain `Copy` fields — including the
+        // `zalloc`/`zfree`/`opaque` fields set just above, which are a function
+        // pointer and a raw cookie the prologue never calls or dereferences.
         let alloc = unsafe { init_allocator_prologue(&mut strm) };
         assert!(
             ptr::eq(strm.opaque, cookie),
@@ -5488,9 +5497,12 @@ mod tests {
         assert_eq!(view.os, 3);
 
         head.extra = ptr::null_mut();
-        // SAFETY: as above.
+        // SAFETY: `head` is still the live, valid `gz_header` built above; clearing
+        // `extra` only makes that field absent, and `name` still points at a NUL
+        // inside `backing`.
         let src = unsafe { read_gz_header_source(&head) }.expect("head is non-null");
-        // SAFETY: as above.
+        // SAFETY: `src` borrows `backing`, which lives to the end of this test and is
+        // not referenced anywhere else for the duration of the borrow.
         assert_eq!(unsafe { src.borrow() }.extra, None);
     }
 
@@ -5574,7 +5586,9 @@ mod tests {
         // An empty *field* occupies no bytes and so overlaps nothing, however the
         // window is placed around it.
         let empty = source_header(&mut backing, Some((8, 0)), None, None);
-        // SAFETY: as above.
+        // SAFETY: `empty` is a live, valid `gz_header` whose only present field is
+        // `extra`, declared at offset 8 of `backing` with length 0 — a zero-length
+        // read at an in-bounds address, which needs no readable byte at all.
         let src = unsafe { read_gz_header_source(&empty) }.expect("head is non-null");
         assert!(
             !src.intersects(base, base + 32),

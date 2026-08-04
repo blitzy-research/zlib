@@ -34,10 +34,10 @@ Every figure in this subsection was produced by the command beside it, on stable
 | Default test suite | **1015** passed, 0 failed, **0 ignored** | `RUSTUP_TOOLCHAIN=stable cargo test --locked` |
 | All features | **1028** passed, 0 failed, 0 ignored | `… cargo test --locked --all-features` |
 | `no_std` rows | **713** passed, 0 failed, 0 ignored (each) | `… cargo test --locked --no-default-features [--features no-std]` |
-| Rust source | **40** files, **78,386** lines | `git ls-files src \| grep '\.rs$' \| xargs wc -l` |
-| Integration tests | 7 files, **18,388** lines | `wc -l tests/*.rs` |
+| Rust source | **40** files, **78,457** lines | `git ls-files src \| grep '\.rs$' \| xargs wc -l` |
+| Integration tests | 7 files, **18,389** lines | `wc -l tests/*.rs` |
 | Benchmarks | 3 files, **806** lines | `wc -l benches/*.rs` |
-| Fuzz targets | 5 files, 8,537 lines | `wc -l fuzz/fuzz_targets/*.rs` |
+| Fuzz targets | 5 files, 8,533 lines | `wc -l fuzz/fuzz_targets/*.rs` |
 | Retained C baseline | 15 `.c` + 11 `.h` = **23,107** lines, 0 modified | `cat *.c *.h \| wc -l` |
 | Dependency closure | **89** root + **13** fuzz = 102 packages | `grep -c '^\[\[package\]\]' Cargo.lock fuzz/Cargo.lock` |
 | Cargo features | **7** named (`std`, `gzip`, `gz-io`, `no-std`, `simd`, `inflate_strict`, `c-oracle`) plus the `default` meta-key | Section 9.2 |
@@ -48,7 +48,7 @@ Every figure in this subsection was produced by the command beside it, on stable
 
 **Key achievements:**
 
-- 78,386 lines of Rust across 40 `.rs` files, standing alongside — not replacing in-tree — the 23,107 lines of retained C
+- 78,457 lines of Rust across 40 `.rs` files, standing alongside — not replacing in-tree — the 23,107 lines of retained C
 - Complete DEFLATE compression engine with all five block producers (stored, fast, slow, huff, rle)
 - Complete DEFLATE decompression engine with a 32-mode state machine
 - Adler-32 and CRC-32 checksum engines with combine operations
@@ -223,27 +223,27 @@ pie title Completed Work Distribution (240 hours)
 > **Mixed content, by design.** The **Hours** column is the original effort-estimate snapshot and is
 > *historical*: it sums to 240 h and is retained for planning history. The **Files** and **Lines** columns are
 > *current*, refreshed to values measured on this tree, so the columns describe different points in the
-> timeline. The **seven** `src/` component rows sum exactly to 40 files and 78,386 lines; the Test, Benchmark,
+> timeline. The **seven** `src/` component rows sum exactly to 40 files and 78,457 lines; the Test, Benchmark,
 > Architecture, Documentation, CI/CD and Fuzzing rows are outside `src/` and are excluded from that total.
 > Section 8.5 is the authoritative code-metrics summary.
 
 | Component | Files | Lines | Hours | Rationale |
 |-----------|-------|------:|-------|-----------|
-| Deflate Engine | 9 files (`src/deflate/`) | 11,384 | 60h | 5 block producers, state machine, hash chains, Huffman trees — most complex module |
-| Inflate Engine | 6 files (`src/inflate/`) | 10,932 | 45h | 32-mode state machine, fast-path decode loop, callback API, Huffman table builder |
-| Gzip File I/O | 6 files (`src/gz/`) | 11,220 | 32h | stdio-like interface: open/read/write/close/seek with the LOOK/COPY/GZIP pipeline |
-| FFI Boundary | 7 files (`src/ffi/`) | 30,869 | — | `#[unsafe(no_mangle)] extern "C"` drop-in shims + `#[repr(C)]` mirrors; the sole `unsafe` module (effort folded into the Public API Types and Quality rows) |
-| Public API Types | 5 files (`lib.rs`, `error.rs`, `constants.rs`, `stream.rs`, `gz_header.rs`) | 9,714 | 20h | Foundational types, error handling, streaming interface, version constants |
-| Checksum Engines | 3 files (`src/checksum/`) | 2,542 | 12h | Adler-32 with combine, CRC-32 with combine/gen/op over `build.rs`-generated tables |
+| Deflate Engine | 9 files (`src/deflate/`) | 11,385 | 60h | 5 block producers, state machine, hash chains, Huffman trees — most complex module |
+| Inflate Engine | 6 files (`src/inflate/`) | 10,936 | 45h | 32-mode state machine, fast-path decode loop, callback API, Huffman table builder |
+| Gzip File I/O | 6 files (`src/gz/`) | 11,221 | 32h | stdio-like interface: open/read/write/close/seek with the LOOK/COPY/GZIP pipeline |
+| FFI Boundary | 7 files (`src/ffi/`) | 30,916 | — | `#[unsafe(no_mangle)] extern "C"` drop-in shims + `#[repr(C)]` mirrors; the sole `unsafe` module (effort folded into the Public API Types and Quality rows) |
+| Public API Types | 5 files (`lib.rs`, `error.rs`, `constants.rs`, `stream.rs`, `gz_header.rs`) | 9,730 | 20h | Foundational types, error handling, streaming interface, version constants |
+| Checksum Engines | 3 files (`src/checksum/`) | 2,544 | 12h | Adler-32 with combine, CRC-32 with combine/gen/op over `build.rs`-generated tables |
 | Utilities | 4 files (`src/util/`) | 1,725 | 6h | `compress`/`uncompress` wrappers, `zutil.h` internals, version and compile flags |
-| **Subtotal (`src/` only)** | **40 `.rs`** | **78,386** | — | The **seven** rows above, which sum exactly: 11,384 + 10,932 + 11,220 + 30,869 + 9,714 + 2,542 + 1,725. This is the figure Section 9.1's tree reproduces |
-| Test Suite | 7 files (`tests/`) | 18,388 | 28h | Ports of C `test/example.c`, `infcover.c`, `minigzip.c`, plus property tests, the two-tier interop gate, and the opt-in `c_oracle` sweep |
+| **Subtotal (`src/` only)** | **40 `.rs`** | **78,457** | — | The **seven** rows above, which sum exactly: 11,385 + 10,936 + 11,221 + 30,916 + 9,730 + 2,544 + 1,725. This is the figure Section 9.1's tree reproduces |
+| Test Suite | 7 files (`tests/`) | 18,389 | 28h | Ports of C `test/example.c`, `infcover.c`, `minigzip.c`, plus property tests, the two-tier interop gate, and the opt-in `c_oracle` sweep |
 | Quality & Debugging | — | — | 16h | Blitzy Agent commits: formatting, Clippy compliance, `// SAFETY:` documentation, bug fixes |
-| Architecture/Config | `Cargo.toml`, `build.rs`, `rust-toolchain.toml`, `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.cargo/config.toml`, `.gitignore` | 4,822 | 8h | Manifest, CRC table generation, feature flags, profiles, lint/format/supply-chain policy |
+| Architecture/Config | `Cargo.toml`, `build.rs`, `rust-toolchain.toml`, `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.cargo/config.toml`, `.gitignore` | 4,406 | 8h | Manifest, CRC table generation, feature flags, profiles, lint/format/supply-chain policy |
 | Benchmarks | 3 files (`benches/`) | 806 | 6h | Criterion deflate/inflate/checksum throughput, including the incompressible profile |
-| Documentation | `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, `doc/index.md`, `docs/index.md` | 4,542 | 6h | Crate docs, release history, contribution workflow, disclosure policy, published landing pages. This row deliberately **excludes** `doc/technical-specifications.md` and this file: a page cannot stably state its own length, so quoting one guarantees a stale number |
-| CI/CD | `ci.yml`, `audit.yml`, `fuzz.yml` | 5,883 | 1h | 12-job Rust CI pipeline, 4-job supply-chain audit, 1-job `cargo-fuzz` workflow. `mkdocs.yml` (176 lines) is documentation tooling rather than CI and is counted in neither row |
-| Fuzzing | 5 targets (`fuzz/fuzz_targets/`) + `fuzz/{Cargo.toml,Cargo.lock}` | 8,830 | — | Detached libFuzzer workspace, carrying no policy file of its own (effort folded into the Quality row). The single root `deny.toml` governs that 13-package graph as well as the 89-package root graph, so the two invocations of one policy together cover the 102-package closure — see Section 9.2 |
+| Documentation | `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, `doc/index.md`, `docs/index.md` | 4,571 | 6h | Crate docs, release history, contribution workflow, disclosure policy, published landing pages. This row deliberately **excludes** `doc/technical-specifications.md` and this file: a page cannot stably state its own length, so quoting one guarantees a stale number |
+| CI/CD | `ci.yml`, `audit.yml`, `fuzz.yml` | 5,594 | 1h | 12-job Rust CI pipeline, 4-job supply-chain audit, 1-job `cargo-fuzz` workflow. `mkdocs.yml` (93 lines) is documentation tooling rather than CI and is counted in neither row |
+| Fuzzing | 5 targets (`fuzz/fuzz_targets/`) + `fuzz/{Cargo.toml,Cargo.lock}` | 8,824 | — | Detached libFuzzer workspace, carrying no policy file of its own (effort folded into the Quality row). The single root `deny.toml` governs that 13-package graph as well as the 89-package root graph, so the two invocations of one policy together cover the 102-package closure — see Section 9.2 |
 | **Historical hours total** | — | — | **240h** | Spans every component; see Section 3 |
 
 ### 4.2 Remaining Hours Calculation *(historical)*
@@ -760,11 +760,11 @@ cargo package --locked --list | grep -cE '\.(c|h|in|map|pc)$|^(contrib|examples|
 | Metric | Value | Reproduce with |
 |--------|-------|----------------|
 | Rust files | **51** = 40 `src/` + 7 `tests/` + 3 `benches/` + 1 `build.rs` | `git ls-files src tests benches \| grep -c '\.rs$'` (plus `build.rs`) |
-| Source lines (`src/`) | **78,386** | `git ls-files src \| grep '\.rs$' \| xargs wc -l \| tail -1` |
-| Test lines (`tests/`) | **18,388** (7 files) | same form over `tests` |
+| Source lines (`src/`) | **78,457** | `git ls-files src \| grep '\.rs$' \| xargs wc -l \| tail -1` |
+| Test lines (`tests/`) | **18,389** (7 files) | same form over `tests` |
 | Benchmark lines (`benches/`) | **806** (3 files) | same form over `benches` |
-| Build script (`build.rs`) | **2,425** | `wc -l build.rs` |
-| Fuzz target lines | **8,537** (5 targets) | same form over `fuzz/fuzz_targets` |
+| Build script (`build.rs`) | **2,397** | `wc -l build.rs` |
+| Fuzz target lines | **8,533** (5 targets) | same form over `fuzz/fuzz_targets` |
 | `unsafe { … }` blocks | **1,265** — `src/ffi/**` 1,250 (`inflate` 474, `deflate` 335, `gz` 134, `types` 132, `util` 130, `alloc` 41, `mod` 4) and `src/lib.rs` 15. **Zero** in `deflate/`, `inflate/`, `checksum/`, `gz/`, `util/`, `error.rs`, `constants.rs`, `gz_header.rs` | `find src -name '*.rs' \| while read f; do sed 's://.*::' "$f" \| grep -cE 'unsafe \{'; done` |
 | `unsafe fn` declarations | **72** | `sed 's://.*::' \| grep -cE 'unsafe fn'` over `src/**` |
 | `extern "C"` sites | **258** | same form for `extern "C"` |
@@ -800,7 +800,7 @@ Line counts below are current and every subtotal sums exactly to its children; t
 to the seven groups. Regenerate the whole block with:
 
 ```sh
-git ls-files src | grep '\.rs$' | xargs wc -l | tail -1          # 78386 total
+git ls-files src | grep '\.rs$' | xargs wc -l | tail -1          # 78457 total
 for d in deflate inflate checksum gz util ffi; do
   printf '%-10s %s\n' "$d" "$(git ls-files "src/$d" | grep '\.rs$' | xargs wc -l | tail -1)"
 done
@@ -811,19 +811,19 @@ intervening path component and so silently drops the five files directly under `
 `git ls-files src | grep '\.rs$'`.
 
 ```text
-src/                                  (40 files, 78,386 lines)
-├── lib.rs            (4,191 lines) — Crate root, curated re-exports, version constants,
+src/                                  (40 files, 78,457 lines)
+├── lib.rs            (4,205 lines) — Crate root, curated re-exports, version constants,
 │                                     #![deny(unsafe_code)] plus the two carve-outs, and the
 │                                     private no_std libc allocator + abort panic handler
 ├── error.rs            (448 lines) — ReturnCode / ZlibError, the nine C error values
-├── constants.rs        (759 lines) — FlushMode, Strategy, DataType, Method, WrapMode,
+├── constants.rs        (761 lines) — FlushMode, Strategy, DataType, Method, WrapMode,
 │                                     and the single parse_window_bits overloading site
 ├── stream.rs         (2,831 lines) — ZStream, Allocator / AllocHook / AllocBuffer / ForeignBuffer
 ├── gz_header.rs      (1,485 lines) — GzHeader, the 13-field gzip metadata mirror
-├── deflate/                          (9 files, 11,384 lines)
+├── deflate/                          (9 files, 11,385 lines)
 │   ├── mod.rs        (3,429 lines) — Public deflate API and driver; zlib + gzip framing;
 │                                     the engine-owning half of compress.c (compress, compress2)
-│   ├── state.rs      (4,068 lines) — DeflateState, DeflateStatus ladder, update_hash / insert_string
+│   ├── state.rs      (4,069 lines) — DeflateState, DeflateStatus ladder, update_hash / insert_string
 │   ├── trees.rs      (1,745 lines) — Huffman construction and block-type selection
 │   ├── rle.rs          (578 lines) — Distance-1 run matching (Z_RLE)
 │   ├── strategy.rs     (475 lines) — CONFIGURATION_TABLE, CompressFunc tag enum
@@ -831,25 +831,25 @@ src/                                  (40 files, 78,386 lines)
 │   ├── stored.rs       (313 lines) — Level 0 pass-through
 │   ├── fast.rs         (265 lines) — Greedy matching (levels 1-3)
 │   └── huff.rs         (196 lines) — Huffman-only, no LZ77 (Z_HUFFMAN_ONLY)
-├── inflate/                          (6 files, 10,932 lines)
-│   ├── mod.rs        (4,524 lines) — Public inflate API, the 32-mode state machine;
+├── inflate/                          (6 files, 10,936 lines)
+│   ├── mod.rs        (4,527 lines) — Public inflate API, the 32-mode state machine;
 │                                     the engine-owning half of uncompr.c (uncompress, uncompress2)
-│   ├── back.rs       (2,037 lines) — Callback-driven inflateBack decoder
+│   ├── back.rs       (2,038 lines) — Callback-driven inflateBack decoder
 │   ├── state.rs      (1,710 lines) — InflateState, InflateMode, TableSource offsets
 │   ├── tables.rs     (1,229 lines) — inflate_table builder, ENOUGH bounds
 │   ├── fast.rs       (1,098 lines) — Bulk decode hot loop; zero unsafe
 │   └── fixed.rs        (334 lines) — Pre-built LENFIX / DISTFIX tables
-├── checksum/                         (3 files, 2,542 lines)
-│   ├── crc32.rs      (1,870 lines) — CRC-32, braid tables, combine / gen / op
+├── checksum/                         (3 files, 2,544 lines)
+│   ├── crc32.rs      (1,872 lines) — CRC-32, braid tables, combine / gen / op
 │   ├── adler32.rs      (658 lines) — Adler-32 with combine
 │   └── mod.rs           (14 lines) — Re-export surface
-├── gz/                               (6 files, 11,220 lines)
-│   ├── write.rs      (3,375 lines) — gz_write, gz_fwrite, gz_putc, gz_flush, gz_setparams
+├── gz/                               (6 files, 11,221 lines)
+│   ├── write.rs      (3,374 lines) — gz_write, gz_fwrite, gz_putc, gz_flush, gz_setparams
 │   ├── open.rs       (2,859 lines) — gz_open, gz_buffer, gz_seek, gz_tell, gz_error
-│   ├── state.rs      (1,848 lines) — GzState, GzMode, How; the intentionally empty Drop
-│   ├── read.rs       (1,580 lines) — gz_read, gz_fread, gz_gets, gz_getc, gz_ungetc
+│   ├── state.rs      (1,851 lines) — GzState, GzMode, How; the intentionally empty Drop
+│   ├── read.rs       (1,581 lines) — gz_read, gz_fread, gz_gets, gz_getc, gz_ungetc
 │   ├── close.rs        (679 lines) — gz_close dispatch to gz_close_r / gz_close_w
-│   └── mod.rs          (879 lines) — Façade and re-export surface
+│   └── mod.rs          (877 lines) — Façade and re-export surface
 ├── util/                             (4 files, 1,725 lines)
 │   ├── version.rs      (597 lines) — zlibVersion, zlibCompileFlags, zError
 │   ├── compress.rs     (577 lines) — compress_bound plus the compress.c driver loop,
@@ -857,12 +857,12 @@ src/                                  (40 files, 78,386 lines)
 │   ├── uncompress.rs   (216 lines) — the uncompr.c driver loop, engine-agnostic behind
 │                                     the OneCallInflate port trait
 │   └── mod.rs          (335 lines) — Shared internals and OS_CODE selection
-└── ffi/                              (7 files, 30,869 lines) — the SOLE unsafe module
-    ├── inflate.rs    (8,856 lines) — extern "C" inflate* / inflateBack* entry points (22)
-    ├── types.rs      (5,639 lines) — #[repr(C)] mirrors, HandleKind, the guard_* helpers
-    ├── gz.rs         (5,027 lines) — extern "C" gz* entry points (34)
-    ├── deflate.rs    (5,020 lines) — extern "C" deflate* entry points (17)
-    ├── alloc.rs      (2,409 lines) — CForeignBuffer / try_alloc_foreign zalloc-zfree bridge
+└── ffi/                              (7 files, 30,916 lines) — the SOLE unsafe module
+    ├── inflate.rs    (8,855 lines) — extern "C" inflate* / inflateBack* entry points (22)
+    ├── types.rs      (5,653 lines) — #[repr(C)] mirrors, HandleKind, the guard_* helpers
+    ├── gz.rs         (5,048 lines) — extern "C" gz* entry points (34)
+    ├── deflate.rs    (5,022 lines) — extern "C" deflate* entry points (17)
+    ├── alloc.rs      (2,420 lines) — CForeignBuffer / try_alloc_foreign zalloc-zfree bridge
     ├── mod.rs        (2,060 lines) — Wiring, the 96 fn-pointer ABI-drift coercions, inventory tests
     └── util.rs       (1,858 lines) — extern "C" one-call, checksum, version entry points (25)
 ```
@@ -881,7 +881,7 @@ Two structural notes worth carrying forward:
 - **`src/deflate/strategy.rs` is deliberately data-only**, depending on nothing but
   `crate::constants::Strategy`, so it compiles *before* the block producers — all of which return the
   `BlockState` it defines.
-- **`build.rs` (2,425 lines) generates `${OUT_DIR}/crc32_tables.rs`** from a pure-`std`, zero-`unsafe`,
+- **`build.rs` (2,397 lines) generates `${OUT_DIR}/crc32_tables.rs`** from a pure-`std`, zero-`unsafe`,
   zero-build-dependency reimplementation of `crc32.c`'s `make_crc_table`, `multmodp`, `x2nmodp`, `byte_swap`
   and `braid`. That single step replaces 9,446 checked-in lines of generated C tables with a verifiable
   algorithm, and it is why the crate has no `[build-dependencies]` at all.

@@ -519,7 +519,7 @@ pub fn inflate_back_init_with<A: Allocator>(
 /// state = ZALLOC(strm, 1, sizeof(struct inflate_state));  /* infback.c L51 */
 /// if (state == Z_NULL) return Z_MEM_ERROR;
 /// ...
-/// state->window = window;                                 /* infback.c L60 */
+/// state->window = window;                                 /* infback.c L59 */
 /// ```
 ///
 /// Passing the caller's region in as `window` (wrapped by the boundary's borrowed
@@ -1760,8 +1760,9 @@ mod tests {
             Err(ReturnCode::StreamError)
         ));
     }
+
     /// The engine must read input **through** the provider on every byte rather
-    /// than copying each chunk once into a buffer of its own (M4-02).
+    /// than copying each chunk once into a buffer of its own.
     ///
     /// The observable that separates the two strategies is how often
     /// [`InFunc::chunk`] is consulted. A copying engine calls it exactly once per
@@ -1879,8 +1880,8 @@ mod tests {
     }
 
     /// Every one of the twelve `infback.c` error sites must report C's exact
-    /// diagnostic string (M4-01), and a clean or short stream must report the
-    /// cleared field C leaves at `infback.c` L214.
+    /// diagnostic string, and a clean or short stream must report the cleared
+    /// field C leaves at `infback.c` L214.
     ///
     /// The vectors and their expected texts are `test/infcover.c` L584-L598, the
     /// official table this crate treats as the decoder's conformance oracle.
@@ -1966,7 +1967,7 @@ mod tests {
 
     /// A state `inflate_back` refuses must leave the diagnostic field alone,
     /// because C returns at `infback.c` L209-L210 — *before* the
-    /// `strm->msg = Z_NULL` at L214 (M4-01).
+    /// `strm->msg = Z_NULL` at L214.
     #[test]
     fn a_refused_call_leaves_the_diagnostic_untouched() {
         let mut state = inflate_back_init(15).expect("15 is valid");
@@ -1990,9 +1991,9 @@ mod tests {
     }
 
     /// `inflateBackInit_`'s allocation ordering: C's single state `ZALLOC`
-    /// (`infback.c` L51-L53) runs *before* `state->window = window;` (L60), so a
+    /// (`infback.c` L51-L53) runs *before* `state->window = window;` (L59), so a
     /// refused state request must return `Z_MEM_ERROR` without the caller's window
-    /// ever being named, let alone written (M6-09).
+    /// ever being named, let alone written.
     #[test]
     fn a_refused_state_request_never_reaches_the_window() {
         use crate::stream::AllocBuffer;

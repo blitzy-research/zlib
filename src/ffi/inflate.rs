@@ -470,7 +470,7 @@ struct InflateBackHandle {
     /// same, so for a caller with an active hook these bytes live in the caller's
     /// own region and go back through their `zfree` when the handle drops.
     inner: BoxedEngine<InflateState>,
-    /// Base of the caller-supplied window the engine adopted (`infback.c` L60),
+    /// Base of the caller-supplied window the engine adopted (`infback.c` L59),
     /// retained as a raw pointer alongside [`window_len`](Self::window_len).
     ///
     /// The engine owns the region through an `AllocBuffer::Foreign`, so this is a
@@ -1304,7 +1304,7 @@ pub unsafe extern "C" fn inflateInit_(
 ///
 /// This is the one zlib entry point whose sliding window is supplied by the
 /// caller. Reference zlib adopts the pointer verbatim — `state->window = window;`
-/// (`infback.c` L60) — makes exactly **one** `zalloc` (the state, `infback.c`
+/// (`infback.c` L59) — makes exactly **one** `zalloc` (the state, `infback.c`
 /// L51), and frees only that state in `inflateBackEnd` (`infback.c` L572-L577).
 /// This shim reproduces all three properties: the region is lent to the engine
 /// through the boundary's borrowed-buffer bridge, so no second allocation is made,
@@ -1409,7 +1409,7 @@ pub unsafe extern "C" fn inflateBackInit_(
 
         // Lend the caller's buffer to the engine rather than allocating a
         // replacement: C adopts the pointer with `state->window = window;`
-        // (`infback.c` L60) and `inflateBackEnd` never frees it.
+        // (`infback.c` L59) and `inflateBackEnd` never frees it.
         //
         // The borrow is handed over as a *closure* so the engine can run C's
         // ordering: the state `ZALLOC` (`infback.c` L51-L53) first, and only on
@@ -5122,7 +5122,7 @@ mod tests {
     /// allocate a replacement.
     ///
     /// Reference zlib adopts the pointer verbatim (`state->window = window;`,
-    /// `infback.c` L60). Three consequences are observable through the C ABI and
+    /// `infback.c` L59). Three consequences are observable through the C ABI and
     /// all three are asserted here:
     ///
     /// 1. the decoder writes the decompressed data into the caller's buffer, so
@@ -6464,7 +6464,7 @@ mod tests {
     }
 
     // =======================================================================
-    // Owner-bound handles (S7-02) and validation-before-borrow (S7-01)
+    // Owner-bound handles and validation-before-borrow
     // =======================================================================
 
     /// All three tagged handles share the same `#[repr(C)]` `(kind, owner)`
@@ -6737,7 +6737,7 @@ mod tests {
     }
 
     /// A stateless stream is refused by every auxiliary-pointer entry point
-    /// *without* the auxiliary pointer being bridged (S7-01).
+    /// *without* the auxiliary pointer being bridged.
     ///
     /// The pointers below are non-null and deliberately far smaller than the
     /// lengths claimed, so a shim that bridged them before validating would be
@@ -7422,12 +7422,11 @@ mod tests {
         assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
     }
     /// `inflateBack` must publish C's exact diagnostic into `strm.msg` for every
-    /// error site, and must clear the field on the paths where C clears it
-    /// (M4-01).
+    /// error site, and must clear the field on the paths where C clears it.
     ///
-    /// The field is planted with a sentinel first, so a shim that simply never
-    /// wrote it — the pre-remediation behaviour — fails on every row rather than
-    /// passing vacuously on the ones whose expected value happens to be null.
+    /// The field is planted with a sentinel first, so that a shim which never wrote
+    /// it at all fails on every row rather than passing vacuously on the ones whose
+    /// expected value happens to be null.
     #[test]
     fn inflate_back_publishes_cs_exact_diagnostic() {
         /// `(raw DEFLATE, expected return code, expected `strm.msg`)` — the error
@@ -7546,7 +7545,7 @@ mod tests {
 
     /// A rejected `inflateBack` must leave `strm.msg` exactly as the caller left
     /// it, because C's `strm->state == Z_NULL` return at `infback.c` L209-L210
-    /// happens *before* the `strm->msg = Z_NULL` at L214 (M4-01).
+    /// happens *before* the `strm->msg = Z_NULL` at L214.
     #[test]
     fn a_rejected_inflate_back_leaves_the_callers_message_alone() {
         const PLANTED: &CStr = c"survives rejection";
@@ -7616,9 +7615,9 @@ mod tests {
     }
 
     /// Every path `inflateBackInit_` **refuses** must leave the caller's window
-    /// byte-for-byte unchanged, and so must `inflateBackEnd` (M6-09, SEC-FFI-01).
+    /// byte-for-byte unchanged, and so must `inflateBackEnd`.
     ///
-    /// C's `infback.c` L60 is a bare `state->window = window;`: it stores the
+    /// C's `infback.c` L59 is a bare `state->window = window;`: it stores the
     /// pointer and writes nothing. And because the single state `ZALLOC` at
     /// L51-L53 runs *first*, a refused allocation returns `Z_MEM_ERROR` having
     /// never reached the window at all — so a caller that pre-fills the buffer and
@@ -7883,9 +7882,9 @@ mod tests {
     }
 
     /// An accepted `inflateBackInit_` must initialize the adopted window, and
-    /// nothing afterwards may re-initialize it (SEC-FFI-01).
+    /// nothing afterwards may re-initialize it.
     ///
-    /// C adopts the caller's buffer with a bare pointer store (`infback.c` L60) and
+    /// C adopts the caller's buffer with a bare pointer store (`infback.c` L59) and
     /// writes nothing, so its bytes arrive abstract-uninitialized. A
     /// `&[u8]`/`&mut [u8]` over such bytes is validity UB whether or not it is
     /// read, and the decoder addresses the window through slices — so it must be
@@ -7899,7 +7898,7 @@ mod tests {
     /// 1. a successful init leaves no pre-fill byte anywhere — the region is
     ///    initialized;
     /// 2. anything the caller writes *after* that survives, which is what makes
-    ///    input staged inside the window (SEC-FFI-07) viable at all;
+    ///    input staged inside the window viable at all;
     /// 3. decoding does not re-initialize: a sentinel planted after the first
     ///    decode, at an offset the second decode never reaches, survives a second
     ///    `inflateBack`.
@@ -8003,7 +8002,7 @@ mod tests {
     }
 
     /// Pre-buffered input placed **inside** the adopted window must decode
-    /// correctly (SEC-FFI-07, the `next_in` case).
+    /// correctly — the `next_in` route.
     ///
     /// zlib nowhere requires `next_in` to be disjoint from the `inflateBack`
     /// window: a caller may perfectly well stage a compressed record in the tail of
@@ -8076,8 +8075,8 @@ mod tests {
         assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
     }
 
-    /// A **callback** buffer inside the adopted window must decode correctly
-    /// (SEC-FFI-07, the `in_func` case).
+    /// A **callback** buffer inside the adopted window must decode correctly — the
+    /// `in_func` route.
     ///
     /// Same legal placement as
     /// `inflate_back_decodes_input_placed_inside_the_window`, reached through the
@@ -8153,7 +8152,7 @@ mod tests {
     }
 
     /// `CInFunc` must never form a slice longer than `isize::MAX`, segmenting
-    /// oversized provider buffers instead (SEC-FFI-06).
+    /// oversized provider buffers instead.
     ///
     /// The zlib `in_func` contract returns a `c_uint`. On a 32-bit target that
     /// range exceeds `isize::MAX`, so a conforming callback may answer
@@ -8166,9 +8165,9 @@ mod tests {
     /// `isize::MAX`, so the cap is unreachable by construction. The test therefore
     /// checks the two halves separately and completely:
     ///
-    /// * the clamping **rule**, evaluated at the 32-bit widths, which is where the
-    ///   bug lived — a `c_uint::MAX` count must clamp to that target's
-    ///   `isize::MAX`;
+    /// * the clamping **rule**, evaluated at the 32-bit widths where an
+    ///   unclamped count is representable — a `c_uint::MAX` count must clamp to
+    ///   that target's `isize::MAX`;
     /// * the multi-segment **machinery**, driven end-to-end through the real
     ///   engine with the cap shrunk to a few bytes, so every transition an
     ///   oversized buffer would take is exercised: repeated segment publication
@@ -8267,7 +8266,7 @@ mod tests {
     }
 
     /// Segmentation and staging must compose: a window-overlapping buffer decoded
-    /// through many small staged segments (SEC-FFI-06 x SEC-FFI-07).
+    /// through many small staged segments.
     ///
     /// Staging alone is exercised by the two `inside_the_window` tests above, but
     /// there the whole stream fits in one staged segment. Shrinking the cap forces
@@ -8337,15 +8336,15 @@ mod tests {
         );
     }
 
-    // -- SEC-FFI-02: gzip-header sink aliasing ------------------------------
+    // -- gzip-header sink aliasing ------------------------------------------
     //
     // C's `inflate` writes the header's three payloads through `head->extra`,
     // `head->name` and `head->comment` — caller pointers under **no** disjointness
     // obligation, either with each other or with `strm->next_in`/`next_out`. The
-    // tests below pin both halves of the resolution: overlap between the payloads
-    // is honoured (the boundary holds raw descriptors, never `&mut [u8]`), and
-    // overlap with a *window* is honoured by separating the header phase from the
-    // data phase in time, in C's order.
+    // tests below pin both halves of the contract: overlap between the payloads is
+    // honoured (the boundary holds raw descriptors, never `&mut [u8]`), and overlap
+    // with a *window* is honoured by separating the header phase from the data phase
+    // in time, in C's order.
 
     /// The 64-byte plaintext [`gzip_stream_with_fields`] compresses.
     #[cfg(feature = "gzip")]

@@ -62,9 +62,9 @@
 //! word advertises, so an `inflate_init2` that rejects gzip framing in a build
 //! whose flags claim gzip, or accepts it in one that does not, is itself a
 //! finding rather than a silently skipped probe. Inferring the capability from
-//! "did `inflate_init2` happen to fail" — as this harness previously did — cannot
-//! tell those two situations apart, and a genuine regression in the gzip path
-//! therefore disabled the very coverage that would have caught it.
+//! "did `inflate_init2` happen to fail" cannot tell those two situations apart, so
+//! a genuine regression in the gzip path would disable the very coverage that would
+//! have caught it.
 //!
 //! `inflate_get_header` is reached the same way. It is feature-gated *inside* the
 //! library, so it is named only from items carrying the same per-item gate — which
@@ -372,10 +372,10 @@ fn assert_abi_integer(code: ReturnCode) {
 /// The entry points this harness calls, each carrying the exact set of codes its
 /// own documentation permits.
 ///
-/// Accepting all nine codes everywhere — as this harness previously did — means a
-/// `Z_VERSION_ERROR` out of `inflate`, or a `Z_NEED_DICT` out of `inflate_end`,
-/// would pass unremarked even though neither entry point can produce them and
-/// either would be a serious ABI regression. Each set below was read from the
+/// Accepting all nine codes everywhere would let a `Z_VERSION_ERROR` out of
+/// `inflate`, or a `Z_NEED_DICT` out of `inflate_end`, pass unremarked even though
+/// neither entry point can produce them and either would be a serious ABI
+/// regression. Each set below was read from the
 /// `# Errors` section of the function it names, so this is a contract check
 /// rather than a guess, and it stays orthogonal to the "arbitrary bytes may be
 /// rejected" rule: the sets say which answers are *possible*, never which answer
@@ -690,10 +690,9 @@ fn drive(stream: &[u8], window_bits: i32, drain: Drain) -> Option<Decoded> {
 /// controls end to end.
 ///
 /// Discarding the decode code is NOT the same as discarding the call, and the
-/// difference is what this function used to lose: previously [`drive`] could report
-/// a swallowed init failure that this function then threw away, so a decoder that
-/// refused `windowBits = 15` — a value it must always accept — would have produced
-/// no signal at all.
+/// difference matters: if [`drive`] reported a swallowed init failure for this
+/// function to throw away, a decoder that refused `windowBits = 15` — a value it
+/// must always accept — would produce no signal at all.
 ///
 /// What *is* checked here holds for every input: total output never exceeds
 /// [`MAX_PRODUCED`], which is the bounded-work design proving itself rather than
