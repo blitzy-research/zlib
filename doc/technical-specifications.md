@@ -11,8 +11,8 @@ complete mapping from that baseline's heading names and numbers to the ones used
 ## How to read this document
 
 **The section numbering is fixed and load-bearing.** Source files across the repository cite sections
-of this plan by number — a citation that points at the wrong section is worse than no citation. Twenty-two
-distinct anchors are cited from the tree today — twenty once `§0.4.1.8` and `§0.4.1.12` are folded into
+of this plan by number — a citation that points at the wrong section is worse than no citation. Twenty-three
+distinct anchors are cited from the tree today — twenty-one once `§0.4.1.8` and `§0.4.1.12` are folded into
 their `§0.4.1` parent — and every one of them resolves to a real heading below.
 The complete census, together with the anchors that are cited approximately and the notes that
 disambiguate them, is in [§0.7.1](#071-user-specified-rules) and
@@ -2320,16 +2320,16 @@ cites() { grep -ohE '§0(\.[0-9]+)+' "$@"; }
 # `cites` is a shell function, so it must be given the file list as arguments;
 # `... | xargs cites` would try to exec a binary named `cites` and find none.
 echo "population scanned      : $(aap_population | wc -l)"                                   # 65
-echo "files containing a cite : $(aap_population | xargs grep -lE '§0(\.[0-9]+)+' | wc -l)"   # 42
-echo "total citations         : $(cites $(aap_population) | wc -l)"                           # 548
+echo "files containing a cite : $(aap_population | xargs grep -lE '§0(\.[0-9]+)+' | wc -l)"   # 43
+echo "total citations         : $(cites $(aap_population) | wc -l)"                           # 561
 echo "distinct as written     : $(cites $(aap_population) | sort -u | wc -l)"                 # 23
 echo "distinct normalised     : $(cites $(aap_population) | cut -d. -f1-3 | sort -u | wc -l)" # 21
 ```
 
 Note that `grep -c` would answer a *different* question — matching lines, not matches — and undercounts
-`src/stream.rs` as 67 rather than 85. Per-file totals therefore use `cites "$f" | wc -l`.
+`src/stream.rs` as 64 rather than 80. Per-file totals therefore use `cites "$f" | wc -l`.
 
-**Measured population.** 65 tracked files scanned; **42** contain at least one citation; **548** citations
+**Measured population.** 65 tracked files scanned; **43** contain at least one citation; **561** citations
 total; **23** distinct citation strings as written, which normalise to **21** distinct top-level anchors once
 `§0.4.1.8` and `§0.4.1.12` are folded into their `§0.4.1` parent. Both figures are correct answers to
 different questions, and the earlier flat claim of "19 anchors" was the normalised count as it then
@@ -2337,10 +2337,10 @@ stood, stated without saying so.
 
 | Scope | Files with a citation | Citations |
 |-------|----------------------:|----------:|
-| `CODE` | 36 | 531 |
+| `CODE` | 37 | 543 |
 | `MANIFEST` | 1 | 2 |
-| `DOCS` | 5 | 15 |
-| **Total** | **42** | **548** |
+| `DOCS` | 5 | 16 |
+| **Total** | **43** | **561** |
 
 **Every cited anchor resolves.** All 23 strings, in document order, with citation counts and the heading
 each reaches — so the acceptance set can be verified rather than trusted:
@@ -2348,33 +2348,33 @@ each reaches — so the acceptance set can be verified rather than trusted:
 | Anchor | Cites | Resolves to |
 |--------|------:|-------------|
 | `§0.2.2` | 1 | ### 0.2.2 Explicitly Out of Scope |
-| `§0.3.1` | 38 | ### 0.3.1 Refactored Structure Planning |
+| `§0.3.1` | 49 | ### 0.3.1 Refactored Structure Planning |
 | `§0.3.2` | 16 | ### 0.3.2 Design Pattern Applications |
 | `§0.4.1` | 2 | ### 0.4.1 File-by-File Transformation Plan |
 | `§0.4.1.8` | 1 | #### 0.4.1.8 Verification layer |
 | `§0.4.1.12` | 2 | #### 0.4.1.12 Retained C baseline (REFERENCE only, never modified) |
-| `§0.4.2` | 24 | ### 0.4.2 Cross-File Dependencies |
+| `§0.4.2` | 31 | ### 0.4.2 Cross-File Dependencies |
 | `§0.5.1` | 2 | ### 0.5.1 Key Packages |
-| `§0.5.2` | 9 | ### 0.5.2 Dependency Updates |
+| `§0.5.2` | 11 | ### 0.5.2 Dependency Updates |
 | `§0.5.3` | 3 | ### 0.5.3 Feature Flags |
 | `§0.6.1` | 4 | ### 0.6.1 State Machine Translation |
 | `§0.6.2` | 49 | ### 0.6.2 Unsafe Code Boundary |
-| `§0.6.3` | 91 | ### 0.6.3 Memory Ownership Model |
+| `§0.6.3` | 79 | ### 0.6.3 Memory Ownership Model |
 | `§0.6.4` | 43 | ### 0.6.4 Bit-Exact Wire Format |
-| `§0.6.5` | 134 | ### 0.6.5 Allocation Sites and Failure Timing |
+| `§0.6.5` | 133 | ### 0.6.5 Allocation Sites and Failure Timing |
 | `§0.6.6` | 10 | ### 0.6.6 Numeric-Constant Correctness |
 | `§0.6.7` | 7 | ### 0.6.7 Official Test-Vector Conformance |
-| `§0.7.2` | 31 | ### 0.7.2 Plan-Adopted Engineering Standards |
-| `§0.8.1` | 48 | ### 0.8.1 Preservation and Byte-Identity Directives |
-| `§0.8.2` | 22 | ### 0.8.2 Documented Divergences to Preserve |
+| `§0.7.2` | 32 | ### 0.7.2 Plan-Adopted Engineering Standards |
+| `§0.8.1` | 52 | ### 0.8.1 Preservation and Byte-Identity Directives |
+| `§0.8.2` | 23 | ### 0.8.2 Documented Divergences to Preserve |
 | `§0.8.3` | 5 | ### 0.8.3 Performance Expectations |
 | `§0.10.1` | 5 | ### 0.10.1 Authoritative D1–D12 Register |
 | `§0.10.3` | 1 | ### 0.10.3 Document Conventions |
 
-The heaviest-citing files are `src/stream.rs` (85), `src/deflate/state.rs` (44), `tests/c_oracle.rs` (38),
-`src/inflate/mod.rs` (37), and `src/lib.rs` (31).
+The heaviest-citing files are `src/stream.rs` (80), `src/lib.rs` (41), `src/deflate/state.rs` (41),
+`tests/c_oracle.rs` (38), and `src/inflate/mod.rs` (36).
 
-**Citations from outside `src/` and `tests/`: 9 files, 39 citations, 13 distinct anchors.** An earlier
+**Citations from outside `src/` and `tests/`: 9 files, 40 citations, 13 distinct anchors.** An earlier
 revision of this section said "three anchors", which was wrong by a factor of four; the itemised table
 replaces the summary so the claim is checkable:
 
@@ -2387,9 +2387,9 @@ replaces the summary so the claim is checkable:
 | `fuzz/fuzz_targets/fuzz_ffi_roundtrip.rs` | 3 | `§0.6.5` `§0.8.1` |
 | `Cargo.toml` | 2 | `§0.3.1` `§0.4.1` |
 | `fuzz/fuzz_targets/fuzz_gzip.rs` | 2 | `§0.7.2` `§0.8.1` |
-| `CHANGELOG.md` | 1 | `§0.8.2` |
+| `CHANGELOG.md` | 2 | `§0.8.2` |
 | `SECURITY.md` | 1 | `§0.6.7` |
-| **Total** | **39** | **13 distinct** |
+| **Total** | **40** | **13 distinct** |
 
 `doc/index.md`, `docs/index.md`, all three `benches/*.rs`, `fuzz/Cargo.toml`, and the other three fuzz
 targets cite no anchor at all, which is why 9 rather than 18 files appear above. Reproduce with
@@ -2420,7 +2420,7 @@ the numbering had to keep every in-tree citation valid: `§0.2.2`, `§0.3.1`, `�
 set is fully accounted for rather than approximately matched.
 
 An earlier recorded baseline of this document worked from a smaller census of 111 citations across 23 files.
-The growth to 548 across 42 is not drift: it is the fuzz targets, `tests/c_oracle.rs`, and the expanded
+The growth to 561 across 43 is not drift: it is the fuzz targets, `tests/c_oracle.rs`, and the expanded
 module documentation entering the tree, each carrying its own provenance citations.
 
 **§0.7.1 itself is no longer cited.** At one point ten source sites pointed at this section, and those ten
@@ -2945,12 +2945,12 @@ re-measure a count rather than treating a transcribed one as authoritative.
 | ID | Artifact | As first recorded | Measured status today | Severity |
 |----|----------|-------------------|-----------------------|----------|
 | D1 | `deny.toml` — `cargo-deny` policy (licenses / advisories / bans / sources) over the 102-package closure | absent | **CLOSED** — present as ONE reviewed policy, `deny.toml`, governing the whole closure: the 89 root packages via `--config deny.toml`, and the 13 fuzz-only packages via `--manifest-path fuzz/Cargo.toml --config deny.toml`. Singular by design — D1 asks for *a* policy over the closure, and a second file would be a second rulebook that could drift | High |
-| D2 | A supply-chain workflow running `cargo-audit` / `cargo-deny` | absent; no CI job ran either | **CLOSED** — `.github/workflows/audit.yml`, 1,678 lines, 4 jobs (`policy-integrity`, `cargo-audit`, `cargo-deny`, `cargo-deny-fuzz`), daily schedule plus push / pull-request / manual dispatch | High |
+| D2 | A supply-chain workflow running `cargo-audit` / `cargo-deny` | absent; no CI job ran either | **CLOSED** — `.github/workflows/audit.yml`, 1,687 lines, 4 jobs (`policy-integrity`, `cargo-audit`, `cargo-deny`, `cargo-deny-fuzz`), daily schedule plus push / pull-request / manual dispatch | High |
 | D3 | Cross-platform CI matrix rows — the matrix varied **features only**, with `runs-on: ubuntu-latest` everywhere | absent | **CLOSED, with a residual** — `build-test` carries native `windows-latest` x86_64 and `macos-latest` aarch64 rows; `cross-targets` type-checks and Clippy-lints `aarch64` / `i686` / big-endian `s390x` / `x86_64-pc-windows-msvc`, the last being the cross Windows lane rather than a duplicate of the native one; `build-script-tests` type-checks the big-endian braid selection. Residual: those cross rows are compile-verified, not runtime-verified | Medium |
 | D4 | `rust-toolchain.toml` — pin the toolchain so contributor builds do not float | absent | **CLOSED** — present, 291 lines, `channel = "1.85.0"` with `rustfmt` and `clippy`, `profile = "minimal"` | Medium |
-| D5 | `CHANGELOG.md` — the Rust crate had no release history of its own | absent | **CLOSED** — present, 631 lines | Medium |
+| D5 | `CHANGELOG.md` — the Rust crate had no release history of its own | absent | **CLOSED** — present, 667 lines | Medium |
 | D6 | `SECURITY.md` and `CONTRIBUTING.md` | both absent | **CLOSED** — `SECURITY.md` present (773 lines); `CONTRIBUTING.md` present (1,707 lines), covering the contribution workflow, the blocking quality gates, the MSRV policy, and the seven byte-identity-risk files | Medium |
-| D7 | `.cargo/config.toml` — no home for target rustflags or link arguments | absent | **CLOSED** — present, 305 lines | Low |
+| D7 | `.cargo/config.toml` — no home for target rustflags or link arguments | absent | **CLOSED** — present, 320 lines | Low |
 | D8 | cdylib symbol-version wiring — `zlib.map` authoritative but consumed by no Rust build step | absent | **CLOSED as an opt-in** — `build.rs` emits `cargo:rustc-cdylib-link-arg` under `ZLIB_RS_VERSION_SCRIPT`; measured 54 tagged symbols and 16 version definitions when enabled, 0 tags when not, 95 `T` symbols either way | Low |
 | D9 | Automated C-oracle conformance harness — the 3,750-combination sweep was not reproducible in-repository | absent; no `[[test]]`, no `c-oracle` feature | **CLOSED** — `tests/c_oracle.rs` (3,548 lines) plus the `c-oracle` feature and `[[test]] name = "c_oracle"` with `required-features`; 13 tests, exact 3,750-combination grid, no mandatory build-dependency | Medium |
 | D10 | `no_std` embedded-target validation — no bare-metal target in CI | absent | **PARTIAL** — a `bare-metal-no-std` job verifies `thumbv7em-none-eabihf` reports `target_os = "none"` and 32-bit pointers, builds both no-`std` configurations, and asserts the freestanding runtime block is present in the archive. Residual: execution on real hardware | Medium |
