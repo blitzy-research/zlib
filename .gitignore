@@ -57,25 +57,6 @@ MODULE.bazel.lock
 # and the migration pins exact resolved dependency versions for reproducible,
 # offline builds, so the lockfile is intentionally committed.
 
-# MkDocs published-site output (see mkdocs.yml). MkDocs defaults `site_dir` to
-# `<repo>/site`, so a bare `mkdocs build` writes the whole generated site — 60
-# files: three rendered pages, the search index, the theme's CSS/JS bundles, and
-# the RFC texts copied verbatim — straight into the working tree. CI never does
-# that (`.github/workflows/ci.yml` builds with `--site-dir "$RUNNER_TEMP/site"`,
-# outside the checkout) and the commands in `README.md`, `CONTRIBUTING.md`, and
-# `doc/technical-specifications.md` pass `--site-dir` for the same reason, but a
-# hand-run bare build otherwise leaves `?? site/` in `git status` and is one
-# `git add -A` away from committing generated HTML. This rule is the backstop for
-# that case; it is not a substitute for `--site-dir`, which keeps the checkout
-# untouched rather than merely unstaged, and which matters because several CI
-# steps assert on `git status --porcelain` and would fail for an unrelated
-# reason. Anchored with a leading `/` so it matches only the repository root and
-# cannot shadow a directory named `site` further down (`contrib/**` carries
-# third-party trees), and closed with a trailing `/` so it matches only a
-# directory and never a file that happens to be called `site`. No tracked path
-# is named `site`, so nothing is shadowed today.
-/site/
-
 # cargo-fuzz (fuzz/ is a detached workspace; see .github/workflows/fuzz.yml).
 # Build output and fuzzer-generated data are never committed; the fuzz targets,
 # fuzz/Cargo.toml, and (once generated in CI) fuzz/Cargo.lock ARE tracked.
@@ -83,21 +64,3 @@ MODULE.bazel.lock
 /fuzz/corpus
 /fuzz/artifacts
 /fuzz/coverage
-# Reproducers libFuzzer writes when no -artifact_prefix is supplied. `cargo fuzz
-# run` always passes one (pointing into /fuzz/artifacts above), but a target
-# binary invoked DIRECTLY — the normal way to replay a single input, minimise a
-# corpus by hand, or bisect a finding — defaults to `artifact_prefix='./'` and
-# drops the file into whatever the current directory happens to be. Run one from
-# the repository root over a corpus holding a crashing unit and the reproducer
-# lands here as `./crash-<sha1>`, untracked and, without these five patterns,
-# NOT ignored: it then shows up in `git status` and is one `git add -A` away from
-# being committed. The names are libFuzzer's own fixed prefixes for its five
-# finding classes. Anchored with a leading `/` so they match only at the
-# repository root and cannot shadow a legitimately named file in a subdirectory.
-# `fuzz/seeds/**` — the committed, read-only gate-opening seed inputs — is
-# deliberately NOT ignored and is unaffected by these patterns.
-/crash-*
-/oom-*
-/timeout-*
-/leak-*
-/slow-unit-*

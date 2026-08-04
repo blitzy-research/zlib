@@ -102,34 +102,39 @@
 # SUPPLY-CHAIN POLICY - OWNED BY `audit.yml`, NOT BY THIS FILE
 # ============================================================
 #   `fuzz/Cargo.lock` pins 13 packages that the ROOT `cargo deny check` never
-#   resolves, precisely because `fuzz/` is a detached workspace - and the root
-#   policy would (correctly) reject four of them, since the harness legitimately
-#   needs a C-toolchain build dependency (`cc`, for the libFuzzer runtime shim)
-#   and an NCSA-licensed `libfuzzer-sys`, neither of which the crate proper may
-#   ever acquire. Those 13 are therefore governed by their OWN reviewed policy,
-#   `fuzz/deny.toml`, aimed at this graph with
-#   `--manifest-path fuzz/Cargo.toml --config fuzz/deny.toml`. One policy per
-#   graph is what lets each file state the truth about its own closure at full
-#   severity, with no suppression flags on this graph at all.
+#   resolves, precisely because `fuzz/` is a detached workspace. They are governed
+#   by the SAME reviewed policy the root graph is - the root `deny.toml` - aimed at
+#   this graph with `--manifest-path fuzz/Cargo.toml --config deny.toml`. Naming
+#   the config is MANDATORY there: `fuzz/` holds no policy of its own, so without
+#   the flag cargo-deny would fall back to built-in defaults and report `ok` over
+#   13 unreviewed packages.
 #
-#   BOTH POLICIES ARE ENFORCED IN `audit.yml`, AND NOWHERE ELSE. Two policy
-#   FILES, one evaluator: `deny.toml` governs the 89-package root graph,
-#   `fuzz/deny.toml` governs these 13, and `.github/workflows/audit.yml` is the
-#   workflow that evaluates both - `cargo-deny` for the root graph,
-#   `cargo-deny-fuzz` for this one, `cargo-audit` for advisories over both
-#   lockfiles, and `policy-integrity` for the structural integrity of both policy
-#   files plus their agreement on every shared key. THIS workflow builds and
-#   fuzzes; it runs no `cargo-deny` and no `cargo-audit` job, and it must not grow
-#   one. A second copy of the GATE is not defence in depth: it is a second place
-#   for the tool pin, the `--locked` discipline and the lockfile assertion to
-#   drift out of step with the first.
+#   That one file can govern both graphs is a property of how it states the
+#   C-toolchain boundary. The harness legitimately needs a C-toolchain build
+#   dependency (`cc`, for the libFuzzer runtime shim) and an NCSA-licensed
+#   `libfuzzer-sys`, neither of which the crate proper may ever acquire - so the
+#   root policy SCOPES the `cc` ban with `wrappers = ["libfuzzer-sys"]` and grants
+#   NCSA through a crate-scoped `[[licenses.exceptions]]` entry. Both graphs are
+#   held to one written boundary rather than to two that could drift apart.
+#
+#   THE POLICY IS ENFORCED IN `audit.yml`, AND NOWHERE ELSE. ONE policy file, one
+#   evaluator: `deny.toml` governs the 89-package root graph AND these 13, and
+#   `.github/workflows/audit.yml` is the workflow that evaluates both -
+#   `cargo-deny` for the root graph, `cargo-deny-fuzz` for this one, `cargo-audit`
+#   for advisories over both lockfiles, and `policy-integrity` for that policy's
+#   structural integrity plus the assertion that it is the ONLY policy file in the
+#   tree. THIS workflow builds and fuzzes; it runs no `cargo-deny` and no
+#   `cargo-audit` job, and it must not grow one. A second copy of the GATE is not
+#   defence in depth: it is a second place for the tool pin, the `--locked`
+#   discipline and the lockfile assertion to drift out of step with the first.
 #
 #   WHAT THAT COSTS, STATED HONESTLY. An earlier revision of this file carried a
 #   `supply-chain` job that `cargo-fuzz` declared `needs:` on, so a policy
 #   failure blocked fuzzing within the same run. A job in another workflow cannot
 #   be a `needs:` predecessor, so that intra-run SEQUENCING is genuinely given
 #   up. What replaces it is broader TRIGGER coverage, not a weaker gate:
-#   `audit.yml` evaluates both policies on `push`, on `pull_request`, on a
+#   `audit.yml` evaluates that policy over BOTH graphs on `push`, on
+#   `pull_request`, on a
 #   daily 05:00 cron and on `workflow_dispatch`, whereas the removed job only ran
 #   on `pull_request`, the Monday 03:00 cron and manual dispatch - it never saw a
 #   direct push at all. So every trigger this workflow has is also a trigger
@@ -142,14 +147,14 @@
 #   minute.
 #
 #   THE TOOL PIN AND THE `--locked` DISCIPLINE LIVE WITH THE GATE. `cargo-deny`
-#   is pinned to 0.20.2 in `audit.yml` because that is the release both policy
-#   files were authored and validated against, and every invocation there passes
+#   is pinned to 0.20.2 in `audit.yml` because that is the release the policy
+#   file was authored and validated against, and every invocation there passes
 #   `--locked` and then asserts that neither lockfile moved. That matters: without
 #   `--locked`, cargo-deny re-resolves the graph, may REWRITE `fuzz/Cargo.lock` on
 #   the runner, and still reports `ok` - measured on this repository, a single
 #   un-`--locked` invocation moved `fuzz/Cargo.lock` from sha256 prefix 522d40b9
 #   to 5ffba8d2 while printing all four `ok` lines. The reasoning is recorded
-#   once, in `audit.yml` and in the two policy files themselves; it is
+#   once, in `audit.yml` and in the policy file itself; it is
 #   deliberately not duplicated here.
 #
 #   `cargo-fuzz` - the one tool this workflow DOES install - is PINNED to 0.13.2,
@@ -271,11 +276,11 @@ concurrency:
 
 jobs:
   # The only job in this workflow. Building and fuzzing the harnesses is all this
-  # file does: the supply-chain policy over both graphs -- `deny.toml` for the root
-  # graph and `fuzz/deny.toml` for this workspace -- is owned and enforced by
-  # `audit.yml`, so there is deliberately no `cargo-deny` job here and no `needs:`
-  # on one. See "SUPPLY-CHAIN POLICY" in the header for what that trade-off costs
-  # and what it buys.
+  # file does: the supply-chain policy over both graphs -- the single root
+  # `deny.toml`, aimed at the root graph and at this workspace -- is owned and
+  # enforced by `audit.yml`, so there is deliberately no `cargo-deny` job here and
+  # no `needs:` on one. See "SUPPLY-CHAIN POLICY" in the header for what that
+  # trade-off costs and what it buys.
   cargo-fuzz:
     name: cargo-fuzz (libFuzzer)
     runs-on: ubuntu-latest

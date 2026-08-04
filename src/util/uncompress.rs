@@ -15,9 +15,13 @@
 //! The two C-named entry points — `uncompress` and `uncompress2` — are
 //! consequently defined one layer up, in [`crate::inflate`], which is also where
 //! the C `uncompr.c` translation unit sits in the `#include` order (it includes
-//! `zlib.h`, not `zutil.h`). Both are re-exported unchanged from the crate root,
-//! so `zlib_rs::uncompress` and `zlib_rs::uncompress2` are exactly the names
-//! `zlib.h` publishes.
+//! `zlib.h`, not `zutil.h`). Both are re-exported unchanged both from the crate
+//! root and from [`crate::util`] itself, so `zlib_rs::uncompress`,
+//! `zlib_rs::uncompress2` and their `zlib_rs::util::…` spellings all resolve to
+//! exactly the names `zlib.h` publishes (AAP §0.3.1). Re-exporting a *name*
+//! upward costs the layer graph nothing — what §0.4.2 B2 forbids is a *code*
+//! dependency running upward, and neither this module nor [`crate::util`] calls
+//! an engine or mentions an engine type in any signature of its own.
 //!
 //! # Relationship to the C original
 //!

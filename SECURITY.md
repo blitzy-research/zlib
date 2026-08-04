@@ -311,46 +311,55 @@ disagree with an assessment, say so there.
 
 The following are **deliberate, documented design decisions that are preserved on
 purpose**, not defects awaiting a fix. They are listed here so nobody spends
-effort rediscovering them. Each is also recorded in
-[`CHANGELOG.md`](CHANGELOG.md) under *Known limitations and documented
-divergences*.
+effort rediscovering them.
 
-- **`gzprintf` / `gzvprintf` return `Z_STREAM_ERROR`.** Rendering a C `va_list`
-  needs the nightly-only `c_variadic` language feature, which would break the
-  crate's stable build and its MSRV contract. Both symbols are still exported with
-  the correct signatures — removing them would break linkage — and the limitation
-  is **programmatically detectable rather than silent**: `zlibCompileFlags` sets
-  **bit 27**, exactly as a C zlib built without a secure `vsnprintf` does
-  ([`src/util/version.rs`](src/util/version.rs)). This ships the documented
-  no-`vsnprintf` zlib build variant. The *idiomatic Rust* `gzprintf`, which takes
-  `core::fmt::Arguments` instead of a `va_list`, formats fully.
-- **`inflate_strict` is off by default.** Enabling it changes which streams are
-  accepted, so the default build deliberately matches a default-built reference
-  zlib. It is therefore *not* a defect that this crate accepts a stream reference
-  zlib also accepts, however lenient that pair of decisions looks in isolation. A
-  divergence **from** reference zlib, in either direction, is — see class 5 above.
-- **`gzclose` / `gzclose_w` are mandatory.** `GzState`'s `Drop`
-  ([`src/gz/state.rs`](src/gz/state.rs)) releases every buffer but is
-  intentionally empty of *finishing* logic, because a destructor cannot surface a
-  deferred compression or I/O error — silently swallowing a failed write of a
-  member's final block and trailer during unwinding would be strictly worse than
-  matching C's explicit-close contract. Dropping a writer without closing it
-  leaves an unfinished gzip member on disk. That is the documented contract, and
-  it must not be "improved" into an auto-finishing destructor.
-- **Exported symbols carry no `@ZLIB_x.y.z` version tags by default.** The symbol
-  *set* is exactly right — **95** emitted symbols, all of type `T`, with **54/54**
-  [`zlib.map`](zlib.map) `global:` names present and **0/10** `local:` names
-  leaked — and only the version *tags* are absent. Static linking, ordinary
-  dynamic linking, `-lz` substitution, and `LD_PRELOAD` are all unaffected.
-  Opting in with `ZLIB_RS_VERSION_SCRIPT=1` makes [`build.rs`](build.rs) derive a
-  version script from `zlib.map` and apply it to the `cdylib`. It is off by
-  default because a version script is a GNU-ld/ELF-only construct and no CI row
-  sets the variable, so the opt-in path carries linker-portability risk the matrix
-  does not yet retire. Full detail:
-  [Symbol versioning](README.md#symbol-versioning).
-- **The retained C sources are not compiled into the shipped artifact.** They are
-  the oracle and the specification, they are excluded from the published crate,
-  and their presence in the repository is not an exposure.
+### The five divergences a C caller can observe
+
+The same five, numbered in the same order, appear in
+[`CHANGELOG.md`](CHANGELOG.md#the-five-divergences-a-c-caller-can-observe) under
+*Known limitations and documented divergences* and in
+[`CONTRIBUTING.md`](CONTRIBUTING.md#five-divergences-that-must-be-preserved-not-fixed).
+There is no sixth.
+
+1. **`gzprintf` / `gzvprintf` return `Z_STREAM_ERROR`.** Rendering a C `va_list`
+   needs the nightly-only `c_variadic` language feature, which would break the
+   crate's stable build and its MSRV contract. Both symbols are still exported
+   with the correct signatures — removing them would break linkage — and the
+   limitation is **programmatically detectable rather than silent**:
+   `zlibCompileFlags` sets **bit 27**, exactly as a C zlib built without a secure
+   `vsnprintf` does ([`src/util/version.rs`](src/util/version.rs)). This ships the
+   documented no-`vsnprintf` zlib build variant. The *idiomatic Rust* `gzprintf`,
+   which takes `core::fmt::Arguments` instead of a `va_list`, formats fully.
+2. **`inflate_strict` is off by default.** Enabling it changes which streams are
+   accepted, so the default build deliberately matches a default-built reference
+   zlib. It is therefore *not* a defect that this crate accepts a stream reference
+   zlib also accepts, however lenient that pair of decisions looks in isolation. A
+   divergence **from** reference zlib, in either direction, is — see class 5 above.
+3. **The retained C sources are not compiled into the shipped artifact.** They are
+   the oracle and the specification, they are excluded from the published crate,
+   and their presence in the repository is not an exposure.
+4. **Exported symbols carry no `@ZLIB_x.y.z` version tags by default.** The symbol
+   *set* is exactly right — **95** emitted symbols, all of type `T`, with **54/54**
+   [`zlib.map`](zlib.map) `global:` names present and **0/10** `local:` names
+   leaked — and only the version *tags* are absent. Static linking, ordinary
+   dynamic linking, `-lz` substitution, and `LD_PRELOAD` are all unaffected.
+   Opting in with `ZLIB_RS_VERSION_SCRIPT=1` makes [`build.rs`](build.rs) derive a
+   version script from `zlib.map` and apply it to the `cdylib`. It is off by
+   default because a version script is a GNU-ld/ELF-only construct and no CI row
+   sets the variable, so the opt-in path carries linker-portability risk the matrix
+   does not yet retire. Full detail:
+   [Symbol versioning](README.md#symbol-versioning).
+5. **`gzclose` / `gzclose_w` are mandatory.** `GzState`'s `Drop`
+   ([`src/gz/state.rs`](src/gz/state.rs)) releases every buffer but is
+   intentionally empty of *finishing* logic, because a destructor cannot surface a
+   deferred compression or I/O error — silently swallowing a failed write of a
+   member's final block and trailer during unwinding would be strictly worse than
+   matching C's explicit-close contract. Dropping a writer without closing it
+   leaves an unfinished gzip member on disk. That is the documented contract, and
+   it must not be "improved" into an auto-finishing destructor.
+
+### General limitations, which are not compatibility divergences
+
 - **Performance is not a security property here.** The crate is measurably slower
   than C on compression (*attributed*: aggregate ≈ 85% of C throughput; per-profile
   roughly 58–64% on compressible input and 82–86% on incompressible input) and at
@@ -361,6 +370,15 @@ divergences*.
   first: the heuristics that cost throughput are the same ones that determine the
   output bytes, so a faster match finder that emits different tokens is a
   regression, not an improvement.
+- **A `write(2)` that accepts zero bytes is retried in place**, because that is
+  what C does: its two `gz_comp` write loops advance by `writ` and re-test, so a
+  zero-byte acceptance re-issues the identical request (`gzwrite.c` L76-L90,
+  L112-L124). This is not an unbounded spin, and it is not a divergence: POSIX
+  permits a `0` return only for a zero-length request, and neither loop ever issues
+  one — `avail_in`/`out_pending` bound every request below by one byte. A
+  destination that could genuinely accept nothing forever reports `EAGAIN` or
+  `EWOULDBLOCK`, which **is** handled as a retryable `Z_ERRNO` with the caller's
+  cursor and buffered input preserved.
 
 ---
 
@@ -391,37 +409,44 @@ Both lockfiles are committed deliberately, because the crate ships
 `cdylib`/`staticlib` distributables and reproducible offline builds need exact
 resolved versions.
 
-**The gate.** `cargo-deny` governs that closure through **one reviewed policy per
-graph**: [`deny.toml`](deny.toml) over the 89 root packages and
-[`fuzz/deny.toml`](fuzz/deny.toml) over the 13 fuzz-only packages. Both files are
-reviewed on this repository's normal review surface, both are asserted structurally
-by CI, and both are compared against each other so "two policies" can never become
-"two standards". Each invocation names its file explicitly with `--config`, because
-`cargo-deny` otherwise resolves configuration from the *target* manifest's
+**The gate.** `cargo-deny` governs that closure through **one reviewed policy**:
+[`deny.toml`](deny.toml), covering the 89 root packages and the 13 fuzz-only
+packages alike. One file is deliberate — a second policy would be a second
+rulebook, so a boundary would be stated twice, the two statements could drift, and
+an auditor reading one graph's rules could be reading rules that do not govern the
+other. `cargo-deny` resolves one graph per invocation, so there are **two commands
+and one rulebook**, and each command names the file explicitly with `--config`
+because `cargo-deny` otherwise resolves configuration from the *target* manifest's
 workspace root and a discovery miss falls back to built-in defaults — a fallback
-that looks exactly like a pass:
+that looks exactly like a pass. The fuzz command is precisely that hazard, since
+`fuzz/` is a detached workspace holding no policy of its own:
 
 ```sh
-# Root graph: 89 packages, against the policy that governs them.
+# Root graph: 89 packages.
 cargo deny --locked --config deny.toml check \
   -A unused-wrapper -A license-exception-not-encountered
 
-# Detached fuzz workspace: 13 packages, against their own policy.
-cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check
+# Detached fuzz workspace: 13 packages, against the same policy.
+cargo deny --locked --manifest-path fuzz/Cargo.toml --config deny.toml check \
+  -A license-not-encountered -A unmatched-skip -A unnecessary-skip
 ```
 
 Those are the invocations verbatim, `-A` allowances included, as
 [`.github/workflows/audit.yml`](.github/workflows/audit.yml) runs them and as
 [`CONTRIBUTING.md`](CONTRIBUTING.md) documents them. Reproducing the gate means
-reproducing the flags. Measured on this tree, the root invocation reports
-`0 errors, 0 warnings` with the pair; dropped, it still exits 0 but emits
-`warning[unused-wrapper]` and `warning[license-exception-not-encountered]` — a
-reviewer-facing erosion rather than a gate failure, which is exactly why the pair is
-stated rather than left implicit. The fuzz invocation needs no allowance at all,
-because its policy is shaped for its own graph. Both allowed codes name entries the
-**root** policy retains as latent defence in depth for crates that are absent from the
-root graph, and both stay at full severity on the fuzz invocation, where those crates
-do live — so nothing is waived in both places at once.
+reproducing the flags. Measured on this tree, both invocations report
+`0 errors, 0 warnings`.
+
+The five allowances are the entire cost of one policy spanning two graphs, and each
+is downgraded **only on the graph where the entry it covers cannot match**. On the
+root invocation, `unused-wrapper` and `license-exception-not-encountered` name the
+two entries the policy retains as latent defence in depth for `cc` and
+`libfuzzer-sys`, which are fuzz-graph-only. On the fuzz invocation,
+`license-not-encountered` names the root-only `Unicode-3.0` allowance, and
+`unmatched-skip` / `unnecessary-skip` name the four duplicate-major pins, all of
+which are root-graph crates. Every one of the five stays at **full** severity on the
+other invocation, where the entry is load-bearing — so no code is waived on a graph
+where it could report something real, and nothing is waived in both places at once.
 
 The policy declares `[advisories]`, `[licenses]`, `[bans]`, and `[sources]`,
 resolves with `all-features = true`, denies yanked crates, and bounds
@@ -432,23 +457,22 @@ measured, nine triples reduced coverage from 89 crates to 86, silently dropping 
 `spirv`-only and `uefi`-only leaves from licence and ban review), and names `cc`,
 `bindgen`, `pkg-config`, `libz-sys`, and the bzip2/lzma/zstd/brotli families in
 `[bans] deny` so the zero-C-dependency and single-codec properties cannot erode by
-accident. The two concessions the fuzz graph needs are scoped rather than relaxed —
-in **both** files, stated identically, so the boundary reads the same wherever an
-auditor opens it: the `cc` ban carries `wrappers = ["libfuzzer-sys"]`, so every
-*other* path to a C toolchain is still an error, and `libfuzzer-sys`'s mandatory
-NCSA term is granted through a crate-scoped `[[licenses.exceptions]]` entry rather
-than added to the global allow list. `fuzz/deny.toml` differs from the root policy
-only where the graphs genuinely differ: it allows exactly the three licences its 13
-packages use and carries `skip = []`, since the four acknowledged duplicate majors
-are root-graph-only.
+accident. The two concessions the fuzz graph needs are **scoped rather than
+relaxed**, which is exactly what lets one file govern both graphs: the `cc` ban
+carries `wrappers = ["libfuzzer-sys"]`, so `cc` is admitted only as that crate's
+build dependency and every *other* path to a C toolchain is still an error, and
+`libfuzzer-sys`'s mandatory NCSA term is granted through a crate-scoped
+`[[licenses.exceptions]]` entry rather than added to the global allow list. One
+boundary, written once, correct on both graphs.
 [`.github/workflows/audit.yml`](.github/workflows/audit.yml) is the single owner of
-that gate. It runs `cargo-audit` over **both** lockfiles and evaluates **both**
-policies — the root graph against `deny.toml` in its `cargo-deny` job and the
-detached fuzz graph against `fuzz/deny.toml` in its `cargo-deny-fuzz` job — on every
-push and pull request and on a daily schedule (`cron: '0 5 * * *'`), and asserts that
-neither lockfile was rewritten. A fourth job, `policy-integrity`, parses both policy
-files and fails if either is missing, if any load-bearing key has drifted from the
-value reviewed here, or if the two disagree on any key they share.
+that gate. It runs `cargo-audit` over **both** lockfiles and evaluates **both
+graphs against that one policy** — the root graph in its `cargo-deny` job and the
+detached fuzz graph in its `cargo-deny-fuzz` job — on every push and pull request
+and on a daily schedule (`cron: '0 5 * * *'`), and asserts that neither lockfile was
+rewritten. A fourth job, `policy-integrity`, parses the policy and fails if it is
+missing, if any load-bearing key has drifted from the value reviewed here, or if a
+**second** policy file has appeared anywhere in the tree — because that would mean a
+graph had quietly acquired its own rulebook.
 
 [`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml) deliberately declares **no**
 `cargo-deny` job of its own, so fuzzing is not gated on a policy verdict inside its own
@@ -605,9 +629,9 @@ derivation: [Exported symbol reconciliation](README.md#exported-symbol-reconcili
 
 | Command | Result |
 |---------|--------|
-| `cargo test --locked` | **956 passed / 0 failed / 0 ignored** (797 unit, 130 integration, 29 doctests) |
-| `cargo test --locked --all-features` | **969 passed / 0 failed / 0 ignored** (adds the 13 live C-oracle tests) |
-| `cargo test --locked --no-default-features` | **695 passed / 0 failed / 0 ignored** (571 unit, 97 integration, 27 doctests) |
+| `cargo test --locked` | **959 passed / 0 failed / 0 ignored** (799 unit, 131 integration, 29 doctests) |
+| `cargo test --locked --all-features` | **972 passed / 0 failed / 0 ignored** (adds the 13 live C-oracle tests) |
+| `cargo test --locked --no-default-features` | **696 passed / 0 failed / 0 ignored** (571 unit, 98 integration, 27 doctests) |
 
 The **ignored-test count is zero in every configuration and stays zero**. A
 capability that cannot be exercised in a given build is expressed by a feature
@@ -650,8 +674,8 @@ workspace that the root build never pulls in.
 runs each on a weekly schedule (`cron: '0 3 * * 1'`) and on pull requests, with a
 per-target budget of **120 s on a pull request and 600 s otherwise**, at
 `-max_len=65536 -rss_limit_mb=2048`. Supply-chain policy over the fuzz graph is not
-enforced by that workflow: `fuzz/deny.toml` is aimed at that graph by `audit.yml`'s
-`cargo-deny-fuzz` job on every push and pull request.
+enforced by that workflow: the root `deny.toml` is aimed at that graph by
+`audit.yml`'s `cargo-deny-fuzz` job on every push and pull request.
 Each target's corpus is persisted between runs, and crash artifacts are uploaded
 on failure. The fuzz crate builds with `overflow-checks = true`, so an arithmetic
 overflow is a finding rather than a wrap.
@@ -688,25 +712,31 @@ sits here:
   own `rustc -vV` host triple and `runner.arch`, so a mutable runner label that
   changes architecture underneath us fails the job instead of quietly invalidating
   this paragraph.
-- **Compile-verified only, never executed:** `aarch64-unknown-linux-gnu`,
-  `i686-unknown-linux-gnu` (32-bit `usize`), and `s390x-unknown-linux-gnu`
-  (**big-endian**) are cross type-checked with
-  `cargo check --locked --all-targets --all-features`, the `--all-features`
-  spelling being what pulls the `c_oracle` harness and the `inflate_strict` arms
-  into the check rather than skipping them. So the
+- **Compile-verified only, never executed:** four triples —
+  `aarch64-unknown-linux-gnu`, `i686-unknown-linux-gnu` (32-bit `usize`),
+  `s390x-unknown-linux-gnu` (**big-endian**), and `x86_64-pc-windows-msvc`
+  (32-bit `c_ulong`) — are cross type-checked *and* cross-linted with
+  `cargo check --locked --all-targets --all-features` and
+  `cargo clippy --locked --all-targets --all-features -- -D warnings`, the
+  `--all-features` spelling being what pulls the `c_oracle` harness and the
+  `inflate_strict` arms into the check rather than skipping them. So the
   big-endian CRC braid arms and the 32-bit pointer-width arms are **compiled but
   not run**, and this document does not claim otherwise. A unit test does assert
   that the endian-selected table anchors match the active target's values on every
   target, so the relationship is checked at run time even where those arms are
-  not.
+  not. The Windows-MSVC entry here is the *cross* lane and does not double-count
+  the native `windows-latest` row above: that row executes the suite on Windows
+  with the default feature set, while this one reaches the whole `cfg(windows)`
+  surface with every feature on and executes nothing. Neither subsumes the other,
+  which is why both exist.
 - **Built, not run:** the bare-metal `thumbv7em-none-eabihf` target, in both
   `--no-default-features` and `--features no-std` configurations, with an `nm`
   assertion that the freestanding runtime block — the libc-backed allocator, the
   abort panic handler, the personality shim — was genuinely compiled. **`no_std`
   has been validated on a hosted target and compile-verified for bare metal; it
-  has not been exercised on real embedded hardware.** 695 passing hosted tests do
+  has not been exercised on real embedded hardware.** 696 passing hosted tests do
   not prove an embedded target works.
-- **Human code review across the full Rust surface — 71,795 lines across 40 files
+- **Human code review across the full Rust surface — 72,082 lines across 40 files
   under `src/`, measured on 2026-08-03 with
   `find src -name '*.rs' -print0 | xargs -0 wc -l` — is outstanding**, and it is
   the highest-severity remaining hardening item
@@ -730,8 +760,7 @@ The same boundary is drawn, job by job, in
 | [`README.md`](README.md) | Overview, feature matrix, measured evidence, the drop-in ABI, and the portability boundary |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution workflow, the blocking quality gates, and the MSRV policy |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release history for the Rust crate; `Security` entries record every fix |
-| [`deny.toml`](deny.toml) | The supply-chain policy for the 89-package root graph |
-| [`fuzz/deny.toml`](fuzz/deny.toml) | The supply-chain policy for the 13-package detached fuzz graph |
+| [`deny.toml`](deny.toml) | The single supply-chain policy, governing the 89-package root graph and the 13-package detached fuzz graph |
 | [`Cargo.toml`](Cargo.toml) | Crate identity, the feature contract, profiles, and the published-crate `exclude` list |
 | [`LICENSE`](LICENSE) | The zlib/libpng license, carried forward from upstream |
 

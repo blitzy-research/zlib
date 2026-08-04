@@ -24,7 +24,7 @@ named explicitly below so nobody has to discover them in review.
 - [⚠ The `unsafe` boundary](#-the-unsafe-boundary)
 - [⚠ The C ABI is a compile-time-guarded contract](#-the-c-abi-is-a-compile-time-guarded-contract)
 - [No silent behaviour change](#no-silent-behaviour-change)
-- [Six divergences that must be preserved, not fixed](#six-divergences-that-must-be-preserved-not-fixed)
+- [Five divergences that must be preserved, not fixed](#five-divergences-that-must-be-preserved-not-fixed)
 - [Performance policy](#performance-policy)
 - [Working in this repository](#working-in-this-repository)
 - [Pre-submission checklist](#pre-submission-checklist)
@@ -56,11 +56,11 @@ Know the scale of what you are touching:
 
 | Quantity | Measured value | How it was measured |
 |----------|----------------|---------------------|
-| Rust modules under `src/` | **40 files**, **71,795 lines** (2026-08-03) | `find src -name '*.rs' -print0 \| xargs -0 wc -l` — the `total` row, with the file count from the same listing |
+| Rust modules under `src/` | **40 files**, **72,082 lines** (2026-08-04) | `find src -name '*.rs' -print0 \| xargs -0 wc -l` — the `total` row, with the file count from the same listing |
 | Retained C baseline | **23,107 lines** across 26 root translation units and headers | `cat` of the 26 files piped to `wc -l` |
 | Public C entry points the baseline declares | **119** `ZEXTERN` declarations in `zlib.h` | the retained header |
 | Exported C symbols this crate emits | **95**, all type `T` | `nm -D --defined-only target/release/libzlib_rs.so` |
-| Tests, default features | **956 passed / 0 failed / 0 ignored** | `cargo test --locked` |
+| Tests, default features | **959 passed / 0 failed / 0 ignored** | `cargo test --locked` |
 
 Three companion documents carry things this one deliberately does not repeat:
 
@@ -289,10 +289,11 @@ cargo +nightly-2026-08-01 install cargo-fuzz --version 0.13.2 --locked
 
 # The published-documentation gate. CI's `docs` job resolves CPython 3.12.13 and
 # installs the whole documentation closure - these three plus their 43 transitive
-# dependencies - from `.github/workflows/docs-requirements.txt` under
-# `--require-hashes`, then runs `mkdocs build --strict`. To reproduce that exactly:
-#   python -m pip install --require-hashes --only-binary=:all: \
-#     -r .github/workflows/docs-requirements.txt
+# dependencies - from a hash-pinned requirement set held INLINE in the `docs` job of
+# `.github/workflows/ci.yml`, under `--require-hashes`, then runs
+# `mkdocs build --strict`. To reproduce that exactly, copy the `REQS` heredoc out of
+# that job into a file and install from it:
+#   python -m pip install --require-hashes --only-binary=:all: -r <that-file>
 # Naming the three below is the looser local equivalent - pip resolves the other
 # forty-three at whatever versions the index serves today, which is fine for a
 # local preview and is precisely what the lock exists to prevent in CI.
@@ -322,10 +323,10 @@ cargo install cargo-audit --version 0.22.2 --locked
 ```
 
 Note what cargo offers in each case: an *older* tool that does satisfy 1.85.0. Taking
-that suggestion would silently downgrade the gate — [`deny.toml`](deny.toml) and
-[`fuzz/deny.toml`](fuzz/deny.toml) are both authored against cargo-deny **0.20.2**
-and CI pins that version at both of its call sites — so the correct response is to
-name the toolchain, never to relax the `--version` pin.
+that suggestion would silently downgrade the gate — [`deny.toml`](deny.toml) is
+authored against cargo-deny **0.20.2** and CI pins that version at both of its call
+sites — so the correct response is to name the toolchain, never to relax the
+`--version` pin.
 
 **Why `+nightly-2026-08-01` on the third.** `cargo-fuzz` needs nightly outright for its
 `-Z` sanitizer and coverage flags, so the failure mode there is the same shape for a
@@ -441,10 +442,10 @@ MkDocs site is built with `--strict`, which turns a missing nav page or dangling
 internal link into an error. CI pins that environment down to the artifact: CPython
 `3.12.13`, and every package in the closure (`mkdocs 1.6.1`,
 `mkdocs-techdocs-core 1.7.0`, `mkdocs-mermaid2-plugin 1.2.3` and their 43 transitive
-dependencies) hash-pinned in
-[`.github/workflows/docs-requirements.txt`](.github/workflows/docs-requirements.txt)
-and installed under `--require-hashes`; install from that lock locally if you want
-the identical verdict.
+dependencies) hash-pinned in the `REQS` heredoc inside the `docs` job of
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) and installed under
+`--require-hashes`; copy that block into a file and install from it locally if you
+want the identical verdict.
 
 Three flags on those lines are load-bearing, not decorative:
 
@@ -474,16 +475,16 @@ different total is information, not noise — find out why before you push.
 
 | Command | Expected result |
 |---------|-----------------|
-| `cargo test --locked` | **956 passed / 0 failed / 0 ignored** |
-| `cargo test --locked --all-features` | **969 passed / 0 failed / 0 ignored** |
-| `cargo test --locked --no-default-features` | **695 passed / 0 failed / 0 ignored** |
-| `cargo test --locked --no-default-features --features no-std` | **695 passed / 0 failed / 0 ignored** |
+| `cargo test --locked` | **959 passed / 0 failed / 0 ignored** |
+| `cargo test --locked --all-features` | **972 passed / 0 failed / 0 ignored** |
+| `cargo test --locked --no-default-features` | **696 passed / 0 failed / 0 ignored** |
+| `cargo test --locked --no-default-features --features no-std` | **696 passed / 0 failed / 0 ignored** |
 
-The 956 decompose as **797** in-crate unit tests, **130** integration tests
+The 959 decompose as **799** in-crate unit tests, **131** integration tests
 (`checksum` 23, `gzip_compat` 17, `inflate_coverage` 29, `interop` 30, `regression`
-12, `round_trip` 19), and **29** doctests — 28 runnable plus one `compile_fail`.
+13, `round_trip` 19), and **29** doctests — 28 runnable plus one `compile_fail`.
 `--all-features` adds the **13** tests of the opt-in live C-oracle harness. Under
-`--no-default-features` the total is **571** unit + **97** integration + **27**
+`--no-default-features` the total is **571** unit + **98** integration + **27**
 doctests, and the `gzip_compat` suite correctly
 reports 0 because the whole `gz*` file API is feature-gated off.
 
@@ -531,12 +532,15 @@ crates.io except the fuzz workspace's single `path = ".."` self-reference.
 cargo deny --locked --config deny.toml check \
   -A unused-wrapper -A license-exception-not-encountered
 
-# Detached fuzz workspace, against ITS OWN reviewed policy fuzz/deny.toml.
-# `--config` is MANDATORY here too: cargo-deny resolves configuration from the
-# target manifest's workspace root, so a discovery miss judges the fuzz graph
-# against built-in defaults. No -A codes are needed on this invocation -- a policy
-# shaped for the graph it governs has no unused entries to explain away.
-cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check
+# Detached fuzz workspace, against the SAME deny.toml. `--config` is MANDATORY
+# here, not stylistic: cargo-deny resolves configuration from the target manifest's
+# workspace root, and `fuzz/` holds no policy of its own -- so without the flag it
+# finds nothing, falls back to built-in defaults, and reports `ok` over 13
+# unreviewed packages. The three -A codes cover five entries that describe
+# root-graph-only crates and so cannot match here; each stays at FULL severity on
+# the root invocation above, where those entries are load-bearing.
+cargo deny --locked --manifest-path fuzz/Cargo.toml --config deny.toml check \
+  -A license-not-encountered -A unmatched-skip -A unnecessary-skip
 
 # RustSec advisories over both lockfiles.
 cargo audit --deny warnings
@@ -553,9 +557,10 @@ why installing these tools does need `+stable` (above) while running them does n
 
 [`.github/workflows/audit.yml`](.github/workflows/audit.yml) — migration artifact
 `D2` — runs all of those on push, pull request, a daily schedule, and manual
-dispatch, in four jobs: `policy-integrity` (which asserts the policy file has not
-been hollowed out), `cargo-audit`, `cargo-deny`, and `cargo-deny-fuzz`. Both `deny`
-policies enforce `[advisories]`, `[licenses]`, `[bans]`, and `[sources]`, and the
+dispatch, in four jobs: `policy-integrity` (which asserts the single policy file has
+not been hollowed out and that no second one has appeared), `cargo-audit`,
+`cargo-deny`, and `cargo-deny-fuzz`. The one `deny` policy enforces `[advisories]`,
+`[licenses]`, `[bans]`, and `[sources]` on **both** graphs, and its
 `[bans]` list is where the project's scope boundaries are mechanically enforced:
 `cc`, `bindgen`, `pkg-config`, `libz-sys`, `bzip2`, `lzma-sys`, `zstd`, and `brotli`
 are all denied by name, with the reason recorded inline.
@@ -599,7 +604,7 @@ something the seven gates above cannot see:
 | `unsafe-boundary` | Three in-crate boundary tests **plus** a toolchain-independent shell scan, so the containment invariant holds even if the tests are weakened |
 | `build-script-tests` | `build.rs` compiled as its own test binary — `cargo test` never compiles it — plus generated-table reproducibility and the big-endian (`s390x`) table selection |
 | `c-abi-linkage` | The emitted `cdylib`/`staticlib` linked, dynamically linked, and `dlopen`'d by a real C consumer on four feature rows, with the exported set checked against `zlib.map` |
-| `cross-targets` | Cross **type-check only** for `aarch64`, 32-bit `i686`, and big-endian `s390x` (migration artifact `D3`) |
+| `cross-targets` | Cross **type-check + Clippy only, nothing executed** for four triples: `aarch64`, 32-bit `i686`, big-endian `s390x`, and `x86_64-pc-windows-msvc` — the last being the *cross* Windows lane, distinct from `build-test`'s native `windows-latest` row, because neither `check` nor `clippy` links and so `--all-features` is reachable from Ubuntu (migration artifact `D3`) |
 | `bare-metal-no-std` | Library build for `thumbv7em-none-eabihf`, the only configuration in which the freestanding runtime block compiles (migration artifact `D10`) |
 | `package-verify` | `cargo package --list` against the `exclude` contract, then the packaging build, then the **unpacked archive's own `cargo test` run** (migration artifact `D12`) |
 
@@ -1067,16 +1072,20 @@ If a divergence is genuinely unavoidable, it is documented and — where the ABI
 carry the signal — advertised through `zlibCompileFlags`, never left implicit.
 
 Two distinct classes exist, and conflating them is what makes a register go stale.
-**Six divergences are visible to a C caller** and are enumerated in the next section;
+**Five divergences are visible to a C caller** and are enumerated in the next section;
 they are frozen. A second, separate class — **internal conveniences that are strictly
 invisible at the C ABI** — is enumerated in the section after it. A change that moves
 an item from the second class into the first is a breaking change to the drop-in
 contract and must be treated as one.
 
-## Six divergences that must be preserved, not fixed
+## Five divergences that must be preserved, not fixed
 
 Each of these looks like an unfinished job. None is. Closing any one of them would
 require a nightly compiler, break byte-identity, or bloat the published crate.
+
+The same five, numbered in the same order, appear in
+[`CHANGELOG.md`](CHANGELOG.md#the-five-divergences-a-c-caller-can-observe) and
+[`SECURITY.md`](SECURITY.md#what-is-not-a-vulnerability).
 
 1. **`gzprintf` / `gzvprintf` ship as ABI-compatible stubs returning
    `Z_STREAM_ERROR`.** Rendering a C `va_list` requires the nightly-only
@@ -1109,23 +1118,24 @@ require a nightly compiler, break byte-identity, or bloat the published crate.
    matching C's explicit-close contract. **Do not "improve" this into an
    auto-finishing destructor.** It is a documented, deliberate divergence from
    idiomatic Rust cleanup.
-6. **A gzip destination that accepts nothing is reported as a *retryable*
-   `Z_ERRNO`, not retried forever.** C's inner drain loop
-   (`gzwrite.c` L119-L124) leaves `state->x.next` unchanged when `write(2)`
-   returns `0` for a non-empty request and iterates again, with no exit
-   condition — an unbounded spin inside the library (CWE-835). Both Rust output
-   loops in [`src/gz/write.rs`](src/gz/write.rs) report the condition instead,
-   but mark it **retryable**, which preserves everything else: the output cursor
-   and the buffered input are retained, the stream is not declared dead, and
-   `gzwrite` returns its true partial count rather than `0`, so a caller that
-   retries drives exactly the outcome C's endless retry would have reached.
-   POSIX permits that return only for a zero-length write and neither loop ever
-   issues one, so the arm is as unreachable in practice as C's spin. **Do not
-   "restore" the spin.**
 
 [`CHANGELOG.md`](CHANGELOG.md#known-limitations-and-documented-divergences) carries
 the same list as release-facing text. If a divergence is ever added, removed, or
 altered in scope, it must be recorded there.
+
+**A zero-byte write acceptance is not on this list, and must not be added to it.**
+C's two `gz_comp` write loops have exactly one success arm each —
+`state->x.next += writ` and `strm->next_in += writ` (`gzwrite.c` L76-L90,
+L112-L124) — so a `write(2)` returning `0` for a non-empty request advances no
+cursor and the enclosing `while` re-issues the identical request. Both loops in
+[`src/gz/write.rs`](src/gz/write.rs) reproduce that single-arm shape, which is why
+`gzwrite`'s count and `gzerror`'s code match C's. Reporting the condition instead —
+even as a *retryable* `Z_ERRNO` — is a behavioural change a C caller can observe,
+so it belongs to neither class and was reverted. The retry is bounded for the same
+reason C's is: POSIX permits a `0` return only for a zero-length request, and
+neither loop ever issues one. Four unit tests pin the shape; if you find yourself
+adding an `Ok(0)` arm to either loop, they will fail, and that is the intended
+outcome.
 
 ## Internal divergences that are invisible at the C ABI
 
@@ -1269,7 +1279,7 @@ by a command that was actually run. Hold your pull request to the same bar:
 Concretely, paste **the observed output of the gates you ran** into the pull request
 description — the test totals, the exit codes, and, if you touched any of the seven
 byte-identity-risk files, the byte-identity result. "Tests pass" is an assertion;
-`956 passed / 0 failed / 0 ignored` is evidence.
+`959 passed / 0 failed / 0 ignored` is evidence.
 
 ### Import conventions
 
@@ -1289,7 +1299,7 @@ and two design decisions are what keep the graph one-way:
   neither `DeflateState` nor `InflateState`.
 - The one-call façades are split rather than layered upward: the C driver loops stay
   at layer 3 behind the `OneCallDeflate` / `OneCallInflate` port traits
-  (`src/util/compress.rs:140`, `src/util/uncompress.rs:63`), and the engine-owning
+  (`src/util/compress.rs:145`, `src/util/uncompress.rs:67`), and the engine-owning
   entry points sit at layer 6 and implement them (`src/deflate/mod.rs:1770`,
   `src/inflate/mod.rs:2951`) — mirroring how `compress.c` and `uncompr.c` *include*
   `zlib.h` and drive the engine rather than being part of it.
@@ -1409,10 +1419,19 @@ portability that CI has not exercised, and know where the line currently sits:
   `ffi::gz::tests::wide_path_open_round_trip` by name (UTF-16 path through `gzopen_w`,
   write, close, reopen, read back, `gzerror` state) and asserts exactly one test
   passed. The macOS row covers `OS_CODE = 19` and aarch64.
-- **Cross type-checked, not natively run:** `aarch64-unknown-linux-gnu`,
-  `i686-unknown-linux-gnu` (32-bit), and `s390x-unknown-linux-gnu` (**big-endian**),
-  each with `cargo check --locked --all-targets --all-features` so the `c_oracle`
-  harness and the `inflate_strict` arms are type-checked rather than skipped.
+- **Cross type-checked and cross-linted, not natively run:** four triples —
+  `aarch64-unknown-linux-gnu`, `i686-unknown-linux-gnu` (32-bit),
+  `s390x-unknown-linux-gnu` (**big-endian**), and `x86_64-pc-windows-msvc` (32-bit
+  `c_ulong`) — each with `cargo check --locked --all-targets --all-features` *and*
+  `cargo clippy --locked --all-targets --all-features -- -D warnings`, so the
+  `c_oracle` harness and the `inflate_strict` arms are type-checked rather than
+  skipped and a target-conditional lint cannot hide. Read the Windows-MSVC entry as
+  the *cross* lane, not a second count of the native `windows-latest` row above:
+  that row is native and narrow (it **runs** the suite, with default features
+  only), this one is cross and wide (every feature on, nothing executed), and a
+  `cfg(windows)` diagnostic reachable only under `--all-features` had no gate at
+  all before it existed. Neither `check` nor `clippy` links, which is why no MSVC
+  linker or cross toolchain is needed to reach it from Ubuntu.
 - **Built, not run:** the bare-metal `thumbv7em-none-eabihf` target, in both
   `--no-default-features` and `--features no-std` configurations.
 
@@ -1503,8 +1522,8 @@ builds all five and runs each on pull requests and a weekly schedule
 (`cron: '0 3 * * 1'`) with a per-target budget of **120 s on a pull request and 600 s
 otherwise**. That workflow declares exactly one job and runs no `cargo-deny` of its own:
 supply-chain policy over the fuzz graph is owned and enforced by `audit.yml`'s
-`cargo-deny-fuzz` job, which aims [`fuzz/deny.toml`](fuzz/deny.toml) — that graph's own
-reviewed policy — at it on every push and pull request. Corpora are persisted between runs under per-target cache keys, the
+`cargo-deny-fuzz` job, which aims the single reviewed [`deny.toml`](deny.toml) at it
+on every push and pull request. Corpora are persisted between runs under per-target cache keys, the
 committed seeds are supplied as read-only inputs on every run, and crash artifacts are
 uploaded on failure. The fuzz crate builds with
 `overflow-checks = true`, so an arithmetic overflow is a **finding**, not a wrap.
@@ -1549,15 +1568,18 @@ Tick every line before you open the pull request.
 - [ ] `RUSTUP_TOOLCHAIN=stable cargo fmt --all -- --check` — exit 0
 - [ ] `RUSTUP_TOOLCHAIN=stable cargo clippy --locked --all-targets --all-features -- -D warnings` — exit 0
 - [ ] `RUSTUP_TOOLCHAIN=stable cargo build --locked` — exit 0
-- [ ] `RUSTUP_TOOLCHAIN=stable cargo test --locked` — **956 passed / 0 failed / 0
+- [ ] `RUSTUP_TOOLCHAIN=stable cargo test --locked` — **959 passed / 0 failed / 0
       ignored**, or higher with **zero** ignored
 - [ ] `RUSTUP_TOOLCHAIN=stable cargo test --locked --no-default-features` —
-      **695 passed**, same rule
+      **696 passed**, same rule
 - [ ] `RUSTUP_TOOLCHAIN=stable RUSTDOCFLAGS='-D warnings' cargo doc --locked
       --no-deps --all-features` — exit 0 with zero warnings
-- [ ] `mkdocs build --strict` — exit 0 with **zero MkDocs strict diagnostics**: no
-      `WARNING` and no `ERROR` from MkDocs, its plugins, or this project's content
-      (CI's `docs` job runs both). The Material theme additionally prints one
+- [ ] `mkdocs build --strict --site-dir "$(mktemp -d)/site"` — exit 0 with **zero
+      MkDocs strict diagnostics**: no `WARNING` and no `ERROR` from MkDocs, its
+      plugins, or this project's content (CI's `docs` job runs both). Keep
+      `--site-dir` pointed outside the checkout: `.gitignore` does not cover
+      `site/`, so a bare build leaves 60 untracked files behind. The Material
+      theme additionally prints one
       upstream advisory banner from its own maintainers about the forthcoming MkDocs
       2.0 — that is a vendor notice, not a build diagnostic; `--strict` does not fail
       on it and nothing in this repository can suppress it, so do not treat it as a
@@ -1566,13 +1588,12 @@ Tick every line before you open the pull request.
       `RUSTUP_TOOLCHAIN=1.85.0 cargo check --locked --all-targets` — exit 0
       (MSRV is verified, not assumed)
 - [ ] Both `cargo-deny` invocations clean, run exactly as
-      [Supply-chain gates](#supply-chain-gates) prints them — the root line's two `-A`
-      allowances included, because without them that graph reports two
-      "unused configuration" warnings; the fuzz line needs none, because its policy is
-      shaped for the graph it governs:
+      [Supply-chain gates](#supply-chain-gates) prints them — **every** `-A` allowance
+      included, because each covers entries that cannot match on the graph being
+      checked and dropping one turns a shape artifact into a reported warning:
       `cargo deny --locked --config deny.toml check -A unused-wrapper -A license-exception-not-encountered`
       and
-      `cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check`
+      `cargo deny --locked --manifest-path fuzz/Cargo.toml --config deny.toml check -A license-not-encountered -A unmatched-skip -A unnecessary-skip`
 - [ ] `cargo audit --deny warnings` and
       `cargo audit --deny warnings --file fuzz/Cargo.lock` — both clean
 - [ ] **No test removed, weakened, or `#[ignore]`d.** Ignored count is zero and stays zero
@@ -1651,8 +1672,7 @@ moderate anything that makes the project a worse place to contribute.
 | [`Cargo.toml`](Cargo.toml) | Crate identity, the feature contract, profiles, and the published-crate `exclude` list |
 | [`rust-toolchain.toml`](rust-toolchain.toml) | The pinned toolchain (MSRV floor) |
 | [`clippy.toml`](clippy.toml) / [`rustfmt.toml`](rustfmt.toml) | The lint and format contracts |
-| [`deny.toml`](deny.toml) | The supply-chain policy for the 89-package root graph |
-| [`fuzz/deny.toml`](fuzz/deny.toml) | The supply-chain policy for the 13-package detached fuzz graph |
+| [`deny.toml`](deny.toml) | The single supply-chain policy, governing the 89-package root graph and the 13-package detached fuzz graph |
 | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | The twelve CI jobs, each documented in place |
 | [`LICENSE`](LICENSE) | The zlib/libpng license |
 | `doc/rfc1950.txt`, `doc/rfc1951.txt`, `doc/rfc1952.txt` | The normative wire-format specifications, retained in-tree |

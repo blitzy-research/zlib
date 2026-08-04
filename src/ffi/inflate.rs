@@ -411,7 +411,7 @@ unsafe fn inflate_handle(strm: &mut z_stream) -> Option<&mut InflateHandle> {
 /// The owner clause is what makes reclaim sound against transplantation: a caller
 /// who copies the 14-field `z_stream` holds a second struct pointing at the SAME
 /// handle, and freeing through the copy would leave the original with a dangling
-/// `state`. C returns `Z_STREAM_ERROR` for the copy (`inflate.c` L95,
+/// `state`. C returns `Z_STREAM_ERROR` for the copy (`inflate.c` L94,
 /// `state->strm != strm`) and this reproduces that refusal, so the allocation is
 /// released exactly once, through its owner.
 ///
@@ -557,7 +557,7 @@ unsafe fn inflate_back_state_check(strm: &z_stream) -> bool {
 /// was installed into. The cost is that a *moved* stream leaks rather than frees
 /// and reports `Z_STREAM_ERROR`; a leak is memory-safe and observable, a double
 /// free is neither, and no other zlib engine tolerates a moved stream either
-/// (`deflate.c` L546, `inflate.c` L95), so no portable caller can be relying on
+/// (`deflate.c` L544, `inflate.c` L94), so no portable caller can be relying on
 /// it.
 ///
 /// # Safety
@@ -1516,7 +1516,7 @@ pub unsafe extern "C" fn inflateSetDictionary(
         let sref = unsafe { &mut *strm };
 
         // C runs `inflateStateCheck(strm)` before it looks at `dictionary` at all
-        // (`inflate.c` L1256-L1262); the dictionary bytes are read only afterwards,
+        // (`inflate.c` L1200-L1201); the dictionary bytes are read only afterwards,
         // and only when the state permits. Validating first is what makes the
         // `slice::from_raw_parts` below sound: a stale pointer paired with an
         // invalid stream must be refused without a slice ever being constructed
@@ -1610,7 +1610,7 @@ pub unsafe extern "C" fn inflateSync(strm: z_streamp) -> c_int {
         let sref = unsafe { &mut *strm };
 
         // C runs `inflateStateCheck(strm)` as the very first statement of
-        // `inflateSync` (`inflate.c` L1349-L1351) and only then reaches
+        // `inflateSync` (`inflate.c` L1271-L1272) and only then reaches
         // `syncsearch(..., strm->next_in, ...)`. Validating before the input
         // window is bridged reproduces that order and keeps a stale `next_in` on
         // an invalid stream from being turned into a slice.
@@ -1726,7 +1726,7 @@ pub unsafe extern "C" fn inflateCopy(dest: z_streamp, source: z_streamp) -> c_in
         }
 
         // C evaluates `inflateStateCheck(source) || dest == Z_NULL` as one
-        // expression (`inflate.c` L1381), so the *source* is fully validated
+        // expression (`inflate.c` L1334-L1335), so the *source* is fully validated
         // before anything else is read — including its own allocator fields — and
         // before `dest` is used at all. Running the whole predicate first means an
         // invalid source is refused before a reference to either stream is formed
@@ -1793,10 +1793,11 @@ pub unsafe extern "C" fn inflateCopy(dest: z_streamp, source: z_streamp) -> c_in
                 let dref = unsafe { &mut *dest };
                 // SAFETY: transfers ownership of the cloned handle into
                 // `dest.state` and re-points its owner at `dest`, reproducing
-                // C's `ds->strm = dest` in `deflateCopy` (`deflate.c` L1340) —
-                // the clone belongs to the destination, not to the source, so
-                // `inflateEnd(dest)` reclaims it and `inflateEnd(source)` cannot.
-                // Reclaimed by `inflateEnd`.
+                // C's `copy->strm = dest` (`inflate.c` L1356) together with the
+                // `dest->state = (struct internal_state FAR *)copy` that closes
+                // `inflateCopy` (`inflate.c` L1366) — the clone belongs to the
+                // destination, not to the source, so `inflateEnd(dest)` reclaims
+                // it and `inflateEnd(source)` cannot. Reclaimed by `inflateEnd`.
                 unsafe { install_handle(dref, boxed) };
 
                 // Mirror zlib's `zmemcpy(dest, source, sizeof(z_stream))` for the
@@ -2488,7 +2489,7 @@ mod tests {
     /// It initializes IN PLACE, through `&mut z_stream`, rather than returning an
     /// initialized stream by value. `deflateInit_` records the owning stream's
     /// address in its handle and every later entry point re-checks it - C's
-    /// `s->strm != strm` clause (`deflate.c` L546, `inflate.c` L95), ported by
+    /// `s->strm != strm` clause (`deflate.c` L544, `inflate.c` L94), ported by
     /// `handle_owner_valid`. Returning the stream by value MOVES it to a different
     /// address, so the handle would point at the caller's slot while recording the
     /// helper's, and `deflateEnd` would answer `Z_STREAM_ERROR` and leak the
@@ -2541,7 +2542,7 @@ mod tests {
     ///
     /// History only exists once a call has *returned* mid-stream: C folds produced
     /// bytes into the check value at `CHECK` and resets its progress counter
-    /// (`out = left`, `inflate.c` L1121), so a stream decoded entirely inside one
+    /// (`out = left`, `inflate.c` L1081), so a stream decoded entirely inside one
     /// call never touches the window. The decode below is therefore deliberately
     /// output-starved rather than run to `Z_STREAM_END`.
     #[test]
@@ -2703,7 +2704,7 @@ mod tests {
     /// Once more bytes have been produced than the window holds, the engine's
     /// circular buffer has `wnext != 0` and the oldest surviving byte sits at
     /// `window[wnext]`, not at `window[0]`. C therefore emits `window[wnext..whave]`
-    /// followed by `window[..wnext]` (`inflate.c` L1301-L1313). A shim that handed
+    /// followed by `window[..wnext]` (`inflate.c` L1176-L1180). A shim that handed
     /// the window back verbatim would return the right *count* of bytes in the
     /// wrong *order* — decodable-looking, silently corrupt as a preset dictionary,
     /// and invisible to a length-only assertion. This is the one defect the report
@@ -5535,7 +5536,7 @@ mod tests {
 
     /// The prologue runs in exactly C's position: after the version and
     /// null-stream guards, and before the state allocation and the `windowBits`
-    /// validation (`inflate.c` L173-L214).
+    /// validation (`inflate.c` L173-L212).
     #[test]
     fn the_allocator_prologue_is_ordered_exactly_as_c_orders_it() {
         // A bad version *and* a half hook: the version guard precedes the
@@ -5953,7 +5954,7 @@ mod tests {
     /// A byte-copied `z_stream` must not be able to drive or reclaim the
     /// original's inflate state.
     ///
-    /// This is C's `state->strm != strm` clause (`inflate.c` L95). Without it the
+    /// This is C's `state->strm != strm` clause (`inflate.c` L94). Without it the
     /// copy could reclaim and free the handle, leaving the original's `state`
     /// dangling — a use-after-free reachable from ordinary C usage. Reference zlib
     /// returns `Z_STREAM_ERROR` for the copy and `Z_OK` for the owner.
@@ -6557,8 +6558,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Reset publication (`inflate.c` L100-L134) and the `inflate_fast`
-    // give-back (`inffast.c` L282-L299) as a C caller observes them.
+    // Reset publication (`inflate.c` L100-L134, spanning `inflateResetKeep` and
+    // `inflateReset`) and the `inflate_fast` give-back (`inffast.c` L290-L294) as
+    // a C caller observes them.
     // -----------------------------------------------------------------------
 
     /// Every reset variant publishes C's cleared `data_type` into the *caller's*

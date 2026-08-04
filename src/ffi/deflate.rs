@@ -1132,7 +1132,7 @@ pub unsafe extern "C" fn deflateGetDictionary(
 ///
 /// The registration survives `deflateReset`: C clears `gzhead` only in
 /// `deflateInit2_` (`deflate.c` L448). It also travels to a `deflateCopy` clone,
-/// because C's struct-wide `zmemcpy` duplicates the pointer (`deflate.c` L1345),
+/// because C's struct-wide `zmemcpy` duplicates the pointer (`deflate.c` L1339),
 /// so both streams read the caller's one header.
 ///
 /// # Safety
@@ -2011,7 +2011,7 @@ mod tests {
         );
 
         // Level 6 loads `configuration_table[6] == {8, 16, 128, 128}`
-        // (`deflate.c` L118). Establishing the pre-state is what makes the
+        // (`deflate.c` L121). Establishing the pre-state is what makes the
         // override below meaningful rather than a coincidence.
         assert_eq!(
             tune_fields(&mut strm),
@@ -3155,20 +3155,26 @@ mod tests {
         assert_eq!(restored, input);
     }
 
-    /// End-to-end out-of-memory propagation: when the caller's arena is exhausted part-way through
-    /// `deflateCopy`, the C entry point must report `Z_MEM_ERROR`, leave `dest`
-    /// untouched, release every buffer it did manage to allocate, and leave
-    /// `source` fully usable — never silently completing the copy on the Rust
-    /// global allocator.
-    /// A caller arena that runs out on the *last* working buffer sees its regions
-    /// handed back in C's documented teardown order, not in Rust field order.
+    /// End-to-end out-of-memory propagation through **initialization**: when the
+    /// caller's arena is exhausted on the last of the five regions
+    /// `deflateInit2_` requests, the C entry point must report `Z_MEM_ERROR`,
+    /// hand every region it did manage to allocate back to the caller's `zfree`,
+    /// and leave nothing outstanding — never silently completing the init on the
+    /// Rust global allocator. A caller arena that runs out on the *last* working
+    /// buffer sees its regions handed back in C's documented teardown order, not
+    /// in Rust field order.
     ///
-    /// C issues all four working-buffer `ZALLOC`s unconditionally and checks them
-    /// **together** (`deflate.c` L458-L460, L505, tested at L507-L513), then calls
-    /// `deflateEnd`, which frees `pending_buf`, `head`, `prev`, `window` and
-    /// finally the state — "deallocate in reverse order of allocations"
-    /// (`deflate.c` L1300-L1306). Request numbers make that `[3, 2, 1, 0]`
-    /// followed by the state's `0`th region last.
+    /// The test drives `deflateInit_`, which forwards to `deflateInit2_` with the
+    /// documented defaults (`deflate.c` L379-L384). That path charges the arena
+    /// five times: the state (`deflate.c` L440), then `window`, `prev` and `head`
+    /// issued unconditionally (`deflate.c` L458-L460), then `pending_buf`
+    /// (`deflate.c` L505). C checks all four working buffers **together** rather
+    /// than short-circuiting after the first failure (`deflate.c` L508-L509),
+    /// and on failure sets `FINISH_STATE`, sets `msg`, and calls `deflateEnd`
+    /// before returning `Z_MEM_ERROR` (`deflate.c` L510-L513). `deflateEnd` frees
+    /// `pending_buf`, `head`, `prev`, `window` and finally the state —
+    /// "deallocate in reverse order of allocations" (`deflate.c` L1300-L1306).
+    /// Request numbers make that `[3, 2, 1, 0]`, the state's `0`th region last.
     ///
     /// This is a real divergence this port had: dropping the buffers as a tuple
     /// pattern released them left-to-right (`window, prev, head, pending_buf`,
@@ -3500,7 +3506,7 @@ mod tests {
             stats.ooms(),
             3,
             "C `deflateCopy` issues all four working-buffer `ZALLOC`s and checks \
-             them together (`deflate.c` L1341-L1350), so the three that cannot be \
+             them together (`deflate.c` L1342-L1350), so the three that cannot be \
              served each report out-of-memory to the caller's hook"
         );
         assert_eq!(
@@ -3825,7 +3831,7 @@ mod tests {
     /// A byte-copied `z_stream` must not be able to drive or reclaim the
     /// original's state.
     ///
-    /// This is C's `s->strm != strm` clause (`deflate.c` L546), and it is the
+    /// This is C's `s->strm != strm` clause (`deflate.c` L544), and it is the
     /// clause that makes reclaim sound. A caller who writes `z_stream copy = strm;`
     /// holds a second 14-field struct whose `state` names the SAME handle.
     /// Reference zlib refuses every call through the copy — measured against a
@@ -3963,7 +3969,7 @@ mod tests {
     ///
     /// C reaches its verdict from `deflateStateCheck(strm)` alone and never reads
     /// the `dictionary`, `head`, `next_in` or `next_out` it was handed
-    /// (`deflate.c` L602-L603, L981-L1010). The pointers below are deliberately
+    /// (`deflate.c` L567-L568, L981-L1010). The pointers below are deliberately
     /// non-null and deliberately not backed by the sizes claimed, so any shim that
     /// bridged them before validating would be constructing a slice or reference
     /// over memory it has no right to. The structural companion to this test —
@@ -4257,7 +4263,7 @@ mod tests {
     #[test]
     #[cfg(feature = "gzip")]
     fn copy_carries_the_registered_header_pointer_to_the_clone() {
-        // C's `zmemcpy(ds, ss, sizeof(deflate_state))` (`deflate.c` L1345) copies
+        // C's `zmemcpy(ds, ss, sizeof(deflate_state))` (`deflate.c` L1339) copies
         // the `gzhead` member, so the clone reads the same caller-owned header.
         let payload = b"copy carries the header".repeat(3);
         let name = c"copy";

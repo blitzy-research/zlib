@@ -477,6 +477,14 @@ pub const ZLIB_VER_SUBREVISION: u32 = 1;
 // `OneCallDeflate`/`OneCallInflate` port traits plus layer-6 engine-owning
 // entry points, mirroring how `compress.c` and `uncompr.c` include `zlib.h`
 // and drive the engine rather than sitting beside `zutil.h`.
+//
+// The one exception, enumerated in that test's `PUBLIC_REEXPORT_EXCEPTIONS`, is
+// that `util` re-exports those layer-6 entry points back down with a `pub use`,
+// because AAP §0.3.1 publishes them as `util::{compress, compress2, uncompress,
+// uncompress2}` and dropping a public path is a source-breaking change. A
+// re-export moves a *name*, not a dependency: no layer-3 code calls them, no
+// layer-3 signature mentions them, and deleting the two `pub use` lines leaves
+// `util` compiling byte-for-byte the same.
 // ===========================================================================
 
 pub mod checksum;
@@ -544,10 +552,13 @@ pub use gz_header::GzHeader;
 // One-call, whole-buffer wrappers (ported from `compress.c`/`uncompr.c`). Both
 // the idiomatic snake_case names and the zlib-style `compressBound` alias are
 // surfaced. `compress.c` and `uncompr.c` are C translation units that include
-// `zlib.h` and drive the engines, so their engine-owning halves live with the
-// engines (`deflate` / `inflate`) while the engine-free sizing formula stays in
-// `util`; the six names published here are exactly the `zlib.h` spellings
-// regardless (AAP §0.3.1, §0.4.2 B2).
+// `zlib.h` and drive the engines, so their engine-owning halves are *defined*
+// with the engines (`deflate` / `inflate`) while the engine-free sizing formula
+// stays in `util`. All six are additionally re-exported from `util` itself, so
+// both `zlib_rs::compress2` and `zlib_rs::util::compress2` resolve — those are
+// the paths AAP §0.3.1 publishes, and a `pub use` costs the layer graph nothing
+// because it re-exports a name rather than creating a code dependency
+// (AAP §0.4.2 B2).
 pub use deflate::{compress, compress2};
 pub use inflate::{uncompress, uncompress2};
 pub use util::{compress_bound, compressBound};
@@ -1278,6 +1289,68 @@ mod tests {
     /// [`the_module_graph_has_no_upward_edges`](fn@the_module_graph_has_no_upward_edges)
     /// just as loudly as an unlisted one — so this list cannot drift away from
     /// the code it describes.
+    /// The complete set of `(from, to, why)` module references that shipped code
+    /// may hold **only** in the form `pub use crate::<to>::…;` — a re-export of a
+    /// *name*, never an import that creates a code dependency.
+    ///
+    /// The distinction is the whole content of the exemption, and it is exact. An
+    /// arrow in AAP §0.4.2 B2 means "the right side may *depend on* the left
+    /// side": the ordering exists so that each layer can be compiled, read, and
+    /// reasoned about without the layers above it. A `pub use` does none of that.
+    /// It publishes an item under a second path and adds no call, no field, no
+    /// trait bound, and no type in any signature the lower layer owns; delete
+    /// every re-export listed here and the lower layer compiles unchanged.
+    ///
+    /// The exemption is needed because AAP §0.3.1 and §0.4.2 B2 constrain the same
+    /// two names from opposite directions. §0.3.1 publishes the one-call surface as
+    /// `util::{compress, compress_bound, compress2, compressBound, uncompress,
+    /// uncompress2}`, so `zlib_rs::util::compress2` is a promised public path and
+    /// removing it is a source-breaking change for a downstream `use`. §0.4.2 B2
+    /// forbids the utility layer from *driving* an engine, which is why the
+    /// concrete entry points are defined in [`crate::deflate`] and
+    /// [`crate::inflate`] — they must name a concrete engine adapter, and layer 3
+    /// may not. Re-exporting the finished functions back down to the promised path
+    /// satisfies both readings with no code dependency in either direction.
+    ///
+    /// Scope is deliberately minimal, and three separate conditions must all hold
+    /// for a reference to be exempt: the `(from, to)` pair appears below, the text
+    /// at the reference is literally `pub use crate::<to>::`, and — as with
+    /// [`TEST_ONLY_CROSS_LAYER_EXCEPTIONS`] — the entry is actually exercised, so a
+    /// stale one fails this test as loudly as an unlisted violation. A plain `use`,
+    /// a call, a type mention, or a second reference anywhere else in the file is
+    /// an ordinary violation and still fails.
+    const PUBLIC_REEXPORT_EXCEPTIONS: [(&str, &str, &str); 2] = [
+        (
+            "util",
+            "deflate",
+            "AAP §0.3.1 publishes the one-call compression entry points at \
+             util::{compress, compress2}, but §0.4.2 B2 forbids layer 3 from driving \
+             an engine, so they are defined in crate::deflate and re-exported back \
+             down to the promised path; src/util/** never calls them",
+        ),
+        (
+            "util",
+            "inflate",
+            "AAP §0.3.1 publishes the one-call decompression entry points at \
+             util::{uncompress, uncompress2}, defined in crate::inflate for the same \
+             reason and re-exported back down on the same terms",
+        ),
+    ];
+
+    /// Whether the `crate::…` reference at byte offset `at` in `shipped` is a
+    /// `pub use` re-export rather than a dependency-creating reference.
+    ///
+    /// Walks backwards over whitespace only — the blanker turns comments into
+    /// spaces and preserves offsets, so a `crate::deflate` mentioned in a doc
+    /// comment has already been erased — and requires the immediately preceding
+    /// non-whitespace text to be exactly the keywords `pub use`. Any other
+    /// context, including a bare `use crate::deflate::…`, a call, or a type
+    /// position, is therefore *not* a re-export and stays a violation.
+    fn is_pub_use_reexport(shipped: &str, at: usize) -> bool {
+        let head = &shipped[..at];
+        head.trim_end().ends_with("pub use")
+    }
+
     const TEST_ONLY_CROSS_LAYER_EXCEPTIONS: [(&str, &str, &str); 3] = [
         (
             "stream",
@@ -1554,8 +1627,9 @@ mod tests {
         );
     }
 
-    /// **No `use` in the shipped library points upward, or sideways, in the layer
-    /// graph — and every test-only exception is one of three enumerated ones.**
+    /// **No `use` in the shipped library creates an upward, or sideways, code
+    /// dependency in the layer graph — and every exception is one of five
+    /// enumerated ones.**
     ///
     /// This is the mechanical form of AAP §0.4.2 B2. It scans every `.rs` file
     /// under `src/` twice: once with the `#[cfg(test)]` items removed, which is
@@ -1564,6 +1638,13 @@ mod tests {
     /// [`TEST_ONLY_CROSS_LAYER_EXCEPTIONS`] rather than ignored. Every violation
     /// is reported at once with its file, line, tier and both layer numbers, so a
     /// regression is diagnosable without re-running the analysis by hand.
+    ///
+    /// Shipped code holds exactly two exemptions, both in
+    /// [`PUBLIC_REEXPORT_EXCEPTIONS`] and both of the form `pub use
+    /// crate::<higher>::…;` — a re-export publishing a name at the second path
+    /// AAP §0.3.1 promises, which creates no call, no field, no bound and no
+    /// signature and therefore no dependency. `#[cfg(test)]` code holds three more,
+    /// in [`TEST_ONLY_CROSS_LAYER_EXCEPTIONS`].
     ///
     /// Four structural facts are asserted alongside it, each closing a way the
     /// check could pass while measuring nothing:
@@ -1574,7 +1655,7 @@ mod tests {
     ///    blanking bug that erases the source cannot masquerade as compliance;
     /// 3. `#[cfg(test)]` blanking removed something but not everything, so the
     ///    two tiers are genuinely different texts;
-    /// 4. every entry in the exception list is actually exercised, so a stale
+    /// 4. every entry in *both* exception lists is actually exercised, so a stale
     ///    exemption fails just as loudly as an unlisted violation.
     #[test]
     fn the_module_graph_has_no_upward_edges() {
@@ -1605,6 +1686,7 @@ mod tests {
         let mut shipped_edges = 0usize;
         let mut test_edges = 0usize;
         let mut exceptions_used = [0usize; TEST_ONLY_CROSS_LAYER_EXCEPTIONS.len()];
+        let mut reexports_used = [0usize; PUBLIC_REEXPORT_EXCEPTIONS.len()];
         for (rel, text) in &sources {
             let Some(from) = owning_module(rel) else {
                 continue;
@@ -1623,11 +1705,23 @@ mod tests {
                 if in_shipped {
                     shipped_edges += 1;
                     if lt >= lf {
-                        let direction = if lt == lf { "SAME-LAYER" } else { "UPWARD" };
-                        violations.push(alloc::format!(
-                            "{rel}:{line}: SHIPPED {direction} \
-                             {from}(layer {lf}) -> {to}(layer {lt})"
-                        ));
+                        // A `pub use crate::<to>::…;` publishes a name at a second
+                        // path and creates no dependency, so an enumerated one is
+                        // exempt; everything else is a violation.
+                        match PUBLIC_REEXPORT_EXCEPTIONS
+                            .iter()
+                            .position(|(f, t, _)| *f == from && *t == to)
+                            .filter(|_| is_pub_use_reexport(&shipped, at))
+                        {
+                            Some(idx) => reexports_used[idx] += 1,
+                            None => {
+                                let direction = if lt == lf { "SAME-LAYER" } else { "UPWARD" };
+                                violations.push(alloc::format!(
+                                    "{rel}:{line}: SHIPPED {direction} \
+                                     {from}(layer {lf}) -> {to}(layer {lt})"
+                                ));
+                            }
+                        }
                     }
                     continue;
                 }
@@ -1670,14 +1764,22 @@ mod tests {
             violations.join("\n")
         );
 
-        // Guard 4: no stale exemption. An entry that stops being needed must be
-        // deleted, or the list stops describing the code.
+        // Guard 4: no stale exemption in either list. An entry that stops being
+        // needed must be deleted, or the list stops describing the code.
         for (idx, (from, to, why)) in TEST_ONLY_CROSS_LAYER_EXCEPTIONS.iter().enumerate() {
             assert!(
                 exceptions_used[idx] > 0,
                 "TEST_ONLY_CROSS_LAYER_EXCEPTIONS still exempts {from} -> {to} but no \
                  #[cfg(test)] code needs it any more; delete the entry (rationale on \
                  record: {why})"
+            );
+        }
+        for (idx, (from, to, why)) in PUBLIC_REEXPORT_EXCEPTIONS.iter().enumerate() {
+            assert!(
+                reexports_used[idx] > 0,
+                "PUBLIC_REEXPORT_EXCEPTIONS still exempts a {from} -> {to} re-export but \
+                 no `pub use crate::{to}::…;` remains in src/{from}/**; delete the entry \
+                 (rationale on record: {why})"
             );
         }
     }

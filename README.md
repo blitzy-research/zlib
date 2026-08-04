@@ -83,10 +83,10 @@ except the two MSRV rows.
 
 | Gate | Command | Result |
 |------|---------|--------|
-| Test suite (default features) | `cargo test --locked` | **956 passed / 0 failed / 0 ignored** |
-| Test suite (all features) | `cargo test --locked --all-features` | **969 passed / 0 failed / 0 ignored** |
-| Test suite (`no_std`) | `cargo test --locked --no-default-features` | **695 passed / 0 failed / 0 ignored** |
-| Test suite (`no-std` feature) | `cargo test --locked --no-default-features --features no-std` | **695 passed / 0 failed / 0 ignored** |
+| Test suite (default features) | `cargo test --locked` | **959 passed / 0 failed / 0 ignored** |
+| Test suite (all features) | `cargo test --locked --all-features` | **972 passed / 0 failed / 0 ignored** |
+| Test suite (`no_std`) | `cargo test --locked --no-default-features` | **696 passed / 0 failed / 0 ignored** |
+| Test suite (`no-std` feature) | `cargo test --locked --no-default-features --features no-std` | **696 passed / 0 failed / 0 ignored** |
 | Formatting | `cargo fmt --all -- --check` | exit 0 |
 | Lints | `cargo clippy --locked --all-targets --all-features -- -D warnings` | exit 0 |
 | API docs | `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features` | exit 0, 0 warnings |
@@ -94,15 +94,15 @@ except the two MSRV rows.
 | MSRV build | `cargo +1.85.0 build --locked` | exit 0 |
 | MSRV type-check | `cargo +1.85.0 check --locked --all-targets` | exit 0 |
 | Exported C symbols | `nm -D --defined-only target/release/libzlib_rs.so` | **95**, all type `T` |
-| Packaged crate | `cargo package --locked --list` | **76** files; the unpacked archive re-runs its own suite at 956 |
+| Packaged crate | `cargo package --locked --list` | **75** files; the unpacked archive re-runs its own suite at 959 |
 | Live byte-identity sweep | `cargo test --locked --features c-oracle --test c_oracle` | **3750/3750** and **50/50** byte-identical |
 
-The 956 default-feature tests decompose as **797** in-crate unit tests, **130**
+The 959 default-feature tests decompose as **799** in-crate unit tests, **131**
 integration tests (`checksum` 23, `gzip_compat` 17, `inflate_coverage` 29,
-`interop` 30, `regression` 12, `round_trip` 19), and **29** doctests (28
+`interop` 30, `regression` 13, `round_trip` 19), and **29** doctests (28
 runnable plus one `compile_fail`).
 `--all-features` adds the 13 tests of the opt-in live C-oracle harness. Under
-`--no-default-features` the total is **571** unit + **97** integration + **27**
+`--no-default-features` the total is **571** unit + **98** integration + **27**
 doctests; the `gzip_compat` suite correctly reports 0 because the whole `gz*`
 file API is feature-gated off.
 
@@ -702,30 +702,32 @@ Both lockfiles are committed deliberately, because the crate ships
 `cdylib`/`staticlib` distributables and reproducible offline builds need exact
 resolved versions.
 
-Two `cargo-deny` policies govern that closure, **one per graph**:
-[`deny.toml`](deny.toml) over the 89 root packages and
-[`fuzz/deny.toml`](fuzz/deny.toml) over the 13 fuzz-only packages. Both
-invocations name their policy explicitly, because `cargo-deny` resolves
-configuration from the *target* manifest's workspace root and a discovery miss
-falls back to built-in defaults — silently, and a silent fallback looks exactly
-like a pass:
+**One** `cargo-deny` policy governs that closure: [`deny.toml`](deny.toml), over
+the 89 root packages and the 13 fuzz-only packages alike. `cargo-deny` resolves one
+graph per invocation, so there are two commands and one rulebook, and each names the
+policy explicitly — because `cargo-deny` otherwise resolves configuration from the
+*target* manifest's workspace root and a discovery miss falls back to built-in
+defaults, silently, and a silent fallback looks exactly like a pass. The fuzz
+command is precisely that hazard, since `fuzz/` is a detached workspace holding no
+policy of its own:
 
 ```sh
-# Root graph: 89 packages, against the policy that governs them.
+# Root graph: 89 packages.
 cargo deny --locked --config deny.toml check \
   -A unused-wrapper -A license-exception-not-encountered
 
-# Detached fuzz workspace: 13 packages, against their own policy.
-cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check
+# Detached fuzz workspace: 13 packages, against the same policy.
+cargo deny --locked --manifest-path fuzz/Cargo.toml --config deny.toml check \
+  -A license-not-encountered -A unmatched-skip -A unnecessary-skip
 ```
 
 Both command lines are reproduced exactly as
-[`.github/workflows/audit.yml`](.github/workflows/audit.yml) runs them, the root
-`-A` allowances included. Those two allowances are not optional decoration:
-measured on this tree the root invocation reports `0 errors, 0 warnings` with them
-and, without them, still exits 0 but emits `warning[unused-wrapper]` and
-`warning[license-exception-not-encountered]`. The fuzz command line carries no
-allowance at all, because its policy is shaped for the graph it governs.
+[`.github/workflows/audit.yml`](.github/workflows/audit.yml) runs them, `-A`
+allowances included, and both report `0 errors, 0 warnings` on this tree. The five
+allowances are the entire cost of one policy spanning two graphs, and each is
+downgraded **only on the graph where the entry it covers cannot match** — so no code
+is waived where it could report something real, and every one of the five stays at
+full severity on the other invocation.
 
 The policy sets `[advisories]`, `[licenses]`, `[bans]`, and `[sources]` with
 `all-features = true`, denies yanked crates, and bounds advisory staleness. Its
@@ -739,14 +741,14 @@ every duplication in this project is dev-only and the check would otherwise repo
 `bans ok` regardless — and the four acknowledged duplicates are pinned to exact
 `crate@version` `skip` entries so an *unreviewed* duplicate fails the build rather
 than merely printing a warning. The two things the fuzz graph legitimately needs —
-a C-toolchain build dependency and an NCSA-licensed `libfuzzer-sys` — are scoped,
-not waived, in **both** files: `cc` stays banned but carries
-`wrappers = ["libfuzzer-sys"]`, and NCSA is granted crate-scoped rather than
-globally. On the root graph neither crate is present, so those two entries are
-latent defence in depth and the root invocation allows exactly their two
-"unused configuration" codes; on the fuzz graph they are load-bearing, so that
-invocation needs no suppressions at all. Both report `0 errors, 0 warnings`
-across all four checks.
+a C-toolchain build dependency and an NCSA-licensed `libfuzzer-sys` — are **scoped,
+not waived**, which is exactly what lets one file govern both graphs: `cc` stays
+banned but carries `wrappers = ["libfuzzer-sys"]`, so it is admitted only as that
+crate's build dependency, and NCSA is granted crate-scoped rather than globally. On
+the root graph neither crate is present, so those two entries are latent defence in
+depth and the root invocation allows exactly their two "unused configuration" codes;
+on the fuzz graph they are load-bearing and run at full severity. Both invocations
+report `0 errors, 0 warnings` across all four checks.
 
 [`.github/workflows/audit.yml`](.github/workflows/audit.yml) runs the gate on
 push, pull request, a daily schedule, and manual dispatch, as four independent
@@ -755,10 +757,10 @@ another's verdict:
 
 | Job | What it proves |
 | --- | --- |
-| `policy-integrity` | Both `deny.toml` and `fuzz/deny.toml` are present, still declare every governed table, still hold every load-bearing key at its reviewed value, and still agree with each other on every shared key. Guards against a deleted policy and against section-level erosion, which would otherwise pass vacuously. |
+| `policy-integrity` | `deny.toml` is present, still declares every governed table, still holds every load-bearing key at its reviewed value, and is still the **only** cargo-deny policy in the tree. Guards against a deleted policy, against section-level erosion (which would otherwise pass vacuously), and against a second policy appearing and quietly giving one graph its own rulebook. |
 | `cargo-audit` | No known advisory affects either lockfile — the root graph and the detached fuzz graph are both scanned. |
 | `cargo-deny` | The root graph satisfies all four categories against `deny.toml`: licences, advisories, bans, sources. |
-| `cargo-deny-fuzz` | The detached fuzz graph satisfies the same four categories against `fuzz/deny.toml`. |
+| `cargo-deny-fuzz` | The detached fuzz graph satisfies the same four categories against the same `deny.toml`. |
 
 Those four jobs are the **only** place either tool runs.
 [`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml) builds and fuzzes the
@@ -1031,9 +1033,19 @@ Platform claims deserve platform coverage, so here is the boundary, drawn honest
   step runs that test **by name** and asserts exactly one test passed, so the
   coverage cannot regress into a mere compile check. The macOS row exercises
   `OS_CODE = 19` and aarch64.
-- **Cross type-checked, not natively run:** `aarch64-unknown-linux-gnu`,
-  `i686-unknown-linux-gnu` (32-bit), and `s390x-unknown-linux-gnu`
-  (**big-endian**). The `build-script-tests` job additionally type-checks the
+- **Cross type-checked and cross-linted, not natively run:** four triples —
+  `aarch64-unknown-linux-gnu`, `i686-unknown-linux-gnu` (32-bit),
+  `s390x-unknown-linux-gnu` (**big-endian**), and `x86_64-pc-windows-msvc`. Each
+  gets both `cargo check` and `cargo clippy -D warnings` with `--all-targets
+  --all-features`; neither command links, which is why no cross linker, emulator
+  or MSVC toolchain is needed. The Windows-MSVC row is a *cross* lane and is not
+  the same claim as the native `windows-latest` row above: that one is native and
+  narrow (one OS, one feature selection, and it **runs** the suite), this one is
+  cross and wide (every feature on, nothing executed). Both are kept because a
+  regression has to evade both — `c_ulong` is 32-bit on MSVC and 64-bit on LP64,
+  so a `uLong as u32` cast is a real truncation on Linux and an identity cast
+  there, and `unnecessary_cast` fires on exactly one of the two. The
+  `build-script-tests` job additionally type-checks the
   library and test profile for s390x specifically so the big-endian CRC braid arms
   are compiled — on a little-endian runner they otherwise never are, and a wrong
   index in one of them would go unnoticed until somebody built for big-endian
@@ -1072,11 +1084,12 @@ that were previously tracked as open items are now closed:
   [Compatibility and RFCs](#compatibility-and-rfcs) for the full grid.
 - **`no_std` test coverage (done).** The full test suite compiles and passes
   under `cargo test --locked --no-default-features` (and `--features no-std`) —
-  **695 tests, 0 failed, 0 ignored** in both rows — and CI runs both as blocking
+  **696 tests, 0 failed, 0 ignored** in both rows — and CI runs both as blocking
   gates, plus a bare-metal `thumbv7em-none-eabihf` build job.
 - **Cross-platform CI (done).** Native Windows and macOS rows run the real suite;
-  aarch64, 32-bit x86, and big-endian s390x are cross type-checked. The residual
-  limits are stated precisely under
+  four further triples — aarch64, 32-bit x86, big-endian s390x, and
+  Windows-MSVC — are cross type-checked and cross-linted without being executed.
+  The residual limits are stated precisely under
   [Portability](#portability-what-ci-actually-exercises).
 - **Fuzzing (done).** A detached `cargo-fuzz` crate under `fuzz/` ships targets
   for inflate, deflate round-trip, gzip parsing, checksums, and the FFI

@@ -164,12 +164,12 @@ every entry in one would have to be invented.
   [`tests/gzip_compat.rs`](tests/gzip_compat.rs); checksum known-answer vectors
   in [`tests/checksum.rs`](tests/checksum.rs); and the two-tier byte-identity and
   wire-format gate in [`tests/interop.rs`](tests/interop.rs).
-  **956 tests pass** by default — 797 in-crate unit tests, 130 integration tests
+  **959 tests pass** by default — 799 in-crate unit tests, 131 integration tests
   (`checksum` 23, `gzip_compat` 17, `inflate_coverage` 29, `interop` 30,
-  `regression` 12, `round_trip` 19), and 29 doctests (28 runnable plus one
+  `regression` 13, `round_trip` 19), and 29 doctests (28 runnable plus one
   `compile_fail`) — with **0 failed and 0 ignored**. `--no-default-features`
-  passes **695** (571 unit + 97 integration + 27 doctests) and `--all-features`
-  passes **969**. CI parses every
+  passes **696** (571 unit + 98 integration + 27 doctests) and `--all-features`
+  passes **972**. CI parses every
   `test result:` line and fails on any failure, on any *ignored* test, or on a
   count below a per-row lower bound, because `cargo test` exits 0 when tests are
   skipped.
@@ -205,10 +205,9 @@ every entry in one would have to be invented.
 - **Repository hygiene shipped with this release:**
   [`rust-toolchain.toml`](rust-toolchain.toml) pinning the toolchain to the MSRV,
   [`clippy.toml`](clippy.toml) and [`rustfmt.toml`](rustfmt.toml) pinning lint
-  and format behaviour, [`deny.toml`](deny.toml) and
-  [`fuzz/deny.toml`](fuzz/deny.toml) as the `cargo-deny` policies over the
-  governed dependency closure — one reviewed policy per graph, the root graph and
-  the detached fuzz graph — [`.cargo/config.toml`](.cargo/config.toml),
+  and format behaviour, [`deny.toml`](deny.toml) as the single `cargo-deny` policy
+  over the governed dependency closure — one reviewed rulebook for both the root
+  graph and the detached fuzz graph — [`.cargo/config.toml`](.cargo/config.toml),
   [`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md), and this
   file.
 
@@ -337,9 +336,11 @@ the security properties the initial release establishes.
 - **Supply-chain gates over the governed closure of 102 packages** — 89 pinned by
   [`Cargo.lock`](Cargo.lock) and 13 by [`fuzz/Cargo.lock`](fuzz/Cargo.lock), both
   committed deliberately because the crate ships `cdylib`/`staticlib`
-  distributables. [`deny.toml`](deny.toml) over the root graph and
-  [`fuzz/deny.toml`](fuzz/deny.toml) over the fuzz graph — each named at its call
-  site with an explicit `--config` — declare `[advisories]`,
+  distributables. [`deny.toml`](deny.toml) governs both the root graph and the
+  detached fuzz graph — named at each call site with an explicit `--config`, which
+  is mandatory on the fuzz invocation because `fuzz/` holds no policy of its own and
+  a discovery miss falls back silently to built-in defaults. It declares
+  `[advisories]`,
   `[licenses]`, `[bans]`, and `[sources]`, resolves the graph with
   `all-features = true`, denies yanked crates (`yanked = "deny"`), and bounds
   advisory-database staleness (`maximum-db-staleness = "P7D"`). Its
@@ -348,7 +349,7 @@ the security properties the initial release establishes.
   `[bans] deny` list keeps
   `cc`, `bindgen`, `pkg-config`, `libz-sys`, and the bzip2/lzma/zstd/brotli
   families out of the graph by name.
-  Both policies hold duplicate major versions to the same standard
+  The policy holds duplicate major versions to a single standard on both graphs
   (`[bans] multiple-versions = "deny"` with
   `multiple-versions-include-dev = true` — the second key is load-bearing, since
   every duplication here is dev-only and the check would otherwise report `bans ok`
@@ -357,26 +358,29 @@ the security properties the initial release establishes.
   duplications — `rand@0.10.2`, `rand_core@0.10.1`, `getrandom@0.4.3`, and
   `r-efi@6.0.0`, the chain reached through `quickcheck 1.1.0` — are acknowledged
   individually with exact-version `skip` entries that expire on the next bump, and
-  `skip-tree` is deliberately empty in both files because a subtree waiver would
+  `skip-tree` is deliberately empty because a subtree waiver would
   silently widen as the tree changes. `r-efi@6.0.0` is the fourth precisely
   *because* `[graph] targets` is empty: the nine-triple list `deny.toml` used to
   carry pruned it out of view, which was a coverage hole rather than a refinement,
   and acknowledging it explicitly is what closing that hole costs. The two things
-  the fuzz graph legitimately needs are scoped rather than waived: `cc` stays in
-  `[bans] deny` but carries `wrappers = ["libfuzzer-sys"]`, and NCSA is granted
-  crate-scoped rather than globally — load-bearing in `fuzz/deny.toml`, where those
-  crates live, and kept verbatim in `deny.toml`, where they do not, as latent
-  defence in depth. Run as documented in [`CONTRIBUTING.md`](CONTRIBUTING.md), both
-  invocations report `advisories ok, bans ok, licenses ok, sources ok`: the root
-  command line carries `-A unused-wrapper -A license-exception-not-encountered` for
-  exactly those two latent entries, the fuzz command line carries no allowance at
-  all, and both codes stay at full severity on the graph where they mean something.
+  the fuzz graph legitimately needs are scoped rather than waived, which is exactly
+  what lets one file govern both graphs: `cc` stays in `[bans] deny` but carries
+  `wrappers = ["libfuzzer-sys"]`, so it is admitted only as that crate's build
+  dependency, and NCSA is granted crate-scoped rather than globally. Run as
+  documented in [`CONTRIBUTING.md`](CONTRIBUTING.md), both invocations report
+  `advisories ok, bans ok, licenses ok, sources ok`. Five `-A` allowances are the
+  whole cost of one policy spanning two graphs — `unused-wrapper` and
+  `license-exception-not-encountered` on the root invocation for the two entries
+  covering fuzz-graph-only crates, and `license-not-encountered`, `unmatched-skip`
+  and `unnecessary-skip` on the fuzz invocation for the root-only `Unicode-3.0`
+  allowance and the four duplicate-major pins. Each is downgraded only on the graph
+  where the entry it covers cannot match, and stays at full severity on the other.
   [`.github/workflows/audit.yml`](.github/workflows/audit.yml) runs the gate on
   push, pull request, a daily schedule, and manual dispatch as four independent
-  blocking jobs — `policy-integrity` (both policy files, `deny.toml` and
-  `fuzz/deny.toml`, still exist, still declare every governed table, still hold
-  every load-bearing key at its reviewed value, and still agree on every shared
-  key, so section-level erosion cannot pass vacuously), `cargo-audit` (both
+  blocking jobs — `policy-integrity` (`deny.toml` still exists, still declares every
+  governed table, still holds every load-bearing key at its reviewed value, and is
+  still the only cargo-deny policy in the tree, so neither section-level erosion nor
+  a second rulebook can pass unnoticed), `cargo-audit` (both
   lockfiles),
   `cargo-deny` (all four root categories), and `cargo-deny-fuzz` (the detached
   fuzz graph). None declares `needs:`, so one failing category cannot mask
@@ -434,6 +438,21 @@ the security properties the initial release establishes.
     the reference byte for byte.
 - **Decompression accepts any valid stream** — zlib, raw DEFLATE, or gzip —
   including output from other implementations.
+- **A gzip destination that accepts nothing is retried in place, exactly as C
+  retries it.** C's write loops have a single success arm — `state->x.next += writ`
+  in the drain loop and `strm->next_in += writ` in the transparent one
+  (`gzwrite.c` L76-L90, L112-L124) — so a `write(2)` returning `0` for a non-empty
+  request advances no cursor and the enclosing `while` re-issues the identical
+  request. Both loops in [`src/gz/write.rs`](src/gz/write.rs) reproduce that shape
+  rather than special-casing it, so `gzwrite` reports the same count and `gzerror`
+  the same code a C caller would see. An earlier revision reported the condition as
+  a *retryable* `Z_ERRNO` and listed it as a sixth documented divergence; that was
+  a behavioural change no C caller can observe in reference zlib, it was not one of
+  the five §0.8.2 sanctions, and it has been removed. The retry is bounded for the
+  same reason C's is: POSIX permits a `0` return only for a zero-length request,
+  and neither loop ever issues one. Four unit tests pin the shape, two asserting
+  that a refusal moves the cursor by exactly zero and two that a refusal mid-loop
+  is invisible to the caller.
 - **Live C-ABI drop-in verification**, statically and dynamically linked:
 
   ```text
@@ -468,10 +487,10 @@ the security properties the initial release establishes.
   | `cargo fmt --all -- --check` | exit 0 |
   | `cargo clippy --locked --all-targets --all-features -- -D warnings` | exit 0 |
   | `cargo build --locked` | exit 0 |
-  | `cargo test --locked` | **956 passed / 0 failed / 0 ignored** |
-  | `cargo test --locked --no-default-features` | **695 passed / 0 failed / 0 ignored** |
+  | `cargo test --locked` | **959 passed / 0 failed / 0 ignored** |
+  | `cargo test --locked --no-default-features` | **696 passed / 0 failed / 0 ignored** |
   | `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features` | exit 0, 0 warnings |
-  | `mkdocs build --strict` | exit 0, 0 strict diagnostics |
+  | `mkdocs build --strict --site-dir "$(mktemp -d)/site"` | exit 0, 0 strict diagnostics |
 
   On the documentation row, "0 strict diagnostics" means no `WARNING` and no
   `ERROR` from MkDocs, its plugins, or this project's content. The Material theme
@@ -504,51 +523,64 @@ the security properties the initial release establishes.
 All of the following are **deliberate and preserved**, not pending fixes
 (AAP §0.8.2). Each is listed with the reason it must stay.
 
-The list above is exactly the set of divergences a **C caller can observe**. Internal departures that are invisible at the C ABI are tracked separately in `CONTRIBUTING.md` rather than here, because each is strictly stricter or strictly safer than C while leaving the return-code set, the struct layout, and the emitted bytes untouched: `deflateSetHeader` deep-copies the header instead of retaining the caller's pointer and still reports through C's exact `{Z_OK, Z_STREAM_ERROR}` return set; opaque state is kind-tagged so a cross-engine `End` is a defined error rather than C's undefined reinterpretation; indexing is bounds-checked; and allocation is fallible with no global fallback.
+#### The five divergences a C caller can observe
 
-- **`gzprintf` / `gzvprintf` return `Z_STREAM_ERROR`.** Consuming a C `va_list`
-  requires the nightly-only `c_variadic` language feature, which would break the
-  crate's stable build and its MSRV contract. Both symbols are still exported with
-  the correct signatures — removing them would break linkage — and the limitation
-  is **programmatically detectable**: `zlibCompileFlags` sets **bit 27**, exactly
-  as a C zlib built without a secure `vsnprintf` does. Measured through the C ABI:
-  `zlibCompileFlags() = 0x080000a9` (bit 27 set) and `gzprintf(NULL, "x") = -2`,
-  which is `Z_STREAM_ERROR`. The idiomatic Rust `gzprintf`, which takes
-  `core::fmt::Arguments` instead of a `va_list`, formats fully.
-- **`inflate_strict` defaults to OFF.** Enabling it changes which streams are
-  accepted, so the default build deliberately matches a default-built reference
-  zlib. Byte-exactness and acceptance parity take precedence over stricter
-  validation; enable the feature only to reject out-of-window distances early.
-- **`gzclose` / `gzclose_w` remain mandatory.** The gzip state's `Drop` is
-  intentionally empty of finishing logic, because a destructor cannot surface a
-  deferred compression or I/O error — silently swallowing a failed write of a
-  member's final block and trailer during unwinding would be strictly worse than
-  matching C's explicit-close contract. This is a documented departure from
-  idiomatic Rust cleanup and must not be "improved" into an auto-finishing
-  destructor.
-- **Exported symbols carry no `@ZLIB_x.y.z` version tags by default.** The symbol
-  *set* is exactly right (95 emitted, 54/54 `zlib.map` globals, 0/10 locals
-  leaked); only the version *tags* are absent, and static linking, ordinary
-  dynamic linking, `-lz` substitution, and `LD_PRELOAD` are all unaffected.
-  Opting in with `ZLIB_RS_VERSION_SCRIPT=1` makes [`build.rs`](build.rs) derive a
-  version script from [`zlib.map`](zlib.map) and apply it to the `cdylib`,
-  yielding the same 95 symbols with 54 tagged and all 16 `ZLIB_*` nodes declared.
-  It is off by default because a version script is a GNU-ld/ELF-only construct and
-  no CI row sets the variable, so the opt-in path carries linker-portability risk
-  the matrix does not yet retire.
-- **A gzip destination that accepts nothing yields a *retryable* `Z_ERRNO`
-  instead of an endless retry.** C's inner drain loop leaves its output cursor
-  unchanged when `write(2)` returns `0` for a non-empty request and simply tries
-  again forever, which is an unbounded spin inside the library (CWE-835). Both
-  Rust output loops report the condition instead and mark it retryable, so the
-  output cursor and the buffered input are retained, the stream is not declared
-  dead, and `gzwrite` reports its true partial count rather than `0` — a retry
-  therefore reaches exactly the outcome C's spin would have. POSIX allows a `0`
-  return only for a zero-length write, which neither loop ever issues, so the
-  case is as unreachable in practice as C's retry.
-- **The retained C baseline is excluded from the published crate.** It is
-  indispensable in-repository — oracle, specification, and the source of the
-  official test vectors — and dead weight in a `crates.io` package.
+The same five, numbered in the same order, appear in
+[`CONTRIBUTING.md`](CONTRIBUTING.md#five-divergences-that-must-be-preserved-not-fixed)
+and [`SECURITY.md`](SECURITY.md#what-is-not-a-vulnerability). Adding one, removing
+one, or altering one's scope is a change to the drop-in contract and must be
+recorded in all three.
+
+1. **`gzprintf` / `gzvprintf` return `Z_STREAM_ERROR`.** Consuming a C `va_list`
+   requires the nightly-only `c_variadic` language feature, which would break the
+   crate's stable build and its MSRV contract. Both symbols are still exported
+   with the correct signatures — removing them would break linkage — and the
+   limitation is **programmatically detectable**: `zlibCompileFlags` sets **bit
+   27**, exactly as a C zlib built without a secure `vsnprintf` does. Measured
+   through the C ABI: `zlibCompileFlags() = 0x080000a9` (bit 27 set) and
+   `gzprintf(NULL, "x") = -2`, which is `Z_STREAM_ERROR`. The idiomatic Rust
+   `gzprintf`, which takes `core::fmt::Arguments` instead of a `va_list`, formats
+   fully.
+2. **`inflate_strict` defaults to OFF.** Enabling it changes which streams are
+   accepted, so the default build deliberately matches a default-built reference
+   zlib. Byte-exactness and acceptance parity take precedence over stricter
+   validation; enable the feature only to reject out-of-window distances early.
+3. **The retained C baseline is excluded from the published crate.** It is
+   indispensable in-repository — oracle, specification, and the source of the
+   official test vectors — and dead weight in a `crates.io` package.
+4. **Exported symbols carry no `@ZLIB_x.y.z` version tags by default.** The symbol
+   *set* is exactly right (95 emitted, 54/54 `zlib.map` globals, 0/10 locals
+   leaked); only the version *tags* are absent, and static linking, ordinary
+   dynamic linking, `-lz` substitution, and `LD_PRELOAD` are all unaffected.
+   Opting in with `ZLIB_RS_VERSION_SCRIPT=1` makes [`build.rs`](build.rs) derive a
+   version script from [`zlib.map`](zlib.map) and apply it to the `cdylib`,
+   yielding the same 95 symbols with 54 tagged and all 16 `ZLIB_*` nodes declared.
+   It is off by default because a version script is a GNU-ld/ELF-only construct
+   and no CI row sets the variable, so the opt-in path carries linker-portability
+   risk the matrix does not yet retire.
+5. **`gzclose` / `gzclose_w` remain mandatory.** The gzip state's `Drop` is
+   intentionally empty of finishing logic, because a destructor cannot surface a
+   deferred compression or I/O error — silently swallowing a failed write of a
+   member's final block and trailer during unwinding would be strictly worse than
+   matching C's explicit-close contract. This is a documented departure from
+   idiomatic Rust cleanup and must not be "improved" into an auto-finishing
+   destructor.
+
+Those five are exactly the divergences a **C caller can observe**. Internal
+departures that are invisible at the C ABI are tracked in
+[`CONTRIBUTING.md`](CONTRIBUTING.md#internal-divergences-that-are-invisible-at-the-c-abi)
+rather than here, because each is strictly stricter or strictly safer than C while
+leaving the return-code set, the struct layout, and the emitted bytes untouched:
+opaque state is kind-tagged so a cross-engine `End` is a defined error rather than
+C's undefined reinterpretation; indexing is bounds-checked; and allocation is
+fallible with no global fallback. `deflateSetHeader` is **not** one of them — it
+retains the caller's pointer exactly as C does, which is why the caller must keep
+the `gz_header` and its `extra` / `name` / `comment` buffers alive and unmodified
+until the header has been emitted (`zlib.h` L843-L847), and why the entry point
+allocates nothing and still reports through C's exact `{Z_OK, Z_STREAM_ERROR}` set.
+
+#### General limitations, which are not compatibility divergences
+
 - **Platform coverage, stated honestly.** CI runs **twelve jobs**. Windows
   (x86_64) and macOS (aarch64) execute the real suite natively, which is what
   exercises `OS_CODE = 10`, `OS_CODE = 19`, and the `#[cfg(windows)]`-gated
@@ -558,8 +590,12 @@ The list above is exactly the set of divergences a **C caller can observe**. Int
   coverage cannot silently decay into a compile-only check. Each row also asserts
   its own `rustc -vV` host triple and `runner.arch`, so a runner label that
   changes architecture fails the job rather than weakening the claim.
-  `aarch64`, 32-bit `i686`, and **big-endian** `s390x` are **cross
-  type-checked, not natively run**, and the bare-metal `thumbv7em-none-eabihf`
+  Four further triples — `aarch64`, 32-bit `i686`, **big-endian** `s390x`, and
+  `x86_64-pc-windows-msvc` — are **cross type-checked and cross-linted, not
+  natively run**; that last one is the cross Windows lane and is not a second
+  count of the native Windows row above, since it reaches the whole
+  `cfg(windows)` surface with every feature on while executing nothing. The
+  bare-metal `thumbv7em-none-eabihf`
   target is **built, not run**. So a 32-bit, big-endian, or bare-metal build is
   compile-verified rather than runtime-verified, and `no_std` has been validated on
   a hosted target rather than on real embedded hardware. The declared lifecycle is

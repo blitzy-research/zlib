@@ -22,8 +22,13 @@
 #                 generated-table reproducibility and big-endian checks
 #   c-abi-linkage  the emitted cdylib/staticlib linked, dynamically linked and
 #                 dlopen'd by a C consumer on every std-off feature row
-#   cross-targets  cross TYPE-CHECK ONLY (nothing is executed) on the aarch64,
-#                 32-bit i686 and big-endian s390x Linux triples (gap D3)
+#   cross-targets  cross TYPE-CHECK + CLIPPY ONLY (nothing is executed) on FOUR
+#                 foreign triples: the aarch64, 32-bit i686 and big-endian s390x
+#                 Linux triples, plus x86_64-pc-windows-msvc cross-checked FROM
+#                 Linux. That fourth row is not redundant with the native
+#                 `windows-latest` row in `build-test`: this one is cross and
+#                 wide (`--all-features`), that one is native and narrow, and
+#                 neither links (gap D3)
 #   bare-metal-no-std  library build for thumbv7em-none-eabihf: the only
 #                 configuration that compiles `mod no_std_support` for
 #                 `target_os = "none"` and reaches its 32-bit `MIN_ALIGN = 8`
@@ -344,7 +349,7 @@ jobs:
             arch: X64
             features: ''
             test: true
-            min_tests: 956
+            min_tests: 959
           # Every feature turned on at once.
           - name: All features
             os: ubuntu-latest
@@ -352,7 +357,7 @@ jobs:
             arch: X64
             features: '--all-features'
             test: true
-            min_tests: 969
+            min_tests: 972
           # gzip framing + gz file-I/O layer on top of std.
           - name: gzip + gz-io
             os: ubuntu-latest
@@ -360,7 +365,7 @@ jobs:
             arch: X64
             features: '--no-default-features --features std,gzip,gz-io'
             test: true
-            min_tests: 956
+            min_tests: 959
           # simd-enabled CRC-32 on top of std, with the gzip framing and gz
           # file-I/O layers OFF. That combination is what makes this row distinct
           # rather than a second copy of another one: `Default features` already
@@ -389,7 +394,7 @@ jobs:
             # ubuntu rows because `gz-io` is off: `tests/gzip_compat.rs`
             # contributes nothing and the `cfg(feature = "gzip")` /
             # `cfg(feature = "gz-io")` unit tests do not exist.
-            min_tests: 703
+            min_tests: 704
           # Core-only (no_std) LIBRARY build. `test: false` is what makes this row
           # distinct rather than redundant: `mod no_std_support` in `src/lib.rs` is
           # gated on `all(not(feature = "std"), not(test), panic = "abort")`, so a
@@ -451,7 +456,15 @@ jobs:
             arch: X64
             features: ''
             test: true
-            min_tests: 941
+            # 944 = the 941 previously measured on this row plus the three
+            # platform-unconditional tests added since (two in `src/gz/write.rs`'s
+            # `#[cfg(test)] mod tests`, one in `tests/regression.rs`); none carries a
+            # `#[cfg(unix)]` / `#[cfg(windows)]` gate, so every row that runs the
+            # suite gains the same three. The row stays BELOW the ubuntu floor on
+            # purpose: some tests are `#[cfg(unix)]`-only. If a future change
+            # legitimately excludes a test here, lower THIS row with a note rather
+            # than loosening the ubuntu rows.
+            min_tests: 944
           # Native macOS: builds for the runner's own triple and, unlike a cross
           # row, EXECUTES the suite. This row PINS both that triple
           # (`aarch64-apple-darwin`) and the architecture GitHub reports
@@ -472,7 +485,11 @@ jobs:
             arch: ARM64
             features: ''
             test: true
-            min_tests: 941
+            # 944, derived exactly as the Windows row above: 941 plus the three
+            # platform-unconditional tests added since. macOS is a unix target, so
+            # the `#[cfg(unix)]` tests DO run here; the shared 941 base reflects the
+            # non-unix-specific exclusions both native rows share.
+            min_tests: 944
     steps:
     - name: Checkout repository
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -764,7 +781,7 @@ jobs:
     # bare numeric floor comes back.
     env:
       RUSTUP_TOOLCHAIN: stable
-      STD_OFF_FLOOR: 695
+      STD_OFF_FLOOR: 696
     steps:
     - name: Checkout repository
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -829,7 +846,7 @@ jobs:
     # tests are silently lost, and AAP directive D-5 fixes the suite at
     # "preserved and only ever increased, zero ignored" (finding TEST-08).
     #
-    # The floor is STD_OFF_FLOOR (695) on all four, the measured std-off total. It is
+    # The floor is STD_OFF_FLOOR (696) on all four, the measured std-off total. It is
     # LOWER than the default-feature total by design: `gz-io` is off, so the
     # `tests/gzip_compat.rs` target contributes nothing and several
     # `cfg(feature = "gz-io")` unit tests do not exist. That gap is the reason
@@ -1275,8 +1292,9 @@ jobs:
     # whatever patch the runner's tool cache happens to hold on the day, so the
     # interpreter running the docs gate would change without a commit - the same
     # defect `--locked` exists to prevent on the Rust side. It also has a concrete
-    # consequence here: `docs-requirements.txt` carries `cp312` wheel digests, so
-    # the interpreter minor version is part of what that lock is a lock FOR.
+    # consequence here: the hash-pinned closure in the next step carries `cp312`
+    # wheel digests, so the interpreter minor version is part of what that lock is
+    # a lock FOR.
     #
     # Refreshing the patch is ordinary maintenance: bump it here and in the
     # assertion in the next step, in the same commit.
@@ -1304,8 +1322,50 @@ jobs:
     #
     # The interpreter and the three direct versions are asserted AFTER the
     # install, so the log states what actually landed instead of what was asked
-    # for. See `.github/workflows/docs-requirements.txt` for the closure, the
-    # target environment it is pinned against, and the regeneration recipe.
+    # for.
+    #
+    # THE CLOSURE IS INLINE, in the heredoc inside the step below, and it is
+    # written to `$RUNNER_TEMP` rather than kept as a checked-in requirements
+    # file. This workflow is the authorized home for the docs gate, so the gate's
+    # data lives here with the gate rather than in a separate path; and writing it
+    # outside the checkout keeps the tree clean for the `git status --porcelain`
+    # assertions in this file, which must fail only for a real regression.
+    #
+    # TARGET ENVIRONMENT: CPython 3.12 on 64-bit Linux (`ubuntu-latest`), which is
+    # why `python-version` above pins a FULL patch release rather than the `3.12`
+    # series. Each entry carries the digests of every artifact CPython 3.12 on
+    # manylinux-x86_64 can legitimately select: the pure-Python `py3`/`py2.py3`
+    # wheel, plus the `cp312-cp312` manylinux x86_64 wheel where the project
+    # publishes compiled artifacts. Source distributions are deliberately NOT
+    # listed and the install passes `--only-binary=:all:`, because building an
+    # sdist under `--require-hashes` would need unhashed build-time dependencies.
+    # A different interpreter minor version or a non-x86_64 runner fails the
+    # install rather than silently installing something else; regenerate for the
+    # new target instead of relaxing the gate.
+    #
+    # HOW TO REGENERATE (do this; never hand-edit a digest):
+    #
+    #   1. python -m pip download -d /tmp/docs-wheels --only-binary=:all: \
+    #        --python-version 3.12 --implementation cp --abi cp312 \
+    #        --platform manylinux_2_17_x86_64 --platform manylinux2014_x86_64 \
+    #        --platform manylinux_2_28_x86_64 --platform any \
+    #        'mkdocs==1.6.1' 'mkdocs-techdocs-core==1.7.0' \
+    #        'mkdocs-mermaid2-plugin==1.2.3'
+    #   2. Record the sha256 digests PyPI publishes for each resolved name's
+    #      CPython-3.12-compatible wheels (`pip hash <file>` also works on the
+    #      downloaded artifacts).
+    #   3. Verify, which must exit 0 — extract the heredoc below to a file first:
+    #        python -m pip download -d /tmp/docs-verify --require-hashes \
+    #          --only-binary=:all: --python-version 3.12 --implementation cp \
+    #          --abi cp312 --platform manylinux_2_17_x86_64 \
+    #          --platform manylinux2014_x86_64 --platform manylinux_2_28_x86_64 \
+    #          --platform any -r <extracted-file>
+    #   4. Bump the three direct versions ONLY in a deliberate commit, keeping the
+    #      read-back assertion in this step in step with them.
+    #
+    # The three DIRECT requirements are `mkdocs`, `mkdocs-techdocs-core` and
+    # `mkdocs-mermaid2-plugin`; every other entry is transitive. The comment above
+    # each entry names the artifacts its digests cover.
     - name: Install the pinned MkDocs toolchain
       run: |
         set -euo pipefail
@@ -1314,11 +1374,169 @@ jobs:
         got_python="$(python -c 'import platform; print(platform.python_version())')"
         [ "$got_python" = "$want_python" ] || { echo "::error::the docs job resolved"\
           " CPython $got_python, not the pinned $want_python. The setup-python input"\
-          " above and the cp312 wheel digests in docs-requirements.txt no longer"\
+          " above and the cp312 wheel digests in the closure below no longer"\
           " describe the same interpreter"; exit 1; }
+        # `$RUNNER_TEMP`, not the checkout: the closure is job input, not a
+        # tracked artifact, and the tree must stay clean for the
+        # `git status --porcelain` assertions in this workflow. The heredoc is
+        # quoted (`<<'REQS'`) so no `$` or `\` in a digest line is expanded.
+        reqs="$RUNNER_TEMP/docs-requirements.txt"
+        cat > "$reqs" <<'REQS'
+        # babel-2.18.0-py3-none-any.whl
+        babel==2.18.0 \
+            --hash=sha256:e2b422b277c2b9a9630c1d7903c2a00d0830c409c59ac8cae9081c92f1aeba35
+        # backrefs-8.0-py312-none-any.whl
+        backrefs==8.0 \
+            --hash=sha256:87f0fae8c5f207fe9f4b2887efc71d42f4900ac78faa1af08d675ef303692dc5
+        # beautifulsoup4-4.15.0-py3-none-any.whl
+        beautifulsoup4==4.15.0 \
+            --hash=sha256:d6f88de62e1d4e38ecb1077eb9724cd0eff29d2a08ca16a401e9b9e93f117cf9
+        # certifi-2026.7.22-py3-none-any.whl
+        certifi==2026.7.22 \
+            --hash=sha256:62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775
+        # charset_normalizer-3.4.9-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
+        # charset_normalizer-3.4.9-py3-none-any.whl
+        charset-normalizer==3.4.9 \
+            --hash=sha256:5e226f6218febc71f6c1fc2fafb91c226f75bdc1d8fb12d66823716e891608fd \
+            --hash=sha256:68e5f26a1ad57ded6d1cfb85331d1c1a195314756471d97758c48498bb4dcdf5
+        # click-8.4.1-py3-none-any.whl
+        click==8.4.1 \
+            --hash=sha256:482be17c6991b8c19c5429a1e995d9b0efdbb63172824c41f99965dc0ade8ec2
+        # colorama-0.4.6-py2.py3-none-any.whl
+        colorama==0.4.6 \
+            --hash=sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6
+        # editorconfig-0.17.1-py3-none-any.whl
+        EditorConfig==0.17.1 \
+            --hash=sha256:1eda9c2c0db8c16dbd50111b710572a5e6de934e39772de1959d41f64fc17c82
+        # ghp_import-2.1.0-py3-none-any.whl
+        ghp-import==2.1.0 \
+            --hash=sha256:8337dd7b50877f163d4c0289bc1f1c7f127550241988d568c1db512c4324a619
+        # idna-3.18-py3-none-any.whl
+        idna==3.18 \
+            --hash=sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2
+        # jinja2-3.1.6-py3-none-any.whl
+        Jinja2==3.1.6 \
+            --hash=sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67
+        # jsbeautifier-2.0.3-py3-none-any.whl
+        jsbeautifier==2.0.3 \
+            --hash=sha256:f0190e279a2cdb827556ada63f41c9c63c11f8116ee06e264b24aa50311cbee3
+        # markdown-3.10.3-py3-none-any.whl
+        Markdown==3.10.3 \
+            --hash=sha256:fa6c92a00a4a3c98b22728c64a935ae1928250ae65058a6ded814d2cc29a4cea
+        # markdown_graphviz_inline-1.1.3-py3-none-any.whl
+        markdown_graphviz_inline==1.1.3 \
+            --hash=sha256:3571f7da594533b6c2c9ef08a6ce582396b64f778e47ac3678f00e75b2652909
+        # markupsafe-3.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
+        MarkupSafe==3.0.3 \
+            --hash=sha256:d6dd0be5b5b189d31db7cda48b91d7e0a9795f31430b7f271219ab30f1d3ac9d
+        # mdx_truly_sane_lists-1.3-py3-none-any.whl
+        mdx-truly-sane-lists==1.3 \
+            --hash=sha256:b9546a4c40ff8f1ab692f77cee4b6bfe8ddf9cccf23f0a24e71f3716fe290a37
+        # mergedeep-1.3.4-py3-none-any.whl
+        mergedeep==1.3.4 \
+            --hash=sha256:70775750742b25c0d8f36c55aed03d24c3384d17c951b3175d898bd778ef0307
+        # mkdocs-1.6.1-py3-none-any.whl
+        mkdocs==1.6.1 \
+            --hash=sha256:db91759624d1647f3f34aa0c3f327dd2601beae39a366d6e064c03468d35c20e
+        # mkdocs_get_deps-0.2.2-py3-none-any.whl
+        mkdocs-get-deps==0.2.2 \
+            --hash=sha256:e7878cbeac04860b8b5e0ca31d3abad3df9411a75a32cde82f8e44b6c16ff650
+        # mkdocs_github_admonitions_plugin-0.1.1-py3-none-any.whl
+        mkdocs-github-admonitions-plugin==0.1.1 \
+            --hash=sha256:824dc821764171943c1043c88218d4af0329693870ba9be657f890d484a0aa85
+        # mkdocs_material-9.7.6-py3-none-any.whl
+        mkdocs-material==9.7.6 \
+            --hash=sha256:71b84353921b8ea1ba84fe11c50912cc512da8fe0881038fcc9a0761c0e635ba
+        # mkdocs_material_extensions-1.3.1-py3-none-any.whl
+        mkdocs-material-extensions==1.3.1 \
+            --hash=sha256:adff8b62700b25cb77b53358dad940f3ef973dd6db797907c49e3c2ef3ab4e31
+        # mkdocs_mermaid2_plugin-1.2.3-py3-none-any.whl
+        mkdocs-mermaid2-plugin==1.2.3 \
+            --hash=sha256:33f60c582be623ed53829a96e19284fc7f1b74a1dbae78d4d2e47fe00c3e190d
+        # mkdocs_monorepo_plugin-1.1.2-py3-none-any.whl
+        mkdocs-monorepo-plugin==1.1.2 \
+            --hash=sha256:4b917bc224b89e34e1736bb31ad5ae9deb0a907da879e03bb9454b41fb8b1cac
+        # mkdocs_redirects-1.2.3-py3-none-any.whl
+        mkdocs-redirects==1.2.3 \
+            --hash=sha256:ec7312fff462d03ec16395d0c001006a418f8d0c21cdf2b47ff11cf839dc3ce0
+        # mkdocs_techdocs_core-1.7.0-py3-none-any.whl
+        mkdocs-techdocs-core==1.7.0 \
+            --hash=sha256:294c41a69b1c95def9534196fe74f0ef0cfd9625a5aef1fd70c0094ef600f9b4
+        # packaging-26.2-py3-none-any.whl
+        packaging==26.2 \
+            --hash=sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e
+        # paginate-0.5.7-py2.py3-none-any.whl
+        paginate==0.5.7 \
+            --hash=sha256:b885e2af73abcf01d9559fd5216b57ef722f8c42affbb63942377668e35c7591
+        # pathspec-1.1.1-py3-none-any.whl
+        pathspec==1.1.1 \
+            --hash=sha256:a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189
+        # plantuml_markdown-3.11.2-py3-none-any.whl
+        plantuml-markdown==3.11.2 \
+            --hash=sha256:45eb97fed669cc23c90593ae1d42122809bfc3693970a6edb0004c0dc20cde27
+        # platformdirs-4.11.0-py3-none-any.whl
+        platformdirs==4.11.0 \
+            --hash=sha256:360ccded2b7fce0af0ff80cc8f5942a1c5d99b0e856033acb030bfc634709e74
+        # properdocs-1.6.7-py3-none-any.whl
+        properdocs==1.6.7 \
+            --hash=sha256:6fa0cfa2e01bf338f684892c8a506cf70ea88ae7f3479c933b6fa20168101cbd
+        # pygments-2.20.0-py3-none-any.whl
+        Pygments==2.20.0 \
+            --hash=sha256:81a9e26dd42fd28a23a2d169d86d7ac03b46e2f8b59ed4698fb4785f946d0176
+        # pymdown_extensions-10.21.3-py3-none-any.whl
+        pymdown-extensions==10.21.3 \
+            --hash=sha256:d7a5d08014fc571e80ca21dd6f854e31f94c489800350564d55d15b3c41e76b6
+        # python_dateutil-2.9.0.post0-py2.py3-none-any.whl
+        python-dateutil==2.9.0.post0 \
+            --hash=sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427
+        # python_slugify-8.0.4-py2.py3-none-any.whl
+        python-slugify==8.0.4 \
+            --hash=sha256:276540b79961052b66b7d116620b36518847f52d5fd9e3a70164fc8c50faa6b8
+        # pyyaml-6.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
+        PyYAML==6.0.3 \
+            --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc
+        # pyyaml_env_tag-1.1-py3-none-any.whl
+        pyyaml_env_tag==1.1 \
+            --hash=sha256:17109e1a528561e32f026364712fee1264bc2ea6715120891174ed1b980d2e04
+        # requests-2.34.2-py3-none-any.whl
+        requests==2.34.2 \
+            --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0
+        # setuptools-83.0.0-py3-none-any.whl
+        setuptools==83.0.0 \
+            --hash=sha256:29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3
+        # six-1.17.0-py2.py3-none-any.whl
+        six==1.17.0 \
+            --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274
+        # soupsieve-2.9.1-py3-none-any.whl
+        soupsieve==2.9.1 \
+            --hash=sha256:4f4477399246b7a0c720a88ca2454b11cd6bb9ae4c9d170140786e916776c14c
+        # text_unidecode-1.3-py2.py3-none-any.whl
+        text-unidecode==1.3 \
+            --hash=sha256:1311f10e8b895935241623731c2ba64f4c455287888b18189350b67134a822e8
+        # typing_extensions-4.16.0-py3-none-any.whl
+        typing_extensions==4.16.0 \
+            --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8
+        # urllib3-2.7.0-py3-none-any.whl
+        urllib3==2.7.0 \
+            --hash=sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897
+        # watchdog-6.0.0-py3-none-manylinux2014_x86_64.whl
+        watchdog==6.0.0 \
+            --hash=sha256:20ffe5b202af80ab4266dcd3e91aae72bf2da48c0d33bdb15c66658e685e94e2
+        REQS
+        # `--require-hashes` verifies every artifact against its digest AND
+        # refuses to resolve any requirement that is not pinned, so a dependency
+        # appearing in a later release fails the job rather than entering
+        # unnoticed. Asserting the entry count first catches a truncated or
+        # mangled heredoc, which would otherwise install a smaller closure and
+        # still exit 0.
+        want_reqs=46
+        got_reqs="$(grep -cE '^[A-Za-z0-9._-]+==' "$reqs")"
+        [ "$got_reqs" = "$want_reqs" ] || { echo "::error::the inline MkDocs closure"\
+          " holds $got_reqs pinned requirements, not the expected $want_reqs. The"\
+          " heredoc above was truncated or edited without updating this count";
+          exit 1; }
         python -m pip install --disable-pip-version-check --no-input \
-          --require-hashes --only-binary=:all: \
-          -r .github/workflows/docs-requirements.txt
+          --require-hashes --only-binary=:all: -r "$reqs"
         # The lock is the source of truth for the whole closure; these three are
         # the requirements this project chose deliberately, so they are read back
         # by name. A lock edit that moved one of them without a decision fails
@@ -1329,19 +1547,21 @@ jobs:
           want="${pin##*==}"
           got="$(python -m pip show "$name" 2>/dev/null | sed -n 's/^Version: //p' || true)"
           [ "$got" = "$want" ] || { echo "::error::$name resolved to ${got:-nothing},"\
-            " not the pinned $want. docs-requirements.txt and this assertion have"\
-            " drifted apart"; exit 1; }
+            " not the pinned $want. The closure heredoc above and this assertion"\
+            " have drifted apart"; exit 1; }
           echo "pinned and verified: $name $got"
         done
         mkdocs --version
     # `--site-dir` points OUTSIDE the checkout on purpose. A default `mkdocs
-    # build` writes 60 generated files into `<repo>/site`. `/site/` IS in
-    # `.gitignore`, so that alone no longer shows up in `git status --porcelain` -
-    # but an ignore rule only hides the artifact, it does not avoid creating it.
-    # Building outside the checkout leaves the tree untouched rather than merely
-    # unstaged, which is what keeps the `git status --porcelain` assertions in
-    # this workflow (Cargo.lock immutability below, and the packaging job) honest:
-    # they must fail only for a real regression, never for a stray build artifact.
+    # build` writes 60 generated files into `<repo>/site`, which `.gitignore` does
+    # NOT cover - so an unqualified build leaves 60 untracked files behind and the
+    # unscoped `git status --porcelain` assertion in the packaging job fails on a
+    # stray build artifact rather than on a real regression. Widening `.gitignore`
+    # would be the wrong fix twice over: an ignore rule only hides an artifact, it
+    # does not avoid creating it, and hiding it is precisely what would let a real
+    # regression through. Building outside the checkout leaves the tree untouched
+    # rather than merely unstaged, which is what keeps every `git status
+    # --porcelain` assertion in this workflow honest.
     # The documented reproduce commands in `README.md`, `CONTRIBUTING.md`, and
     # `doc/technical-specifications.md` pass `--site-dir` for the same reason.
     - name: Build the documentation site in strict mode
@@ -2366,8 +2586,9 @@ jobs:
   # with `--all-features` the i686 check compiles `c_oracle` (it appears in
   # `--verbose` output), without it that target is skipped entirely. Enabling
   # `c-oracle` costs nothing here because `cargo check` never links and the oracle
-  # harness shells out to a C compiler at RUN time only; all three triples were
-  # measured exit 0 with zero warnings under the widened spelling.
+  # harness shells out to a C compiler at RUN time only; all FOUR triples were
+  # measured exit 0 with zero warnings under the widened spelling, for `check` and
+  # for `clippy -D warnings` alike.
   #
   # A NOTE ON THE 2-SPACE COMMENT LINES IN THIS FILE. `src/lib.rs` locates a job
   # block by scanning for the next line indented exactly two spaces and ending in a
@@ -2776,7 +2997,7 @@ jobs:
     # nothing, since `c-oracle` is not a default feature.
     env:
       RUSTUP_TOOLCHAIN: stable
-      PACKAGED_FLOOR: 956
+      PACKAGED_FLOOR: 959
     steps:
     - name: Checkout repository
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

@@ -226,14 +226,37 @@ const _: () = assert!(
 
 /// The output-bound helper `compress_bound` and its C-parity alias
 /// `compressBound` — the engine-free half of `compress.c`.
-///
-/// The engine-driving entry points `compress` / `compress2` are **not**
-/// re-exported here. They live one layer up in [`crate::deflate`] (and
-/// `uncompress` / `uncompress2` in [`crate::inflate`]) because driving an engine
-/// from layer 3 would be an upward import (AAP §0.3.1, §0.4.2 B2); the crate root
-/// re-exports all six under their `zlib.h` names, so `zlib_rs::compress` and
-/// friends are unaffected.
 pub use compress::{compress_bound, compressBound};
+
+/// The engine-driving one-call compression entry points, at the `util` paths
+/// AAP §0.3.1 publishes them under.
+///
+/// These are **path aliases, not definitions**. The bodies live one layer up, in
+/// [`crate::deflate`], because *driving* an engine from layer 3 would be an
+/// upward import and the layer graph must stay acyclic (AAP §0.4.2 B2). A `pub
+/// use` is a name re-export only: this module gains no call into the engine, no
+/// engine type in any of its own signatures, and therefore no code dependency —
+/// the one-way data flow the layer graph exists to guarantee is untouched.
+///
+/// They are re-exported here because `zlib_rs::util::compress`,
+/// `::compress2`, `::uncompress`, and `::uncompress2` are part of the published
+/// surface AAP §0.3.1 enumerates, and a downstream `use zlib_rs::util::compress2;`
+/// must keep compiling. Removing a public path is a source-breaking change no
+/// matter where the item is defined, so the path is held here permanently rather
+/// than deprecated; the crate root publishes the same six names, and both spellings
+/// resolve to one function.
+///
+/// The module name `compress` (type namespace) and the function name `compress`
+/// (value namespace) coexist without conflict, which is why `[`compress`](mod@compress)`
+/// needs the `mod@` disambiguator in prose but the two `use` items above and below
+/// do not.
+pub use crate::deflate::{compress, compress2};
+
+/// The engine-driving one-call decompression entry points, at the `util` paths
+/// AAP §0.3.1 publishes them under — the [`crate::inflate`] counterparts of the
+/// compression aliases above, held here for the same reason and on the same
+/// terms.
+pub use crate::inflate::{uncompress, uncompress2};
 
 /// Version, compile-flag, and error-string reporting entry points, each paired
 /// with its camelCase C-parity alias (`zlibVersion`, `zlibCompileFlags`,

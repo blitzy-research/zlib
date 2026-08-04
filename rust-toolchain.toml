@@ -64,9 +64,9 @@
 #     not "every job". Of the 17 jobs across the three workflows, 16 invoke
 #     `cargo`/`rustc`/`rustup` and all 16 carry the override; the seventeenth,
 #     `audit.yml`'s `policy-integrity`, runs no Rust binary at all — it is a pure
-#     `python3` structural check over `deny.toml`, `fuzz/deny.toml` and the
-#     workflow files, which also asserts that neither policy file has gone missing
-#     and that the two agree on every shared key, and it
+#     `python3` structural check over `deny.toml` and the workflow files, which also
+#     asserts that the policy has not gone missing and that no SECOND policy file
+#     has appeared anywhere in the tree, and it
 #     installs no toolchain. It therefore correctly sets no
 #     `RUSTUP_TOOLCHAIN`, and adding one would imply a dependency it does not have.
 #

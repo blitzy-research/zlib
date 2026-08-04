@@ -360,6 +360,75 @@ fn test_compress() {
     assert_eq!(&uncompr[..recovered], HELLO, "bad uncompress");
 }
 
+/// The six one-call entry points must also resolve under `zlib_rs::util::…`,
+/// which is where AAP §0.3.1 publishes them.
+///
+/// `compress` / `compress2` are *defined* in `zlib_rs::deflate` and
+/// `uncompress` / `uncompress2` in `zlib_rs::inflate`, because driving an engine
+/// from the utility layer would be an upward import (AAP §0.4.2 B2). That is an
+/// implementation detail: `zlib_rs::util` re-exports all six, so the `util` paths
+/// are part of the published surface and a downstream `use
+/// zlib_rs::util::compress2;` keeps compiling. Removing a public path is a
+/// source-breaking change regardless of where the item is defined, so this test
+/// exists to make that break a *test failure* rather than a downstream discovery.
+///
+/// It is an integration test on purpose: the harness links `zlib_rs` as an
+/// external consumer, so only genuinely `pub` paths resolve here. Driving a real
+/// round trip through them additionally proves each alias reaches the same
+/// function as the crate-root spelling rather than merely naming something.
+#[test]
+fn the_util_paths_publish_all_six_one_call_entry_points() {
+    // Deliberately module-qualified rather than a bare `use`: naming the path in
+    // every call is what makes the test read as an assertion about the path.
+    use zlib_rs::util;
+
+    let source = HELLO;
+
+    // `compress_bound` / `compressBound` — the engine-free sizing pair.
+    let bound = util::compress_bound(source.len());
+    assert_eq!(
+        bound,
+        util::compressBound(source.len()),
+        "the snake_case and camelCase bounds must agree"
+    );
+
+    // `compress` and `compress2` at the `util` paths.
+    let mut one = vec![0u8; bound];
+    let one_len = util::compress(&mut one, source).expect("util::compress");
+    let mut two = vec![0u8; bound];
+    let two_len =
+        util::compress2(&mut two, source, Z_DEFAULT_COMPRESSION).expect("util::compress2");
+    assert_eq!(
+        &one[..one_len],
+        &two[..two_len],
+        "util::compress must be util::compress2 at Z_DEFAULT_COMPRESSION"
+    );
+    assert_eq!(
+        &one[..one_len],
+        &{
+            let mut root = vec![0u8; bound];
+            let n = compress(&mut root, source).expect("crate-root compress");
+            root.truncate(n);
+            root
+        }[..],
+        "the util path and the crate-root path must be the same function"
+    );
+
+    // `uncompress` and `uncompress2` at the `util` paths.
+    let mut back = vec![0u8; UNCOMPR_LEN];
+    let recovered = util::uncompress(&mut back, &one[..one_len]).expect("util::uncompress");
+    assert_eq!(&back[..recovered], HELLO, "util::uncompress round trip");
+
+    let mut back2 = vec![0u8; UNCOMPR_LEN];
+    let mut used = one_len;
+    let mut capacity = back2.len();
+    let recovered2 = util::uncompress2(&mut back2, &one[..one_len], &mut used, &mut capacity)
+        .expect("util::uncompress2");
+    assert_eq!(&back2[..recovered2], HELLO, "util::uncompress2 round trip");
+    assert_eq!(used, one_len, "every compressed byte was consumed");
+    assert_eq!(capacity, recovered2, "the produced count is published");
+}
+
 /// Port of C `test_deflate`: drive the small-buffer deflate loop and assert it
 /// produces a non-empty stream. The byte-exact round-trip is asserted by
 /// [`test_inflate`], which consumes the very same helper output.

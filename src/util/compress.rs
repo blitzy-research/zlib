@@ -21,9 +21,14 @@
 //! length-tracking `compress2_tracked` the FFI shims need — are consequently
 //! defined one layer up, in [`crate::deflate`], which is also where the C
 //! `compress.c` translation unit sits in the `#include` order (it includes
-//! `zlib.h`, not `zutil.h`). They are re-exported unchanged from the crate root,
-//! so `zlib_rs::compress`, `zlib_rs::compress2`, and `zlib_rs::compress_bound`
-//! are exactly the names `zlib.h` publishes.
+//! `zlib.h`, not `zutil.h`). They are re-exported unchanged both from the crate
+//! root and from [`crate::util`] itself, so `zlib_rs::compress`,
+//! `zlib_rs::compress2`, `zlib_rs::compress_bound` and their
+//! `zlib_rs::util::…` spellings all resolve to exactly the names `zlib.h`
+//! publishes (AAP §0.3.1). Re-exporting a *name* upward costs the layer graph
+//! nothing — what §0.4.2 B2 forbids is a *code* dependency running upward, and
+//! neither this module nor [`crate::util`] calls an engine or mentions an engine
+//! type in any signature of its own.
 //!
 //! # Relationship to the C originals
 //!

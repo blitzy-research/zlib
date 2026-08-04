@@ -81,7 +81,7 @@ here: they move with every test added, while that invariant does not.
 
 ## Documented divergences
 
-Six are **visible to a C caller**, each deliberate and none a defect:
+Five are **visible to a C caller**, each deliberate and none a defect:
 
 1. `gzprintf` / `gzvprintf` ship as ABI-compatible stubs returning `Z_STREAM_ERROR`, because rendering a C
    `va_list` needs the nightly-only `c_variadic` feature. This is advertised programmatically through
@@ -93,11 +93,13 @@ Six are **visible to a C caller**, each deliberate and none a defect:
    applying the version script is opt-in.
 5. A gzip handle's `Drop` is intentionally empty of finishing logic, so `gzclose` / `gzclose_w` remain mandatory
    — a destructor cannot surface a deferred compression or I/O error.
-6. A gzip destination that accepts **nothing** (`write(2)` returning `0` for a non-empty request) is reported as a
-   *retryable* `Z_ERRNO` instead of being retried forever, as C's `while (strm->next_out > state->x.next)` loop
-   does. The cursor, the buffered input, and the caller's true partial progress are all retained, so a retry
-   resumes exactly where C would have; POSIX permits that return only for a zero-length write, which this loop
-   never issues, so the case is as unreachable in practice as C's spin.
+
+There is no sixth. In particular, a gzip destination that accepts **nothing** (`write(2)` returning `0` for a
+non-empty request) is **retried in place**, exactly as C retries it: C's write loops advance by `writ` and
+re-test, so a zero-byte acceptance re-issues the identical request. The retry is bounded for the same reason
+C's is — POSIX permits that return only for a zero-length write, and neither loop ever issues one. A destination
+that genuinely cannot accept a byte reports `EAGAIN`/`EWOULDBLOCK`, which *is* surfaced as a retryable
+`Z_ERRNO` with the cursor and the buffered input preserved.
 
 A second class exists and is deliberately kept separate: internal departures from C that are **invisible at the
 C ABI**, because each is strictly stricter or strictly safer than C while leaving the return-code set, the struct
@@ -115,10 +117,14 @@ is compiled and `OS_CODE` is 10), and on `macos-latest` (aarch64, where `OS_CODE
 `gzopen_w` is not merely compiled: `ffi::gz::tests::wide_path_open_round_trip` opens a UTF-16 path through it,
 writes, closes, reopens, and reads the payload back, and a dedicated step runs that test by name so the coverage
 cannot decay into a signature check. Each row also asserts its own `rustc -vV` host triple and `runner.arch`. The
-aarch64, 32-bit `i686`, and big-endian `s390x` Linux triples are **cross type-checked** (with `--all-features`,
-so the `c_oracle` harness and `inflate_strict` arms are included), and the bare-metal `thumbv7em-none-eabihf`
-target is **built** in both `no_std` configurations. A 32-bit, big-endian, or bare-metal build is therefore
-compile-verified rather than runtime-verified, and this page does not claim otherwise.
+aarch64, 32-bit `i686`, and big-endian `s390x` Linux triples plus `x86_64-pc-windows-msvc` are **cross
+type-checked and cross-linted** (with `--all-features`, so the `c_oracle` harness and `inflate_strict` arms are
+included, and with `clippy -D warnings` so a target-conditional lint cannot hide), and the bare-metal
+`thumbv7em-none-eabihf` target is **built** in both `no_std` configurations. The Windows-MSVC triple appears in
+both lists deliberately and means two different things: natively it **runs** the suite with default features,
+while the cross lane reaches the whole `cfg(windows)` surface with every feature on and executes nothing. A
+32-bit, big-endian, or bare-metal build is therefore compile-verified rather than runtime-verified, and this page
+does not claim otherwise.
 
 ## Where to go next
 

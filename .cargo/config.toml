@@ -18,12 +18,18 @@
 #   * NATIVE rows RUN the full suite on their own host triple -- `build-test`
 #     spans `ubuntu-latest`, `windows-latest` and `macos-latest`. A native build
 #     uses the host toolchain's own linker, so there is nothing to redirect.
-#   * CROSS rows TYPE-CHECK ONLY: `cross-targets` runs `cargo check` for
-#     `aarch64-unknown-linux-gnu`, `i686-unknown-linux-gnu` and
-#     `s390x-unknown-linux-gnu`, and `build-script-tests` `cargo check`s the
-#     big-endian arms on `s390x-unknown-linux-gnu`. `cargo check` does not link,
-#     so no cross linker, emulator, or `runner` key is required. That is exactly
-#     why two of those triples have no table below and do not need one.
+#   * CROSS rows TYPE-CHECK AND LINT ONLY: `cross-targets` runs `cargo check`
+#     and `cargo clippy` for FOUR triples -- `aarch64-unknown-linux-gnu`,
+#     `i686-unknown-linux-gnu`, `s390x-unknown-linux-gnu` and
+#     `x86_64-pc-windows-msvc` -- and `build-script-tests` `cargo check`s the
+#     big-endian arms on `s390x-unknown-linux-gnu`. Neither `check` nor `clippy`
+#     links, so no cross linker, emulator, or `runner` key is required. That is
+#     exactly why two of those four triples -- `i686-` and
+#     `s390x-unknown-linux-gnu` -- have no table below and do not need one; the
+#     other two are anchored for reasons that have nothing to do with this lane.
+#     `x86_64-pc-windows-msvc` is the one cross triple that is ALSO reached
+#     natively, by `build-test`'s `windows-latest` row, and the anchor below is
+#     written for that native row; the cross row adds no requirement to it.
 #   * The BARE-METAL row only BUILDS (`bare-metal-no-std`, target
 #     `thumbv7em-none-eabihf`); it never runs, so it needs no `runner`.
 #
@@ -222,6 +228,15 @@
 [target.x86_64-pc-windows-msvc]
 # Reached NATIVELY by the `os: windows-latest` row in `build-test`, which builds
 # and runs the default-feature suite with its own linker and needs nothing here.
+# It is ALSO the one non-Linux triple in the `cross-targets` matrix, cross
+# type-checked and cross-LINTED from Ubuntu with `--all-features`; that lane
+# links nothing either, so it likewise needs no key. The two lanes are
+# deliberately different rather than redundant -- native and narrow versus cross
+# and wide -- and `ci.yml` states the rationale on the matrix entry itself: a
+# `cfg(windows)` diagnostic reachable only with every feature on had no gate
+# before the cross row existed, and `c_ulong` is 32-bit here against 64-bit on
+# LP64, so `unnecessary_cast` fires on exactly one of the two and no Linux-host
+# lane can see which.
 # Anchored because it is the row that COMPILES two Windows-only paths no other
 # job reaches: `gzopen_w` in `src/ffi/gz.rs`, the single `#[cfg(windows)]`-gated
 # symbol behind 96 declared `#[unsafe(no_mangle)]` functions versus 95 emitted

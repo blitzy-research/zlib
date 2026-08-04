@@ -343,9 +343,47 @@ pub type gzFile = *mut gzFile_s;
 /// unconditional: supplying `zalloc`/`zfree` routes allocation through them and
 /// never breaks the stream, and leaving them null works identically to before.
 ///
-/// The boxed engine *state* handle itself is still allocated through the global
-/// allocator (Rust `Box`); it is the working *buffers* — the bulk of a stream's
-/// footprint and precisely what AAP §0.6.3 enumerates — that honor the hook.
+/// # Where the engine *state* itself lives
+///
+/// The working buffers are not the only thing the hook owns. Placement of the
+/// `deflate_state`/`inflate_state` value is decided by `EngineReservation` in
+/// `src/stream.rs`, whose arm is selected from two allocator predicates —
+/// [`reserves_state_footprint`](Allocator::reserves_state_footprint) and
+/// [`hook().is_active()`](AllocHook::is_active):
+///
+/// | `reserves_state_footprint()` | `hook().is_active()` | Arm | Where the state's bytes are |
+/// |---|---|---|---|
+/// | `false` | — | `Global` | the Rust global heap (`Box<E>`) |
+/// | `true` | `true` | `Foreign` | the region the caller's `zalloc` returned |
+/// | `true` | `false` | `Charged` | the global heap, with the footprint charged beside it |
+///
+/// [`CAllocator`] reports `reserves_state_footprint() == hook().is_active()`
+/// (see its [`Allocator`] impl), so a C caller only ever reaches the first two
+/// rows, and which one is fixed by whether a hook is installed:
+///
+/// * **Null hooks — or a pair made up solely of the crate's built-in
+///   substitutes, which is what a hookless caller ends up publishing —** take
+///   the `Global` arm. The state and every buffer stay on the Rust global heap,
+///   keeping a hookless caller's allocation count and footprint byte-for-byte
+///   what they have always been (AAP §0.6.5).
+/// * **An installed hook** takes the `Foreign` arm, so the state *itself* is
+///   carved from the caller's `zalloc` — reserved where C makes its
+///   `ZALLOC(strm, 1, sizeof(deflate_state))` (`deflate.c` L440), released
+///   through their `zfree`, and reached only through the safe
+///   `ForeignEngine` interface implemented in `src/ffi/alloc.rs`. The caller's
+///   arena is the real owner of the state, not merely of the buffers beside it.
+///
+/// The `Charged` arm — a globally boxed state with the footprint charged to an
+/// allocator that hands out typed slice buffers and therefore cannot host an
+/// arbitrary Rust value — is unreachable through this bridge and exists only for
+/// a custom Rust [`Allocator`] implementation.
+///
+/// What remains on the global heap in *every* arm is the small type-erasing
+/// owner: the `Box` holding the two-arm `EngineBox` handle, which is what lets
+/// the stream's state slot stay a single non-generic boxed trait object. That is
+/// one small allocation per stream, requested fallibly, so a refusal surfaces as
+/// `Z_MEM_ERROR` and never aborts; it never re-requests the caller's region, so
+/// C's allocation *count* is unaffected by it.
 #[derive(Clone, Copy)]
 pub struct CAllocator {
     /// The caller's allocation hook, or `None` (mirrors [`z_stream::zalloc`]).
@@ -1006,8 +1044,8 @@ pub(crate) unsafe fn handle_owner_valid<T: TaggedHandle>(strm: &z_stream) -> Opt
         return None;
     }
 
-    // Clause `s->strm != strm` — the owner check (`deflate.c` L546,
-    // `inflate.c` L95).
+    // Clause `s->strm != strm` — the owner check (`deflate.c` L544,
+    // `inflate.c` L94).
     if !core::ptr::eq(owner, strm) {
         return None;
     }
@@ -1603,8 +1641,10 @@ pub(crate) unsafe fn borrow_gz_header<'a>(head: *const gz_header) -> Option<Fore
     Some(ForeignGzHeader {
         text: h.text != 0,
         // C writes the low four bytes of `head->time` (`deflate.c` L1098-L1101),
-        // so a 64-bit `uLong` is truncated exactly as C truncates it.
-        time: h.time as u32,
+        // so a 64-bit `uLong` is truncated exactly as C truncates it. The
+        // narrowing goes through `ulong_to_u32` because it is the identity on
+        // LLP64 targets, where a bare `as u32` trips `clippy::unnecessary_cast`.
+        time: ulong_to_u32(h.time),
         os: h.os,
         hcrc: h.hcrc != 0,
         extra: if h.extra.is_null() {

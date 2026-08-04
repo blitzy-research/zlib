@@ -289,12 +289,14 @@ impl CompOutcome {
 /// regular file — and this module is `#![deny(unsafe_code)]`, so `pipe(2)`,
 /// `socketpair(2)`, `fcntl(O_NONBLOCK)`, and `SO_SNDBUF` are all out of reach.
 /// Under `cfg(test)` this indirection therefore consults a thread-local script
-/// (see [`fault`]) that can make one write accept only part of its buffer or fail
-/// with [`io::ErrorKind::WouldBlock`], [`io::ErrorKind::Interrupted`], or `Ok(0)`,
-/// which makes all four of the outcomes an operating-system write can report
-/// deterministic and portable to test with no `unsafe`, no extra dependency, and
-/// no platform-specific code. A scripted partial acceptance really does write that
-/// prefix to the file, so end-to-end assertions still decode genuine output.
+/// (see [`fault`]) that can make one write accept only part of its buffer, accept
+/// nothing at all (`Ok(0)`), or fail with [`io::ErrorKind::WouldBlock`] or
+/// [`io::ErrorKind::Interrupted`]. Those are the four outcomes an ordinary file
+/// never produces; together with the accept-everything an ordinary file always
+/// produces they cover every outcome a `write(2)` can report, deterministically
+/// and portably, with no `unsafe`, no extra dependency, and no platform-specific
+/// code. A scripted partial acceptance really does write that prefix to the file,
+/// so end-to-end assertions still decode genuine output.
 ///
 /// Outside `cfg(test)` the entire mechanism is absent: the function below is the
 /// only definition compiled into the library, and it is the bare `write` call.
@@ -352,9 +354,11 @@ mod fault {
         /// any byte moves — the `EINTR` a signal delivers mid-`write(2)`. The loop
         /// must retry it, and retrying must not resubmit an accepted byte.
         Interrupted,
-        /// Accept nothing at all (`Ok(0)`) while bytes remain. Per the
-        /// [`Write::write`] contract that means the destination can take no more,
-        /// so it must be reported rather than spun on or silently dropped.
+        /// Accept nothing at all (`Ok(0)`) while bytes remain — the `writ == 0`
+        /// that C's single `+= writ` success arm folds into a re-issue of the
+        /// identical request. Both loops must retry it in place: the cursor may
+        /// neither advance nor rewind, so no byte is dropped and none is
+        /// resubmitted.
         Refuse,
     }
 
@@ -452,26 +456,28 @@ mod fault {
 /// *whether* it failed, not how far it got, so a partial write followed by a
 /// fault would lose the progress this window exists to preserve.
 ///
+/// # A write that accepts nothing is retried in place
+///
+/// C has exactly one success arm — `state->x.next += writ` (`gzwrite.c` L124) —
+/// so a `writ` of `0` advances nothing and the enclosing
+/// `while (strm->next_out > state->x.next)` re-issues the identical request. This
+/// loop reproduces that shape rather than special-casing `Ok(0)`: the cursor is
+/// advanced by whatever was accepted, zero included, and the condition is
+/// re-tested. Reporting a zero-byte acceptance as an error instead would be an
+/// observable behaviour change C callers never see, and it is not one of the five
+/// divergences `doc/technical-specifications.md` §0.8.2 sanctions.
+///
+/// The retry cannot become a live spin for the same reason C's does not: POSIX
+/// permits `write(2)` to return `0` only for a zero-length request, and neither
+/// this loop nor C's ever issues one — `state.out_pending > 0` bounds the request
+/// below by one byte.
+///
 /// # Errors
 ///
 /// * [`ZlibError::ErrNo`] on a non-blocking stall
 ///   ([`io::ErrorKind::WouldBlock`]), which additionally sets
 ///   [`GzState::again`](crate::gz::state::GzState) so the caller may retry;
-/// * [`ZlibError::ErrNo`] on any other write failure;
-/// * [`ZlibError::ErrNo`] on a writer that accepts nothing (`Ok(0)`) while bytes
-///   remain, which — like a stall — also sets
-///   [`GzState::again`](crate::gz::state::GzState). C has no such arm at all:
-///   `writ == 0` leaves `state->x.next` unchanged and its
-///   `while (strm->next_out > state->x.next)` loop simply tries again, forever
-///   (`gzwrite.c` L119-L124). Spinning inside the library is not an option
-///   (CWE-835), so the condition is reported instead — but reported as
-///   *retryable*, which is what keeps the rest of C's behaviour intact: the
-///   cursor and the buffered input are both retained, `gzwrite` reports its true
-///   partial progress rather than `0`, and the stream is not declared dead.
-///   POSIX permits `write(2)` to return `0` only for a zero-length request, and
-///   this loop never issues one, so the arm is as unreachable in practice as C's
-///   spin. It is documented as divergence 6 in `doc/technical-specifications.md`
-///   §0.8.2.
+/// * [`ZlibError::ErrNo`] on any other write failure.
 ///
 /// On every error path the pending window is left intact, so a retry resumes at
 /// the exact byte the OS stopped at.
@@ -481,18 +487,12 @@ fn drain_pending(state: &mut GzState) -> Result<(), ZlibError> {
         let start = state.out_start;
         let end = start + core::cmp::min(WRITE_MAX, state.out_pending);
         match write_some(&mut state.file, &state.out_buf[start..end]) {
-            Ok(0) => {
-                // The destination accepts nothing while output is still pending.
-                // C would retry this forever; report it instead, but keep it
-                // retryable so the cursor, the buffered input, and the caller's
-                // ability to resume all survive (see "# Errors").
-                state.again = true;
-                state.error(ReturnCode::ErrNo, Some("write error"));
-                return Err(ZlibError::ErrNo);
-            }
             Ok(written) => {
                 // Advance the cursor past what the OS took — C's
-                // `state->x.next += writ` (C L124). No bytes move.
+                // `state->x.next += writ` (C L124). No bytes move. A zero-byte
+                // acceptance advances nothing, so the `while` re-issues the same
+                // request; that is C's single success arm reproduced exactly, and
+                // C has no `writ == 0` case of its own (see the section above).
                 state.out_start += written;
                 state.out_pending -= written;
             }
@@ -527,9 +527,10 @@ fn drain_pending(state: &mut GzState) -> Result<(), ZlibError> {
 /// [`GzState::again`](crate::gz::state::GzState) and reports
 /// [`ReturnCode::ErrNo`]; any other write failure likewise reports
 /// [`ReturnCode::ErrNo`]. A writer that accepts nothing (`Ok(0)`) while bytes
-/// remain is reported the same way as a stall, `again` included, for the reason
-/// given under [`drain_pending`]'s `# Errors`: C retries that case forever, and a
-/// retryable report is the closest terminating equivalent.
+/// remain is **retried in place**, leaving `off` where it was, exactly as C's
+/// `strm->next_in += writ` over `while (strm->avail_in)` does with a `writ` of
+/// zero (`gzwrite.c` L76-L90); see [`drain_pending`] for why that cannot become a
+/// live spin.
 ///
 /// No pending-output window is needed here: the bytes still live in the caller's
 /// `input` slice, so the accurate `consumed` count is all a retry requires.
@@ -539,16 +540,10 @@ fn write_direct(state: &mut GzState, input: &[u8]) -> CompOutcome {
         state.again = false;
         let end = off + core::cmp::min(WRITE_MAX, input.len() - off);
         match write_some(&mut state.file, &input[off..end]) {
-            Ok(0) => {
-                // The destination accepts nothing while input remains. Reporting
-                // this (rather than breaking out silently) is what stops the
-                // unwritten tail from vanishing without a trace; reporting it as
-                // retryable is what lets the caller resume, as C's endless retry
-                // would have.
-                state.again = true;
-                state.error(ReturnCode::ErrNo, Some("write error"));
-                return CompOutcome::err(off, ZlibError::ErrNo);
-            }
+            // C's single success arm: `strm->next_in += writ` (C L90). A `writ`
+            // of zero advances nothing and `while (strm->avail_in)` re-issues the
+            // same request, so a destination that accepts nothing is retried in
+            // place rather than reported.
             Ok(written) => off += written,
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -2003,14 +1998,20 @@ mod tests {
     // ---------------------------------------------------------------------
     // Write-outcome branch coverage.
     //
-    // An operating-system write reports exactly four outcomes, and both output
-    // loops must handle each one differently: accept-everything, accept-a-prefix
-    // (`Ok(n)`), `EINTR` ([`io::ErrorKind::Interrupted`]), `EAGAIN`
-    // ([`io::ErrorKind::WouldBlock`]), and accept-nothing (`Ok(0)`). Only the
-    // first is exercised by an ordinary file, so each of the others is driven
-    // through the [`fault`] seam against the **production** loops themselves —
-    // `drain_pending` and `write_direct` — rather than against a copy of them, so
-    // a divergence between the tested code and the shipped code is impossible.
+    // An operating-system write reports five outcomes, and both output loops must
+    // handle each one correctly: accept-everything, accept-a-prefix (`Ok(n)`),
+    // accept-nothing (`Ok(0)`), `EINTR` ([`io::ErrorKind::Interrupted`]), and
+    // `EAGAIN` ([`io::ErrorKind::WouldBlock`]). Only the first is exercised by an
+    // ordinary file, so each of the others is driven through the [`fault`] seam
+    // against the **production** loops themselves — `drain_pending` and
+    // `write_direct` — rather than against a copy of them, so a divergence between
+    // the tested code and the shipped code is impossible.
+    //
+    // The first three share one arm, because C shares it: `+= writ` advances by
+    // whatever was accepted and the enclosing `while` re-tests, so `Ok(0)` is a
+    // retry in place rather than a case of its own. The retry-in-place tests
+    // therefore assert the *absence* of cursor movement across a refusal, which is
+    // what a re-added special case would break.
     //
     // The retry flag and the pending-window bookkeeping are asserted alongside
     // the delivered bytes, because a loop can deliver the right bytes while still
@@ -2138,16 +2139,21 @@ mod tests {
         );
     }
 
-    /// Drain branch 3 of 3 — `Ok(0)`: the refusal is reported, and the retained
-    /// bytes are neither dropped nor resurrected.
+    /// Drain branch 3 of 3 — `Ok(0)`: the request is re-issued unchanged, because
+    /// C's `state->x.next += writ` advances by zero and its
+    /// `while (strm->next_out > state->x.next)` simply tests again
+    /// (`gzwrite.c` L119-L124).
     ///
-    /// A destination that accepts nothing while output remains would hang C's loop
-    /// forever and would lose the tail if this one broke out silently, so it is
-    /// reported — and reported as **retryable**, so the caller can resume exactly
-    /// as C's endless retry eventually would. The window must survive intact: the
-    /// second drain proves it is delivered once and in full.
+    /// The script is `Accept(2)`, `Refuse`, `WouldBlock`: three steps, so
+    /// `remaining() == 0` afterwards is itself the proof that the loop performed a
+    /// *third* write — it retried the refusal rather than reporting it. The stall
+    /// that follows is only there to freeze the cursor where the refusal left it so
+    /// the assertions can read it: `out_pending` is still 14 and the window still
+    /// names `window[2..]`, so the refusal neither advanced the cursor (which would
+    /// drop bytes) nor rewound it (which would resubmit them). The resumed drain
+    /// then proves exactly-once delivery.
     #[test]
-    fn drain_pending_reports_a_destination_that_accepts_nothing_without_losing_data() {
+    fn drain_pending_retries_a_destination_that_accepts_nothing_in_place() {
         let path = TempFile::new("drain_zero");
         let mut state = new_write_state(&path, 64, 6, 0, 0);
         gz_init(&mut state).expect("gz_init");
@@ -2156,36 +2162,39 @@ mod tests {
         stage_pending_window(&mut state, &window);
 
         {
-            let _fault = fault::script(&[fault::Step::Accept(2), fault::Step::Refuse]);
+            let _fault = fault::script(&[
+                fault::Step::Accept(2),
+                fault::Step::Refuse,
+                fault::Step::WouldBlock,
+            ]);
             assert_eq!(
                 drain_pending(&mut state),
                 Err(ZlibError::ErrNo),
-                "a destination that takes nothing is reported, not spun on"
+                "the stall after the refusal is what is reported"
             );
-            assert_eq!(fault::remaining(), 0, "both scripted steps were exercised");
+            assert_eq!(
+                fault::remaining(),
+                0,
+                "all three steps ran, so the refusal was retried rather than reported"
+            );
         }
 
-        assert!(
-            state.again,
-            "`Ok(0)` is reported as retryable, so the caller can resume where C \
-             would have kept retrying"
-        );
+        assert!(state.again, "a stall is retryable, so `again` must be set");
+        assert_eq!(state.err, ReturnCode::ErrNo, "a stall reports Z_ERRNO");
         assert_eq!(
-            state.err,
-            ReturnCode::ErrNo,
-            "zero progress reports Z_ERRNO"
+            state.out_pending, 14,
+            "the refusal advanced the cursor by zero, exactly as C's `+= writ` does"
         );
-        assert_eq!(state.out_pending, 14, "the refused tail is still pending");
         let start = state.out_start;
         assert_eq!(
             &state.out_buf[start..start + state.out_pending],
             &window[2..],
-            "the refused tail stays addressable through the cursor"
+            "so the window still names the undelivered tail, unrewound"
         );
         assert_eq!(
             read_output(&path),
             window[..2].to_vec(),
-            "only the accepted prefix reached the destination"
+            "and a refused write moved no byte at all"
         );
 
         state.clear_error();
@@ -2201,6 +2210,51 @@ mod tests {
             read_output(&path),
             window,
             "the retained bytes were delivered once, in order"
+        );
+    }
+
+    /// A refusal in the middle of a drain is invisible to the caller: the drain
+    /// still completes, reports success, and leaves no retry pending.
+    ///
+    /// This is the companion of
+    /// [`drain_pending_retries_a_destination_that_accepts_nothing_in_place`] with
+    /// nothing to freeze the cursor, so it asserts the end-to-end consequence
+    /// rather than the intermediate state — a C caller draining through a
+    /// destination that momentarily takes nothing observes `Z_OK`, not `Z_ERRNO`.
+    #[test]
+    fn a_refusal_inside_a_drain_is_invisible_to_the_caller() {
+        let path = TempFile::new("drain_zero_transparent");
+        let mut state = new_write_state(&path, 64, 6, 0, 0);
+        gz_init(&mut state).expect("gz_init");
+
+        let window: Vec<u8> = (0..16u8).collect();
+        stage_pending_window(&mut state, &window);
+        // Deliberately stale: the attempts that follow must clear it.
+        state.again = true;
+
+        {
+            let _fault = fault::script(&[
+                fault::Step::Accept(2),
+                fault::Step::Refuse,
+                fault::Step::Refuse,
+                fault::Step::Accept(usize::MAX),
+            ]);
+            drain_pending(&mut state)
+                .expect("a destination that takes nothing is retried, never reported");
+            assert_eq!(fault::remaining(), 0, "every scripted step was exercised");
+        }
+
+        assert!(!state.again, "a completed drain leaves no retry pending");
+        assert_eq!(
+            state.err,
+            ReturnCode::Ok,
+            "and a retried refusal is not an error"
+        );
+        assert_eq!(state.out_pending, 0, "every pending byte was delivered");
+        assert_eq!(
+            read_output(&path),
+            window,
+            "the retries must not duplicate, drop, or reorder a byte"
         );
     }
 
@@ -2276,42 +2330,49 @@ mod tests {
         );
     }
 
-    /// Transparent branch 3 of 3 — `Ok(0)`: the refusal is reported with the true
-    /// progress count, and the unwritten tail is not silently discarded.
+    /// Transparent branch 3 of 3 — `Ok(0)`: the copy re-issues the identical
+    /// request, because C's `strm->next_in += writ` advances by zero and its
+    /// `while (strm->avail_in)` simply tests again (`gzwrite.c` L76-L90).
     ///
-    /// The caller still owns the tail here — no pending window is needed — so an
-    /// accurate `consumed` plus a retryable report is the whole of what a resume
-    /// requires.
+    /// The three-step script proves the retry the same way the drain test does:
+    /// `remaining() == 0` can only hold if a third write ran. The trailing stall
+    /// freezes `off` where the refusal left it, so `consumed == 5` shows the
+    /// refusal neither credited a byte it never wrote nor discarded one it had.
     #[test]
-    fn write_direct_reports_a_destination_that_accepts_nothing_with_true_progress() {
+    fn write_direct_retries_a_destination_that_accepts_nothing_in_place() {
         let path = TempFile::new("direct_zero");
         let mut state = new_write_state(&path, 64, 6, 0, 1);
         let input = b"transparent-copy";
 
         let outcome = {
-            let _fault = fault::script(&[fault::Step::Accept(5), fault::Step::Refuse]);
+            let _fault = fault::script(&[
+                fault::Step::Accept(5),
+                fault::Step::Refuse,
+                fault::Step::WouldBlock,
+            ]);
             let outcome = write_direct(&mut state, input);
-            assert_eq!(fault::remaining(), 0, "both scripted steps were exercised");
+            assert_eq!(
+                fault::remaining(),
+                0,
+                "all three steps ran, so the refusal was retried rather than reported"
+            );
             outcome
         };
 
         assert_eq!(
             outcome.result,
             Err(ZlibError::ErrNo),
-            "zero progress reports Z_ERRNO rather than spinning"
+            "the stall after the refusal is what is reported"
         );
-        assert!(
-            state.again,
-            "`Ok(0)` is reported as retryable, matching the drain loop"
-        );
+        assert!(state.again, "a stall is retryable, so `again` must be set");
         assert_eq!(
             outcome.consumed, 5,
-            "the accepted prefix is reported, not zero"
+            "the refusal advanced the offset by zero, exactly as C's `+= writ` does"
         );
         assert_eq!(
             read_output(&path),
             input[..5].to_vec(),
-            "exactly the reported prefix reached the destination"
+            "and a refused write moved no byte at all"
         );
 
         // A resumed copy from the reported offset delivers the rest exactly once.
@@ -2327,6 +2388,50 @@ mod tests {
             read_output(&path),
             input.to_vec(),
             "the tail was delivered once, in order"
+        );
+    }
+
+    /// A refusal in the middle of a transparent copy is likewise invisible: the
+    /// copy completes, credits the whole input, and reports success.
+    #[test]
+    fn a_refusal_inside_a_transparent_copy_is_invisible_to_the_caller() {
+        let path = TempFile::new("direct_zero_transparent");
+        let mut state = new_write_state(&path, 64, 6, 0, 1);
+        let input = b"transparent-copy";
+        // Deliberately stale: the attempts that follow must clear it.
+        state.again = true;
+
+        let outcome = {
+            let _fault = fault::script(&[
+                fault::Step::Accept(5),
+                fault::Step::Refuse,
+                fault::Step::Refuse,
+                fault::Step::Accept(usize::MAX),
+            ]);
+            let outcome = write_direct(&mut state, input);
+            assert_eq!(fault::remaining(), 0, "every scripted step was exercised");
+            outcome
+        };
+
+        assert!(
+            outcome.result.is_ok(),
+            "a destination that takes nothing is retried, never reported"
+        );
+        assert_eq!(
+            outcome.consumed,
+            input.len(),
+            "the full length is reported as written"
+        );
+        assert!(!state.again, "a completed copy leaves no retry pending");
+        assert_eq!(
+            state.err,
+            ReturnCode::Ok,
+            "and a retried refusal is not an error"
+        );
+        assert_eq!(
+            read_output(&path),
+            input.to_vec(),
+            "the retries must not duplicate, drop, or reorder a byte"
         );
     }
 
