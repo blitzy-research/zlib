@@ -343,7 +343,11 @@ the security properties the initial release establishes.
   `[advisories]`,
   `[licenses]`, `[bans]`, and `[sources]`, resolves the graph with
   `all-features = true`, denies yanked crates (`yanked = "deny"`), and bounds
-  advisory-database staleness (`maximum-db-staleness = "P7D"`). Its
+  advisory-database staleness on the offline path
+  (`maximum-db-staleness = "P7D"`, a tightening of cargo-deny's ninety-day default
+  that is evaluated only for `--offline` runs; a fetching run is protected instead
+  by the fetch being fallible and unhandled, so an unreachable database is a hard
+  error rather than a quiet pass). Its
   `[graph] targets` list is deliberately empty so every crate is audited for every
   platform rather than only those a target list happens to reach, and its
   `[bans] deny` list keeps
@@ -508,8 +512,10 @@ the security properties the initial release establishes.
   `#[ignore]`.
 - **Release artifacts** from `cargo build --locked --release` under **default**
   features on `x86_64-unknown-linux-gnu` with `rustc 1.97.1 (8bab26f4f 2026-07-14)`,
-  into the repository's default `target/release/`: `libzlib_rs.rlib` 2,977,084 bytes ·
-  `libzlib_rs.so` 666,400 · `libzlib_rs.a` 22,468,092, observed on **2026-08-05**.
+  into the repository's default `target/release/`: `libzlib_rs.rlib` 2,977,116 bytes ·
+  `libzlib_rs.so` 551,760 · `libzlib_rs.a` 22,468,092, observed on **2026-08-05**. The
+  `.so` reflects `strip = "symbols"`; the `.a` does not, because Cargo's `strip`
+  reaches only linked outputs and a static archive is not linked.
   Read those as a dated, environment-specific snapshot of one build — not a
   reproducible invariant and not a size budget: no gate asserts them, and they move
   with the compiler, the feature row, the profile, and any change to the crate's own
@@ -570,9 +576,11 @@ recorded in all three.
    destructor.
 
 Those five are exactly the divergences a **C caller can observe**. Internal
-departures that are invisible at the C ABI are tracked in
-[`CONTRIBUTING.md`](CONTRIBUTING.md#internal-divergences-that-are-invisible-at-the-c-abi)
-rather than here, because each is strictly stricter or strictly safer than C while
+departures that are unobservable to a conforming caller are tracked in
+[`CONTRIBUTING.md`](CONTRIBUTING.md#internal-divergences-that-are-unobservable-to-a-conforming-caller)
+rather than here — note the wording: a caller that has already left the contract
+`zlib.h` states *can* see some of them, and that file tabulates exactly which,
+measured against reference C — because each is strictly stricter or strictly safer than C while
 leaving the return-code set, the struct layout, and the emitted bytes untouched:
 opaque state is kind-tagged so a cross-engine `End` is a defined error rather than
 C's undefined reinterpretation; indexing is bounds-checked; allocation is

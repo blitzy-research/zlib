@@ -183,15 +183,15 @@ Two facts underlie that, and three commands establish them against the live regi
 
 ```sh
 cargo search zlib-rs --limit 1
-#   zlib-rs = "0.6.6"    # A memory-safe zlib implementation written in rust
-cargo info zlib-rs@0.6.6 | grep repository
+#   zlib-rs = "0.6.7"    # A memory-safe zlib implementation written in rust
+cargo info zlib-rs@0.6.7 | grep repository
 #   repository: https://github.com/trifectatechfoundation/zlib-rs
 cargo info zlib-rs@1.3.2
 #   error: could not find `zlib-rs@1.3.2` in registry
 #          `https://github.com/rust-lang/crates.io-index`
 ```
 
-The published `zlib-rs` 0.6.6 is an unrelated, independently developed crate from the
+The published `zlib-rs` 0.6.7 is an unrelated, independently developed crate from the
 Trifecta Tech Foundation — a separate memory-safe zlib effort, and not this code.
 Worse, the version requirement `"1.3.2"` cannot be satisfied by it at all, so the
 mistake surfaces either as a confusing resolution failure or, if the requirement is
@@ -502,11 +502,13 @@ nothing else. CI's `c-abi-linkage`
 job runs the equivalent check on four feature rows and additionally asserts that
 the dynamic export set matches the `zlib.map` contract on every one of them.
 
-Release artifact sizes, observed on **2026-08-04** with **stable 1.97.1**, the
+Release artifact sizes, observed on **2026-08-05** with **stable 1.97.1**, the
 **default** feature set, `cargo build --locked --release`, into this repository's
 default `target/release/` (no `CARGO_TARGET_DIR` override): `libzlib_rs.rlib`
-≈ 2.8 MiB (2,977,084 B), `libzlib_rs.so` ≈ 651 KiB (666,400 B), `libzlib_rs.a`
-≈ 21.4 MiB (22,468,092 B).
+≈ 2.8 MiB (2,977,116 B), `libzlib_rs.so` ≈ 539 KiB (551,760 B), `libzlib_rs.a`
+≈ 21.4 MiB (22,468,092 B). The `.so` figure reflects `strip = "symbols"` in
+`[profile.release]`; the `.a` is unaffected, because Cargo's `strip` reaches only
+linked outputs and a static archive is not linked.
 
 Read those as a dated, environment-specific observation rather than a budget or an
 invariant. No gate asserts them; they move with the compiler, the feature row, and

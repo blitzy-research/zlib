@@ -512,7 +512,7 @@ jobs:
       with:
         persist-credentials: false
     # PROVENANCE, EMITTED BEFORE ANY GATE RUNS. This contract is stated once, here,
-    # and it governs ALL TWELVE jobs in this file: each one checks out the
+    # and it governs ALL FOURTEEN jobs in this file: each one checks out the
     # repository and then immediately records the commit it is judging, and
     # `src/lib.rs`'s `every_ci_job_records_the_commit_it_is_judging` asserts that
     # ordering and the exact witnesses below for every job.
@@ -1526,6 +1526,579 @@ jobs:
         done
         echo "documentation site built in strict mode; every nav entry produced a page"
 
+    # THE MEASURED COUNTERS ARE A GATE, NOT A CONVENTION.
+    #
+    # Fourteen documentation sites quoted a stale `src/` line count, five quoted a
+    # stale `tests/` count, and the AAP-citation census was stale in five figures
+    # at once - population, citing files, total citations, distinct-as-written and
+    # distinct-normalised - because nothing recomputed any of them. Every one of
+    # those figures is derived from the tree by a one-line command, so leaving them
+    # to be re-typed by hand is a defect generator: the figure and the tree drift
+    # apart silently, and a reader who spots the disagreement cannot tell which
+    # side is wrong.
+    #
+    # This step closes that loop. It recomputes each counter from the working tree
+    # and then asserts that the documentation actually carries the recomputed
+    # value, naming the file, line, published figure and measured figure on a
+    # mismatch. Note the direction: nothing here hardcodes an expected number, so
+    # the gate cannot itself go stale the way the prose did.
+    #
+    # WHY IT LIVES IN THIS JOB. `docs` is already the documentation-accuracy gate -
+    # it is where rustdoc runs with warnings denied and where MkDocs runs in strict
+    # mode. A figure that contradicts the tree is the same class of defect as a
+    # dead link, and it belongs beside it. The interpreter is the hash-pinned
+    # Python installed above, and the script is standard library only: no pip
+    # install, no new repository file, nothing for `package-verify` to arbitrate.
+    #
+    # WHEN THIS STEP FAILS, READ THE MESSAGE BEFORE EDITING EITHER SIDE. Two
+    # different failures print differently and want opposite fixes:
+    #   * "publishes X ... but the tree measures Y" - the prose is stale. Update
+    #     the documentation to Y. This is the ordinary case after adding code.
+    #   * "claim for `k` matched 0 time(s)" - the prose was reworded and the
+    #     pattern no longer finds it. Move the pattern, do not delete the claim;
+    #     deleting it is how the figure becomes unverified again.
+    #
+    # THREE `unsafe` COUNTS ARE IN CIRCULATION AND THEY ARE NOT INTERCHANGEABLE,
+    # which is why they are gated separately rather than folded together:
+    #   * `unsafe { .. }` blocks, comment-stripped              -> 1,265 crate-wide
+    #   * `\bunsafe\b` construct lines, comment-stripped        -> 1,662 in src/ffi
+    #   * `\bunsafe\b` construct lines, whole-line strip only   -> differs from the
+    #     stripped scan by exactly two lines, and only in `src/lib.rs`, where the
+    #     boundary test carries the string literals "// unsafe" and "//! unsafe"
+    #     as fixtures for its own classifier.
+    # Each figure is checked against the command the document publishing it prints,
+    # so `SECURITY.md` reading 51 and the specification reading 49 for the same
+    # file is correct rather than contradictory.
+    #
+    # THIS SCRIPT IS EMBEDDED IN A FILE IT MEASURES, so any pattern it applies to a
+    # workflow can match its own source text. `checkouts_pc` is anchored as a YAML
+    # key line (`^ +persist-credentials: false *$`) for exactly that reason: an
+    # unanchored substring search matched the pattern literal on its own definition
+    # line and over-counted by one. Any new workflow-shape counter added below must
+    # be anchored the same way, or verified against this file's own body.
+    #
+    # PER-FILE LENGTHS ARE GATED TOO, because they are the fastest-drifting figures
+    # in the tree. The repository-layout tree in `technical-specifications.md`
+    # annotates every root file with a `wc -l`, and the D1-D12 gap register beneath
+    # it restates several of them in prose - so a single commit touching
+    # `CONTRIBUTING.md` can stale four published figures at once. Each is derived
+    # here, and the patterns are anchored on the filename plus its trailing gloss
+    # rather than on the box-drawing glyphs, which is what keeps this file ASCII.
+    #
+    # WHAT IS DELIBERATELY NOT GATED, in three distinct categories:
+    #   1. Any figure a page states about ITSELF. A page cannot stably quote its own
+    #      length, because the edit that publishes the figure changes it. Both long
+    #      doc/ pages are therefore excluded from the aggregate line-count rows, and
+    #      `technical-specifications.md` publishes no length for itself. The
+    #      asymmetric case IS gated because it is stable: that file publishes the
+    #      length of `doc/project-guide.md`, and nothing publishes the length of
+    #      `technical-specifications.md`, so the dependency is a chain, not a cycle.
+    #   2. Release artifact byte sizes. They move with the compiler, the feature row
+    #      and the profile with no source change at all, so the documentation labels
+    #      them a dated observation beside a reproduce command; asserting them would
+    #      fail this job on an unrelated toolchain bump.
+    #   3. Anything derived from commit history, such as the pinned-range diffstat in
+    #      section 8.1 of the project guide. This job checks out at the default
+    #      shallow depth, so the baseline commit is not present. That table pins BOTH
+    #      endpoints to a hash instead, which is what keeps it honest without a gate.
+    - name: Assert every documented tree metric matches the tree
+      run: |
+        set -euo pipefail
+        python3 - <<'DOCMETRICS'
+        #!/usr/bin/env python3
+        """Recompute every measured counter the documentation publishes, then assert the
+        documentation actually carries the recomputed value.
+
+        WHY THIS EXISTS
+            Fourteen documentation sites quoted a stale `src/` line count, five quoted a
+            stale `tests/` count, and the AAP-citation census was stale in five figures at
+            once, because nothing recomputed them. Every one of those numbers is derived
+            from the tree by a one-line command, so leaving them to be re-typed by hand is
+            a defect generator: the figure and the tree drift apart silently and a reader
+            cannot tell which is wrong.
+
+        HOW IT WORKS
+            Two tables. MEASURE names each counter and the callable that derives it from
+            the working tree -- so the expected value is never hardcoded here either.
+            CLAIMS names each place a counter is published, as (files, pattern, key). The
+            pattern must contain exactly one capture group holding the number. Every match
+            across every named file must equal the measured value, and at least `min_hits`
+            matches must exist, so deleting a claim fails as loudly as staling one.
+
+        WHAT IT DELIBERATELY DOES NOT GATE
+            1. Figures a page states about ITSELF. A page cannot stably quote its own
+               length: the edit that publishes the figure changes it. So neither long
+               doc/ page appears in the aggregate rows, and `technical-specifications.md`
+               publishes no length for itself. The asymmetric case IS gated, because it is
+               stable: `technical-specifications.md` publishes the length of
+               `doc/project-guide.md`, and nothing publishes the length of
+               `technical-specifications.md`, so the dependency is a chain, not a cycle.
+            2. Release artifact byte sizes. Those move with the compiler, the feature row
+               and the profile with no source change at all, so the documentation labels
+               them a dated observation next to a reproduce command instead, and asserting
+               them here would fail CI on an unrelated toolchain bump.
+            3. Anything derived from commit history, such as the pinned-range diffstat in
+               project-guide.md section 8.1. CI checks out at the default shallow depth,
+               so the baseline commit is not present; that table pins BOTH endpoints to a
+               hash instead, which is what keeps it honest without a gate.
+        """
+
+        import os
+        import re
+        import subprocess
+        import sys
+
+        ROOT = os.getcwd()
+
+
+        def sh(cmd):
+            return subprocess.run(cmd, shell=True, cwd=ROOT, capture_output=True, text=True,
+                                  check=True).stdout
+
+
+        def rs_under(*dirs):
+            """Git-tracked *.rs files under the given directories."""
+            out = sh("git ls-files %s" % " ".join(dirs)).split()
+            return [p for p in out if p.endswith(".rs")]
+
+
+        def lines_of(paths):
+            n = 0
+            for p in paths:
+                with open(os.path.join(ROOT, p), encoding="utf-8") as fh:
+                    n += sum(1 for _ in fh)
+            return n
+
+
+        def wc(path):
+            return lines_of([path])
+
+
+        def strip_trailing(text):
+            """The `sed 's://.*::'` convention: drop from the first // to end of line."""
+            return "\n".join(re.sub(r"//.*$", "", ln) for ln in text.split("\n"))
+
+
+        def drop_whole_comment_lines(text):
+            """The looser `grep -v -E '^[[:space:]]*(//|/\\*|\\*)'` convention."""
+            return "\n".join(ln for ln in text.split("\n")
+                             if not re.match(r"^[ \t]*(//|/\*|\*)", ln))
+
+
+        def token_count(paths, transform, pattern):
+            n = 0
+            for p in paths:
+                with open(os.path.join(ROOT, p), encoding="utf-8") as fh:
+                    body = transform(fh.read())
+                n += sum(1 for ln in body.split("\n") if re.search(pattern, ln))
+            return n
+
+
+        WORKFLOWS = [".github/workflows/ci.yml", ".github/workflows/audit.yml",
+                     ".github/workflows/fuzz.yml"]
+        JOB_KEY = re.compile(r"^  ([A-Za-z0-9_][A-Za-z0-9_-]*):[ \t]*$")
+
+
+        def job_count(path):
+            """Count top-level keys under `jobs:`.
+
+            This duplicates, on purpose, the shape of the census in audit.yml's
+            policy-integrity job. That census asserting a job count is what went stale and
+            turned the audit workflow permanently red; a second, independent derivation
+            guarding the figure the repository-layout tree publishes is cheap, and the two
+            disagreeing would itself be the signal.
+            """
+            n, inside = 0, False
+            with open(os.path.join(ROOT, path), encoding="utf-8") as fh:
+                for line in fh:
+                    if line.rstrip("\n").rstrip() == "jobs:":
+                        inside = True
+                        continue
+                    if inside:
+                        if line.strip() and not line.startswith(" "):
+                            break
+                        if JOB_KEY.match(line.rstrip("\n")):
+                            n += 1
+            return n
+
+
+        def prefixed(path, tool, chan=r"(?:stable|1\.85\.0|nightly[^ ]*)"):
+            """Count `<tool> +<toolchain>` invocations on non-comment lines."""
+            rx = re.compile(r"%s \+%s" % (tool, chan))
+            n = 0
+            with open(os.path.join(ROOT, path), encoding="utf-8") as fh:
+                for line in fh:
+                    if line.lstrip().startswith("#"):
+                        continue
+                    n += len(rx.findall(line))
+            return n
+
+
+        def grep_count(paths, pattern):
+            rx = re.compile(pattern)
+            n = 0
+            for p in paths:
+                with open(os.path.join(ROOT, p), encoding="utf-8") as fh:
+                    n += sum(1 for line in fh if rx.search(line))
+            return n
+
+
+        SRC = rs_under("src")
+        TESTS = rs_under("tests")
+        BENCHES = rs_under("benches")
+        FUZZ = rs_under("fuzz/fuzz_targets")
+        FFI = [p for p in SRC if p.startswith("src/ffi/")]
+
+        ARCH_CONFIG = ["Cargo.toml", "build.rs", "rust-toolchain.toml", "deny.toml",
+                       "clippy.toml", "rustfmt.toml", ".cargo/config.toml", ".gitignore"]
+        DOC_FILES = ["README.md", "CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md",
+                     "doc/index.md", "docs/index.md"]
+
+        # The AAP-citation census population, defined exactly as the published script does.
+        CITE_POP = rs_under("src", "tests", "benches", "fuzz/fuzz_targets") + [
+            "build.rs", "Cargo.toml", "fuzz/Cargo.toml", "README.md", "CHANGELOG.md",
+            "CONTRIBUTING.md", "SECURITY.md", "doc/index.md", "doc/project-guide.md",
+            "docs/index.md"]
+        CITE_RE = re.compile(r"\u00a70(\.[0-9]+)+")
+
+
+        def all_cites():
+            out = []
+            for p in CITE_POP:
+                with open(os.path.join(ROOT, p), encoding="utf-8") as fh:
+                    out += [m.group(0) for m in CITE_RE.finditer(fh.read())]
+            return out
+
+
+        _ALL = all_cites()
+
+
+        def component(name):
+            if name == "root":
+                return lines_of([p for p in SRC if p.count("/") == 1])
+            return lines_of([p for p in SRC if p.startswith("src/%s/" % name)])
+
+
+        MEASURE = {
+            "src_files":            lambda: len(SRC),
+            "src_lines":            lambda: lines_of(SRC),
+            "c_root":               lambda: component("root"),
+            "c_checksum":           lambda: component("checksum"),
+            "c_util":               lambda: component("util"),
+            "c_deflate":            lambda: component("deflate"),
+            "c_inflate":            lambda: component("inflate"),
+            "c_gz":                 lambda: component("gz"),
+            "c_ffi":                lambda: component("ffi"),
+            "ffi_gz_lines":         lambda: wc("src/ffi/gz.rs"),
+            "tests_files":          lambda: len(TESTS),
+            "tests_lines":          lambda: lines_of(TESTS),
+            "t_c_oracle":           lambda: wc("tests/c_oracle.rs"),
+            "t_alloc_balance":      lambda: wc("tests/ffi_alloc_balance.rs"),
+            "benches_files":        lambda: len(BENCHES),
+            "benches_lines":        lambda: lines_of(BENCHES),
+            "fuzz_files":           lambda: len(FUZZ),
+            "fuzz_lines":           lambda: lines_of(FUZZ),
+            "build_rs_lines":       lambda: wc("build.rs"),
+            "arch_config_lines":    lambda: lines_of(ARCH_CONFIG),
+            "doc_files_lines":      lambda: lines_of(DOC_FILES),
+            # The CI/CD aggregate is self-referential: this script is embedded in ci.yml,
+            # so editing the gate moves the figure the gate checks. That is resolved
+            # mechanically -- the local sync helper rewrites the published number from the
+            # tree before the gate runs -- never by dropping the check.
+            "ci_files_lines":       lambda: lines_of(WORKFLOWS),
+            "fuzz_ws_lines":        lambda: lines_of(
+                                        FUZZ + ["fuzz/Cargo.toml", "fuzz/Cargo.lock"]),
+            "rust_files_cmd":       lambda: len(SRC) + len(TESTS) + len(BENCHES),
+            "rust_files_all":       lambda: len(SRC) + len(TESTS) + len(BENCHES) + 1,
+            # unsafe metrics -- three distinct definitions, never interchangeable
+            "blocks_all":           lambda: token_count(SRC, strip_trailing, r"unsafe \{"),
+            "blocks_ffi":           lambda: token_count(FFI, strip_trailing, r"unsafe \{"),
+            "construct_ffi":        lambda: token_count(FFI, strip_trailing, r"\bunsafe\b"),
+            "construct_lib_strip":  lambda: token_count(["src/lib.rs"], strip_trailing, r"\bunsafe\b"),
+            "construct_lib_whole":  lambda: token_count(["src/lib.rs"], drop_whole_comment_lines, r"\bunsafe\b"),
+            "unsafe_fn":            lambda: token_count(SRC, strip_trailing, r"unsafe fn"),
+            "extern_c":             lambda: token_count(SRC, strip_trailing, r'extern "C"'),
+            "safety_comments":      lambda: int(sh("grep -rn '// SAFETY:' src | wc -l").strip()),
+
+            # Individual file lengths, published by the repository-layout tree in
+            # technical-specifications.md and by the D1-D12 gap register beneath it.
+            # A page cannot stably quote its OWN length, so the two long doc/ pages are
+            # handled asymmetrically: doc/project-guide.md's length is published by
+            # technical-specifications.md (gateable), and technical-specifications.md's
+            # own length is published nowhere (correctly absent from both tables).
+            "f_cargo_toml":         lambda: wc("Cargo.toml"),
+            "f_rust_toolchain":     lambda: wc("rust-toolchain.toml"),
+            "f_deny_toml":          lambda: wc("deny.toml"),
+            "f_clippy_toml":        lambda: wc("clippy.toml"),
+            "f_rustfmt_toml":       lambda: wc("rustfmt.toml"),
+            "f_changelog":          lambda: wc("CHANGELOG.md"),
+            "f_security":           lambda: wc("SECURITY.md"),
+            "f_contributing":       lambda: wc("CONTRIBUTING.md"),
+            "f_readme":             lambda: wc("README.md"),
+            "f_license":            lambda: wc("LICENSE"),
+            "f_mkdocs":             lambda: wc("mkdocs.yml"),
+            "f_catalog":            lambda: wc("catalog-info.yaml"),
+            "f_gitignore":          lambda: wc(".gitignore"),
+            "f_cargo_config":       lambda: wc(".cargo/config.toml"),
+            "f_ci_yml":             lambda: wc(".github/workflows/ci.yml"),
+            "f_audit_yml":          lambda: wc(".github/workflows/audit.yml"),
+            "f_fuzz_yml":           lambda: wc(".github/workflows/fuzz.yml"),
+            "f_doc_index":          lambda: wc("doc/index.md"),
+            "f_doc_pg":             lambda: wc("doc/project-guide.md"),
+            "f_docs_index":         lambda: wc("docs/index.md"),
+            "f_fuzz_cargo_toml":    lambda: wc("fuzz/Cargo.toml"),
+
+            # Workflow shape. The job counts are the exact figure whose staleness made the
+            # audit workflow permanently red, so they are derived rather than transcribed.
+            "ci_jobs":              lambda: job_count(WORKFLOWS[0]),
+            "audit_jobs":           lambda: job_count(WORKFLOWS[1]),
+            "fuzz_jobs":            lambda: job_count(WORKFLOWS[2]),
+            "actions_ci":           lambda: grep_count(WORKFLOWS[:1], r"^\s*uses:"),
+            "actions_all":          lambda: grep_count(WORKFLOWS, r"^\s*uses:"),
+            # Anchored as a YAML key line on purpose. This script is itself embedded in
+            # ci.yml, so an unanchored substring search would also match the pattern
+            # literal on this very line and over-count by one.
+            "checkouts_pc":         lambda: grep_count(WORKFLOWS, r"^ +persist-credentials: false *$"),
+
+            # Toolchain-selector census, counted exactly the way CONTRIBUTING.md documents:
+            # a prefixed command is a `cargo +<toolchain>` on a line that is not a comment,
+            # and a job-level env key is a RUSTUP_TOOLCHAIN entry at job indentation.
+            "prefixed_ci":          lambda: prefixed(WORKFLOWS[0], "cargo"),
+            "prefixed_audit":       lambda: prefixed(WORKFLOWS[1], "cargo"),
+            "prefixed_fuzz":        lambda: prefixed(WORKFLOWS[2], "cargo"),
+            "stable_prefixed_ci":   lambda: prefixed(WORKFLOWS[0], "cargo", r"stable"),
+            "msrv_prefixed_ci":     lambda: prefixed(WORKFLOWS[0], "cargo", r"1\.85\.0"),
+            "rustc_probes_ci":      lambda: prefixed(WORKFLOWS[0], "rustc"),
+            "alltools_ci":          lambda: prefixed(WORKFLOWS[0], "(?:cargo|rustc)"),
+            "env_keys_ci":          lambda: grep_count(WORKFLOWS[:1], r"^ +RUSTUP_TOOLCHAIN:"),
+            "env_keys_audit":       lambda: grep_count(WORKFLOWS[1:2], r"^ +RUSTUP_TOOLCHAIN:"),
+            "env_keys_fuzz":        lambda: grep_count(WORKFLOWS[2:3], r"^ +RUSTUP_TOOLCHAIN:"),
+            # AAP citation census
+            "cite_scanned":         lambda: len(CITE_POP),
+            "cite_citing":          lambda: sum(
+                1 for p in CITE_POP
+                if CITE_RE.search(open(os.path.join(ROOT, p), encoding="utf-8").read())),
+            "cite_total":           lambda: len(_ALL),
+            "cite_as_written":      lambda: len(set(_ALL)),
+            "cite_normalised":      lambda: len({".".join(a.split(".")[:3]) for a in _ALL}),
+        }
+
+        PG = "doc/project-guide.md"
+        TS = "doc/technical-specifications.md"
+        BPG = "blitzy/documentation/Project Guide.md"
+
+        CLAIMS = [
+            # ---- src/ totals ----
+            (["CONTRIBUTING.md"], r"\*\*40 files\*\*, \*\*([\d,]+) lines\*\*", "src_lines", 1),
+            (["SECURITY.md"], r"([\d,]+) lines across 40 files", "src_lines", 1),
+            ([PG], r"\*\*40\*\* files, \*\*([\d,]+)\*\* lines", "src_lines", 1),
+            ([PG], r"- ([\d,]+) lines of Rust across 40 `\.rs` files", "src_lines", 1),
+            ([PG], r"sum exactly to 40 files and ([\d,]+) lines", "src_lines", 1),
+            ([PG], r"\| Source lines \(`src/`\) \| \*\*([\d,]+)\*\*", "src_lines", 1),
+            ([PG], r"# (\d+) total", "src_lines", 1),
+            ([PG], r"^src/ +\(40 files, ([\d,]+) lines\)", "src_lines", 1),
+            ([TS], r"modules under `src/` are in scope, totaling \*\*([\d,]+)\*\* lines", "src_lines", 1),
+            ([TS], r"\| \*\*Total\*\* \| \*\*([\d,]+)\*\* \| the seven rows above sum exactly", "src_lines", 1),
+            ([TS], r"the 40 files under `src/` totalling ([\d,]+) lines", "src_lines", 1),
+            ([BPG], r"\(([\d,]+) lines today; AAP baseline", "src_lines", 3),
+            ([BPG], r"under `src/` \(([\d,]+) lines today", "src_lines", 1),
+            # ---- per-component ----
+            ([TS, PG], r"\| Crate root and public types \| ([\d,]+) \|", "c_root", 1),
+            ([TS], r"\| `src/checksum/\*\*\.rs` \| ([\d,]+) \|", "c_checksum", 1),
+            ([TS], r"\| `src/util/\*\*\.rs` \| ([\d,]+) \|", "c_util", 1),
+            ([TS], r"\| `src/deflate/\*\*\.rs` \| ([\d,]+) \|", "c_deflate", 1),
+            ([TS], r"\| `src/inflate/\*\*\.rs` \| ([\d,]+) \|", "c_inflate", 1),
+            ([TS], r"\| `src/gz/\*\*\.rs` \| ([\d,]+) \|", "c_gz", 1),
+            ([TS], r"\| `src/ffi/\*\*\.rs` \| ([\d,]+) \|", "c_ffi", 1),
+            ([PG], r"\| FFI Boundary \| 7 files \(`src/ffi/`\) \| ([\d,]+) \|", "c_ffi", 1),
+            ([PG], r"ffi/ +\(7 files, ([\d,]+) lines\)", "c_ffi", 1),
+            ([TS], r"`gz\.rs` ([\d,]+) ", "ffi_gz_lines", 1),
+            ([PG], r"gz\.rs +\(([\d,]+) lines\)", "ffi_gz_lines", 1),
+            # ---- tests / benches / fuzz / build.rs ----
+            ([PG], r"\| Integration tests \| 8 files, \*\*([\d,]+)\*\* lines", "tests_lines", 1),
+            ([PG], r"\| Test Suite \| 8 files \(`tests/`\) \| ([\d,]+) \|", "tests_lines", 1),
+            ([PG], r"\| Test lines \(`tests/`\) \| \*\*([\d,]+)\*\* \(8 files\)", "tests_lines", 1),
+            ([TS], r"eight drivers, \*\*([\d,]+)\*\* lines", "tests_lines", 1),
+            ([TS], r"8 integration drivers \(([\d,]+) lines\)", "tests_lines", 1),
+            ([TS], r"`c_oracle\.rs` ([\d,]+) ", "t_c_oracle", 1),
+            ([TS], r"`ffi_alloc_balance\.rs` ([\d,]+) \u00b7", "t_alloc_balance", 1),
+            ([TS], r"`tests/ffi_alloc_balance\.rs` \| ([\d,]+) \|", "t_alloc_balance", 1),
+            ([PG], r"\| Benchmark lines \(`benches/`\) \| \*\*([\d,]+)\*\* \(3 files\)", "benches_lines", 1),
+            ([PG], r"\| Benchmarks \| 3 files \(`benches/`\) \| ([\d,]+) \|", "benches_lines", 1),
+            ([TS], r"three Criterion targets, \*\*([\d,]+)\*\* lines", "benches_lines", 1),
+            ([PG], r"\| Fuzz target lines \| \*\*([\d,]+)\*\* \(5 targets\)", "fuzz_lines", 1),
+            ([PG], r"\| Build script \(`build\.rs`\) \| \*\*([\d,]+)\*\*", "build_rs_lines", 1),
+            # ---- the two volatile aggregate rows ----
+            ([PG], r"`\.gitignore` \| ([\d,]+) \| 8h", "arch_config_lines", 1),
+            ([PG], r"`docs/index\.md` \| ([\d,]+) \| 6h", "doc_files_lines", 1),
+            # ---- Rust file count ----
+            ([PG], r"\| Rust files \| \*\*(\d+)\*\* = 40 `src/`", "rust_files_all", 1),
+            ([PG], r"The command yields \*\*(\d+)\*\*; `build\.rs` is the", "rust_files_cmd", 1),
+            # ---- unsafe metrics ----
+            ([PG], r"\| `unsafe \{ \u2026 \}` blocks \| \*\*([\d,]+)\*\*", "blocks_all", 1),
+            ([PG], r"All \*\*([\d,]+)\*\* `unsafe \{ \u2026 \}` blocks live in", "blocks_all", 1),
+            ([BPG], r"\*blocks\* instead answers a different question and yields ([\d,]+)", "blocks_all", 1),
+            ([PG], r"`src/ffi/\*\*` ([\d,]+) \(`inflate` 474", "blocks_ffi", 1),
+            ([PG], r"blocks live in `src/ffi/\*\*` \(([\d,]+)\)", "blocks_ffi", 1),
+            ([PG], r"for `src/ffi/\*\*` against the ([\d,]+) here", "blocks_ffi", 1),
+            ([TS, "CONTRIBUTING.md"], r"\| \*\*`src/ffi/\*\*` total\*\* \| \*\*([\d,]+)\*\* \|", "construct_ffi", 2),
+            (["SECURITY.md"], r"the designated boundary\) \| \*\*([\d,]+)\*\* \u2014 `inflate\.rs` 538", "construct_ffi", 1),
+            ([BPG], r"beside its own table: \*\*([\d,]+)\*\* in `src/ffi/\*\*`", "construct_ffi", 1),
+            ([TS], r"\((([\d,]+)) construct lines\) and the private no-`std`", "construct_ffi", 1),
+            ([TS], r"\| `src/lib\.rs` \| (\d+) \| private libc-backed", "construct_lib_strip", 1),
+            ([TS], r"`src/lib\.rs` \((\d+) lines file-wide", "construct_lib_strip", 1),
+            ([TS], r"publishes beside its own table \u2014 reports \*\*(\d+)\*\*", "construct_lib_whole", 1),
+            ([PG], r"\*whole-line\* comments reports \*\*(\d+)\*\* construct lines", "construct_lib_whole", 1),
+            (["CONTRIBUTING.md"], r"only \*whole-line\* comments reports \*\*(\d+)\*\* rather than", "construct_lib_whole", 1),
+            (["SECURITY.md"], r"police it\) \| \*\*(\d+)\*\*, split \*\*22 / 29\*\*", "construct_lib_whole", 1),
+            ([BPG], r"\*\*(\d+)\*\* in `src/lib\.rs`, of which 22", "construct_lib_whole", 1),
+            ([PG], r"comment-stripped scan reports \*\*(\d+)\*\*", "construct_lib_strip", 1),
+            (["CONTRIBUTING.md"], r"rather than the canonical \*\*(\d+)\*\*", "construct_lib_strip", 1),
+            ([BPG], r"therefore reports \*\*(\d+)\*\* for `src/lib\.rs`", "construct_lib_strip", 1),
+            ([PG], r"\| `unsafe fn` declarations \| \*\*(\d+)\*\*", "unsafe_fn", 1),
+            ([PG], r"\| `extern \"C\"` sites \| \*\*(\d+)\*\*", "extern_c", 1),
+            ([PG, TS, "CONTRIBUTING.md", BPG], r"\*\*(\d+)\*\* `// SAFETY:` comments", "safety_comments", 3),
+            # ---- AAP citation census ----
+            ([TS], r"population scanned\s+:.*?#\s+(\d+)$", "cite_scanned", 1),
+            ([TS], r"files containing a cite\s+:.*?#\s+(\d+)$", "cite_citing", 1),
+            ([TS], r"total citations\s+:.*?#\s+(\d+)$", "cite_total", 1),
+            ([TS], r"distinct as written\s+:.*?#\s+(\d+)$", "cite_as_written", 1),
+            ([TS], r"distinct normalised\s+:.*?#\s+(\d+)$", "cite_normalised", 1),
+            ([TS], r"\*\*Measured population\.\*\* (\d+) tracked files scanned", "cite_scanned", 1),
+            ([TS], r"tracked files scanned; \*\*(\d+)\*\* contain at least one citation", "cite_citing", 1),
+            ([TS], r"contain at least one citation; \*\*(\d+)\*\* citations", "cite_total", 1),
+            ([TS], r"citations\ntotal; \*\*(\d+)\*\* distinct citation strings", "cite_as_written", 1),
+            ([TS], r"normalise to \*\*(\d+)\*\* distinct top-level anchors", "cite_normalised", 1),
+            ([TS], r"All (\d+) strings, in document order", "cite_as_written", 1),
+            ([TS], r"The counts sum to (\d+), which is the identity", "cite_total", 1),
+            ([TS], r"Set arithmetic against the (\d+) measured strings", "cite_as_written", 1),
+            ([TS], r"16 \+ 8 = (\d+) measured", "cite_as_written", 1),
+            ([TS], r"The growth to (\d+) across 47", "cite_total", 1),
+            # ---- repository-layout tree: one annotated line count per file ----
+            # Patterns are anchored on the filename plus its trailing gloss rather than on
+            # the box-drawing glyphs, so this gate stays byte-ASCII inside ci.yml.
+            ([TS], r"Cargo\.toml +([\d,]+) lines ", "f_cargo_toml", 1),
+            ([TS], r"build\.rs +([\d,]+) +<- crc32\.c", "build_rs_lines", 1),
+            ([TS], r"rust-toolchain\.toml +([\d,]+) +pins channel", "f_rust_toolchain", 1),
+            ([TS], r"deny\.toml +([\d,]+) +the ONE cargo-deny policy", "f_deny_toml", 1),
+            ([TS], r"clippy\.toml +([\d,]+) +pinned lint configuration", "f_clippy_toml", 1),
+            ([TS], r"rustfmt\.toml +([\d,]+) +pinned format configuration", "f_rustfmt_toml", 1),
+            ([TS], r"CHANGELOG\.md +([\d,]+) +Rust crate release history", "f_changelog", 1),
+            ([TS], r"SECURITY\.md +([\d,]+) +vulnerability disclosure policy", "f_security", 1),
+            ([TS], r"CONTRIBUTING\.md +([\d,]+) +contribution workflow", "f_contributing", 1),
+            ([TS], r"README\.md +([\d,]+) +measured evidence", "f_readme", 1),
+            ([TS], r"LICENSE +([\d,]+) +upstream zlib licence", "f_license", 1),
+            ([TS], r"mkdocs\.yml +([\d,]+) +docs_dir", "f_mkdocs", 1),
+            ([TS], r"catalog-info\.yaml +([\d,]+) +Backstage component descriptor", "f_catalog", 1),
+            ([TS], r"\.gitignore +([\d,]+) +/target", "f_gitignore", 1),
+            ([TS], r"config\.toml +([\d,]+) +target rustflags", "f_cargo_config", 1),
+            ([TS], r"ci\.yml +([\d,]+) +14 jobs", "f_ci_yml", 1),
+            ([TS], r"audit\.yml +([\d,]+) +4 jobs", "f_audit_yml", 1),
+            ([TS], r"fuzz\.yml +([\d,]+) +1 job", "f_fuzz_yml", 1),
+            ([TS], r"index\.md +([\d,]+) +published landing page", "f_doc_index", 1),
+            ([TS], r"project-guide\.md +([\d,]+) +frozen internal", "f_doc_pg", 1),
+            ([TS], r"index\.md +([\d,]+) +redirect stub", "f_docs_index", 1),
+            ([TS], r"^\W+Cargo\.toml +([\d,]+)$", "f_fuzz_cargo_toml", 1),
+            # ---- the drift-check loop printed beneath that tree ----
+            ([TS], r"^# +(\d+) +src$", "src_files", 1),
+            ([TS], r"^# +(\d+) +tests$", "tests_files", 1),
+            ([TS], r"^# +(\d+) +benches$", "benches_files", 1),
+            ([TS], r"^# +(\d+) +fuzz/fuzz_targets$", "fuzz_files", 1),
+            # ---- D1-D12 gap register: the same lengths, restated in prose ----
+            ([TS], r"workflows/audit\.yml`, ([\d,]+) lines, 4 jobs", "f_audit_yml", 1),
+            ([TS], r"present, ([\d,]+) lines, `channel", "f_rust_toolchain", 1),
+            ([TS], r"^\| D5 \|.*present, ([\d,]+) lines", "f_changelog", 1),
+            ([TS], r"`SECURITY\.md` present \(([\d,]+) lines\)", "f_security", 1),
+            ([TS], r"`CONTRIBUTING\.md` present \(([\d,]+) lines\)", "f_contributing", 1),
+            ([TS], r"^\| D7 \|.*present, ([\d,]+) lines", "f_cargo_config", 1),
+            ([TS], r"`clippy\.toml` ([\d,]+) lines", "f_clippy_toml", 1),
+            ([TS], r"`rustfmt\.toml` ([\d,]+) lines", "f_rustfmt_toml", 1),
+            # ---- workflow shape, as published beside those lengths and in section 0.10.1 ----
+            ([TS], r"ci\.yml +[\d,]+ +(\d+) jobs", "ci_jobs", 1),
+            ([TS], r"audit\.yml +[\d,]+ +(\d+) jobs", "audit_jobs", 1),
+            ([TS], r"fuzz\.yml +[\d,]+ +(\d+) job ", "fuzz_jobs", 1),
+            ([TS], r"all (\d+) external\naction references in this workflow", "actions_ci", 1),
+            ([TS], r"\u2014 (\d+) across all three workflows", "actions_all", 1),
+            ([TS], r"on every one of the (\d+) checkouts", "checkouts_pc", 1),
+            # ---- job counts restated outside the tree ----
+            ([TS], r"workflows/ci\.yml` \((\d+) jobs\)", "ci_jobs", 2),
+            ([TS], r"workflows/audit\.yml` \((\d+) jobs\)", "audit_jobs", 2),
+            ([TS], r"workflows/fuzz\.yml` \((\d+) job\)", "fuzz_jobs", 2),
+            ([TS], r"Keep the (\d+) jobs green", "ci_jobs", 1),
+            ([TS], r"workflows/audit\.yml`, [\d,]+ lines, (\d+) jobs", "audit_jobs", 1),
+            ([BPG], r"CI \((\d+) jobs\)", "ci_jobs", 1),
+            # ---- Section 8.2 CI/CD and Fuzzing rows. Both were stale at HEAD and neither
+            # ---- was covered, which is why they are pinned here rather than re-checked
+            # ---- by eye: the CI/CD row sums three workflow files that change constantly.
+            ([PG], r"^\| CI/CD \| .*? \| ([\d,]+) \| 1h \|", "ci_files_lines", 1),
+            ([PG], r"\| 1h \| (\d+)-job Rust CI pipeline", "ci_jobs", 1),
+            ([PG], r"Rust CI pipeline, (\d+)-job supply-chain audit", "audit_jobs", 1),
+            ([PG], r"supply-chain audit, (\d+)-job `cargo-fuzz` workflow", "fuzz_jobs", 1),
+            ([PG], r"`mkdocs\.yml` \((\d+) lines\) is documentation tooling", "f_mkdocs", 1),
+            ([PG], r"^\| Fuzzing \| 5 targets .*Cargo\.lock\}` \| ([\d,]+) \|",
+                     "fuzz_ws_lines", 1),
+            # ---- CONTRIBUTING.md toolchain-selector table and its methodology ----
+            (["CONTRIBUTING.md"], r"\| (\d+) prefixed `cargo` commands", "prefixed_ci", 1),
+            (["CONTRIBUTING.md"], r"prefixed `cargo` commands \((\d+) `\+stable`", "stable_prefixed_ci", 1),
+            (["CONTRIBUTING.md"], r"`\+stable`, (\d+) `\+1\.85\.0`\)", "msrv_prefixed_ci", 1),
+            (["CONTRIBUTING.md"], r"`\+1\.85\.0`\), (\d+) job-level", "env_keys_ci", 1),
+            (["CONTRIBUTING.md"], r"stable` \| (\d+) prefixed commands", "prefixed_audit", 1),
+            (["CONTRIBUTING.md"], r"unprefixed\*\* \| (\d+) prefixed commands", "prefixed_fuzz", 1),
+            (["CONTRIBUTING.md"], r"(\d+) job-level `env:` keys \|$", "env_keys_audit", 1),
+            (["CONTRIBUTING.md"], r"(\d+) job-level `env:` key \|$", "env_keys_fuzz", 1),
+            (["CONTRIBUTING.md"], r"included in the\s+(\d+), so the all-tools", "prefixed_ci", 1),
+            (["CONTRIBUTING.md"], r"all-tools figure for that\s+file is (\d+)", "alltools_ci", 1),
+            (["CONTRIBUTING.md"], r"\| grep -vE '\^\[0-9\]\+: \*#' \| wc -l      # (\d+)$", "prefixed_ci", 1),
+            (["CONTRIBUTING.md"], r"RUSTUP_TOOLCHAIN:' \.github/workflows/ci\.yml   # (\d+)$", "env_keys_ci", 1),
+        ]
+
+
+        def main():
+            measured = {}
+            for k, fn in MEASURE.items():
+                measured[k] = fn()
+
+            print("== measured counters ==")
+            for k in sorted(measured):
+                print("   %-22s %s" % (k, measured[k]))
+            print()
+
+            bad = 0
+            checked = 0
+            for files, pattern, key, min_hits in CLAIMS:
+                want = measured[key]
+                hits = 0
+                rx = re.compile(pattern, re.M)
+                for f in files:
+                    with open(os.path.join(ROOT, f), encoding="utf-8") as fh:
+                        body = fh.read()
+                    for m in rx.finditer(body):
+                        hits += 1
+                        got = int(m.group(1).replace(",", ""))
+                        if got != want:
+                            line = body[:m.start()].count("\n") + 1
+                            print("::error::%s:%d: publishes %s for `%s`, but the tree measures %s."
+                                  % (f, line, m.group(1), key, want))
+                            bad += 1
+                if hits < min_hits:
+                    print("::error::claim for `%s` matched %d time(s) across %s, expected at least %d."
+                          " Either the documentation dropped the figure or its wording changed and this"
+                          " gate's pattern must move with it." % (key, hits, files, min_hits))
+                    bad += 1
+                checked += hits
+
+            print("checked %d published figure(s) across %d claim group(s)" % (checked, len(CLAIMS)))
+            if bad:
+                print("::error::%d documented metric(s) disagree with the tree." % bad)
+                return 1
+            print("every documented tree metric matches the tree")
+            return 0
+
+
+        if __name__ == "__main__":
+            sys.exit(main())
+        DOCMETRICS
+
     - name: Assert Cargo.lock is unchanged
       if: ${{ !cancelled() }}
       run: |
@@ -2170,19 +2743,92 @@ jobs:
         esac
     - name: Build the shipped artifacts (release)
       run: cargo +stable build --release --locked --verbose ${{ matrix.features }}
+    # `[profile.release]` sets `strip = "symbols"`, so the SHIPPED cdylib carries no
+    # `.symtab` at all. That is the hardening this step pins in place: a release
+    # artifact that grew a static symbol table back would mean the profile key was
+    # dropped or overridden, and nothing else in this workflow would notice.
+    #
+    # WHY IT IS PINNED HERE rather than in a manifest test. The key is only
+    # observable in its effect, and the effect is a property of the linked output --
+    # a manifest scan can prove the key is present but not that the linker honoured
+    # it, and an `RUSTFLAGS`/`CARGO_PROFILE_RELEASE_STRIP` override in a consumer's
+    # environment defeats the key without touching the file. Measured on this tree
+    # for the default row: `strip = "none"` emits 4,578,272 bytes with 6 `.debug_*`
+    # sections; `strip = "debuginfo"` (cargo's own release default, and what this
+    # tree emitted before the key was added) emits 666,400 bytes with a 1,221-entry
+    # `.symtab`; `strip = "symbols"` emits 551,760 bytes with no `.symtab`.
+    - name: Assert the shipped cdylib carries no static symbol table
+      run: |
+        set -euo pipefail
+        so=target/release/libzlib_rs.so
+        test -f "$so" || { echo "::error::$so was not emitted"; exit 1; }
+        symtab=$(readelf -S "$so" | grep -c '\.symtab' || true)
+        echo "shipped cdylib .symtab sections: $symtab (want 0), size: $(stat -c %s "$so") bytes"
+        if [ "$symtab" != "0" ]; then
+          echo "::error::the shipped release cdylib for features '${{ matrix.features }}'"\
+               " carries a static symbol table. \`[profile.release] strip = \"symbols\"\`"\
+               " in Cargo.toml is what removes it, so either that key was dropped or the"\
+               " environment overrode it (RUSTFLAGS, CARGO_PROFILE_RELEASE_STRIP). Restore"\
+               " the key, or delete this assertion in the same commit that deliberately"\
+               " retires the hardening."
+          exit 1
+        fi
+    # Axis 1 of the personality contract lives in `.symtab`, which the step above
+    # has just proved absent from the shipped artifact -- so it cannot be read
+    # there. A SECOND release build, identical except that `strip` stops at
+    # debuginfo, supplies a symbol-retaining copy in its own CARGO_TARGET_DIR so it
+    # cannot clobber the shipped one (all three artifacts share a single path per
+    # target dir, and the steps below inspect the shipped `target/release` copy).
+    #
+    # `debuginfo` rather than `none` on purpose: it isolates the one variable under
+    # test -- `.symtab` presence -- instead of also pulling 3.9 MB of DWARF into a
+    # CI build. And the two artifacts are then compared: if stripping changed
+    # anything a linker or loader can see, the dynamic export sets would differ.
+    # Measured: both sets hold the same 95 `T` names on every row.
     - name: Assert the personality symbol is defined exactly once and never exported
       run: |
         set -euo pipefail
         so=target/release/libzlib_rs.so
         test -f "$so" || { echo "::error::$so was not emitted"; exit 1; }
+        probe_dir="$RUNNER_TEMP/symbol-probe"
+        CARGO_TARGET_DIR="$probe_dir" CARGO_PROFILE_RELEASE_STRIP=debuginfo \
+          cargo +stable build --release --locked --verbose ${{ matrix.features }}
+        probe="$probe_dir/release/libzlib_rs.so"
+        test -f "$probe" || { echo "::error::$probe was not emitted"; exit 1; }
+        probe_symtab=$(readelf -S "$probe" | grep -c '\.symtab' || true)
+        if [ "$probe_symtab" = "0" ]; then
+          echo "::error::the symbol-retaining probe build has no .symtab either, so"\
+               " CARGO_PROFILE_RELEASE_STRIP=debuginfo did not take effect and axis 1"\
+               " below would pass vacuously. Check the cargo version's handling of the"\
+               " profile override."
+          exit 1
+        fi
         # Axis 1: exactly one definition, anywhere in the symbol table. `ld` has
         # already rejected zero (undefined reference) and two (duplicate symbol);
         # this makes the surviving guarantee observable.
-        defined=$(nm --defined-only "$so" | grep -cE ' [tT] rust_eh_personality' || true)
+        defined=$(nm --defined-only "$probe" | grep -cE ' [tT] rust_eh_personality' || true)
         # Axis 2: never in the DYNAMIC table. This is the property the `.hidden`
-        # directive in `src/lib.rs` exists to enforce.
+        # directive in `src/lib.rs` exists to enforce. `.dynsym` survives stripping,
+        # so this axis is asserted on the SHIPPED artifact -- the one consumers link.
         exported=$(nm -D --defined-only "$so" | grep -c ' T rust_eh_personality' || true)
+        probe_exported=$(nm -D --defined-only "$probe" | grep -c ' T rust_eh_personality' || true)
         echo "rust_eh_personality: definitions=$defined (want 1), exported=$exported (want 0)"
+        if [ "$probe_exported" != "$exported" ]; then
+          echo "::error::the stripped and symbol-retaining builds disagree on whether"\
+               " rust_eh_personality is exported ($exported vs $probe_exported), which"\
+               " would mean stripping is not ABI-neutral."
+          exit 1
+        fi
+        nm -D --defined-only "$so"    | awk '$2=="T"{print $3}' | sort > "$RUNNER_TEMP/dyn-shipped.txt"
+        nm -D --defined-only "$probe" | awk '$2=="T"{print $3}' | sort > "$RUNNER_TEMP/dyn-probe.txt"
+        if ! diff -u "$RUNNER_TEMP/dyn-shipped.txt" "$RUNNER_TEMP/dyn-probe.txt"; then
+          echo "::error::the shipped (stripped) and symbol-retaining builds export"\
+               " different dynamic symbol sets for features '${{ matrix.features }}'."\
+               " Stripping must remove only .symtab/.strtab, never anything a linker"\
+               " or loader resolves against."
+          exit 1
+        fi
+        echo "dynamic export sets identical across strip modes: $(wc -l < "$RUNNER_TEMP/dyn-shipped.txt") T symbols"
         if [ "$defined" != "1" ]; then
           echo "::error::expected exactly 1 definition of rust_eh_personality for features" \
                "'${{ matrix.features }}', found $defined. A std-off artifact must supply it" \
@@ -3639,12 +4285,76 @@ jobs:
           fi
         done
 
+        # THE PACKAGED ENTRY COUNT IS DOCUMENTED, SO IT IS ASSERTED HERE.
+        #
+        # Three prose sites quote this number, and they were quoting 75 while the
+        # archive held 76 - the drift arrived with `tests/ffi_alloc_balance.rs` and
+        # nothing recomputed it. The count is derived from the listing this step
+        # already produced rather than hardcoded, so this assertion cannot itself go
+        # stale; what it catches is the prose falling behind the archive.
+        #
+        # The tracked/synthesised split is asserted alongside the total because the
+        # total alone is ambiguous: a reader comparing it against `git ls-files`
+        # finds a mismatch and cannot tell whether files leaked in or the delta is
+        # cargo's own doing. Exactly two entries are synthesised - `Cargo.toml.orig`
+        # (the pre-normalisation manifest) and `.cargo_vcs_info.json` (the commit
+        # stamp) - and naming them is what makes the arithmetic checkable.
+        # `Cargo.toml` and `Cargo.lock` are NOT in that set: both are tracked, and
+        # only the manifest's *content* is rewritten on the way in.
+        packaged_total="$(wc -l < "$list")"
+        packaged_synth=0
+        packaged_tracked=0
+        while read -r entry; do
+          if git ls-files --error-unmatch "$entry" >/dev/null 2>&1; then
+            packaged_tracked=$((packaged_tracked + 1))
+          else
+            packaged_synth=$((packaged_synth + 1))
+            case "$entry" in
+              Cargo.toml.orig|.cargo_vcs_info.json) ;;
+              *) echo "::error::'$entry' is packaged but tracked nowhere, and it is not one of"\
+                      " the two entries cargo is known to synthesise (Cargo.toml.orig,"\
+                      " .cargo_vcs_info.json). Either a build artifact leaked into the archive"\
+                      " or cargo's packaging behaviour changed and the documented split must"\
+                      " move with it."; status=1 ;;
+            esac
+          fi
+        done < "$list"
+        echo "packaged entries: ${packaged_total} = ${packaged_tracked} tracked"\
+             "+ ${packaged_synth} synthesised by cargo"
+        if [ "$((packaged_tracked + packaged_synth))" -ne "$packaged_total" ]; then
+          echo "::error::packaged entry arithmetic does not close:"\
+               " ${packaged_tracked} + ${packaged_synth} != ${packaged_total}."; status=1
+        fi
+        # Each documented claim is checked against the measured value, and a claim
+        # that matches zero times fails just as loudly as one that disagrees -
+        # otherwise rewording the prose would silently retire the check. Note the
+        # file set: `doc/project-guide.md` ships in the crate, the engagement guide
+        # does not, but both are present in this checkout and both publish the
+        # figure, so both are arbitrated here.
+        for claim in \
+          "doc/project-guide.md:cargo package --locked --list\` yields \*\*${packaged_total}\*\* entries" \
+          "doc/project-guide.md:cargo package --locked --list\` reports \*\*${packaged_total}\*\* entries" \
+          "blitzy/documentation/Project Guide.md:resolves to \*\*${packaged_total}\*\* files" \
+          "blitzy/documentation/Project Guide.md:\*\*${packaged_tracked}\*\* of the ${packaged_total} are git-tracked"; do
+          claim_file="${claim%%:*}"
+          claim_pat="${claim#*:}"
+          if ! grep -qE "$claim_pat" "$claim_file"; then
+            echo "::error file=${claim_file}::does not publish the measured packaged-entry"\
+                 " figure. Expected a line matching '${claim_pat}'. The archive now holds"\
+                 " ${packaged_total} entries (${packaged_tracked} tracked +"\
+                 " ${packaged_synth} synthesised); update the prose, or move this pattern if"\
+                 " the wording changed."
+            status=1
+          fi
+        done
+
         if [ "$status" -eq 0 ]; then
           echo "package contents match the exclude contract: no C baseline, no upstream C docs,"\
                "no legacy platform trees, no engagement material; crate sources, tests, benches,"\
                "build script, manifests, README.md and LICENSE all present, and so are the"\
                "toolchain, lint, format, supply-chain and governance files the packaged"\
-               "crate's own test suite and gates read"
+               "crate's own test suite and gates read; and the documented packaged-entry count"\
+               "matches the archive"
         fi
         exit "$status"
     # `--list` proves WHAT would ship; this proves the result is BUILDABLE from

@@ -25,6 +25,7 @@ named explicitly below so nobody has to discover them in review.
 - [⚠ The C ABI is a compile-time-guarded contract](#-the-c-abi-is-a-compile-time-guarded-contract)
 - [No silent behaviour change](#no-silent-behaviour-change)
 - [Five divergences that must be preserved, not fixed](#five-divergences-that-must-be-preserved-not-fixed)
+- [Internal divergences that are unobservable to a conforming caller](#internal-divergences-that-are-unobservable-to-a-conforming-caller)
 - [Performance policy](#performance-policy)
 - [Working in this repository](#working-in-this-repository)
 - [Pre-submission checklist](#pre-submission-checklist)
@@ -56,7 +57,7 @@ Know the scale of what you are touching:
 
 | Quantity | Measured value | How it was measured |
 |----------|----------------|---------------------|
-| Rust modules under `src/` | **40 files**, **80,258 lines** (2026-08-04) | `find src -name '*.rs' -print0 \| xargs -0 wc -l` — the `total` row, with the file count from the same listing |
+| Rust modules under `src/` | **40 files**, **80,286 lines** (2026-08-04) | `find src -name '*.rs' -print0 \| xargs -0 wc -l` — the `total` row, with the file count from the same listing |
 | Retained C baseline | **23,107 lines** across 26 root translation units and headers | `cat` of the 26 files piped to `wc -l` |
 | Public C entry points the baseline declares | **119** `ZEXTERN` declarations in `zlib.h` | the retained header |
 | Exported C symbols this crate emits | **95**, all type `T` | `nm -D --defined-only target/release/libzlib_rs.so` |
@@ -349,22 +350,22 @@ selector, and the difference is deliberate:
 
 | Workflow | Selector for the commands it runs | Measured |
 |----------|-----------------------------------|----------|
-| [`ci.yml`](.github/workflows/ci.yml) | Both: a `+stable` / `+1.85.0` prefix **and** a job-level `RUSTUP_TOOLCHAIN` | 30 prefixed `cargo` commands (28 `+stable`, 2 `+1.85.0`), 12 job-level `env:` keys |
+| [`ci.yml`](.github/workflows/ci.yml) | Both: a `+stable` / `+1.85.0` prefix **and** a job-level `RUSTUP_TOOLCHAIN` | 36 prefixed `cargo` commands (34 `+stable`, 2 `+1.85.0`), 14 job-level `env:` keys — one for every job in the file |
 | [`audit.yml`](.github/workflows/audit.yml) | Both: a `+stable` prefix **and** a job-level `RUSTUP_TOOLCHAIN: stable` | 19 prefixed commands, 3 job-level `env:` keys |
 | [`fuzz.yml`](.github/workflows/fuzz.yml) | **Only** the job-level `RUSTUP_TOOLCHAIN: nightly-2026-08-01`; every command is deliberately **unprefixed** | 0 prefixed commands, 1 job-level `env:` key |
 
 **How the "Measured" column is counted**, so a re-derivation lands on the same numbers
 rather than on a plausible neighbour. A *prefixed command* is a `cargo +<toolchain>`
 invocation on a line that is not a YAML or shell comment; `ci.yml` additionally carries
-**three** `rustc +stable` probe invocations (the target-list and `-vV` checks), which are
-counted separately and are *not* included in the 30 — so the all-tools figure for that
-file is 33. A *job-level `env:` key* is a `RUSTUP_TOOLCHAIN:` entry in a job's own `env:`
-block, not a step-level one. Reproduce with:
+**six** `rustc +stable` probe invocations — one `--test` compile of `build.rs` and five
+`--print cfg` target probes — which are counted separately and are *not* included in the
+36, so the all-tools figure for that file is 42. A *job-level `env:` key* is a
+`RUSTUP_TOOLCHAIN:` entry in a job's own `env:` block, not a step-level one. Reproduce with:
 
 ```sh
 grep -nE 'cargo \+(stable|1\.85\.0|nightly[^ ]*)' .github/workflows/ci.yml \
-  | grep -vE '^[0-9]+: *#' | wc -l      # 30
-grep -cE '^ +RUSTUP_TOOLCHAIN:' .github/workflows/ci.yml   # 12
+  | grep -vE '^[0-9]+: *#' | wc -l      # 36
+grep -cE '^ +RUSTUP_TOOLCHAIN:' .github/workflows/ci.yml   # 14
 ```
 
 `fuzz.yml` is the exception on purpose. The env var (rank 2) is inherited by the nested
@@ -648,6 +649,93 @@ are all denied by name, with the reason recorded inline.
 
 **Never silence a finding by widening a policy.** If `cargo deny` or `cargo audit`
 objects to something your change introduced, the fix is in the change.
+
+### Dependency freshness, and the aged benchmark chain
+
+A clean advisory scan is not the same claim as a fresh graph, so the age of the
+closure is tracked separately from its vulnerability status. Seven packages in it are
+older than three years. All seven were reviewed against live registry metadata; the
+conclusion is that **none should move right now**, and the reasoning is recorded here
+so the next person does not have to redo it.
+
+| Package | Pinned | Published | Latest | Published | MSRV of latest |
+|---------|--------|-----------|--------|-----------|----------------|
+| `anes` | 0.1.6 | 2019-11-29 | 0.2.1 | 2025-07-01 | — |
+| `same-file` | 1.0.6 | 2020-01-11 | **1.0.6** | 2020-01-11 | — |
+| `tinytemplate` | 1.2.1 | 2021-03-04 | **1.2.1** | 2021-03-04 | — |
+| `cast` | 0.3.0 | 2021-09-04 | **0.3.0** | 2021-09-04 | — |
+| `criterion-plot` | 0.5.0 | 2022-09-10 | 0.8.2 | 2026-02-04 | — |
+| `itertools` | 0.10.5 | 2022-09-20 | 0.15.0 | 2026-06-16 | 1.63.0 |
+| `criterion` | 0.5.1 | 2023-05-26 | 0.8.2 | 2026-02-04 | **1.86** |
+
+Three of the seven — `same-file`, `tinytemplate` and `cast` — are **already the newest
+version their authors have published**. "Old" there means finished, not behind, and
+there is no upgrade to take.
+
+The other four are not four decisions. Every one of them reaches this crate through
+`criterion` and through nothing else, on a `[dev-dependencies]` edge:
+
+```sh
+# Prints the path for each. `same-file` arrives via `walkdir`, `cast` and
+# `itertools` via both `criterion` and `criterion-plot`; every path terminates at
+# `criterion v0.5.1  [dev-dependencies]  zlib-rs`.
+for p in anes same-file tinytemplate cast criterion-plot itertools criterion; do
+  cargo tree --locked -i "$p"; done
+
+# And the converse, which is the sharper proof: with dev edges excluded, none of
+# the seven is in the graph at all, so `cargo tree` has nothing to print.
+for p in anes same-file tinytemplate cast criterion-plot itertools criterion; do
+  cargo tree --locked -e no-dev -i "$p"; done
+```
+
+Nothing they contain is linked into `libzlib_rs.so`, `libzlib_rs.a`, the rlib, or the
+published crate; the shipped third-party runtime closure remains `cfg-if` plus the
+optional `crc32fast`. So bumping `criterion` bumps the other three for free, which
+collapses the four into a single decision — and that decision comes out negative for
+two separate reasons:
+
+- **`criterion` 0.8.x declares `rust-version = "1.86"`.** This crate's MSRV is
+  **1.85.0**, and that floor is not negotiable for a benchmark harness: 1.85.0 is the
+  release in which `edition = "2024"` became available, it is asserted in three places
+  that must move together (see [MSRV policy](#msrv-policy)), and it is a published
+  compatibility promise. Taking the newest Criterion means raising the MSRV, which
+  trades a real consumer-facing guarantee for a development convenience.
+- **`criterion` 0.7.0 declares `rust-version = "1.80"`** and so *is* MSRV-compatible.
+  It is therefore a genuine option rather than a blocked one — but not a free one. The
+  0.6 and 0.7 releases carry breaking API changes, so taking them means rewriting all
+  three files in [`benches/`](benches), and the migration plan directs the committed
+  lockfiles to be refreshed **only under advisory pressure**, of which there is none
+  here. A bench-harness rewrite that changes no measured behaviour, buys no coverage,
+  and perturbs a reproducibility-pinned lockfile is not an improvement.
+
+**Advisory status, verified rather than assumed.** The RustSec database carries **zero**
+advisory files for all seven crate names, and both graphs pass `check advisories` at
+`0 errors, 0 warnings, 0 notes`. That verdict is stronger than "no known CVE", because
+[`deny.toml`](deny.toml) sets `unmaintained = "all"` and `unsound = "all"`: an
+*informational* unmaintained or unsoundness advisory against any of these, at any
+depth, is already a blocking error under the policy in force. None exists.
+
+**Re-evaluation cadence.** Review this table whenever any of the following happens,
+and at minimum **once per release** as part of the pre-release checks:
+
+1. `cargo deny check advisories` or `cargo audit` reports anything against one of the
+   seven — in which case the response is to move, not to `ignore` (standard S6, and
+   S10's "no lint is `allow`-ed to make a change land").
+2. The MSRV floor rises for an independent reason. That is the event that makes the
+   newest Criterion reachable; take it in the same change, not later.
+3. A Criterion release lands that is both MSRV-compatible **and** API-compatible with
+   the current [`benches/`](benches) sources, making the bump mechanical.
+4. Any of the seven gains a `RUSTSEC-*` unmaintained advisory, which under
+   `unmaintained = "all"` fails the gate whether or not anything is exploitable.
+
+Reproduce the table with the registry API rather than from memory — the figures above
+were measured, and a stale table here would be exactly the defect it exists to
+prevent:
+
+```sh
+for p in anes same-file tinytemplate cast criterion-plot itertools criterion; do
+  cargo info "$p" | sed -n "1,3p"; done
+```
 
 ### Pinned tool configuration
 
@@ -1160,10 +1248,10 @@ carry the signal — advertised through `zlibCompileFlags`, never left implicit.
 
 Two distinct classes exist, and conflating them is what makes a register go stale.
 **Five divergences are visible to a C caller** and are enumerated in the next section;
-they are frozen. A second, separate class — **internal conveniences that are strictly
-invisible at the C ABI** — is enumerated in the section after it. A change that moves
-an item from the second class into the first is a breaking change to the drop-in
-contract and must be treated as one.
+they are frozen. A second, separate class — **internal conveniences that are
+unobservable to a conforming caller** — is enumerated in the section after it. A change
+that moves an item from the second class into the first is a breaking change to the
+drop-in contract and must be treated as one.
 
 ## Five divergences that must be preserved, not fixed
 
@@ -1179,9 +1267,11 @@ The same five, numbered in the same order, appear in
    `Z_STREAM_ERROR`.** Rendering a C `va_list` requires the nightly-only
    `c_variadic` language feature, which would break both the stable build and the
    MSRV contract. This is **not silent**: it is advertised through `zlibCompileFlags`
-   **bit 27**, the bit C reserves for exactly this signal, so a caller can detect the
-   limitation programmatically — which is precisely how a C zlib built without a
-   secure `vsnprintf` behaves. The symbols must **not** be removed (that breaks
+   **bit 27**, which `zlib.h` *defines* — "`0 = gzprintf() present, 1 = not -- 1 means
+   gzprintf() returns an error`" — rather than reserves; the reserved range is bits
+   **28-31**, and this build leaves those zero. So a caller detects the limitation
+   through the bit the header assigns to precisely this condition, which is how a C
+   zlib built without a secure `vsnprintf` behaves. The symbols must **not** be removed (that breaks
    linkage) and must **not** be made to appear functional. There is deliberately no
    `c-variadic` Cargo feature.
 2. **`inflate_strict` defaults OFF.** Stricter inflate distance validation is
@@ -1225,7 +1315,7 @@ neither loop ever issues one. Four unit tests pin the shape; if you find yoursel
 adding an `Ok(0)` arm to either loop, they will fail, and that is the intended
 outcome.
 
-## Internal divergences that are invisible at the C ABI
+## Internal divergences that are unobservable to a conforming caller
 
 The five above are the whole list of divergences a C caller can *observe*. The port
 also departs from C internally in the places below. None of them belongs in that list,
@@ -1234,6 +1324,35 @@ than C, while leaving the return-code set, the struct layout, and the emitted by
 untouched. They are recorded here so nobody has to guess whether an omission was an
 oversight, and so that anyone who *changes* one can tell immediately whether they have
 just promoted it into the observable list.
+
+**Read the heading precisely: *unobservable to a conforming caller*, not "invisible at
+the C ABI".** The stronger phrasing was used here previously and it was wrong, because
+several of these items *are* detectable through the ABI — just only by a caller that has
+already left the contract `zlib.h` states. Measured against a reference C zlib built
+from this repository's own retained sources, both linked into the same probe:
+
+| Call | zlib-rs | reference C | Is it in contract? |
+|------|---------|-------------|--------------------|
+| `inflateBackEnd` on a `deflateInit` handle | `Z_STREAM_ERROR` | `Z_OK` — frees a deflate state through the inflateBack path | No. Undefined in C: `z_stream.state` is untyped |
+| `inflateBackEnd` on an `inflateInit` handle | `Z_STREAM_ERROR` | `Z_OK` | No, same reason |
+| `gzprintf(file, NULL)` | `Z_STREAM_ERROR` | **SIGSEGV** | No. `zlib.h` documents `format` as a format string |
+| `compress(NULL, &len, src, n)` | `Z_STREAM_ERROR` | `Z_STREAM_ERROR` | No, and both refuse identically |
+| `uncompress(dst, &len, NULL, n)` | `Z_STREAM_ERROR` | `Z_STREAM_ERROR` | No, and both refuse identically |
+
+Two conclusions follow, and both matter when editing this section. First, the difference
+in the top three rows is real and a caller *can* see it — so "invisible at the C ABI" is
+an overclaim and must not be reintroduced. Second, none of those differences is a
+compatibility defect: every one of them requires invalid or undefined usage to reach, and
+in each case the port replaces undefined behaviour with a defined refusal, which narrows
+what a program can do rather than changing anything `zlib.h` promises. A **conforming**
+caller — one that passes a handle to the engine that created it, and a format string
+where a format string is documented — cannot distinguish this library from C on any item
+below. That is the property this list claims, and it is the only property it claims.
+
+Reproduce the table with the probe form used above: compile one C file twice, once
+against `target/release/libzlib_rs.a` and once against an archive built from the
+in-tree `*.c` baseline, and run each case in a forked child so a crash in the reference
+build is reported as a signal instead of taking the harness down.
 
 - **`deflateSetHeader` retains the caller's pointer, exactly as C does — this is
   no longer a divergence, and the entry is kept to record that.** C stores the
@@ -1878,7 +1997,7 @@ moderate anything that makes the project a worse place to contribute.
 | [`rust-toolchain.toml`](rust-toolchain.toml) | The pinned toolchain (MSRV floor) |
 | [`clippy.toml`](clippy.toml) / [`rustfmt.toml`](rustfmt.toml) | The lint and format contracts |
 | [`deny.toml`](deny.toml) | The single supply-chain policy, governing the 89-package root graph and the 13-package detached fuzz graph |
-| [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | The twelve CI jobs, each documented in place |
+| [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | The fourteen CI jobs, each documented in place |
 | [`LICENSE`](LICENSE) | The zlib/libpng license |
 | `doc/rfc1950.txt`, `doc/rfc1951.txt`, `doc/rfc1952.txt` | The normative wire-format specifications, retained in-tree |
 | `zlib.h`, `deflate.c`, `trees.c`, `inflate.c`, … | The C oracle. Read freely; never edit |

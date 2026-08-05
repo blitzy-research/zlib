@@ -40,6 +40,35 @@ authors = [
 # `keywords` is capped at 5 entries by crates.io.
 keywords = ["zlib", "deflate", "gzip", "compression", "codec"]
 categories = ["compression", "no-std", "encoding", "api-bindings"]
+# PUBLICATION IS DISABLED, DELIBERATELY, AND NOT BECAUSE THE CRATE IS UNFINISHED.
+#
+# The `name` above collides with a crate that already exists on crates.io.
+# `zlib-rs` there is an unrelated, independently developed Rust zlib
+# implementation from the Trifecta Tech Foundation, published across 24 versions
+# (0.6.7 at the time of writing). This crate is a different lineage with a
+# different API and a different version scheme - it reports `1.3.2` here and
+# `"1.3.2.1-motley"` through `zlibVersion()` - so publishing under that name is
+# not merely unavailable, it would be actively misleading to anyone resolving the
+# dependency by name.
+#
+# Leaving `publish` unset means "publishable", which is the wrong default for a
+# package in that position: `cargo publish` would run its full archive-and-verify
+# pass and then attempt an upload. Ownership of the registry name is what would
+# actually stop it, i.e. an external control rather than a decision recorded in
+# this repository. `publish = false` moves the decision here, where it is
+# reviewable, and makes `cargo publish` refuse before it does any work at all.
+#
+# WHAT THIS DOES NOT AFFECT. `cargo package` is untouched: it still builds the
+# `.crate` archive, still honours the `exclude` contract below, and still runs
+# the packaged crate's own verification build. That is exactly what the
+# `package-verify` job in `ci.yml` invokes - deliberately `cargo package` rather
+# than `cargo publish --dry-run`, so the job stays entirely off the publishing
+# path - and it keeps working unchanged with this key set.
+#
+# TO PUBLISH LATER: decide the registry identity first (claim a free name, or
+# obtain ownership of this one), update `name` to match, then remove this key in
+# the same commit as that decision. Do not remove it on its own.
+publish = false
 # Explicitly declare the build script (Cargo also auto-detects `build.rs`).
 # `build.rs` regenerates the CRC-32 lookup tables into `OUT_DIR` at build time,
 # replacing the checked-in `crc32.h` tables from the C baseline.
@@ -188,6 +217,23 @@ crc32fast = { version = "1.5.0", optional = true, default-features = false }
 
 [dev-dependencies]
 # Statistical benchmarking harness driving `benches/*.rs`.
+#
+# HELD AT 0.5.1 DELIBERATELY, and this pin is the reason six other packages in the
+# lockfile are also old: `anes`, `same-file` (via `walkdir`), `tinytemplate`, `cast`,
+# `criterion-plot` and `itertools` all reach this crate through THIS edge and no
+# other, so they move only when it does. `criterion` 0.8.x declares
+# `rust-version = "1.86"`, above this crate's 1.85.0 MSRV, so the newest release is
+# unreachable without trading a consumer-facing compatibility promise for a
+# development convenience. 0.7.0 declares 1.80 and so is MSRV-compatible, but brings
+# breaking API changes that would require rewriting all three `benches/` files, and
+# the committed lockfiles are refreshed only under advisory pressure - of which
+# there is none: the RustSec database carries zero advisories for any of the seven,
+# under a policy where `unmaintained = "all"` and `unsound = "all"` would already
+# make an informational one blocking.
+#
+# The full evaluation, the measured version table and the re-evaluation triggers are
+# in `CONTRIBUTING.md` under "Dependency freshness, and the aged benchmark chain".
+# Do not bump this line without reading it.
 criterion = "0.5.1"
 # Reference DEFLATE implementation for interop / round-trip cross-checks. Its
 # DEFAULT features select the pure-Rust `miniz_oxide` backend, so the test suite
@@ -395,6 +441,82 @@ codegen-units = 1
 # aborts the process (a sound, non-UB outcome) instead of being caught and
 # converted to a `Z_*` error code.
 panic = "abort"
+# Drop the STATIC symbol table from linked release artifacts. A shared library
+# shipped as a drop-in `libz` replacement has no use for it: the only symbols a
+# consumer can reach are the ones in `.dynsym`, and those are unaffected.
+#
+# WHAT IT REMOVES, MEASURED. `.symtab` and `.strtab` disappear from
+# `libzlib_rs.so`, taking the static symbol-table entries from 1368 to 147 (the
+# remainder being `.dynsym` itself) and the file from 666,400 to 551,760 bytes.
+# The internal Rust symbol names and the relative source-location strings that
+# came with them go too. There was never any DWARF to remove - `debug` is off in
+# this profile, so the release `.so` carried no `.debug_*` section before or
+# after - and there were no absolute build paths, no secrets, and no internal
+# symbols in the dynamic table to begin with. So this is a reduction in incidental
+# metadata, not a fix for a leak.
+#
+# WHAT IT DOES NOT REMOVE, ALSO MEASURED, AND THIS IS THE PART THAT MATTERS.
+# Cargo's `strip` reaches only LINKED outputs. The `staticlib` and the `lib`
+# (rlib) are archives, not link products, so `libzlib_rs.a` is byte-for-byte as
+# before: 2311 `T` symbols, unchanged. That is load-bearing, because
+# `ci.yml`'s `bare-metal-no-std` job proves the freestanding runtime block was
+# compiled by reading `nm` output from the `thumbv7em-none-eabihf` archive, and
+# `c-abi-linkage` links that archive from C. Both were verified against a strip-on
+# build - including a `--release` bare-metal archive, which is not even the
+# profile that job uses - and all six of its symbol assertions still hold
+# (`no_std_support`, the `calloc`/`realloc`/`posix_memalign`/`abort` references,
+# and crate-owned `rust_eh_personality`/`rust_begin_unwind`).
+#
+# THE EXPORT CONTRACT IS UNCHANGED, verified by set comparison rather than by
+# count: the stripped and unstripped `.so` export exactly the same 95 `T`
+# symbols, covering 54/54 of `zlib.map`'s `global:` names with 0/10 of its
+# `local:` names leaked. ELF hardening survives too (`BIND_NOW`, `FLAGS_1: NOW`,
+# `GNU_RELRO`, a non-executable `GNU_STACK`, and no `RPATH`/`RUNPATH`), and a C
+# consumer linked both statically and dynamically against the stripped artifacts
+# round-trips 50,000 bytes byte-exactly with correct `1f 8b` gzip framing.
+#
+# COST TO DEBUGGING, STATED HONESTLY. CI runs `cargo test --release` on three
+# rows, and a stripped test binary yields a panic backtrace without symbol names.
+# All four feature rows were re-run under this setting and are unaffected in
+# outcome (1039 default, 1052 all-features, 737 no-default-features, 737
+# no-std - all passing, none ignored), because harness names and panic messages
+# are compiled-in strings rather than symbol-table entries. Anyone who needs the
+# names back gets them from the debug profile, or with `--config
+# profile.release.strip=false` on a one-off build; nothing here is baked into a
+# published artifact, since `publish = false` above means there is none.
+#
+# THE BASELINE THIS IS MEASURED AGAINST, STATED PRECISELY, because "666,400
+# bytes" reads like "unstripped" and it is not. Cargo's own default for a
+# release profile with `debug = 0` is `strip = "debuginfo"`, so every figure
+# above compares two *stripping* modes rather than stripping against none. All
+# three, measured on the default feature row with one `readelf` methodology
+# (`-SW` for sections, `-sW` for per-table entry counts):
+#
+#   strip        bytes   .symtab  .debug_*  .symtab  .dynsym  exported
+#                        sections sections  entries  entries  `T`
+#   none       4,578,272     1        6       1,221     147      95
+#   debuginfo    666,400     1        0       1,221     147      95   <- cargo default
+#   symbols      551,760     0        0           0     147      95   <- this key
+#
+# The last column is the point: all three builds export the identical 95-name
+# set (compared as sets, not counted), so the choice is invisible to every
+# consumer and costs only local debuggability.
+#
+# ONE CI ASSERTION HAD TO MOVE WITH THIS KEY, and a reader who changes the key
+# needs to know which. `c-abi-linkage`'s personality-symbol assertion has two
+# axes: `rust_eh_personality` must be DEFINED exactly once - read from
+# `.symtab` - and EXPORTED zero times - read from `.dynsym`. Removing `.symtab`
+# silently zeroed axis 1, which would have let a genuine regression through as
+# a vacuous pass. That job now builds a `strip = "debuginfo"` probe into a
+# separate `CARGO_TARGET_DIR`, refuses to proceed if the probe has no `.symtab`
+# either, reads axis 1 from the probe and axis 2 from the SHIPPED artifact,
+# cross-checks that both agree on the exported count, and `diff`s the two
+# dynamic export sets to prove the probe is ABI-identical to what ships. A
+# companion step asserts the shipped `.so` carries NO `.symtab`, so this key
+# cannot be dropped - or overridden by `RUSTFLAGS` or
+# `CARGO_PROFILE_RELEASE_STRIP` - without CI going red. Deliberately retiring
+# the hardening therefore means deleting that assertion in the same commit.
+strip = "symbols"
 
 [profile.dev]
 # The panic strategy MUST match `[profile.release]`. The reproduction command

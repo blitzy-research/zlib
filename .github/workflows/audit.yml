@@ -384,9 +384,16 @@
 # database is fetched fresh on every run, at a real cost of two `cargo install`
 # builds per run on a daily schedule. What it buys is that neither a stale tool nor
 # a stale advisory database can ever produce a verdict here: a cached advisory DB is
-# the classic way a security gate degrades into one that always passes, which is the
-# failure root `deny.toml`'s `maximum-db-staleness = "P7D"` backstops, and a cached
+# the classic way a security gate degrades into one that always passes, and a cached
 # tool binary would defeat the `--version` pins, which are enforced at install time.
+#
+# Fetching fresh is not merely belt-and-braces alongside `deny.toml`'s
+# `maximum-db-staleness = "P7D"` - it is the ONLY thing enforcing freshness here.
+# In cargo-deny 0.20.2 that duration is consulted exclusively on the offline
+# (`Fetch::Disallow`) path; a fetching run never evaluates it. What protects a
+# fetching run is that the fetch itself is fallible and unhandled: an unreachable
+# database is a hard error, so no verdict is produced at all. See the key's own
+# comment in `deny.toml` for the source citations and the measured behaviour.
 #
 # If build minutes ever become the binding constraint, cache the CARGO REGISTRY
 # INDEX (which is content-addressed and cannot go stale in a way that changes a
@@ -401,7 +408,9 @@ name: Audit
 # The DAILY 05:00 UTC `schedule` is what makes this workflow able to do its job at
 # all: the RustSec database changes with no commit to this repository, so a
 # push/PR-only audit is structurally incapable of noticing a new advisory. Daily
-# also keeps `deny.toml`'s `maximum-db-staleness = "P7D"` comfortably satisfied.
+# also keeps a fetching run well inside `deny.toml`'s `maximum-db-staleness =
+# "P7D"`, but that is a side effect and not the reason for the schedule: the bound
+# is evaluated only on the offline path, so a fetching run never reaches it.
 # The 05:00 offset from `fuzz.yml`'s Monday 03:00 UTC slot REDUCES the likelihood of
 # the two overlapping without guaranteeing it - GitHub schedules are best-effort and
 # may start late, and a long campaign can still be running. That slot belongs to
@@ -819,10 +828,36 @@ jobs:
       #    `actions/checkout@v4` uses there are across the three workflows, how
       #    many `dtolnay/rust-toolchain@*` call sites a future SHA-pinning change
       #    would have to convert, and so on. Counts in a comment rot the instant a
-      #    job is added or removed, and these had in fact already rotted: they were
-      #    written when the three files held 13 and 12 respectively. A stale
+      #    job is added or removed, and these have now rotted TWICE.
+      #
+      #    The FIRST time the `uses:` totals were the casualty: they were written
+      #    against 13 `actions/checkout` and 12 `dtolnay/rust-toolchain`
+      #    references and stayed behind as jobs were added. That is why those
+      #    totals are asserted here at all.
+      #
+      #    The SECOND time it was the JOB COUNT below. `ci.yml` grew to 14 jobs
+      #    while `EXPECTED_JOBS` still said 12, so this step failed on every push,
+      #    pull request, dispatch and schedule - and it failed while the very same
+      #    dictionary already expected 14 `actions/checkout` and 14
+      #    `dtolnay/rust-toolchain` uses in that same file. Nothing was comparing
+      #    the two halves, so the contradiction sat in plain sight. A stale
       #    migration instruction is worse than none, because it tells whoever
-      #    performs the conversion that they are finished when they are not.
+      #    performs the conversion that they are finished when they are not; a
+      #    stale ASSERTION is worse still, because it turns a governance gate into
+      #    a permanent red that reviewers learn to look past.
+      #
+      #    WHAT THAT SECOND FAILURE CHANGED. A job count is now held to THREE
+      #    independent sources instead of one: the reviewed literal in
+      #    `EXPECTED_JOBS`, the `jobs:` block GitHub Actions actually executes, and
+      #    the `# Jobs:` index in the workflow's own header - which is what a
+      #    contributor reads first, and which had stayed correct throughout. The
+      #    index is compared as a SET OF JOB NAMES, not as a count and not in
+      #    order: `ci.yml` deliberately lists `unsafe-boundary` ahead of
+      #    `build-script-tests` in its header while the block defines them the
+      #    other way round, so an ordered comparison would fail a file that is
+      #    entirely correct. Comparing names also means a job added in one place
+      #    and not the other is NAMED in the failure rather than merely counted,
+      #    which is the difference between a diagnosis and a puzzle.
       #
       #    This step belongs in THIS job for the same reason step 2 does: it needs
       #    no Rust toolchain, no network and no dependency resolution, only the
@@ -836,8 +871,11 @@ jobs:
       #    review yet is a distinct byte sequence to `grep`, so it once made a
       #    packaging assertion depend on an unstated encoding.
       #
-      #    WHEN YOU ADD OR REMOVE A JOB: update the expectation below and the
-      #    prose above in the same commit. That coupling is the whole point.
+      #    WHEN YOU ADD OR REMOVE A JOB: update `EXPECTED_JOBS` below, the
+      #    workflow's own `# Jobs:` index, and the prose above, all in the same
+      #    commit. That coupling is the whole point, and all three are now asserted
+      #    against one another, so a commit that moves only one of them fails here
+      #    and says which one was left behind.
       - name: Assert the workflow census matches this file's documented counts
         run: |
           set -euo pipefail
@@ -850,13 +888,26 @@ jobs:
               ".github/workflows/fuzz.yml",
           )
 
-          # Expected job count per workflow. Keep in step with each file's own
-          # `# Jobs:` index.
+          # Expected job count per workflow: the REVIEWED figure. It is checked
+          # below against both the `jobs:` block and the file's own `# Jobs:`
+          # index, so no two of the three can drift apart unnoticed.
           EXPECTED_JOBS = {
-              ".github/workflows/ci.yml": 12,
+              ".github/workflows/ci.yml": 14,
               ".github/workflows/audit.yml": 4,
               ".github/workflows/fuzz.yml": 1,
           }
+
+          # Workflows that deliberately carry NO `# Jobs:` header index, and why.
+          # `fuzz.yml` holds a single job and indexes its `# Triggers:` instead, so
+          # an index there would restate one key that sits a few lines below it.
+          #
+          # The exemption is DECLARED rather than inferred, so the check bites in
+          # both directions: add a `# Jobs:` index to `fuzz.yml` and this step asks
+          # for the exemption to be dropped so the index starts being checked;
+          # delete the index from `ci.yml` or `audit.yml` and it asks for the index
+          # back. Silently skipping a file with no index would have let the header
+          # index disappear entirely without a word.
+          NO_JOBS_INDEX = {".github/workflows/fuzz.yml"}
 
           # Expected `uses:` census: action prefix -> {workflow: count}. The totals
           # quoted in the ACTION PINNING section are the sums of these rows:
@@ -900,6 +951,12 @@ jobs:
           }
 
           JOB_KEY = re.compile(r"^  ([A-Za-z][A-Za-z0-9_-]*):\s*$")
+          # A `# Jobs:` index entry names its job at exactly three spaces after the
+          # `#`; the description that follows may wrap onto continuation lines,
+          # which indent much further. That indentation is the ONLY thing telling an
+          # entry apart from its own wrapped description, so the pattern is anchored
+          # to it rather than to the words.
+          INDEX_ENTRY = re.compile(r"^#   (\S+)")
           # `(\S+?)` plus an optional trailing comment: every `uses:` line here is
           # `uses: <action>@<sha> # <release>`, so a pattern anchored straight to
           # end-of-line would match none of them.
@@ -916,6 +973,30 @@ jobs:
                   if line and not line.startswith((" ", "\t", "#")):
                       break
                   found = JOB_KEY.match(line)
+                  if found:
+                      names.append(found.group(1))
+              return names
+
+          def indexed_job_names(text):
+              """Job names documented in the header's `# Jobs:` index.
+
+              Returns None when the file carries no index at all, which is a
+              different condition from an index that lists nothing and is handled
+              separately below.
+              """
+              lines = text.split("\n")
+              if "# Jobs:" not in lines:
+                  return None
+              names = []
+              for line in lines[lines.index("# Jobs:") + 1:]:
+                  if not line.startswith("#"):
+                      break
+                  body = line[1:]
+                  # A bare `#` separator, or a paragraph that resumes at the left
+                  # margin, ends the index.
+                  if not body.strip() or len(body) - len(body.lstrip(" ")) < 3:
+                      break
+                  found = INDEX_ENTRY.match(line)
                   if found:
                       names.append(found.group(1))
               return names
@@ -940,6 +1021,44 @@ jobs:
               if len(names) != EXPECTED_JOBS[path]:
                   failures.append(f"{path}: expected {EXPECTED_JOBS[path]} job(s), "
                                   f"found {len(names)}: {names}")
+
+              # THE THIRD SOURCE for that same number, and the regression for the
+              # failure that made this whole step red: the workflow's own `# Jobs:`
+              # header index. `EXPECTED_JOBS` is the reviewed literal and `names` is
+              # what Actions executes; the index is what a contributor reads first,
+              # and it stayed correct while the literal rotted. Deriving the check
+              # from the file itself is what stops any one of the three from going
+              # stale in silence.
+              indexed = indexed_job_names(text)
+              if indexed is None:
+                  if path not in NO_JOBS_INDEX:
+                      failures.append(f"{path}: header carries no `# Jobs:` index; "
+                                      "the job census needs it as an independent "
+                                      "source of truth, so either restore it or add "
+                                      "the file to NO_JOBS_INDEX with a reason")
+              elif path in NO_JOBS_INDEX:
+                  failures.append(f"{path}: header now carries a `# Jobs:` index "
+                                  "but the file is still exempted in "
+                                  "NO_JOBS_INDEX; drop the exemption so the index "
+                                  "is actually checked")
+              else:
+                  # Compared as SETS, deliberately: `ci.yml`'s index and its `jobs:`
+                  # block list the same 14 keys in different orders, so an ordered
+                  # comparison would fail a correct file. Naming the difference also
+                  # beats reporting a count that is merely off by one.
+                  unindexed = sorted(set(names) - set(indexed))
+                  phantom = sorted(set(indexed) - set(names))
+                  if unindexed:
+                      failures.append(f"{path}: job(s) {unindexed} are defined "
+                                      "under `jobs:` but missing from the "
+                                      "`# Jobs:` index")
+                  if phantom:
+                      failures.append(f"{path}: the `# Jobs:` index names "
+                                      f"{phantom}, which no `jobs:` key defines")
+                  if len(indexed) != EXPECTED_JOBS[path]:
+                      failures.append(f"{path}: the `# Jobs:` index lists "
+                                      f"{len(indexed)} entr(ies) {indexed}, but "
+                                      f"{EXPECTED_JOBS[path]} job(s) are expected")
 
               for prefix, per_file in EXPECTED_USES.items():
                   seen = sum(1 for u in USES.findall(text) if u.startswith(prefix))
@@ -994,14 +1113,20 @@ jobs:
               for failure in failures:
                   print(f"::error::{failure}")
               print(f"{len(failures)} workflow-census assertion(s) failed. Either a "
-                    "workflow changed, or the ACTION PINNING section of audit.yml is "
-                    "out of date -- update whichever is actually wrong, in the same "
+                    "workflow changed, or this step's expectations, a `# Jobs:` "
+                    "index, or the ACTION PINNING section of audit.yml is out of "
+                    "date -- update whichever is actually wrong, in the same "
                     "commit.")
               raise SystemExit(1)
 
           summary = ", ".join(f"{n} {p.rstrip('@')}" for p, n in census.items())
+          indexed_total = sum(
+              len(indexed_job_names(open(p, encoding="utf-8").read()) or ())
+              for p in WORKFLOWS if p not in NO_JOBS_INDEX)
           print(f"workflow census matches the documented counts: {summary}; "
-                "all three workflows are byte-ASCII")
+                f"{indexed_total} job(s) named identically by their `# Jobs:` "
+                "index and their `jobs:` block; all three workflows are "
+                "byte-ASCII")
           PY
 
   # RustSec advisory scan of both lockfiles. This is the only `cargo-audit` run in
@@ -1379,10 +1504,15 @@ jobs:
                -A unused-wrapper -A license-exception-not-encountered
 
       # 7. Advisories. Reaches the NETWORK for the RustSec database named by
-      #    `deny.toml`'s `db-urls`, where `maximum-db-staleness` makes a database too
-      #    old to trust an error rather than a quiet pass - so an offline run fails
-      #    here instead of reporting a false clean. Severity comes entirely from the
-      #    file, whose `ignore` list is empty. This is the step the guard exists for:
+      #    `deny.toml`'s `db-urls`, and that reach is itself the freshness
+      #    guarantee: the fetch is fallible and unhandled, so a database that
+      #    cannot be reached fails this step outright rather than yielding a quiet
+      #    pass against whatever was on disk. `maximum-db-staleness` is NOT what
+      #    protects this step - cargo-deny 0.20.2 evaluates that bound only on the
+      #    offline (`Fetch::Disallow`) path, which this invocation never takes; it
+      #    is the backstop for a run that has been told not to fetch. Severity
+      #    comes entirely from the file, whose `ignore` list is empty. This is the
+      #    step the guard exists for:
       #    without it a licence rejection above would leave a run red for a licensing
       #    reason while saying nothing about whether the graph is vulnerable.
       - name: Check advisories

@@ -403,6 +403,28 @@ There is no sixth.
   failure mode**, because it runs only once every fallible step has already
   succeeded. Reporting it as a vulnerability is therefore out of scope; reporting a
   path on which it *fails* to run before the first slice is formed is class 1 above.
+- **Several out-of-contract calls are refused here that reference C accepts or
+  crashes on, and that difference *is* observable at the ABI.** Measured with one C
+  probe compiled twice — once against `target/release/libzlib_rs.a` and once
+  against an archive built from the retained in-tree `*.c` sources, with each case
+  run in a forked child so a crash in the reference build is reported as a signal
+  instead of taking the harness down — `inflateBackEnd` on a `deflateInit_` or an
+  `inflateInit_` handle returns `Z_STREAM_ERROR` here and `Z_OK` there, where C
+  reinterprets one state struct as another and releases it through the wrong path;
+  and `gzprintf(file, NULL)` returns `Z_STREAM_ERROR` here where the reference
+  build raises **SIGSEGV**. The one-call wrappers agree in both libraries:
+  `compress(NULL, ...)` and `uncompress(..., NULL, ...)` each return
+  `Z_STREAM_ERROR`. None of this is a compatibility divergence, because every one
+  of those calls requires usage `zlib.h` does not sanction — an untyped `state`
+  handed to the wrong engine, or a null pointer where a format string is documented
+  — and in each case a defined refusal replaces undefined behaviour, which
+  narrows what a program can do rather than changing anything the header promises.
+  This is why the register above is scoped to what a **conforming** caller can
+  observe, and why the phrase "invisible at the C ABI" is deliberately not used for
+  this class anywhere in the repository: it would overclaim. The reportable
+  direction is the mirror image — a call that `zlib.h` *defines* and that this
+  crate aborts on is class 3 above, and one it answers differently than reference C
+  is class 5.
 
 ---
 
@@ -474,7 +496,18 @@ where it could report something real, and nothing is waived in both places at on
 
 The policy declares `[advisories]`, `[licenses]`, `[bans]`, and `[sources]`,
 resolves with `all-features = true`, denies yanked crates, and bounds
-advisory-database staleness at `maximum-db-staleness = "P7D"`. It carries an
+advisory-database staleness at `maximum-db-staleness = "P7D"` **on the offline
+path**. Read that bound narrowly: in cargo-deny 0.20.2 the duration is carried only
+by the `Fetch::Disallow` variant, which is constructed solely for an `--offline`
+run, so a fetching run never evaluates it. What keeps a *fetching* run honest is
+that the fetch is fallible and unhandled — an unreachable database is a hard error,
+so an audit that cannot obtain a current database produces no verdict rather than a
+falsely clean one. Measured on this tree: online against a nonexistent `db-urls`
+repository exits 1 with `failed to fetch advisory database`; `--offline` against a
+clone backdated 30 days exits 1 with `repository is stale`; online against that same
+backdated clone exits 0, because the fetch refreshes it before the bound could be
+read. Seven days is therefore a tightening of cargo-deny's ninety-day *offline*
+default, not the mechanism behind the daily online scan. It carries an
 **empty `ignore` list** — no advisory is waived — leaves `[graph] targets` **empty**
 so every crate is evaluated for every platform (naming triples *prunes* the graph:
 measured, nine triples reduced coverage from 89 crates to 86, silently dropping the
@@ -793,7 +826,7 @@ sits here:
   QEMU reproduces the ISA, the memory map and the absence of an OS, but not a
   device's timing, memory controller or peripheral behaviour, so validation on
   real silicon remains genuinely outstanding.
-- **Human code review across the full Rust surface — 80,258 lines across 40 files
+- **Human code review across the full Rust surface — 80,286 lines across 40 files
   under `src/`, measured on 2026-08-04 with
   `find src -name '*.rs' -print0 | xargs -0 wc -l` — is outstanding**, and it is
   the highest-severity remaining hardening item

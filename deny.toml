@@ -132,8 +132,10 @@
 #     Triggers: `push`, `pull_request`, `workflow_dispatch`, and a DAILY `schedule`
 #     at 05:00 UTC. The daily run is what makes the advisory half meaningful at all:
 #     the RustSec database changes without any commit here, so a push-only audit
-#     cannot notice a newly published advisory. Daily also keeps
-#     `maximum-db-staleness = "P7D"` comfortably satisfied.
+#     cannot notice a newly published advisory. Daily also keeps a fetching run
+#     well inside `maximum-db-staleness = "P7D"`, though that bound is consulted
+#     only on the offline path -- see the key itself for what actually enforces
+#     freshness online.
 #   * FUZZ GRAPH -- job `cargo-deny-fuzz`, running this SAME file against
 #     `--manifest-path fuzz/Cargo.toml`, which gives the fuzz graph the same trigger
 #     coverage as the root graph. That breadth is the point: without it, a direct
@@ -375,13 +377,45 @@ yanked = "deny"
 # Yank checking must stay on; stated explicitly so a future edit has to argue with
 # an existing line rather than silently rely on a default.
 disable-yank-checking = false
-# Fail if the local advisory database is older than 7 days. Without a staleness
-# bound, a fetch that silently fails degrades this into a check that always
-# passes -- the worst possible failure mode for a security gate. CI fetches fresh
-# every run, so this only bites when the network path is broken, which is exactly
-# when you want to know. Locally: `cargo deny fetch`. If your environment needs
+# Fail if the advisory database being used is older than 7 days -- ON THE OFFLINE
+# PATH, which is the only path that consults this value. Read the next paragraph
+# before relying on it, because the obvious reading of this key is wrong.
+#
+# WHAT ACTUALLY ENFORCES ONLINE FRESHNESS: the MANDATORY SUCCESSFUL FETCH, not
+# this duration. Verified against cargo-deny 0.20.2's own source. Its
+# `src/cargo-deny/check.rs` builds `Fetch::Disallow(maximum_db_staleness)` only
+# inside `if offline`; an ordinary run takes `Fetch::Allow` or
+# `Fetch::AllowWithGitCli`, and neither variant carries the duration at all.
+# `src/advisories/helpers/db.rs` then guards the comparison with
+# `if let Fetch::Disallow(max_staleness) = fetch`, so on the fetch-allowed paths it
+# is never evaluated. Freshness on those paths comes from the line just above it:
+# the fetch is propagated with `?`, so a database that cannot be reached or cloned
+# is a HARD ERROR and the run dies there. That is what rules out the failure mode
+# people reach for this key to prevent -- there is no quiet degradation into a
+# check that always passes, because there is no scan at all without a database.
+#
+# Measured, on this tree, with cargo-deny 0.20.2:
+#   * online, `db-urls` pointed at a nonexistent repository -> exit 1,
+#     "failed to fetch advisory database ... failed to clone". No verdict is
+#     produced, let alone a clean one.
+#   * offline (`--offline`), with the local clone's `.git/FETCH_HEAD` backdated 30
+#     days -> exit 1, "repository is stale (last update: ...)". THIS is where the
+#     7-day bound bites.
+#   * online, same backdated clone -> exit 0. The bound is not consulted; the
+#     fetch refreshes the timestamp before anything reads it.
+#
+# WHY KEEP IT AT 7 DAYS ANYWAY. cargo-deny's default is NINETY days
+# (`src/advisories/cfg.rs`), which is long enough for an offline or air-gapped run
+# to audit against a database that predates a whole quarter of advisories and
+# still report clean. Seven days tightens that to a window in which "stale" and
+# "current" are still meaningfully the same answer. The daily 05:00 UTC schedule
+# in `audit.yml` keeps a fetching run comfortably inside it as a side effect, but
+# the schedule's real job is to notice advisories published without a commit here.
+#
+# Locally: `cargo deny fetch` refreshes the database. If your environment needs
 # proxy-aware or authenticated fetching, set `git-fetch-with-cli = true` rather
-# than raising this bound.
+# than raising this bound -- raising it buys nothing online and weakens the only
+# path it governs.
 maximum-db-staleness = "P7D"
 #
 # ADVISORY IGNORE LIST -- INTENTIONALLY EMPTY, AND VERIFIED EMPTY.
