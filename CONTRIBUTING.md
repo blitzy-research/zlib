@@ -488,6 +488,66 @@ Three flags on those lines are load-bearing, not decorative:
   a build command, and rejects the flag outright —
   `error: unexpected argument '--locked' found`. Do not add it there.
 
+### One invocation that looks like a gate but is not: `cargo build --all-targets`
+
+`--all-targets` is correct — and mandatory — on `cargo check` and `cargo clippy`
+above. It does **not** work on `cargo build` in this crate, no job in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs it, and it is not a
+gate. From a clean target directory,
+`cargo build --locked --all-targets [--all-features]` exits **101** after printing
+four Cargo warnings and three compiler errors:
+
+```text
+warning: output filename collision at target/debug/deps/libzlib_rs.rlib
+  = note: the lib target `zlib_rs` in package `zlib-rs v1.3.2 (…)` has the same
+          output filename as the lib target `zlib_rs` in package `zlib-rs v1.3.2 (…)`
+  = note: this may become a hard error in the future;
+          see <https://github.com/rust-lang/cargo/issues/6313>
+  = help: consider changing their names to be unique or compiling them separately
+…the same three notes again for libzlib_rs.so, libzlib_rs.so.dwp, and libzlib_rs.a
+error: the crate `zlib_rs` requires panic strategy `abort` which is incompatible
+       with this crate's strategy of `unwind`
+```
+
+Two deliberate properties of this crate collide there, and **both are load-bearing**:
+
+- **`crate-type = ["lib", "cdylib", "staticlib"]`** ([`Cargo.toml`](Cargo.toml)) is
+  what makes the C drop-in possible at all. Because that lib target also emits
+  non-rlib artifacts, Cargo omits its `-C extra-filename` hash — so a single
+  invocation that has to build the lib twice writes both copies to the same
+  `deps/libzlib_rs.{rlib,so,so.dwp,a}` paths, which is
+  [rust-lang/cargo#6313](https://github.com/rust-lang/cargo/issues/6313).
+- **`panic = "abort"` in both profiles** is required for the std-off
+  `cdylib`/`staticlib` link on a stable toolchain (see
+  [The feature matrix](#the-feature-matrix)), while Cargo always compiles a lib
+  *as a dependency of a test or bench target* with `panic = "unwind"` — the
+  `[profile.dev]` comment in [`Cargo.toml`](Cargo.toml) records exactly that.
+  `--all-targets` therefore asks for one lib under both panic strategies in one
+  invocation, which no `rustc` can satisfy.
+
+The mechanism is confirmable in a single command: prefixing the same invocation with
+`CARGO_PROFILE_DEV_PANIC=unwind` makes it exit 0 with zero collisions and zero panic
+errors. **That is a diagnosis, not a workaround** — running a gate that way runs it
+under a panic strategy the crate does not ship. Note also that the four collision
+warnings come from *Cargo*, not from `rustc`, so `-D warnings` neither sees nor
+promotes them; the exit code is what tells you.
+
+No coverage is lost, because every target is reachable through an invocation that
+does work. Each of these exits 0 from a clean target directory:
+
+```sh
+RUSTUP_TOOLCHAIN=stable cargo check  --locked --all-targets --all-features
+RUSTUP_TOOLCHAIN=stable cargo clippy --locked --all-targets --all-features -- -D warnings
+RUSTUP_TOOLCHAIN=stable cargo test   --locked --no-run   # builds every test target
+RUSTUP_TOOLCHAIN=stable cargo bench  --locked --no-run   # builds every bench target
+RUSTUP_TOOLCHAIN=stable cargo build  --locked            # lib + cdylib + staticlib
+```
+
+"Fixing" the collision by dropping a `crate-type` entry or by relaxing the panic
+strategy is out of bounds: the first withdraws the drop-in artifacts that user
+Constraint 2 exists for, and the second breaks the std-off link. Use the invocations
+above instead.
+
 ### Expected results
 
 If your change did not touch behaviour, you should see exactly these numbers. A

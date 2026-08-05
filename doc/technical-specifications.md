@@ -717,7 +717,7 @@ zlib-rs (same repository, additive to the retained C baseline)
 ├── rustfmt.toml                    179  pinned format configuration
 ├── CHANGELOG.md                    713  Rust crate release history
 ├── SECURITY.md                     866  vulnerability disclosure policy
-├── CONTRIBUTING.md                2007  contribution workflow, the seven blocking gates, MSRV policy
+├── CONTRIBUTING.md                2067  contribution workflow, the seven blocking gates, MSRV policy
 ├── README.md                      1420  measured evidence, drop-in transcript, quick-start guide
 ├── LICENSE                          22  upstream zlib licence, retained verbatim
 ├── mkdocs.yml                      129  docs_dir: doc — three-entry nav + Material-search wiring + canonical-root rationale
@@ -810,7 +810,7 @@ zlib-rs (same repository, additive to the retained C baseline)
 │       └── fuzz_inflate.rs        1838
 ├── doc/                                 [the published docs_dir]
 │   ├── index.md                    158  published landing page
-│   ├── project-guide.md            961  frozen internal §1-§9 numbering
+│   ├── project-guide.md            962  frozen internal §1-§9 numbering
 │   ├── technical-specifications.md      this document
 │   └── rfc1950.txt, rfc1951.txt, rfc1952.txt, algorithm.txt, txtvsbin.txt, crc-doc.1.0.pdf
 │                                        REFERENCE ONLY — never edited (D-7)
@@ -3107,7 +3107,7 @@ re-measure a count rather than treating a transcribed one as authoritative.
 | D3 | Cross-platform CI matrix rows — the matrix varied **features only**, with `runs-on: ubuntu-latest` everywhere | absent | **CLOSED, with a residual** — `build-test` carries native `windows-latest` x86_64 and `macos-latest` aarch64 rows; `cross-targets` type-checks *and* Clippy-lints `aarch64` / `i686` / big-endian `s390x` / `x86_64-pc-windows-msvc`, the last being the cross Windows lane rather than a duplicate of the native one; `build-script-tests` type-checks the big-endian braid selection; and `cross-run` EXECUTES the suite for the three Linux triples of that four under `qemu-user`, across the default row and both std-off rows, asserting each row's declared `target_endian` / `target_pointer_width` against `rustc --print cfg` and running the four endian-critical CRC tests by name. Residual: that execution is emulated, not run on IBM Z or 32-bit hardware, and the Windows-MSVC lane executes nothing at all | Medium |
 | D4 | `rust-toolchain.toml` — pin the toolchain so contributor builds do not float | absent | **CLOSED** — present, 179 lines, `channel = "1.85.0"` with `rustfmt` and `clippy`, `profile = "minimal"` | Medium |
 | D5 | `CHANGELOG.md` — the Rust crate had no release history of its own | absent | **CLOSED** — present, 713 lines | Medium |
-| D6 | `SECURITY.md` and `CONTRIBUTING.md` | both absent | **CLOSED** — `SECURITY.md` present (866 lines); `CONTRIBUTING.md` present (2,007 lines), covering the contribution workflow, the blocking quality gates, the MSRV policy, and the seven byte-identity-risk files | Medium |
+| D6 | `SECURITY.md` and `CONTRIBUTING.md` | both absent | **CLOSED** — `SECURITY.md` present (866 lines); `CONTRIBUTING.md` present (2,067 lines), covering the contribution workflow, the blocking quality gates, the MSRV policy, and the seven byte-identity-risk files | Medium |
 | D7 | `.cargo/config.toml` — no home for target rustflags or link arguments | absent | **CLOSED** — present, 173 lines | Low |
 | D8 | cdylib symbol-version wiring — `zlib.map` authoritative but consumed by no Rust build step | absent | **CLOSED as an opt-in** — `build.rs` emits `cargo:rustc-cdylib-link-arg` under `ZLIB_RS_VERSION_SCRIPT`; measured 54 tagged symbols and 16 version definitions when enabled, 0 tags when not, 95 `T` symbols either way | Low |
 | D9 | Automated C-oracle conformance harness — the 3,750-combination sweep was not reproducible in-repository | absent; no `[[test]]`, no `c-oracle` feature | **CLOSED** — `tests/c_oracle.rs` (3,548 lines) plus the `c-oracle` feature and `[[test]] name = "c_oracle"` with `required-features`; 13 tests, exact 3,750-combination grid, no mandatory build-dependency | Medium |
