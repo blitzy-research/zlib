@@ -22,7 +22,7 @@ of the published crate through the `exclude` list in `Cargo.toml`.
 | **Feature flags** | Seven: `std`, `gzip`, `gz-io`, and `simd` (the default set), plus `no-std`, `inflate_strict`, and the opt-in `c-oracle` harness gate. |
 | **Toolchain** | Edition **2024**, MSRV **1.85.0** — verified on both 1.85.0 and stable 1.97.1. |
 | **Dependencies** | A **two**-crate runtime closure: `cfg-if 1.0.4` plus optional `crc32fast 1.5.0`. |
-| **Performance** | A constraint respected, not the objective: compression ≈ **85%** of C throughput, decompression **107–127%**. The heuristics that cost throughput also decide which bytes are emitted, so a faster match finder emitting different tokens is a regression. |
+| **Performance** | A constraint respected, not the objective — but measured per profile rather than quoted as an aggregate. Compression runs at **113–161%** of reference C throughput on compressible input and **82–94%** on incompressible input; `uncompress` at **101–160%**; `inflateBack` at **216–344%** on input that decodes Huffman symbols. Method and the full per-level tables are in [§0.8.3](technical-specifications.md#083-performance-expectations). The heuristics that cost throughput also decide which bytes are emitted, so a faster match finder emitting different tokens is a regression. |
 
 ## What it provides
 
@@ -123,12 +123,17 @@ writes, closes, reopens, and reads the payload back, and a dedicated step runs t
 cannot decay into a signature check. Each row also asserts its own `rustc -vV` host triple and `runner.arch`. The
 aarch64, 32-bit `i686`, and big-endian `s390x` Linux triples plus `x86_64-pc-windows-msvc` are **cross
 type-checked and cross-linted** (with `--all-features`, so the `c_oracle` harness and `inflate_strict` arms are
-included, and with `clippy -D warnings` so a target-conditional lint cannot hide), and the bare-metal
-`thumbv7em-none-eabihf` target is **built** in both `no_std` configurations. The Windows-MSVC triple appears in
-both lists deliberately and means two different things: natively it **runs** the suite with default features,
-while the cross lane reaches the whole `cfg(windows)` surface with every feature on and executes nothing. A
-32-bit, big-endian, or bare-metal build is therefore compile-verified rather than runtime-verified, and this page
-does not claim otherwise.
+included, and with `clippy -D warnings` so a target-conditional lint cannot hide). The first three are then
+**executed under `qemu-user`** by the `cross-run` job across the default row and both std-off rows, with each row
+asserting its declared `target_endian` and `target_pointer_width` and a dedicated step running the four
+endian-critical CRC tests by name. The Windows-MSVC triple appears in both lists deliberately and means two
+different things: natively it **runs** the suite with default features, while the cross lane reaches the whole
+`cfg(windows)` surface with every feature on and executes nothing. The bare-metal `thumbv7em-none-eabihf` target
+is **built** in both `no_std` configurations by `bare-metal-no-std` and **executed** by `bare-metal-run`, which
+links that staticlib into a firmware image and runs it on a no-OS Cortex-M4 under `qemu-system-arm`. So
+big-endian, 32-bit and bare-metal are all executed under emulation rather than on the hardware — a real
+distinction this page keeps, and the reason validation on real IBM Z, i686 and Cortex-M silicon remains open
+rather than claimed.
 
 ## Where to go next
 

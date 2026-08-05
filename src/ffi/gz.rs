@@ -2896,9 +2896,22 @@ mod tests {
     /// appears only on the feature rows whose thread interleaving happens to hit
     /// the window.
     ///
-    /// A high number is race-free by construction instead: nothing in the process
-    /// can be handed it while the harness's own descriptor use stays orders of
-    /// magnitude below, so no retry is needed and the outcome is deterministic.
+    /// A high number keeps the *kernel* out of the picture: nothing in the process
+    /// can be handed it by `open` while the harness's own descriptor use stays
+    /// orders of magnitude below, so no retry loop is needed against POSIX's
+    /// lowest-free-descriptor rule.
+    ///
+    /// # Why the reservation is also serialized
+    ///
+    /// Height alone is not sufficient, because the competing allocator is not only
+    /// the kernel — it is this helper. Two tests calling it concurrently both probe
+    /// the same first candidate, both see it closed, and both `dup2` into it, so the
+    /// two "reservations" are the same number. One test then closes it while the
+    /// other still believes it owns it, and the loser fails on an assertion about a
+    /// descriptor another thread reopened underneath it. The probe-then-claim pair
+    /// is therefore held under `HIGH_DESCRIPTOR_LOCK`, and the guard is returned
+    /// *with* the number so it lives exactly as long as the reservation does and a
+    /// caller cannot forget to take it.
     ///
     /// # Why each candidate is probed before it is claimed
     ///
@@ -2913,7 +2926,14 @@ mod tests {
     /// If no candidate can be claimed, which would mean the process cannot hold a
     /// descriptor at any of them.
     #[cfg(unix)]
-    fn reserve_high_descriptor() -> c_int {
+    fn reserve_high_descriptor() -> (c_int, std::sync::MutexGuard<'static, ()>) {
+        // Poisoning carries no meaning for a lock over `()`: it only records that
+        // some other test panicked while holding it, which says nothing about the
+        // descriptor space. Recover the guard rather than cascade the panic, the
+        // same way `ffi::types::with_silenced_panic_hook` does.
+        let guard = HIGH_DESCRIPTOR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for candidate in [8192 as c_int, 4096, 1024, 512, 256] {
             if descriptor_is_open(candidate).is_ok() {
                 // Occupied — `dup2` would close it. Leave it alone.
@@ -2923,11 +2943,16 @@ mod tests {
             // and `0` is the process's standard input, always open under the test
             // harness. `candidate` was just proven closed, so nothing is evicted.
             if unsafe { dup2(0, candidate) } == candidate {
-                return candidate;
+                return (candidate, guard);
             }
         }
         panic!("no high descriptor number could be reserved");
     }
+
+    /// Serializes [`reserve_high_descriptor`] against itself so two concurrently
+    /// running tests cannot claim the same descriptor number.
+    #[cfg(unix)]
+    static HIGH_DESCRIPTOR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn write_then_read_round_trip() {
@@ -4776,8 +4801,9 @@ mod tests {
         // A genuinely closed descriptor, taken at a deliberately high number so
         // that closing it cannot hand the slot to a concurrently running test —
         // see [`reserve_high_descriptor`] for why a low number would be a race
-        // rather than a test.
-        let copy = reserve_high_descriptor();
+        // rather than a test. The guard rides along for the reservation's lifetime
+        // so the sibling descriptor test cannot claim the same number meanwhile.
+        let (copy, _reservation) = reserve_high_descriptor();
         assert!(
             descriptor_is_open(copy).is_ok(),
             "a fresh duplicate must probe as open"
@@ -4962,8 +4988,10 @@ mod tests {
         // does not merely probe the descriptor — `gzdopen` ADOPTS it and
         // `gzclose_r` CLOSES it. Over a recycled low number that makes the test
         // actively destructive to whichever concurrently running test was handed
-        // the slot. See [`reserve_high_descriptor`].
-        let copy = reserve_high_descriptor();
+        // the slot. See [`reserve_high_descriptor`], whose guard is held here for
+        // the whole reservation so the sibling descriptor test cannot claim the
+        // same number while this one is closing and adopting it.
+        let (copy, _reservation) = reserve_high_descriptor();
         // SAFETY: `copy` is solely owned by this test.
         assert_eq!(unsafe { close(copy) }, 0);
         assert!(

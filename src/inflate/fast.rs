@@ -18,20 +18,25 @@
 //! throughout. The entry contract documented on [`inflate_fast`] guarantees
 //! that at most six input bytes and at most 258 output bytes are touched per
 //! loop iteration, so — for a well-formed stream honoring that contract — the
-//! bounds checks never fail. Unchecked indexing is *not* available here, and at
-//! 107%-127% of the C baseline's decompression throughput it is not warranted
-//! either: introducing it would violate User Constraint 3 ("zero unsafe blocks
-//! in core compression logic") and fail the crate-root `#![deny(unsafe_code)]`.
-//! This module carries no `// SAFETY:` justification and needs none.
+//! bounds checks never fail. Unchecked indexing is *not* available here, and it
+//! is not warranted either: introducing it would violate User Constraint 3 ("zero
+//! unsafe blocks in core compression logic") and fail the crate-root
+//! `#![deny(unsafe_code)]`. Where per-byte checking did cost measurable
+//! throughput — the overlapping back-reference copy — the answer was a better
+//! *algorithm* rather than unchecked access: `copy_within_output` moves whole
+//! blocks with one bounds check each instead of one per byte. This module carries
+//! no `// SAFETY:` justification and needs none.
 //!
 //! # Byte-exact output
 //!
 //! The decode sequence, the bit-refill schedule, and — crucially — the
 //! *overlapping* LZ77 back-reference copy are reproduced exactly so that output
-//! is byte-identical to reference zlib (AAP §0.6.4, §0.8.1 directive D-1). The overlapping
-//! copy (when `dist < len`) is performed forward, one byte at a time, so that
-//! freshly written bytes are re-read; a `memcpy`/`copy_from_slice` would be
-//! incorrect there.
+//! is byte-identical to reference zlib (AAP §0.6.4, §0.8.1 directive D-1). The
+//! overlapping copy (when `dist < len`) must re-read freshly written bytes, so a
+//! single `copy_from_slice`/`copy_within` over the whole run would be *incorrect*
+//! there; `copy_within_output` instead materializes the periodic run in
+//! geometrically growing blocks that provably read only already-final bytes, and
+//! documents the equivalence with C's byte loop in full.
 
 use crate::inflate::state::{InflateMode, InflateState};
 use crate::inflate::tables::Code;
@@ -478,25 +483,75 @@ fn copy_from_window(output: &mut [u8], out: &mut usize, window: &[u8], wpos: usi
 }
 
 /// Copies `n` bytes within `output` from `src` to `*out`, advancing `*out` by
-/// `n`.
+/// `n`, reproducing the LZ77 back-reference semantics of C's forward
+/// byte-at-a-time `do { *out++ = *from++; } while (--len);`.
 ///
-/// The copy is performed forward, one byte at a time, so it is correct for the
-/// overlapping LZ77 back-references that make `dist < n` meaningful: each byte
-/// is read only after all nearer bytes have been written, so a short-distance
-/// reference correctly repeats the just-written pattern. A `copy_within` /
-/// `copy_from_slice` (memmove/memcpy) would be *incorrect* here because it would
-/// not observe the freshly written bytes.
+/// # Why this is not a plain `copy_within`
+///
+/// The reference is *self-observing* whenever `dist = *out - src` is smaller
+/// than `n`: byte `d + dist` must read the byte just written at `d`, so the
+/// pattern of `dist` bytes repeats. A single `copy_within` (a `memmove`) would
+/// copy the pre-existing bytes instead and produce different output, which is why
+/// the naive spelling is wrong here.
+///
+/// # Strategy (byte-for-byte equivalent to the C byte loop)
+///
+/// Reference `inffast.c` L236-L259 does not copy byte-at-a-time either — it runs
+/// a 3-way-unrolled pointer copy. This port goes one step further and moves whole
+/// blocks, which is what closes the measured gap against C on the short-distance
+/// range that dominates real streams (distances 3-24; see the module header). All
+/// three arms below emit exactly the bytes the C loop emits:
+///
+/// * `dist == 1` — every output byte equals `output[src]`, so the run is a
+///   `memset`. This is the RLE case and by far the cheapest.
+/// * `dist >= n` — the source range `[src, src + n)` ends at or before `*out`, so
+///   nothing self-observes: one `copy_within` (a `memmove` over disjoint ranges)
+///   is exactly the byte loop. This covers every *non*-overlapping match, which
+///   is the common case for ordinary text.
+/// * otherwise — the run is periodic with period `dist`, and it is materialized
+///   in geometrically growing blocks. With `copied` bytes already written, the
+///   already-final bytes form the run `output[src .. *out + copied]`, whose length
+///   is `dist + copied`; copying `chunk = min(dist + copied, n - copied)` bytes
+///   from `src` to `*out + copied` therefore reads **only already-final bytes**
+///   (the source range ends at or before the destination start, so the two ranges
+///   are disjoint and `copy_within` is exact). Correctness of each individual byte
+///   needs the source to be the periodic continuation, i.e. `copied` must be a
+///   multiple of `dist`: it is, because `chunk` is `dist` on the first pass and
+///   `dist + copied` (itself a multiple) on every later pass — the only pass that
+///   can break the multiple is the one truncated by `n - copied`, and that pass
+///   ends the loop. The block size doubles every pass, so at most
+///   `log2(n / dist) + 1` moves are issued (nine for the worst case
+///   `n = 258, dist = 2`).
+///
+/// # Panics
+///
+/// Panics if `src >= *out` (not a back-reference) or if `*out + n` exceeds
+/// `output.len()`, both of which are prevented by [`inflate_fast`]'s entry
+/// contract. `src < *out` is the invariant that makes `dist` non-zero.
 #[inline]
 fn copy_within_output(output: &mut [u8], out: &mut usize, src: usize, n: usize) {
-    let mut d = *out;
-    let mut s = src;
-    let end = d + n;
-    while d < end {
-        output[d] = output[s];
-        d += 1;
-        s += 1;
+    let d = *out;
+    debug_assert!(
+        src < d,
+        "copy_within_output: a back-reference must start strictly before the write cursor"
+    );
+    let dist = d - src;
+
+    if dist == 1 {
+        // RLE run: one byte repeated `n` times (a `memset`).
+        let b = output[src];
+        output[d..d + n].fill(b);
+    } else {
+        // One pass when `dist >= n` (disjoint ranges), geometric growth otherwise.
+        let mut copied = 0usize;
+        while copied < n {
+            let chunk = core::cmp::min(dist + copied, n - copied);
+            output.copy_within(src..src + chunk, d + copied);
+            copied += chunk;
+        }
     }
-    *out = d;
+
+    *out = d + n;
 }
 
 #[cfg(test)]
@@ -1094,5 +1149,61 @@ mod tests {
             "every recorded byte must still be backed by whole bits in the \
              accumulator",
         );
+    }
+
+    /// The reference model for [`copy_within_output`]: C's forward
+    /// byte-at-a-time back-reference copy,
+    /// `do { *out++ = *from++; } while (--len);` (`inffast.c` L236-L259 in its
+    /// unrolled form, semantically one byte at a time).
+    fn byte_loop_reference(output: &mut [u8], out: &mut usize, src: usize, n: usize) {
+        let mut d = *out;
+        let mut s = src;
+        let end = d + n;
+        while d < end {
+            output[d] = output[s];
+            d += 1;
+            s += 1;
+        }
+        *out = d;
+    }
+
+    /// The block-moving [`copy_within_output`] must be *byte-for-byte* the C
+    /// byte loop for every distance and length a DEFLATE stream can produce —
+    /// this is the property byte-identity (AAP §0.8.1 directive D-1) rests on,
+    /// so it is checked exhaustively rather than sampled.
+    ///
+    /// Coverage: every distance `1..=64` (which spans the `dist == 1` RLE arm,
+    /// the geometric arm for `dist < n`, and the single-move arm for
+    /// `dist >= n`) crossed with every length `0..=MAX_MATCH`, i.e. 16,576
+    /// cases, plus the maximum coded distance 32,768.
+    #[test]
+    fn copy_within_output_is_byte_identical_to_the_c_byte_loop() {
+        /// A deterministic, non-repeating prefix so a wrong source offset
+        /// cannot accidentally produce the right bytes.
+        fn seed(buf: &mut [u8]) {
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+            }
+        }
+
+        const PRE: usize = 40_000; // > 32_768 so the maximum distance fits
+        for dist in (1..=64usize).chain([1 << 15]) {
+            for n in 0..=INFLATE_FAST_MIN_OUTPUT {
+                let mut got = alloc::vec![0u8; PRE + INFLATE_FAST_MIN_OUTPUT];
+                seed(&mut got[..PRE]);
+                let mut want = got.clone();
+
+                let mut out_got = PRE;
+                let mut out_want = PRE;
+                copy_within_output(&mut got, &mut out_got, PRE - dist, n);
+                byte_loop_reference(&mut want, &mut out_want, PRE - dist, n);
+
+                assert_eq!(out_got, out_want, "cursor mismatch (dist={dist}, n={n})");
+                assert_eq!(
+                    got, want,
+                    "output mismatch against the C byte loop (dist={dist}, n={n})",
+                );
+            }
+        }
     }
 }

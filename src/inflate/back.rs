@@ -25,19 +25,41 @@
 //! wrapping those into the safe [`InFunc`] / [`OutFunc`] traits is the job of
 //! the FFI boundary (`src/ffi/inflate.rs`).
 //!
-//! # Relationship to `inflate_fast`
+//! # The two decode paths, and why the batched one is a specialization
 //!
-//! Reference `infback.c` calls the shared `inflate_fast` hot loop when at least
-//! six input and 258 output bytes are available. That routine
-//! ([`crate::inflate::fast::inflate_fast`]) is written for the main driver,
-//! where the output buffer and the history window are **distinct** allocations.
-//! In back-inflate the window *is* the output buffer, so feeding it as both the
-//! `&mut` output and the `&` history would require aliasing a single `Vec<u8>`
-//! mutably and immutably at once — impossible in safe Rust, and a per-call
-//! window clone would cost more than it saves. This port therefore always uses
-//! the equivalent single-symbol decode path (a faithful port of `infback.c`
-//! L446-L543). The emitted bytes are identical either way; the fast path is a
-//! pure throughput optimization, not a correctness requirement.
+//! Reference `infback.c` L422-L428 hands the symbol loop to the shared
+//! `inflate_fast` hot loop whenever at least six input bytes and 258 output
+//! bytes are available, and uses the single-symbol loop (`infback.c` L430-L543)
+//! only when they are not. **Both** paths are ported here — `back_fast` is the
+//! batched one, `do_len` the per-symbol one — and the same
+//! `have >= 6 && left >= 258` test selects between them, so the crossover point
+//! is C's.
+//!
+//! [`crate::inflate::fast::inflate_fast`] itself cannot be *reused*, because it
+//! is written for the main driver, where the output buffer and the history
+//! window are **distinct** allocations: it takes the output as `&mut [u8]` and
+//! the window as `&[u8]`, two separate borrows. In back-inflate the window *is*
+//! the output buffer, so `back_fast` is the single-buffer specialization of
+//! the same algorithm. That specialization is markedly *simpler* than the
+//! general routine rather than harder, because two invariants collapse:
+//!
+//! * `wnext` is `0` for the entire session — `infback.c` L60 sets it and nothing
+//!   in the file ever moves it — so only the "very common case" arm of
+//!   `inffast.c` L197-L206 is reachable. The two window-wrap arms are dead code
+//!   in back-inflate.
+//! * `beg` — the earliest output byte a back-reference may reach — is the window
+//!   base. `infback.c` L425 calls `inflate_fast(strm, state->wsize)` with
+//!   `avail_out == left`, and `put + left == wsize` always holds, so C's
+//!   `beg = out - (start - avail_out)` evaluates to `put - put`. C's "max
+//!   distance in output", `out - beg`, is therefore just `put`.
+//!
+//! What the shared buffer *does* demand is that every copy be a single move
+//! inside a single slice, including the ones that read bytes the same copy is
+//! writing. `forward_copy` is that primitive: it reproduces C's forward
+//! `do { *put++ = *from++; } while (--n);` for **any** source/destination
+//! relationship, block-at-a-time instead of byte-at-a-time. Both paths route
+//! every window and match copy through it, so the batched path, the per-symbol
+//! path, and C agree byte-for-byte by construction rather than by coincidence.
 //!
 //! # `no_std`
 //!
@@ -79,6 +101,104 @@ const MIN_WBITS: i32 = 8;
 #[inline]
 const fn low_mask(n: u32) -> u32 {
     (1u32 << n) - 1
+}
+
+/// Input bytes that must be available before the batched decode path is
+/// entered.
+///
+/// C `infback.c` L424 spells this `have >= 6`. Six is what lets
+/// [`back_fast`] refill the accumulator with unchecked-in-C reads for one whole
+/// literal/length + distance pair without re-testing the input bound, which is
+/// the entire reason the batched path is faster than the per-symbol one.
+const BACK_FAST_MIN_INPUT: usize = 6;
+
+/// Free window bytes that must be available before the batched decode path is
+/// entered.
+///
+/// C `infback.c` L424 spells this `left >= 258`; 258 is the longest match a
+/// single DEFLATE length code can encode, so one iteration can never overrun the
+/// window.
+const BACK_FAST_MIN_OUTPUT: usize = 258;
+
+/// Copies `n` bytes inside `buf` from `src` to `dst` in **increasing byte
+/// order**, reproducing C's `do { *put++ = *from++; } while (--n);` for any
+/// relationship between `src` and `dst`.
+///
+/// This is the one copy primitive of this module. Back-inflate decodes into the
+/// sliding window itself, so a match copy, a ring-wrapped window read and an
+/// RLE run are all moves *within a single slice* — and two of those three cases
+/// read bytes that the very same copy is writing. Getting that right, and doing
+/// it block-at-a-time rather than byte-at-a-time, is what makes the batched path
+/// worthwhile at all.
+///
+/// # Why one `copy_within` is not enough
+///
+/// [`slice::copy_within`] has `memmove` semantics: it behaves as if the source
+/// were snapshotted first, so it always reproduces the *pre-existing* bytes.
+/// That is right for two of the three cases and wrong for the third:
+///
+/// * `src == dst` — the C loop copies every byte onto itself. A no-op.
+/// * `src > dst` — the write cursor trails the read cursor. At step `i` the C
+///   loop reads `src + i`, which is not written until step `src + i - dst > i`,
+///   so every read sees an original byte. That is exactly `memmove`, so a single
+///   [`slice::copy_within`] is byte-for-byte equivalent no matter how far the
+///   two ranges overlap. This is the ring-wrap arm (`from = put + copy` in
+///   `infback.c` L529, `from = window + wsize - op` in `inffast.c` L199).
+/// * `src < dst` — a back-reference. Once `dist = dst - src` is smaller than
+///   `n`, byte `dst + dist` must read the byte just written at `dst`: the run is
+///   *periodic* with period `dist` and `memmove` would emit the wrong bytes.
+///
+/// # The periodic arm
+///
+/// The `src < dst` arm uses the same strategy as
+/// `crate::inflate::fast`'s `copy_within_output`, whose doc comment carries the
+/// full argument; in brief:
+///
+/// * `dist == 1` collapses to `fill` (a `memset`) — the RLE case.
+/// * otherwise, with `copied` bytes already written, the bytes in
+///   `buf[src .. dst + copied]` are all final and number `dist + copied`, so
+///   copying `chunk = min(dist + copied, n - copied)` bytes from `src` to
+///   `dst + copied` reads only final bytes (the ranges are disjoint, so
+///   `copy_within` is exact) and lands on the correct periodic continuation
+///   because `copied` is a multiple of `dist` on every pass that is not the last
+///   one. The block size doubles each pass, so at most `log2(n / dist) + 1`
+///   moves are issued.
+///
+/// # Panics
+///
+/// Panics if `src + n` or `dst + n` exceeds `buf.len()`; both callers derive
+/// their indices from the window geometry, which bounds every copy by `wsize`.
+#[inline]
+fn forward_copy(buf: &mut [u8], dst: usize, src: usize, n: usize) {
+    if n == 0 || src == dst {
+        // Copying a byte onto itself is what the C loop does here, so there is
+        // nothing to move. The `n == 0` guard also keeps `fill`/`copy_within`
+        // off an empty range.
+        return;
+    }
+
+    if src > dst {
+        // Reads run ahead of writes at every step, so `memmove` semantics are
+        // exactly the C byte loop even when the ranges overlap.
+        buf.copy_within(src..src + n, dst);
+        return;
+    }
+
+    let dist = dst - src;
+    if dist == 1 {
+        // RLE run: every byte equals `buf[src]`.
+        let b = buf[src];
+        buf[dst..dst + n].fill(b);
+    } else {
+        // One pass when `dist >= n` (disjoint ranges); geometric growth
+        // otherwise.
+        let mut copied = 0usize;
+        while copied < n {
+            let chunk = core::cmp::min(dist + copied, n - copied);
+            buf.copy_within(src..src + chunk, dst + copied);
+            copied += chunk;
+        }
+    }
 }
 
 /// Provides input bytes to [`inflate_back`], replacing the C `in_func`
@@ -918,15 +1038,340 @@ fn do_table<I: InFunc, O: OutFunc>(
     Ok(())
 }
 
+/// Decode literal/length and distance symbols in one batch, returning when
+/// fewer than six input bytes or 258 free window bytes remain, at end-of-block,
+/// or on a malformed code.
+///
+/// Port of `inflate_fast` (`inffast.c` L50-L305) specialized for back-inflate,
+/// entered from [`do_len`] under exactly C's `have >= 6 && left >= 258` test
+/// (`infback.c` L422-L428). See the module header for why this is a
+/// specialization of [`crate::inflate::fast::inflate_fast`] rather than a call
+/// to it, and for the two invariants (`wnext == 0`, `beg == window base`) that
+/// make the single-buffer form simpler than the general one.
+///
+/// # What it does *not* do
+///
+/// It never flushes. C's `inflate_fast` has no access to `infback.c`'s `ROOM()`
+/// macro either: it is called only when 258 bytes are already free and it stops
+/// while at least 257 still are, leaving every flush to the per-symbol path. It
+/// likewise never touches `whave`, which only `ROOM()` advances.
+///
+/// # State transitions
+///
+/// Leaves `state.mode` at [`InflateMode::Len`] when it simply runs out of input
+/// or window space (the caller re-dispatches and the per-symbol path picks up
+/// where this left off), sets it to [`InflateMode::Type`] on end-of-block, and to
+/// [`InflateMode::Bad`] — together with C's exact diagnostic on
+/// [`BackCtx::msg`] — for an invalid code or an out-of-range distance. There is
+/// no error return: a callback is never invoked from here, so every outcome is a
+/// mode.
+///
+/// # Returning unused input bytes
+///
+/// C L295-L300 ends with `len = bits >> 3; in -= len; bits -= len << 3;`, handing
+/// back whole bytes that are still sitting in the accumulator so the per-symbol
+/// path can re-read them. `in_idx` is an index into the *current provider chunk*,
+/// so "before the chunk" is not expressible; the rewind is therefore clamped at
+/// index zero and any bits that cannot be given back stay in `hold`, which keeps
+/// the bitstream synchronised either way. The clamp can only bite when the
+/// accumulator straddles a chunk boundary — for a single-chunk provider (every
+/// FFI caller of `inflateBack`, and every one-shot Rust caller) `in_idx` counts
+/// from the buffer start and the rewind is byte-for-byte C's.
+fn back_fast<I: InFunc, O: OutFunc>(ctx: &mut BackCtx<'_, I, O>, state: &mut InflateState) {
+    // ---- entry contract (mirrors C's implicit one at infback.c L424) --------
+    debug_assert_eq!(
+        state.mode,
+        InflateMode::Len,
+        "back_fast entry: state.mode must be Len"
+    );
+    debug_assert!(
+        ctx.have() >= BACK_FAST_MIN_INPUT,
+        "back_fast entry: at least {BACK_FAST_MIN_INPUT} input bytes required"
+    );
+    debug_assert!(
+        ctx.left >= BACK_FAST_MIN_OUTPUT,
+        "back_fast entry: at least {BACK_FAST_MIN_OUTPUT} free window bytes required"
+    );
+    debug_assert_eq!(
+        ctx.put + ctx.left,
+        ctx.wsize,
+        "back_fast entry: the put/left window invariant must hold"
+    );
+    debug_assert_eq!(
+        state.wnext, 0,
+        "back_fast entry: back-inflate never advances wnext (infback.c L60)"
+    );
+    debug_assert!(
+        state.sane,
+        "back_fast entry: back-inflate never clears sane (infback.c L62)"
+    );
+    debug_assert!(
+        ctx.bits <= 32,
+        "back_fast entry: bits must fit the u32 hold"
+    );
+
+    // ---- LOAD: pull everything the loop touches into locals (C L77-L97) -----
+    let wsize = ctx.wsize;
+    let whave = state.whave as usize;
+    let lmask = low_mask(state.lenbits);
+    let dmask = low_mask(state.distbits);
+    // Consulted only by the optional INFLATE_STRICT check, so it is read under
+    // the same gate to avoid a dead load in a default build.
+    #[cfg(feature = "inflate_strict")]
+    let dmax = state.dmax as usize;
+
+    let mut hold = ctx.hold;
+    let mut bits = ctx.bits;
+    let mut put = ctx.put;
+    let mut in_idx = ctx.next;
+
+    // The two decode tables and the window are reached through *disjoint field*
+    // borrows of `state`: the tables read `state.codes` (or a module-static fixed
+    // table) while `window` mutably borrows `state.window`. `state.mode` is
+    // therefore only written after both borrows have ended, below.
+    let lcode: &[Code] = match state.lentable {
+        TableSource::Fixed => &LENFIX[..],
+        TableSource::Dynamic => &state.codes[state.lencode..],
+    };
+    let dcode: &[Code] = match state.disttable {
+        TableSource::Fixed => &DISTFIX[..],
+        TableSource::Dynamic => &state.codes[state.distcode..],
+    };
+    let window: &mut [u8] = &mut state.window;
+
+    // The provider's chunk is borrowed for the length of the loop, exactly as
+    // the per-symbol path borrows it one expression at a time.
+    let input: &[u8] = ctx.src.chunk();
+
+    // Loop bounds. C `last = in + (have - 5)` and `end = out + (left - 257)`:
+    // while `in_idx < last_safe_in` at least six input bytes remain, and while
+    // `put < end_safe` at least 258 free window bytes remain. `end_safe` is
+    // derived from `wsize`, not from `window.len()`, because the window buffer is
+    // permitted to be longer than the logical window.
+    let last_safe_in = input.len() - (BACK_FAST_MIN_INPUT - 1);
+    let end_safe = wsize - (BACK_FAST_MIN_OUTPUT - 1);
+
+    // Applied to `state.mode` / `ctx.msg` after the loop. `None` means "leave the
+    // mode alone", which is C's behavior when the loop merely runs out of input
+    // or output space.
+    let mut final_mode: Option<InflateMode> = None;
+    let mut error_msg: Option<&'static str> = None;
+
+    // ---- main decode loop (C `do { ... } while (in < last && out < end)`) ----
+    'outer: loop {
+        // Refill to at least 15 bits (C L100-L105). The loop bound guarantees
+        // both reads are in range.
+        if bits < 15 {
+            hold += u32::from(input[in_idx]) << bits;
+            in_idx += 1;
+            bits += 8;
+            hold += u32::from(input[in_idx]) << bits;
+            in_idx += 1;
+            bits += 8;
+        }
+
+        let mut here: Code = lcode[(hold & lmask) as usize];
+        let mut len: usize = 0;
+        let mut go_dodist = false;
+
+        // C label `dolen` (L107-L280).
+        'dolen: loop {
+            let code_bits = u32::from(here.bits);
+            hold >>= code_bits;
+            bits -= code_bits;
+
+            let op = u32::from(here.op);
+            if op == 0 {
+                // Literal byte straight into the window (C L112-L117).
+                window[put] = here.val as u8;
+                put += 1;
+                break 'dolen;
+            } else if op & 16 != 0 {
+                // Length base plus extra bits (C L118-L131).
+                len = here.val as usize;
+                let extra = op & 15;
+                if extra != 0 {
+                    if bits < extra {
+                        hold += u32::from(input[in_idx]) << bits;
+                        in_idx += 1;
+                        bits += 8;
+                    }
+                    len += (hold & low_mask(extra)) as usize;
+                    hold >>= extra;
+                    bits -= extra;
+                }
+                // Refill for the distance code that must follow (C L133-L138).
+                if bits < 15 {
+                    hold += u32::from(input[in_idx]) << bits;
+                    in_idx += 1;
+                    bits += 8;
+                    hold += u32::from(input[in_idx]) << bits;
+                    in_idx += 1;
+                    bits += 8;
+                }
+                here = dcode[(hold & dmask) as usize];
+                go_dodist = true;
+                break 'dolen;
+            } else if op & 64 == 0 {
+                // Second-level length table (C L270-L273).
+                here = lcode[here.val as usize + (hold & low_mask(op)) as usize];
+                continue 'dolen;
+            } else if op & 32 != 0 {
+                // End of block (C L274-L277).
+                final_mode = Some(InflateMode::Type);
+                break 'outer;
+            } else {
+                // Invalid literal/length code (C L278-L281).
+                error_msg = Some("invalid literal/length code");
+                final_mode = Some(InflateMode::Bad);
+                break 'outer;
+            }
+        }
+
+        if go_dodist {
+            // C label `dodist` (L139-L268).
+            'dodist: loop {
+                let code_bits = u32::from(here.bits);
+                hold >>= code_bits;
+                bits -= code_bits;
+
+                let op = u32::from(here.op);
+                if op & 16 != 0 {
+                    // Distance base plus extra bits (C L144-L155).
+                    let mut dist = here.val as usize;
+                    let extra = op & 15;
+                    if bits < extra {
+                        hold += u32::from(input[in_idx]) << bits;
+                        in_idx += 1;
+                        bits += 8;
+                        if bits < extra {
+                            hold += u32::from(input[in_idx]) << bits;
+                            in_idx += 1;
+                            bits += 8;
+                        }
+                    }
+                    dist += (hold & low_mask(extra)) as usize;
+
+                    // C `#ifdef INFLATE_STRICT` (L156-L163) — off by default, so
+                    // a byte-exact default build does not compile this in.
+                    #[cfg(feature = "inflate_strict")]
+                    {
+                        if dist > dmax {
+                            error_msg = Some("invalid distance too far back");
+                            final_mode = Some(InflateMode::Bad);
+                            break 'outer;
+                        }
+                    }
+
+                    hold >>= extra;
+                    bits -= extra;
+
+                    // C L167-L168: `op = out - beg`, the largest distance the
+                    // freshly written output alone can satisfy. `beg` is the
+                    // window base here, so this is simply `put`.
+                    if dist > put {
+                        // The reference reaches back into the history that the
+                        // window already flushed.
+                        let dist_back = dist - put;
+
+                        // C L170-L177. `sane` is deliberately not consulted:
+                        // back-inflate never clears it (asserted on entry), and
+                        // the `!sane` zero-fill arm is C's
+                        // INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR path, which
+                        // this crate does not port. Rejecting unconditionally is
+                        // also what keeps `wsize - dist_back` below in range:
+                        // passing the test implies `dist_back <= whave <= wsize`.
+                        if dist_back > whave {
+                            error_msg = Some("invalid distance too far back");
+                            final_mode = Some(InflateMode::Bad);
+                            break 'outer;
+                        }
+
+                        // C L197-L206, the `wnext == 0` "very common case" — the
+                        // only reachable arm in back-inflate. Valid history ends
+                        // at `wsize`, so the reference starts `dist_back` bytes
+                        // before the window end.
+                        let wpos = wsize - dist_back;
+                        if dist_back < len {
+                            // Some from the window tail, the rest from what this
+                            // very copy is producing (C `from = out - dist`).
+                            forward_copy(window, put, wpos, dist_back);
+                            put += dist_back;
+                            len -= dist_back;
+                            let src = put - dist;
+                            debug_assert_eq!(
+                                src, 0,
+                                "the window-tail remainder always resumes at the window base"
+                            );
+                            forward_copy(window, put, src, len);
+                            put += len;
+                        } else {
+                            forward_copy(window, put, wpos, len);
+                            put += len;
+                        }
+                    } else {
+                        // Wholly inside the current fill (C L246-L258). This is
+                        // the arm that overlaps whenever `dist < len` — the
+                        // essence of LZ77 — which `forward_copy` reproduces.
+                        let src = put - dist;
+                        forward_copy(window, put, src, len);
+                        put += len;
+                    }
+                    break 'dodist;
+                } else if op & 64 == 0 {
+                    // Second-level distance table (C L260-L263).
+                    here = dcode[here.val as usize + (hold & low_mask(op)) as usize];
+                    continue 'dodist;
+                } else {
+                    // Invalid distance code (C L264-L267).
+                    error_msg = Some("invalid distance code");
+                    final_mode = Some(InflateMode::Bad);
+                    break 'outer;
+                }
+            }
+        }
+
+        // C `} while (in < last && out < end);`.
+        if !(in_idx < last_safe_in && put < end_safe) {
+            break 'outer;
+        }
+    }
+
+    // ---- return unused bytes still in the accumulator (C L295-L300) ---------
+    let owed = (bits >> 3) as usize;
+    let give = owed.min(in_idx);
+    in_idx -= give;
+    bits -= (give as u32) << 3;
+    // A completely full accumulator (`bits == 32`) makes `1u32 << bits`
+    // overflow, so the all-ones mask is produced without shifting.
+    hold &= 1u32.checked_shl(bits).unwrap_or(0).wrapping_sub(1);
+
+    // ---- RESTORE: C's LOAD() at infback.c L427 ------------------------------
+    ctx.hold = hold;
+    ctx.bits = bits;
+    ctx.next = in_idx;
+    ctx.put = put;
+    ctx.left = wsize - put;
+    if let Some(msg) = error_msg {
+        ctx.msg = Some(msg);
+    }
+    if let Some(mode) = final_mode {
+        state.mode = mode;
+    }
+}
+
 /// Handle the `LEN` state: decode one literal/length symbol and, for a length
 /// code, its distance and the resulting match copy.
 ///
-/// Port of `infback.c` L422-L543, using the single-symbol decode path only (see
-/// the module-level note on `inflate_fast`). A literal is emitted to the
-/// window/output; an end-of-block returns to [`InflateMode::Type`]; a
-/// length/distance pair copies the match from the window with correct ring-wrap
-/// and overlapping-copy (RLE) semantics. Malformed codes transition to
-/// [`InflateMode::Bad`].
+/// Port of `infback.c` L422-L543. C's L423-L428 hands whole batches of symbols
+/// to `inflate_fast` whenever six input and 258 free window bytes are available;
+/// that test is the first thing this function performs, and [`back_fast`] is the
+/// batched path it selects. Everything below it is the single-symbol path C falls
+/// back to (L430-L543), which is also the only path that can flush the window: a
+/// literal is emitted to the window/output; an end-of-block returns to
+/// [`InflateMode::Type`]; a length/distance pair copies the match from the window
+/// with correct ring-wrap and overlapping-copy (RLE) semantics. Malformed codes
+/// transition to [`InflateMode::Bad`].
 ///
 /// # Errors
 ///
@@ -936,6 +1381,16 @@ fn do_len<I: InFunc, O: OutFunc>(
     ctx: &mut BackCtx<'_, I, O>,
     state: &mut InflateState,
 ) -> Result<(), ReturnCode> {
+    // C L423-L428: use the batched path while there is enough input to decode a
+    // whole symbol pair without re-checking, and enough window space for the
+    // longest possible match. C returns to the mode dispatch afterwards
+    // (`break` out of the `switch`), which is what returning here does: the mode
+    // is unchanged unless the batch ended the block or found a bad code.
+    if ctx.have() >= BACK_FAST_MIN_INPUT && ctx.left >= BACK_FAST_MIN_OUTPUT {
+        back_fast(ctx, state);
+        return Ok(());
+    }
+
     // C L432-L448: decode a literal/length code (two-level lookup).
     let lenbits = state.lenbits;
     let here = {
@@ -1035,13 +1490,11 @@ fn do_len<I: InFunc, O: OutFunc>(
         }
         length -= copy;
         ctx.left -= copy;
-        // Byte-by-byte in increasing order so an overlapping copy (offset <
-        // run length) propagates like C's `*put++ = *from++` (RLE); `memmove`
-        // / `copy_within` semantics would be wrong here.
-        for k in 0..copy {
-            let byte = state.window[from + k];
-            state.window[ctx.put + k] = byte;
-        }
+        // In increasing byte order so an overlapping copy (offset < run length)
+        // propagates like C's `*put++ = *from++` (RLE). `forward_copy` moves
+        // whole blocks while emitting exactly those bytes; a bare `copy_within`
+        // would be wrong for the back-reference arm.
+        forward_copy(&mut state.window, ctx.put, from, copy);
         ctx.put += copy;
         if length == 0 {
             break;
@@ -1308,6 +1761,13 @@ fn back_end_validate(state: &InflateState) -> ReturnCode {
 mod tests {
     use super::*;
     use alloc::vec::Vec;
+
+    // The batched-path fixtures below build their own raw DEFLATE streams with
+    // the crate's own encoder, which is the `inflate -> deflate` test-only edge
+    // enumerated in `lib.rs`'s `TEST_ONLY_CROSS_LAYER_EXCEPTIONS`: it is the only
+    // way to build a fixture larger than a baked constant without `std` or a
+    // third-party codec.
+    use crate::constants::{Strategy, Z_FINISH};
 
     // Reference raw-DEFLATE (RFC 1951) test vectors, produced by Python's
     // `zlib` (the reference C implementation) with a negative `wbits` (raw
@@ -2033,6 +2493,546 @@ mod tests {
             !lent.get(),
             "the caller's window must not be borrowed at all once the state \
              request has failed -- C never reaches infback.c L59"
+        );
+    }
+
+    // =====================================================================
+    // Batched decode path (`back_fast`)
+    //
+    // C selects between two decoders at `infback.c` L423-L428 purely on how
+    // much input and window space is available, and both must emit the same
+    // bytes. The tests below attack that from three directions:
+    //
+    //  1. `forward_copy` against a literal model of C's byte loop, exhaustively
+    //     over every source/destination relationship.
+    //  2. Differentially: the same stream decoded with providers whose chunks
+    //     are too small for the batched path to ever be entered must produce
+    //     byte-identical output to a one-shot decode that uses it constantly.
+    //  3. White-box: `back_fast` called directly, plus each of its three error
+    //     arms driven by a hand-built bitstream.
+    // =====================================================================
+
+    /// A literal transcription of C's copy loop
+    /// (`do { *put++ = *from++; } while (--n);`), used as the model
+    /// [`forward_copy`] must match. Deliberately naive: one byte at a time, in
+    /// increasing order, re-reading whatever the previous iteration wrote.
+    fn byte_loop_model(buf: &mut [u8], dst: usize, src: usize, n: usize) {
+        for k in 0..n {
+            let b = buf[src + k];
+            buf[dst + k] = b;
+        }
+    }
+
+    /// Deterministic filler so a copy test can tell every position apart
+    /// without pulling in a random number generator.
+    fn ramp(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i as u8) ^ 0x5a).collect()
+    }
+
+    #[test]
+    fn forward_copy_matches_the_c_byte_loop_in_both_directions() {
+        // `src > dst` (the ring-wrap arm), `src == dst` (a distance of exactly
+        // one whole window) and `src < dst` (a back-reference) are three
+        // genuinely different regimes, and every one of them can overlap the
+        // destination. Sweep all three together.
+        const LEN: usize = 1024;
+        let base = ramp(LEN);
+        let lengths = [
+            0usize, 1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 63, 64, 127, 200, 257, 258,
+        ];
+        for src in 0..48usize {
+            for dst in 0..48usize {
+                for n in lengths {
+                    // Keep both ranges inside the buffer; the real callers are
+                    // bounded by the window geometry the same way.
+                    if src + n > LEN || dst + n > LEN {
+                        continue;
+                    }
+                    let mut got = base.clone();
+                    let mut want = base.clone();
+                    forward_copy(&mut got, dst, src, n);
+                    byte_loop_model(&mut want, dst, src, n);
+                    assert_eq!(
+                        got, want,
+                        "forward_copy(dst={dst}, src={src}, n={n}) diverged from the C byte loop"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forward_copy_matches_the_c_byte_loop_for_every_short_distance() {
+        // The periodic arm is the one that must self-observe, so sweep every
+        // distance a DEFLATE match can use against every length it can carry.
+        const LEN: usize = 40_000;
+        let base = ramp(LEN);
+        for dist in 1..=64usize {
+            for n in 0..=258usize {
+                let src = 1_000usize;
+                let dst = src + dist;
+                let mut got = base.clone();
+                let mut want = base.clone();
+                forward_copy(&mut got, dst, src, n);
+                byte_loop_model(&mut want, dst, src, n);
+                assert_eq!(
+                    got, want,
+                    "forward_copy diverged for dist={dist}, n={n} (periodic arm)"
+                );
+            }
+        }
+        // A distance of exactly one window (`src == dst`) is a no-op in C, and
+        // the largest distance DEFLATE can encode must behave too.
+        for n in [0usize, 1, 3, 258] {
+            let mut got = base.clone();
+            let mut want = base.clone();
+            forward_copy(&mut got, 5_000, 5_000, n);
+            byte_loop_model(&mut want, 5_000, 5_000, n);
+            assert_eq!(got, want, "src == dst must copy bytes onto themselves");
+
+            let mut got = base.clone();
+            let mut want = base.clone();
+            forward_copy(&mut got, 1_000, 1_000 + 32_768 - 32_768, n);
+            byte_loop_model(&mut want, 1_000, 1_000, n);
+            assert_eq!(got, want, "degenerate zero distance");
+        }
+    }
+
+    /// Input provider that yields fixed-size chunks, so a test can choose
+    /// whether [`back_fast`]'s `have >= 6` entry test can ever be satisfied.
+    struct ChunkedIn<'a> {
+        data: &'a [u8],
+        pos: usize,
+        size: usize,
+        cur: &'a [u8],
+        /// Total bytes the engine reported as *unconsumed* on the final chunk.
+        unconsumed: usize,
+    }
+    impl InFunc for ChunkedIn<'_> {
+        fn advance(&mut self) -> bool {
+            if self.pos >= self.data.len() {
+                return false;
+            }
+            let end = core::cmp::min(self.pos + self.size, self.data.len());
+            self.cur = &self.data[self.pos..end];
+            self.pos = end;
+            true
+        }
+        fn chunk(&self) -> &[u8] {
+            self.cur
+        }
+        fn set_unconsumed(&mut self, unconsumed: usize) {
+            self.unconsumed = unconsumed;
+        }
+    }
+
+    /// Decodes `data` with a provider that hands out `size`-byte chunks,
+    /// returning the code, the output, and how many input bytes were consumed
+    /// in total.
+    fn run_chunked(window_bits: i32, data: &[u8], size: usize) -> (ReturnCode, Vec<u8>, usize) {
+        let mut state = inflate_back_init(window_bits).expect("valid windowBits");
+        let mut src = ChunkedIn {
+            data,
+            pos: 0,
+            size,
+            cur: &[],
+            unconsumed: 0,
+        };
+        let mut sink = VecOut { data: Vec::new() };
+        let outcome = inflate_back(&mut state, &mut src, &mut sink);
+        let consumed = src.pos - src.unconsumed;
+        (outcome.code, sink.data, consumed)
+    }
+
+    /// Compresses `data` as a **raw** DEFLATE stream (`infback.c` decodes raw
+    /// streams only) using the crate's own encoder, so a fixture can be far
+    /// larger than a baked-in constant vector.
+    ///
+    /// The decoder must be opened with the same `window_bits`: the encoder's
+    /// window bounds the largest distance it emits, and pairing a 15-bit encoder
+    /// with a 9-bit decoder is a legitimately invalid combination whose
+    /// `Z_DATA_ERROR` would look like a decoder defect.
+    fn raw_deflate(data: &[u8], window_bits: i32, level: i32, strategy: Strategy) -> Vec<u8> {
+        use crate::constants::Z_DEFLATED;
+        use crate::stream::ZStream;
+
+        let mut strm = ZStream::new();
+        crate::deflate::deflate_init2(&mut strm, level, Z_DEFLATED, -window_bits, 8, strategy)
+            .expect("raw deflate init");
+        let mut out = alloc::vec![0u8; data.len() + data.len() / 2 + 1024];
+        let r = crate::deflate::deflate(&mut strm, data, &mut out, Z_FINISH);
+        assert_eq!(
+            r.code,
+            ReturnCode::StreamEnd,
+            "the fixture must fit one call"
+        );
+        assert_eq!(r.consumed, data.len());
+        out.truncate(r.produced);
+        crate::deflate::deflate_end(&mut strm).expect("raw deflate end");
+        out
+    }
+
+    /// Cheap deterministic pseudo-random bytes (xorshift32) — the crate has no
+    /// runtime random dependency and the tests must not add one.
+    fn noise(len: usize, seed: u32) -> Vec<u8> {
+        let mut s = seed | 1;
+        (0..len)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                (s >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// The four corpus shapes that between them reach every copy arm:
+    /// ordinary short/medium back-references, `dist == 1` runs, distances at or
+    /// beyond a small window, and mostly-literal data.
+    fn corpus(kind: &str, len: usize) -> Vec<u8> {
+        let v = corpus_body(kind, len);
+        // A fixture that silently came out empty would make every comparison
+        // below vacuously true, so its size is checked rather than assumed.
+        assert_eq!(v.len(), len, "corpus {kind} must be exactly {len} bytes");
+        v
+    }
+
+    fn corpus_body(kind: &str, len: usize) -> Vec<u8> {
+        match kind {
+            "text" => {
+                let base: &[u8] = b"the quick brown fox jumps over the lazy dog -- \
+                                    pack my box with five dozen liquor jugs; ";
+                base.iter().copied().cycle().take(len).collect()
+            }
+            "run" => {
+                // Long identical runs (dist == 1, length 258) interleaved with
+                // short literal islands so blocks do not degenerate to stored.
+                let mut v = Vec::with_capacity(len);
+                let mut b = 0u8;
+                while v.len() < len {
+                    let run = 300 + (usize::from(b) % 700);
+                    for _ in 0..run.min(len - v.len()) {
+                        v.push(b);
+                    }
+                    if v.len() < len {
+                        v.push(b ^ 0xff);
+                    }
+                    b = b.wrapping_add(37);
+                }
+                v
+            }
+            "period" => {
+                // Period deliberately close to a 512-byte window so matches land
+                // on both sides of the `dist > put` split, including
+                // `dist == wsize`.
+                let block = noise(509, 0x1234_5678);
+                block.iter().copied().cycle().take(len).collect()
+            }
+            "noisy" => noise(len, 0x9e37_79b9),
+            other => panic!("unknown corpus {other}"),
+        }
+    }
+
+    /// Decodes one stream every way a provider can hand it over and asserts they
+    /// all agree with `expected`.
+    ///
+    /// Chunk sizes below six make `have >= 6` unsatisfiable, so the batched path
+    /// is never entered and the per-symbol path decodes the whole stream; larger
+    /// ones enter it repeatedly, including right at a chunk boundary where the
+    /// accumulator rewind is clamped. Equality across all of them is the
+    /// property that matters: it proves the two paths are byte-identical on real
+    /// data rather than merely both "plausible".
+    fn decode_every_way(window_bits: i32, stream: &[u8], expected: &[u8], what: &str) {
+        let (rc, out) = run(window_bits, stream);
+        assert_eq!(rc, ReturnCode::StreamEnd, "{what}: one-shot decode");
+        assert_eq!(out, expected, "{what}: one-shot decode (batched path)");
+
+        for size in [1usize, 5, 7, 64, 4096] {
+            let (rc, out, consumed) = run_chunked(window_bits, stream, size);
+            assert_eq!(rc, ReturnCode::StreamEnd, "{what}: chunk size {size}");
+            assert_eq!(out, expected, "{what}: chunk size {size}");
+            assert!(
+                consumed <= stream.len(),
+                "{what}: chunk size {size} claims {consumed} of {} bytes consumed",
+                stream.len()
+            );
+        }
+    }
+
+    #[test]
+    fn both_decode_paths_agree_on_every_corpus_shape() {
+        for kind in ["text", "run", "period", "noisy"] {
+            let data = corpus(kind, if kind == "noisy" { 8 * 1024 } else { 32 * 1024 });
+            for wb in [9i32, 12, 15] {
+                for (level, strategy) in [
+                    (1, Strategy::Default),
+                    (6, Strategy::Default),
+                    (9, Strategy::Default),
+                    (6, Strategy::Fixed),
+                    (6, Strategy::Rle),
+                    (6, Strategy::HuffmanOnly),
+                ] {
+                    let stream = raw_deflate(&data, wb, level, strategy);
+                    let what = alloc::format!("{kind} wb={wb} level={level} {strategy:?}");
+                    decode_every_way(wb, &stream, &data, &what);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn both_decode_paths_agree_when_the_window_wraps_many_times() {
+        // A 512-byte window with 256 KiB of highly repetitive input flushes the
+        // window hundreds of times, so `dist > put` (read from the window tail)
+        // and `dist == wsize` are both hit constantly inside the batched path.
+        let data = corpus("period", 256 * 1024);
+        let stream = raw_deflate(&data, 9, 9, Strategy::Default);
+        decode_every_way(9, &stream, &data, "period wb=9 level=9 many wraps");
+    }
+
+    #[test]
+    fn a_truncated_stream_is_a_buf_error_on_both_paths() {
+        let data = corpus("text", 32 * 1024);
+        let stream = raw_deflate(&data, 15, 6, Strategy::Default);
+        let cut = &stream[..stream.len() * 3 / 4];
+        // One-shot: the batched path consumes most of it, then the per-symbol
+        // path runs dry.
+        let (rc, _out) = run(15, cut);
+        assert_eq!(rc, ReturnCode::BufError, "one-shot truncated");
+        // Chunked below the batched threshold: per-symbol path only.
+        let (rc, _out, _consumed) = run_chunked(15, cut, 5);
+        assert_eq!(rc, ReturnCode::BufError, "chunked truncated");
+    }
+
+    #[test]
+    fn an_aborting_sink_is_a_buf_error_even_when_the_batched_path_runs() {
+        // 256 KiB through a 512-byte window: the batched path decodes, and the
+        // first `ROOM()` flush in the per-symbol path meets the refusing sink.
+        let data = corpus("text", 256 * 1024);
+        let stream = raw_deflate(&data, 9, 6, Strategy::Default);
+        let mut state = inflate_back_init(9).unwrap();
+        let mut src = SliceIn {
+            data: &stream,
+            done: false,
+            cur: &[],
+        };
+        let outcome = inflate_back(&mut state, &mut src, &mut AlwaysErrOut);
+        assert_eq!(outcome.code, ReturnCode::BufError);
+        assert_eq!(outcome.msg, BackMsg::Cleared, "C sets no diagnostic here");
+    }
+
+    /// Least-significant-bit-first bit writer, i.e. DEFLATE's packing order, so
+    /// a test can hand-build a bitstream that reaches an arm no valid encoder
+    /// emits.
+    struct BitWriter {
+        out: Vec<u8>,
+        acc: u32,
+        nbits: u32,
+    }
+    impl BitWriter {
+        fn new() -> Self {
+            BitWriter {
+                out: Vec::new(),
+                acc: 0,
+                nbits: 0,
+            }
+        }
+        fn bit(&mut self, b: u32) {
+            self.acc |= b << self.nbits;
+            self.nbits += 1;
+            if self.nbits == 8 {
+                self.out.push(self.acc as u8);
+                self.acc = 0;
+                self.nbits = 0;
+            }
+        }
+        /// Header fields and extra bits: least-significant bit first.
+        fn bits(&mut self, val: u32, n: u32) {
+            for i in 0..n {
+                self.bit((val >> i) & 1);
+            }
+        }
+        /// A Huffman code: most-significant bit first (RFC 1951 §3.1.1).
+        fn code(&mut self, code: u32, n: u32) {
+            for i in (0..n).rev() {
+                self.bit((code >> i) & 1);
+            }
+        }
+        /// Finishes the stream and pads it so at least
+        /// [`BACK_FAST_MIN_INPUT`] bytes are always available at the first `LEN`
+        /// state — which is what forces the *batched* path to be the one that
+        /// meets the malformed code.
+        fn finish_padded(mut self) -> Vec<u8> {
+            if self.nbits > 0 {
+                self.out.push(self.acc as u8);
+            }
+            self.out.extend_from_slice(&[0u8; 2 * BACK_FAST_MIN_INPUT]);
+            self.out
+        }
+    }
+
+    /// The fixed literal/length code and its bit length (RFC 1951 §3.2.6).
+    fn fixed_litlen(sym: u32) -> (u32, u32) {
+        match sym {
+            0..=143 => (0x30 + sym, 8),
+            144..=255 => (0x190 + sym - 144, 9),
+            256..=279 => (sym - 256, 7),
+            _ => (0xc0 + sym - 280, 8),
+        }
+    }
+
+    /// Opens a final fixed-Huffman block and writes `text` as literals.
+    fn fixed_block_prefix(text: &[u8]) -> BitWriter {
+        let mut w = BitWriter::new();
+        w.bits(1, 1); // BFINAL
+        w.bits(1, 2); // BTYPE = 01, fixed Huffman
+        for b in text {
+            let (c, n) = fixed_litlen(u32::from(*b));
+            w.code(c, n);
+        }
+        w
+    }
+
+    #[test]
+    fn the_batched_path_reports_an_invalid_literal_length_code() {
+        // Symbols 286/287 exist in the fixed tree but have no meaning:
+        // `inftrees.c` gives them `lext` 68 and 193, both with bit 64 set, which
+        // is the invalid marker the decoder tests.
+        let mut w = fixed_block_prefix(b"batched ");
+        let (c, n) = fixed_litlen(286);
+        w.code(c, n);
+        let data = w.finish_padded();
+
+        let ((rc, out), msg) = run_full(15, &data);
+        assert_eq!(rc, ReturnCode::DataError);
+        assert_eq!(msg, BackMsg::Set("invalid literal/length code"));
+        assert_eq!(
+            out, b"batched ",
+            "literals decoded before the bad code are still flushed"
+        );
+    }
+
+    #[test]
+    fn the_batched_path_reports_an_invalid_distance_code() {
+        // Distance symbols 30/31 carry `dext` 64 — the same invalid marker.
+        let mut w = fixed_block_prefix(b"batched ");
+        let (c, n) = fixed_litlen(257); // length 3, no extra bits
+        w.code(c, n);
+        w.code(30, 5); // fixed distance codes are all five bits
+        let data = w.finish_padded();
+
+        let ((rc, out), msg) = run_full(15, &data);
+        assert_eq!(rc, ReturnCode::DataError);
+        assert_eq!(msg, BackMsg::Set("invalid distance code"));
+        assert_eq!(out, b"batched ");
+    }
+
+    #[test]
+    fn the_batched_path_reports_a_distance_that_reaches_too_far_back() {
+        // First symbol of the stream is a match: nothing has been written and
+        // `whave` is zero, so any distance at all reaches past the history.
+        let mut w = fixed_block_prefix(b"");
+        let (c, n) = fixed_litlen(257); // length 3
+        w.code(c, n);
+        w.code(0, 5); // distance code 0 => distance 1
+        let data = w.finish_padded();
+
+        let ((rc, out), msg) = run_full(15, &data);
+        assert_eq!(rc, ReturnCode::DataError);
+        assert_eq!(msg, BackMsg::Set("invalid distance too far back"));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn the_batched_path_is_entered_and_produces_the_same_bytes_as_the_machine() {
+        // White-box: drive the block header by hand so `back_fast` can be called
+        // directly, proving the batched path really is reached (a coverage claim
+        // the differential tests can only imply) and that it leaves the context
+        // invariants intact for the state machine to carry on from.
+        let data = corpus("text", 16 * 1024);
+        let stream = raw_deflate(&data, 15, 6, Strategy::Fixed);
+
+        let mut state = inflate_back_init(15).unwrap();
+        state.mode = InflateMode::Type;
+        state.last = false;
+        state.whave = 0;
+        let wsize = state.wsize as usize;
+        let mut src = SliceIn {
+            data: &stream,
+            done: false,
+            cur: &[],
+        };
+        let mut sink = VecOut { data: Vec::new() };
+        let mut ctx = BackCtx {
+            next: 0,
+            msg: None,
+            hold: 0,
+            bits: 0,
+            put: 0,
+            left: wsize,
+            wsize,
+            src: &mut src,
+            sink: &mut sink,
+        };
+
+        // C `case TYPE` (infback.c L227-L295): consume the block header.
+        do_type(&mut ctx, &mut state).expect("block header");
+        assert_eq!(
+            state.mode,
+            InflateMode::Len,
+            "the fixture's first block must be a Huffman block"
+        );
+        assert!(
+            ctx.have() >= BACK_FAST_MIN_INPUT && ctx.left >= BACK_FAST_MIN_OUTPUT,
+            "the fixture must satisfy C's `have >= 6 && left >= 258`"
+        );
+
+        back_fast(&mut ctx, &mut state);
+        assert!(ctx.put > 0, "the batched path must have produced output");
+        assert_eq!(
+            ctx.put + ctx.left,
+            ctx.wsize,
+            "the put/left window invariant must survive the batch"
+        );
+        assert_eq!(ctx.msg, None, "a valid stream sets no diagnostic");
+        assert!(
+            ctx.left >= BACK_FAST_MIN_OUTPUT - 1,
+            "the batch must stop while at least 257 window bytes remain"
+        );
+
+        // Hand the rest to the ordinary machine and check the whole payload.
+        let ret = drive(&mut ctx, &mut state);
+        assert_eq!(ret, ReturnCode::StreamEnd);
+        let code = inf_leave(&mut ctx, &state, ret);
+        assert_eq!(code, ReturnCode::StreamEnd);
+        assert_eq!(sink.data, data);
+    }
+
+    #[test]
+    fn the_batched_path_consumes_exactly_as_much_input_as_the_per_symbol_path() {
+        // Trailing bytes after the final block must be left unconsumed, and both
+        // decoders must agree on where the stream ended. This is what the C
+        // epilogue's `in -= bits >> 3` exists for; a rewind that over- or
+        // under-returns would show up here as a different consumed count.
+        let data = corpus("text", 32 * 1024);
+        let mut stream = raw_deflate(&data, 15, 6, Strategy::Default);
+        let body = stream.len();
+        stream.extend_from_slice(b"TRAILING BYTES THAT ARE NOT PART OF THE STREAM");
+
+        let (rc, out, consumed_batched) = run_chunked(15, &stream, stream.len());
+        assert_eq!(rc, ReturnCode::StreamEnd);
+        assert_eq!(out, data);
+        let (rc, out, consumed_per_symbol) = run_chunked(15, &stream, 5);
+        assert_eq!(rc, ReturnCode::StreamEnd);
+        assert_eq!(out, data);
+
+        assert_eq!(
+            consumed_batched, consumed_per_symbol,
+            "the two paths must stop on the same input byte"
+        );
+        assert!(
+            consumed_batched <= body,
+            "consumed {consumed_batched} bytes but the DEFLATE stream is only {body}"
         );
     }
 }

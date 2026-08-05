@@ -234,17 +234,36 @@ pub fn deflate_slow(s: &mut DeflateState, io: &mut IoContext, flush: i32) -> Blo
             // hash table.
             s.lookahead -= s.prev_length - 1;
             s.prev_length -= 2;
-            loop {
-                s.strstart += 1;
-                if s.strstart <= max_insert {
-                    let str_idx = s.strstart;
-                    s.insert_string(str_idx);
-                }
-                s.prev_length -= 1;
-                if s.prev_length == 0 {
-                    break;
-                }
-            }
+
+            // C's `do { if (++s->strstart <= max_insert) INSERT_STRING(s,
+            // s->strstart, hash_head); } while (--s->prev_length != 0);` walks the
+            // `run` consecutive positions `strstart + 1 ..= strstart + run` in
+            // ascending order, inserting only those at or below `max_insert`, and
+            // leaves `prev_length` at zero.
+            //
+            // `max_insert` is fixed for the whole run (it was computed above from
+            // the pre-decrement `lookahead`), so the guard is monotone over an
+            // ascending index and the inserted positions are exactly the prefix
+            // `first ..= min(first + run - 1, max_insert)`. The bulk form inserts
+            // that prefix in the same order with the same `prev`-before-`head`
+            // write order, so the chain topology — and therefore the emitted
+            // token stream — is unchanged (AAP §0.6.4 decision (c)); it merely
+            // materializes the three window buffers once for the run instead of
+            // once per position (§0.6.3).
+            //
+            // `prev_length >= MIN_MATCH` on this branch, so `run >= 1` and the
+            // run is never empty, exactly as C's do-while always executes once.
+            let run = s.prev_length;
+            let first = s.strstart + 1;
+            let inserted = if max_insert >= first {
+                core::cmp::min(run, max_insert - first + 1)
+            } else {
+                0
+            };
+            s.insert_string_run(first, inserted);
+            s.strstart += run;
+            s.prev_length = 0;
+
             s.match_available = false;
             s.match_length = MIN_MATCH - 1;
             s.strstart += 1;

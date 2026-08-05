@@ -1784,9 +1784,14 @@ mod tests {
         // (the `build-script-tests` job) so the big-endian `cfg` arms are
         // type-checked as well.
         //
-        // What neither covers is *running* the braid loops on a big-endian target:
-        // no CI job executes on such hardware, so the residual gap is execution,
-        // not selection (AAP §0.6.6 residual risk, §0.7.2 standard S8).
+        // RUNNING the braid loops on a big-endian target is covered separately, and
+        // it is covered: `ci.yml`'s `cross-run` job executes this whole suite for
+        // `s390x-unknown-linux-gnu` under `qemu-user`, so the arms selected here are
+        // arms that actually compute. `crc32fast` offers no accelerated backend for
+        // s390x, which means the braid serves every bulk call on that row even with
+        // `simd` enabled. What remains outstanding is narrower than it used to be:
+        // that execution is EMULATED rather than run on IBM Z hardware
+        // (AAP §0.6.6 residual risk, §0.7.2 standard S8).
         assert_eq!(
             LITTLE_CRC_ENTRY_1, 0x7707_3096,
             "the little-endian CRC anchor is CRC_TABLE[1]"

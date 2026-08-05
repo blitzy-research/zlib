@@ -474,16 +474,17 @@ fn shape_constant(len: usize) -> Vec<u8> {
 /// whole reason this shape is in the grid — it reaches encoder paths the other
 /// four corpora never take.
 ///
-/// This shape is NOT the profile with the largest throughput gap against C, which
-/// is the intuitive but incorrect reading. A per-profile comparison inverts that
-/// intuition: incompressible input is the profile *closest* to C, at roughly
-/// 82%–86%, because the match finder fails fast (`longest_match`'s two-byte
-/// prefilter rejects nearly every candidate) and block-type selection falls back to
-/// stored blocks, so both implementations do similarly little work per byte. The
-/// *compressible* profiles are the furthest, at roughly 58%–64%, where hash chains
-/// are genuinely walked and Huffman trees built. The aggregate "compression ≈ 85%,
-/// decompression 107%–127%" figure is the one AAP §0.8.3 records, and it is
-/// attributed context rather than anything re-derived here.
+/// This shape *is* the profile with the largest throughput gap against C, and it is
+/// the only compression profile below C at all: measured **82%–94%** of reference C,
+/// against **113%–161%** for the compressible profiles. The match finder fails fast
+/// here (`longest_match`'s two-byte prefilter rejects nearly every candidate) and
+/// block-type selection falls back to stored blocks, so both implementations do
+/// similarly little work per byte — which bounds how much either can win.
+///
+/// An earlier revision recorded the opposite ordering, calling incompressible input
+/// the profile *closest* to C at "82%–86%" and the compressible profiles the
+/// *furthest* at "58%–64%", under an aggregate "compression ≈ 85%, decompression
+/// 107%–127%". Nothing measures in the 58%–64% band; that reading is retired.
 ///
 /// None of which this harness measures: it compares bytes and never time, so
 /// nothing here is a performance claim.

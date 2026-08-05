@@ -36,7 +36,15 @@
 //!   caller-supplied memory. It pins the C-shaped hook publication, the
 //!   allocation/deallocation balance, and the *point* at which a hook reporting
 //!   out-of-memory surfaces `Z_MEM_ERROR` — deflate charges every buffer at
-//!   init, inflate defers its sliding window.
+//!   init, inflate defers its sliding window. A hook-backed engine balances on
+//!   **two** heaps, not one: its state lives in the caller's arena, but the small
+//!   owning handles that keep that state type-erased are Rust global allocations,
+//!   deliberately so that they do not become extra `zalloc` requests and disturb
+//!   the allocation count and failure timing above. Counting hook calls cannot see
+//!   the second heap, so [`probe_global_heap_balance`] measures it directly
+//!   through a counting [`std::alloc::GlobalAlloc`] — which means this class of
+//!   leak is now caught by the harness itself rather than only by an external
+//!   sanitizer.
 //! * **The copy / reset lifecycle** — `deflateCopy`, `inflateCopy` and the five
 //!   `*Reset*` entry points, driven at a *fuzzer-chosen mid-stream offset* rather
 //!   than only at the deterministic boundaries a unit test can reach. A copy taken
@@ -549,12 +557,153 @@ impl HookState {
     /// Asserts every block handed out was handed back — an imbalance at the
     /// boundary is a leak (which would eventually trip the fuzzer's RSS limit
     /// and masquerade as an out-of-memory finding) or a double free.
+    ///
+    /// This covers the *caller's* arena only. The hook path also charges the Rust
+    /// global heap for the small owning handles that keep a hook-backed engine
+    /// type-erased, and those are invisible here because they are not hook
+    /// allocations. [`probe_global_heap_balance`] is what covers them; see
+    /// [`GlobalHeapMeter`] for why the two cannot be merged into one assertion.
     fn assert_balanced(&self, what: &str) {
         assert_eq!(
             self.handed_out.get(),
             self.released.get(),
             "{what}: every caller allocation must be released through zfree"
         );
+    }
+}
+
+// ===========================================================================
+// The second heap: Rust global allocations made on behalf of the hook path
+// ===========================================================================
+
+/// Net live bytes on the Rust global heap, maintained by [`CountingAllocator`].
+///
+/// A plain `static` rather than a thread-local because libFuzzer drives this
+/// target on one thread, and because an allocator must not depend on
+/// thread-local storage that may itself allocate. `Cell` is sound here for the
+/// same single-threaded reason, and the harness is not `Sync`-shared.
+static NET_GLOBAL_BYTES: GlobalCounter = GlobalCounter(Cell::new(0));
+
+/// Net live blocks on the Rust global heap.
+static NET_GLOBAL_BLOCKS: GlobalCounter = GlobalCounter(Cell::new(0));
+
+/// A single-threaded counter usable from a `static`.
+struct GlobalCounter(Cell<isize>);
+
+// SAFETY: libFuzzer runs this target's body on a single thread, so no two threads
+// ever touch these counters concurrently. The counters are pure bookkeeping — no
+// allocator decision reads them — so even a torn read could not corrupt memory,
+// only a diagnostic.
+unsafe impl Sync for GlobalCounter {}
+
+impl GlobalCounter {
+    /// Adds `delta`, wrapping rather than panicking: `fuzz/Cargo.toml` sets
+    /// `overflow-checks = true` for the release profile, and an arithmetic slip
+    /// in the harness must not become a false finding.
+    fn add(&self, delta: isize) {
+        self.0.set(self.0.get().wrapping_add(delta));
+    }
+
+    /// The current reading.
+    fn get(&self) -> isize {
+        self.0.get()
+    }
+}
+
+/// [`std::alloc::System`], instrumented so the harness can see Rust global
+/// allocations the way it already sees caller-hook allocations.
+///
+/// Every method forwards to `System` unchanged and only observes, so installing
+/// this cannot alter what the target measures. Note that [`hook_zalloc`] also
+/// allocates through `std::alloc::alloc` and is therefore counted here too —
+/// which is exactly why [`probe_global_heap_balance`] measures a window in which
+/// the caller's arena is also balanced, leaving the owning handles as the only
+/// possible residue.
+struct CountingAllocator;
+
+// SAFETY: every method delegates to `System`, which upholds the `GlobalAlloc`
+// contract. The only additions are counter updates, which allocate nothing and
+// cannot unwind. A null return is forwarded unchanged and deliberately not
+// counted, so a failed allocation is not mistaken for a live block.
+unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: `layout` is the caller's, forwarded verbatim; the `GlobalAlloc`
+        // contract already requires it to be valid and non-zero-sized.
+        let ptr = unsafe { std::alloc::System.alloc(layout) };
+        if !ptr.is_null() {
+            NET_GLOBAL_BYTES.add(layout.size() as isize);
+            NET_GLOBAL_BLOCKS.add(1);
+        }
+        ptr
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: as in `alloc` — the caller's layout, forwarded verbatim.
+        let ptr = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            NET_GLOBAL_BYTES.add(layout.size() as isize);
+            NET_GLOBAL_BLOCKS.add(1);
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        NET_GLOBAL_BYTES.add(-(layout.size() as isize));
+        NET_GLOBAL_BLOCKS.add(-1);
+        // SAFETY: `ptr`/`layout` are the caller's matching pair, which the
+        // contract requires to describe a live block from this allocator.
+        unsafe { std::alloc::System.dealloc(ptr, layout) };
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: `ptr`/`layout` describe a live block from this allocator and
+        // `new_size` satisfies the contract's rounding rules; both obligations
+        // are the caller's and are forwarded unchanged.
+        let fresh = unsafe { std::alloc::System.realloc(ptr, layout, new_size) };
+        if !fresh.is_null() {
+            // One block in, one block out: only the byte total moves.
+            NET_GLOBAL_BYTES.add(new_size as isize - layout.size() as isize);
+        }
+        fresh
+    }
+}
+
+#[global_allocator]
+static GLOBAL: CountingAllocator = CountingAllocator;
+
+/// A `(net_bytes, net_blocks)` reading of the Rust global heap.
+///
+/// # Why this cannot simply be folded into [`HookState::assert_balanced`]
+///
+/// `assert_balanced` is called at nine points across the boundary probes, and at
+/// every one of them the probe legitimately owns live `Vec`s — payloads, output
+/// windows, corpus slices. A blanket "the global heap is where it started"
+/// assertion at those points would fail on correct code. The property that *is*
+/// safe to assert is differential: run a closed engine lifecycle that creates and
+/// drops all of its own buffers, and the net change must be zero. Per-iteration
+/// growth across identical iterations is precisely the defect class this exists
+/// to catch, and nothing else looks like it.
+#[derive(Clone, Copy)]
+struct GlobalHeapMeter {
+    /// Net live bytes at the moment of the reading.
+    bytes: isize,
+    /// Net live blocks at the moment of the reading.
+    blocks: isize,
+}
+
+impl GlobalHeapMeter {
+    /// Reads the counters now.
+    fn read() -> Self {
+        Self {
+            bytes: NET_GLOBAL_BYTES.get(),
+            blocks: NET_GLOBAL_BLOCKS.get(),
+        }
+    }
+
+    /// The change since `self` was taken.
+    fn delta_since(self) -> (isize, isize) {
+        let now = Self::read();
+        (now.bytes - self.bytes, now.blocks - self.blocks)
     }
 }
 
@@ -1827,6 +1976,172 @@ fn probe_allocator_balance(window_bits: c_int) {
         "inflateEnd for an untouched hook-backed inflate stream",
     );
     inflate_hooks.assert_balanced("inflate with an active allocator hook");
+}
+
+/// Confirms that cycling hook-backed engines does not grow the **Rust global
+/// heap** — the second of the two balance obligations a hook-backed engine carries.
+///
+/// # The obligation this covers
+///
+/// A hook-backed engine keeps its state in the caller's arena, but the small
+/// owning handles that keep that state type-erased (`ForeignEngineHome`,
+/// `ForeignEngine`, `EngineBox`) are deliberately Rust global allocations, so that
+/// they do not become extra `zalloc` requests and disturb C's allocation *count*
+/// and failure *timing* — the property [`probe_allocator_failure_timing`] pins.
+/// That design decision means "every block the caller handed out came back" is
+/// only half of what has to be true. The other half is that every owning handle
+/// allocated for an engine is released when that engine ends, which is AAP
+/// §0.6.3's guarantee that no free path exists to forget.
+///
+/// [`HookState::assert_balanced`] structurally cannot see this: the handles are
+/// not hook allocations. Neither can any hookless test, because `DefaultAllocator`
+/// carries an inactive hook and never reaches hook-backed placement at all. The
+/// gap was real — `CEngineHome::fill` leaked its own box once per engine, and only
+/// a sanitizer-instrumented run caught it. This probe closes it inside the harness
+/// itself, so the finding no longer depends on LeakSanitizer being enabled.
+///
+/// # Why it is shaped as a repetition
+///
+/// Every buffer this probe creates is dropped inside the loop body, so across
+/// identical iterations the honest net change is exactly zero. A per-engine leak
+/// therefore shows up multiplied by [`GLOBAL_BALANCE_CYCLES`], and the reported
+/// per-block average names the leaking allocation directly. One warm-up iteration
+/// runs first and is not measured, because one-time lazy initialization anywhere
+/// beneath these calls is legitimately never freed and must not be charged to the
+/// engine.
+///
+/// The cost is bounded and tiny — a fixed, small number of cycles over a 64-byte
+/// payload — so it does not meaningfully reduce the executions the fuzzer gets
+/// through per unit of budget.
+fn probe_global_heap_balance(window_bits: c_int) {
+    /// Identical engine cycles run under one meter reading. Enough that a
+    /// per-engine leak is unmistakable, small enough to stay off the hot path.
+    const GLOBAL_BALANCE_CYCLES: usize = 8;
+
+    let good = version_ok();
+    let size = stream_size_ok();
+
+    // One closed cycle: init both engines from a caller hook, do real work, end
+    // them, and drop every buffer before returning. Nothing this touches may
+    // outlive the call, or the measurement below is meaningless.
+    let one_cycle = || {
+        let hooks = HookState::with_budget(usize::MAX);
+        let payload = [0x7au8; 64];
+
+        let mut ds = zeroed_stream();
+        install_hooks(&mut ds, &hooks);
+        // SAFETY: `ds` is a valid owned `z_stream` whose `opaque` addresses
+        // `hooks`, which outlives every call the engine makes through them.
+        let init = unsafe {
+            deflateInit2_(
+                &mut ds,
+                DEFAULT_LEVEL,
+                Z_DEFLATED,
+                window_bits,
+                1,
+                0,
+                good,
+                size,
+            )
+        };
+        assert_eq!(
+            init, Z_OK,
+            "deflateInit2_ under an unlimited caller hook must succeed"
+        );
+
+        let mut compressed = vec![0u8; 512];
+        ds.next_in = payload.as_ptr();
+        ds.avail_in = payload.len() as c_uint;
+        ds.next_out = compressed.as_mut_ptr();
+        ds.avail_out = compressed.len() as c_uint;
+        // SAFETY: `ds` holds a live deflate handle and both buffer windows are
+        // valid for the lengths reported in `avail_in`/`avail_out`.
+        let done = unsafe { deflate(&mut ds, Z_FINISH) };
+        assert_eq!(
+            done, Z_STREAM_END,
+            "a 64-byte payload must finish in one deflate call"
+        );
+        let produced = compressed.len() - ds.avail_out as usize;
+        compressed.truncate(produced);
+        // SAFETY: `ds` holds a live deflate handle that has not been ended.
+        let end = unsafe { deflateEnd(&mut ds) };
+        assert_eq!(end, Z_OK, "deflateEnd must reclaim a finished stream");
+
+        // A copy taken from a live inflate engine allocates a *second* set of
+        // owning handles, so including it here doubles the per-cycle exposure and
+        // covers `inflateCopy` as well as `inflateInit2_`.
+        let mut is_ = zeroed_stream();
+        install_hooks(&mut is_, &hooks);
+        // SAFETY: `is_` is a valid owned `z_stream` whose `opaque` addresses the
+        // same live `hooks`.
+        let iinit = unsafe { inflateInit2_(&mut is_, window_bits, good, size) };
+        assert_eq!(
+            iinit, Z_OK,
+            "inflateInit2_ under an unlimited caller hook must succeed"
+        );
+
+        let mut restored = vec![0u8; payload.len() + 64];
+        is_.next_in = compressed.as_ptr();
+        is_.avail_in = compressed.len() as c_uint;
+        is_.next_out = restored.as_mut_ptr();
+        is_.avail_out = restored.len() as c_uint;
+        // SAFETY: `is_` holds a live inflate handle and both buffer windows are
+        // valid for the reported lengths.
+        let ret = unsafe { inflate(&mut is_, Z_FINISH) };
+        assert_eq!(
+            ret, Z_STREAM_END,
+            "the round trip must reach the end of the stream"
+        );
+        let restored_len = restored.len() - is_.avail_out as usize;
+        assert_eq!(
+            &restored[..restored_len],
+            &payload[..],
+            "the hook-backed round trip must recover the payload exactly"
+        );
+
+        let mut copy = zeroed_stream();
+        // SAFETY: `copy` is a valid owned zeroed `z_stream` and `is_` holds a
+        // live inflate handle; `inflateCopy` reads one and initialises the other.
+        let copied = unsafe { inflateCopy(&mut copy, &mut is_) };
+        assert_eq!(
+            copied, Z_OK,
+            "inflateCopy must carve its clone from the source's own zalloc"
+        );
+        // SAFETY: `copy` and `is_` hold live, distinct inflate handles.
+        let end_copy = unsafe { inflateEnd(&mut copy) };
+        // SAFETY: as above.
+        let end_src = unsafe { inflateEnd(&mut is_) };
+        assert_eq!(
+            (end_copy, end_src),
+            (Z_OK, Z_OK),
+            "ending both the clone and its source must succeed"
+        );
+
+        hooks.assert_balanced("global-heap balance cycle");
+    };
+
+    // Warm-up: absorbs one-time lazy initialisation, which is legitimately never
+    // freed and must not be charged to the engine.
+    one_cycle();
+
+    let before = GlobalHeapMeter::read();
+    for _ in 0..GLOBAL_BALANCE_CYCLES {
+        one_cycle();
+    }
+    let (bytes, blocks) = before.delta_since();
+
+    assert_eq!(
+        (bytes, blocks),
+        (0, 0),
+        "cycling hook-backed engines must leave the Rust global heap where it \
+         started, but {GLOBAL_BALANCE_CYCLES} cycles left {bytes} byte(s) in \
+         {blocks} block(s) behind ({} byte(s) per block). Every owning handle \
+         allocated for a hook-backed engine has to be released when that engine \
+         ends (AAP §0.6.3): a residue that scales with the cycle count is \
+         unbounded growth for a C consumer that installs zalloc/zfree and cycles \
+         streams.",
+        if blocks == 0 { 0 } else { bytes / blocks }
+    );
 }
 
 /// Confirms that a hook reporting out-of-memory surfaces `Z_MEM_ERROR` — never a
@@ -3524,8 +3839,12 @@ fuzz_target!(|data: &[u8]| {
     // N2 — handle tagging and cross-engine `*End` misuse.
     probe_handle_tag_misuse(window_bits);
 
-    // N3 — the allocator-hook contract and allocation-failure timing.
+    // N3 — the allocator-hook contract and allocation-failure timing. The three
+    // probes cover the caller's arena, the Rust global heap the hook path also
+    // charges, and the *point* at which a refusal surfaces; each is blind to the
+    // others' failure modes, which is why all three are needed.
     probe_allocator_balance(window_bits);
+    probe_global_heap_balance(window_bits);
     probe_allocator_failure_timing(data);
 
     // N4 — the copy / reset lifecycle. Two independent cut offsets and a

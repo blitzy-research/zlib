@@ -1030,16 +1030,75 @@ impl DeflateState {
     /// is C's pointer dereference expressed as index arithmetic (AAP §0.3.2 rule
     /// T3). Bounds are checked by the slice index, so an out-of-range symbol
     /// index panics rather than reading adjacent pending output.
+    ///
+    /// Test-only: the symbol region is written and read one whole 3-byte symbol
+    /// at a time, so the engines drive [`sym_triple`](Self::sym_triple) and
+    /// [`set_sym_triple`](Self::set_sym_triple) instead (one buffer
+    /// materialization per symbol rather than three — AAP §0.6.3). The
+    /// single-position form remains as the primitive the layout tests assert
+    /// against.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn sym(&self, index: usize) -> u8 {
         self.pending_buf[self.lit_bufsize + index]
     }
 
     /// Writes byte `index` of the symbol region. The counterpart of
-    /// `sym`; see there for the index convention.
+    /// `sym`; see there for the index convention and for why it is test-only.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn set_sym(&mut self, index: usize, value: u8) {
         self.pending_buf[self.lit_bufsize + index] = value;
+    }
+
+    /// Reads the three consecutive symbol-region bytes starting at `index` — one
+    /// complete symbol triple — with a single buffer materialization.
+    ///
+    /// Returned **by value**, so no borrow of [`pending_buf`](Self::pending_buf)
+    /// outlives the call. That is what lets the block bits accumulate into the
+    /// same allocation the symbols live in, exactly as C does; see
+    /// [`crate::deflate::trees`]'s `compress_block`.
+    ///
+    /// Equivalent to three [`sym`](Self::sym) calls, in the same order, with the
+    /// same bounds checking — it merely pays one [`AllocBuffer`] dispatch instead
+    /// of three, which on the caller-hook (`Foreign`) arm is one dynamic call
+    /// instead of three (AAP §0.6.3).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index + 2` is outside the symbol region, on the same terms as
+    /// [`sym`](Self::sym).
+    #[inline]
+    pub(crate) fn sym_triple(&self, index: usize) -> (u8, u8, u8) {
+        let base = self.lit_bufsize + index;
+        let buf = self.pending_buf.as_slice();
+        (buf[base], buf[base + 1], buf[base + 2])
+    }
+
+    /// Writes the three consecutive symbol-region bytes starting at `index` — one
+    /// complete symbol triple — with a single buffer materialization.
+    ///
+    /// Equivalent to three [`set_sym`](Self::set_sym) calls in ascending order
+    /// with the same bounds checking, paying one [`AllocBuffer`] dispatch instead
+    /// of three (AAP §0.6.3). This is the hottest write in the encoder: it runs
+    /// once per emitted literal and once per emitted match.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index + 2` is outside the symbol region, on the same terms as
+    /// [`sym`](Self::sym). The bounds check happens before any of the three
+    /// writes rather than between them, which is unobservable: both profiles set
+    /// `panic = "abort"`, so no unwinding can inspect a partially written triple,
+    /// and the callers never reach this state anyway — `sym_end` is checked after
+    /// every tally.
+    #[inline]
+    pub(crate) fn set_sym_triple(&mut self, index: usize, a: u8, b: u8, c: u8) {
+        let base = self.lit_bufsize + index;
+        let buf = self.pending_buf.as_mut_slice();
+        let triple = &mut buf[base..base + 3];
+        triple[0] = a;
+        triple[1] = b;
+        triple[2] = c;
     }
 
     /// The whole symbol region as a slice — `pending_buf[lit_bufsize..]`, i.e.
@@ -2095,10 +2154,84 @@ impl DeflateState {
     #[inline]
     pub fn insert_string(&mut self, str_idx: usize) -> u16 {
         self.update_hash(self.window[str_idx + MIN_MATCH - 1]);
-        let match_head = self.head[self.ins_h];
-        self.prev[str_idx & self.w_mask] = match_head;
-        self.head[self.ins_h] = str_idx as u16;
+        let ins_h = self.ins_h;
+        let wmask = self.w_mask;
+        // Two disjoint fields, so both borrows coexist. As in
+        // [`insert_string_run`](Self::insert_string_run), the chain-head slot is
+        // bound once for the read-then-overwrite pair C spells as
+        // `prev[str & w_mask] = head[ins_h]; head[ins_h] = str;` — same values,
+        // same order, one slot lookup instead of two.
+        let head: &mut [u16] = &mut self.head;
+        let prev: &mut [u16] = &mut self.prev;
+        let slot = &mut head[ins_h];
+        let match_head = *slot;
+        prev[str_idx & wmask] = match_head;
+        *slot = str_idx as u16;
         match_head
+    }
+
+    /// Bulk [`insert_string`](Self::insert_string) over the `count` consecutive
+    /// positions `first .. first + count`, in ascending order.
+    ///
+    /// This is the shape every C `INSERT_STRING` *loop* has — the post-match
+    /// re-insertion runs in `deflate_fast` (`deflate.c` L1909-L1915) and
+    /// `deflate_slow` (L2027-L2033), and the dictionary priming loop in
+    /// `deflateSetDictionary` (L600-L607) — so those call sites drive this rather
+    /// than calling the single-position form `count` times.
+    ///
+    /// # Why the bulk form exists
+    ///
+    /// It is byte-for-byte the single-position form repeated: the same rolling
+    /// hash, the same three array touches, and critically the same **write
+    /// order** — `prev[str & w_mask]` is stored *before* `head[ins_h]` is
+    /// overwritten, which is what preserves the chain topology and therefore the
+    /// emitted token stream (AAP §0.6.4 decision (c), §0.8.1 directive D-1).
+    /// What it avoids is re-materializing the three [`AllocBuffer`]s on every
+    /// position: on the caller-hook (`Foreign`) arm each `Deref` is a dynamic
+    /// call through `Box<dyn ForeignBuffer<T>>`, and the single-position form
+    /// pays four of them per inserted string (AAP §0.6.3).
+    ///
+    /// The chain head the C macro stores into `hash_head` is deliberately not
+    /// returned: none of the loop call sites ever reads it (only the
+    /// single-position form's callers do).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `first + count + MIN_MATCH - 2` is not a valid window index, on
+    /// the same terms as [`insert_string`](Self::insert_string):
+    /// [`fill_window`](Self::fill_window) zero-fills above `high_water` so every
+    /// caller has `MIN_MATCH` hashable bytes at each position.
+    #[inline]
+    pub fn insert_string_run(&mut self, first: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let hash_shift = self.hash_shift;
+        let hash_mask = self.hash_mask;
+        let wmask = self.w_mask;
+        let mut ins_h = self.ins_h;
+
+        // Three disjoint fields, so all three borrows coexist; each costs one
+        // `Deref` for the whole run.
+        let window: &[u8] = &self.window;
+        let head: &mut [u16] = &mut self.head;
+        let prev: &mut [u16] = &mut self.prev;
+
+        for str_idx in first..first + count {
+            // C `UPDATE_HASH(s, s->ins_h, s->window[str + MIN_MATCH-1])`.
+            ins_h =
+                ((ins_h << hash_shift) ^ (window[str_idx + MIN_MATCH - 1] as usize)) & hash_mask;
+            // C `s->prev[str & s->w_mask] = s->head[s->ins_h];` then
+            // `s->head[s->ins_h] = (Pos)str;`. Both touch the *same* chain-head
+            // slot, so it is bound once: the read, the store into `prev`, and the
+            // overwrite happen in exactly C's order with exactly C's values, but
+            // the slot is located and bounds-checked once instead of twice.
+            let slot = &mut head[ins_h];
+            prev[str_idx & wmask] = *slot;
+            *slot = str_idx as u16;
+        }
+
+        self.ins_h = ins_h;
     }
 
     /// Reproduces C `slide_hash` (`deflate.c` L187-L210): when the window
@@ -2264,19 +2397,50 @@ impl DeflateState {
             // Initialize the hash value now that we have some input.
             if self.lookahead + self.insert >= MIN_MATCH {
                 let mut str_idx = self.strstart - self.insert;
-                self.ins_h = self.window[str_idx] as usize;
-                self.update_hash(self.window[str_idx + 1]);
-                // (MIN_MATCH == 3, so no extra UPDATE_HASH calls are needed.)
-                while self.insert != 0 {
-                    self.update_hash(self.window[str_idx + MIN_MATCH - 1]);
-                    self.prev[str_idx & self.w_mask] = self.head[self.ins_h];
-                    self.head[self.ins_h] = str_idx as u16;
-                    str_idx += 1;
-                    self.insert -= 1;
-                    if self.lookahead + self.insert < MIN_MATCH {
-                        break;
+
+                // Loop-invariant scalars and the three buffers are materialized
+                // once for the whole run: on the caller-hook (`Foreign`) arm each
+                // `AllocBuffer` `Deref` is a dynamic call through
+                // `Box<dyn ForeignBuffer<T>>` that no inliner can remove, and the
+                // per-position form pays four of them (AAP §0.6.3). The control
+                // flow, the rolling-hash arithmetic and — critically — the
+                // `prev`-before-`head` write order are byte-for-byte C's
+                // `deflate.c` L1560-L1572 loop (AAP §0.6.4 decision (c)).
+                let hash_shift = self.hash_shift;
+                let hash_mask = self.hash_mask;
+                let wmask = self.w_mask;
+                let lookahead = self.lookahead;
+                let mut insert = self.insert;
+                let mut ins_h;
+                {
+                    // Four disjoint fields, so all four borrows coexist.
+                    let window: &[u8] = &self.window;
+                    let head: &mut [u16] = &mut self.head;
+                    let prev: &mut [u16] = &mut self.prev;
+
+                    // C `s->ins_h = s->window[str];` is *not* masked, then one
+                    // `UPDATE_HASH` folds in the second byte.
+                    ins_h = window[str_idx] as usize;
+                    ins_h = ((ins_h << hash_shift) ^ (window[str_idx + 1] as usize)) & hash_mask;
+                    // (MIN_MATCH == 3, so no extra UPDATE_HASH calls are needed.)
+                    while insert != 0 {
+                        ins_h = ((ins_h << hash_shift)
+                            ^ (window[str_idx + MIN_MATCH - 1] as usize))
+                            & hash_mask;
+                        // One slot lookup for C's read-then-overwrite pair; see
+                        // `insert_string_run`.
+                        let slot = &mut head[ins_h];
+                        prev[str_idx & wmask] = *slot;
+                        *slot = str_idx as u16;
+                        str_idx += 1;
+                        insert -= 1;
+                        if lookahead + insert < MIN_MATCH {
+                            break;
+                        }
                     }
                 }
+                self.ins_h = ins_h;
+                self.insert = insert;
             }
 
             if !(self.lookahead < MIN_LOOKAHEAD && io.avail_in != 0) {
@@ -2356,20 +2520,51 @@ impl DeflateState {
             NIL as usize
         };
         let wmask = self.w_mask;
-        let strend = self.strstart + MAX_MATCH;
+        let strstart = self.strstart;
+        let strend = strstart + MAX_MATCH;
+        let lookahead = self.lookahead;
+        let good_match = self.good_match;
+        let prev_length = self.prev_length;
 
-        let mut scan_end1 = self.window[self.strstart + best_len - 1];
-        let mut scan_end = self.window[self.strstart + best_len];
+        // Materialize the window and the chain array ONCE for the whole search
+        // (AAP §0.6.3). `self.window`/`self.prev` are `AllocBuffer`s, and on the
+        // caller-hook (`Foreign`) arm each `Deref` is a dynamic call through
+        // `Box<dyn ForeignBuffer<T>>` that no inliner can remove. This is the
+        // single hottest loop in the encoder — a chain walk reads the window four
+        // to six times per probe and `prev` once — so paying that dispatch per
+        // *access* rather than per *call* was costing a caller-hook stream ~45%
+        // of its throughput. Hoisting is purely a data-access change: the reads,
+        // their order, and every comparison below are untouched, so the emitted
+        // token stream (AAP §0.6.4, §0.8.1 directive D-1) cannot move.
+        //
+        // Hoisting also helps the default (`Owned`) arm, because the in-loop
+        // write to `self.match_start` previously forced the compiler to re-load
+        // the `Vec` pointer/length after every store; that write is now deferred
+        // to a local and committed once, after the search.
+        let window: &[u8] = &self.window;
+        let prev: &[u16] = &self.prev;
+
+        let mut scan_end1 = window[strstart + best_len - 1];
+        let mut scan_end = window[strstart + best_len];
+        // C compares against `scan[0]`/`scan[1]` through a pointer that the
+        // search never writes through, so these two bytes are loop-invariant.
+        let scan0 = window[strstart];
+        let scan1 = window[strstart + 1];
 
         // Do not waste time if we already have a good match.
-        if self.prev_length >= self.good_match {
+        if prev_length >= good_match {
             chain_length >>= 2;
         }
         // Do not look beyond the end of the input; keeps deflate deterministic.
-        if nice_match > self.lookahead {
-            nice_match = self.lookahead;
+        if nice_match > lookahead {
+            nice_match = lookahead;
         }
 
+        // C's `s->match_start` out-parameter, kept in a register for the search
+        // and written back below. Nothing reads it until `longest_match`
+        // returns, so deferring the store is unobservable; when no better match
+        // is found the value written back is the one already there.
+        let mut match_start = self.match_start;
         let mut cur_match = cur_match;
 
         loop {
@@ -2379,19 +2574,19 @@ impl DeflateState {
             // These are pure reads, so the De Morgan inversion preserves
             // behavior exactly. The offsets and the pair of probes at
             // `best_len` / `best_len - 1` match C.
-            if self.window[match_base + best_len] == scan_end
-                && self.window[match_base + best_len - 1] == scan_end1
-                && self.window[match_base] == self.window[self.strstart]
-                && self.window[match_base + 1] == self.window[self.strstart + 1]
+            if window[match_base + best_len] == scan_end
+                && window[match_base + best_len - 1] == scan_end1
+                && window[match_base] == scan0
+                && window[match_base + 1] == scan1
             {
                 // Offsets 0 and 1 matched above; offset 2 is guaranteed equal
                 // by the hash and is skipped. Extend the match from offset 3.
-                let mut s_idx = self.strstart + 2;
+                let mut s_idx = strstart + 2;
                 let mut m_idx = match_base + 2;
                 loop {
                     s_idx += 1;
                     m_idx += 1;
-                    if self.window[s_idx] != self.window[m_idx] {
+                    if window[s_idx] != window[m_idx] {
                         break;
                     }
                     if s_idx >= strend {
@@ -2401,20 +2596,20 @@ impl DeflateState {
                 let len = MAX_MATCH - (strend - s_idx);
 
                 if len > best_len {
-                    self.match_start = cur_match;
+                    match_start = cur_match;
                     best_len = len;
                     if len >= nice_match {
                         break;
                     }
-                    scan_end1 = self.window[self.strstart + best_len - 1];
-                    scan_end = self.window[self.strstart + best_len];
+                    scan_end1 = window[strstart + best_len - 1];
+                    scan_end = window[strstart + best_len];
                 }
             }
 
             // Advance along the hash chain: C's
             // `while ((cur_match = prev[cur_match & wmask]) > limit
             //         && --chain_length != 0)`.
-            cur_match = self.prev[cur_match & wmask] as usize;
+            cur_match = prev[cur_match & wmask] as usize;
             if cur_match <= limit {
                 break;
             }
@@ -2426,10 +2621,12 @@ impl DeflateState {
             chain_length -= 1;
         }
 
-        if best_len <= self.lookahead {
+        self.match_start = match_start;
+
+        if best_len <= lookahead {
             best_len
         } else {
-            self.lookahead
+            lookahead
         }
     }
 
@@ -2474,12 +2671,25 @@ impl DeflateState {
     ///
     /// # Panics
     ///
-    /// Panics if fewer than two bytes of pending-buffer room remain; see
-    /// [`put_byte`](Self::put_byte), which performs both writes.
+    /// Panics if fewer than two bytes of pending-buffer room remain — the same
+    /// checked-index abort [`put_byte`](Self::put_byte) documents, except that
+    /// both bytes are bounds-checked before either is written. That reordering is
+    /// unobservable: both profiles set `panic = "abort"`, so no unwinding can
+    /// inspect a half-written word, and C never reaches this state (`put_short`
+    /// is only ever called with at least two bytes of room).
+    ///
+    /// Both bytes go through a single [`AllocBuffer`] materialization rather than
+    /// one per byte, which on the caller-hook (`Foreign`) arm is one dynamic call
+    /// instead of two (AAP §0.6.3). `put_short` runs once per 16 bits of
+    /// Huffman-coded output, so it is on the hottest emission path.
     #[inline]
     pub fn put_short(&mut self, w: u16) {
-        self.put_byte((w & 0xff) as u8);
-        self.put_byte((w >> 8) as u8);
+        let p = self.pending;
+        let buf = self.pending_buf.as_mut_slice();
+        let pair = &mut buf[p..p + 2];
+        pair[0] = (w & 0xff) as u8;
+        pair[1] = (w >> 8) as u8;
+        self.pending = p + 2;
     }
 
     /// Reproduces the compiled (non-debug) C `send_bits` macro (`trees.c`):

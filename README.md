@@ -66,15 +66,42 @@ performance has been measured and is reported in the [Roadmap](#roadmap).
 ### Measured evidence
 
 Every figure in this README is a value observed by running the command beside it
-on this tree, never an estimate — **with one clearly marked exception, stated here
-so it is not discovered late.** The four throughput ratios *relative to C zlib*
-(compression ≈ 85%, decompression 107–127%, and the per-profile 82–86% / 58–64%
-band) are **attributed** figures carried from the migration's own measurement
-record. They are not re-derived by anything in this repository: the Criterion suite
-links no C library, and `tests/c_oracle.rs` is a *conformance* oracle for
-byte-identity, not a performance one. Every such ratio is labelled where it appears
-under [Roadmap](#roadmap); absolute Rust throughput, by contrast, is measurable
-here with `cargo bench --locked` and is reported as measured.
+on this tree, never an estimate. That now includes the throughput ratios *relative
+to C zlib* under [Roadmap](#roadmap), which earlier revisions of this file had to
+label as *attributed* because nothing in the repository re-derived them. They are
+measured — but they are **not** measured by `cargo bench`, and the distinction
+matters enough to state before the numbers appear:
+
+- **Absolute Rust throughput** is reproducible here with
+  `RUSTUP_TOOLCHAIN=stable cargo bench --locked`. The Criterion suite links no C
+  library, so it cannot express a ratio at all; it compares this crate against
+  itself across levels, profiles, tuning parameters and commits.
+- **C-relative ratios** come from an out-of-tree *differential* harness: one C
+  driver compiled twice, once against a reference `libz` built from the retained
+  in-tree `*.c` baseline with
+  `gcc -O2 -D_LARGEFILE64_SOURCE=1 -DHAVE_UNISTD_H` and once against this crate's
+  `staticlib`, with the two sides interleaved pair-by-pair. Method for every ratio
+  quoted below: **five interleaved A/B rep pairs**, C/RS order reversed on even
+  reps, each timed phase **≥ 0.30 s**, reporting the **median** (and, where the
+  spread matters, the best) of each side. The reference archive measured
+  135,206 B, and the compiler was **`gcc 15.2.0`** (`Ubuntu 15.2.0-4ubuntu4`) —
+  worth naming because the migration plan's own record of that build cites
+  `gcc 13.3.0`, and a different C compiler is the single largest uncontrolled
+  variable in any C-relative ratio. Any C99 compiler that can consume the retained
+  root `zlib.h` reproduces the harness; the *numbers* it produces are that
+  compiler's, not this document's.
+- **`tests/c_oracle.rs`** is a *conformance* oracle for byte-identity, not a
+  performance one, and is unchanged by any of the above.
+
+One host caveat applies to every absolute number and, to a lesser degree, to every
+ratio: the measuring host is a shared four-CPU quota running under a load average
+near 45, with `perf_event_paranoid=2` and no `perf`/`valgrind` available. Absolute
+MiB/s figures are therefore biased downward, and two harnesses timing the *same*
+operation were observed to disagree by 10–30% purely from warm-up ordering, with a
+0.12 s measurement window swinging ±30%. That is exactly why the method above fixes
+five interleaved reps at ≥ 0.30 s and quotes medians rather than single runs. Treat
+the **ordering and the ratio** as the durable claims and the absolute throughput as
+host-specific.
 
 Each row below was run with `RUSTUP_TOOLCHAIN=stable` — see
 [Installation](#installation) for why that prefix matters — on stable
@@ -83,10 +110,10 @@ except the two MSRV rows.
 
 | Gate | Command | Result |
 |------|---------|--------|
-| Test suite (default features) | `cargo test --locked` | **1015 passed / 0 failed / 0 ignored** |
-| Test suite (all features) | `cargo test --locked --all-features` | **1028 passed / 0 failed / 0 ignored** |
-| Test suite (`no_std`) | `cargo test --locked --no-default-features` | **713 passed / 0 failed / 0 ignored** |
-| Test suite (`no-std` feature) | `cargo test --locked --no-default-features --features no-std` | **713 passed / 0 failed / 0 ignored** |
+| Test suite (default features) | `cargo test --locked` | **1039 passed / 0 failed / 0 ignored** |
+| Test suite (all features) | `cargo test --locked --all-features` | **1052 passed / 0 failed / 0 ignored** |
+| Test suite (`no_std`) | `cargo test --locked --no-default-features` | **737 passed / 0 failed / 0 ignored** |
+| Test suite (`no-std` feature) | `cargo test --locked --no-default-features --features no-std` | **737 passed / 0 failed / 0 ignored** |
 | Formatting | `cargo fmt --all -- --check` | exit 0 |
 | Lints | `cargo clippy --locked --all-targets --all-features -- -D warnings` | exit 0 |
 | API docs | `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features` | exit 0, 0 warnings |
@@ -94,17 +121,18 @@ except the two MSRV rows.
 | MSRV build | `cargo +1.85.0 build --locked` | exit 0 |
 | MSRV type-check | `cargo +1.85.0 check --locked --all-targets --all-features` | exit 0, 0 warnings |
 | Exported C symbols | `nm -D --defined-only target/release/libzlib_rs.so` | **95**, all type `T` |
-| Packaged crate | `cargo package --locked --list` | **75** files; the unpacked archive re-runs its own suite at 1015 |
+| Packaged crate | `cargo package --locked --list` | **76** files; the unpacked archive re-runs its own suite at 1039 |
 | Live byte-identity sweep | `cargo test --locked --features c-oracle --test c_oracle` | **3750/3750** and **50/50** byte-identical |
 
-The 1015 default-feature tests decompose as **854** in-crate unit tests, **132**
+The 1039 default-feature tests decompose as **867** in-crate unit tests, **143**
 integration tests (`checksum` 23, `gzip_compat` 17, `inflate_coverage` 30,
 `interop` 30, `regression` 13, `round_trip` 19), and **29** doctests (28
 runnable plus one `compile_fail`).
 `--all-features` adds the 13 tests of the opt-in live C-oracle harness. Under
-`--no-default-features` the total is **587** unit + **99** integration + **27**
+`--no-default-features` the total is **600** unit + **110** integration + **27**
 doctests; the `gzip_compat` suite correctly reports 0 because the whole `gz*`
-file API is feature-gated off.
+file API is feature-gated off. The two remaining CI feature rows measure **1039**
+(`std,gzip,gz-io`) and **745** (`std,simd`).
 
 CI does not merely run these commands — it parses every `test result:` line and
 fails the job on any failure, on any *ignored* test, or on a count below a
@@ -241,7 +269,7 @@ A root [`rust-toolchain.toml`](rust-toolchain.toml) pins `channel = "1.85.0"`
 build resolves to the same compiler CI's MSRV job uses instead of floating to
 whatever stable happens to be installed. **A bare `cargo …` inside this
 repository therefore invokes the MSRV compiler.** To reach stable — which is what
-eleven of CI's twelve jobs do — set `RUSTUP_TOOLCHAIN` or use a `+stable` prefix;
+thirteen of CI's fourteen jobs do — set `RUSTUP_TOOLCHAIN` or use a `+stable` prefix;
 `rustup`'s environment override outranks the toolchain file, which is exactly why
 CI's `dtolnay/rust-toolchain` steps still select the channel they ask for. Those
 steps are pinned to a commit SHA and name their channel with an explicit
@@ -477,8 +505,8 @@ the dynamic export set matches the `zlib.map` contract on every one of them.
 Release artifact sizes, observed on **2026-08-04** with **stable 1.97.1**, the
 **default** feature set, `cargo build --locked --release`, into this repository's
 default `target/release/` (no `CARGO_TARGET_DIR` override): `libzlib_rs.rlib`
-≈ 2.8 MiB (2,930,500 B), `libzlib_rs.so` ≈ 652 KiB (667,552 B), `libzlib_rs.a`
-≈ 21.4 MiB (22,464,508 B).
+≈ 2.8 MiB (2,977,084 B), `libzlib_rs.so` ≈ 651 KiB (666,400 B), `libzlib_rs.a`
+≈ 21.4 MiB (22,468,092 B).
 
 Read those as a dated, environment-specific observation rather than a budget or an
 invariant. No gate asserts them; they move with the compiler, the feature row, and
@@ -511,6 +539,23 @@ published here: reproduce them locally with
 > setting bit 27. Every other public prototype is fully implemented, and the
 > idiomatic Rust `gzprintf` (which takes `core::fmt::Arguments` instead of a
 > C `va_list`) formats fully.
+
+> **The allocator is bound at init, not re-read per allocation.** A stream's
+> `zalloc`/`zfree`/`opaque` triple is captured by `deflateInit*`/`inflateInit*`/
+> `inflateBackInit*`; writing new values into those fields on a *live* stream has
+> no effect, including on inflate's window, which is deferred until a block needs
+> it. Reference C re-reads the fields inside its `ZALLOC` macro, so install a
+> counting `zalloc` after `inflateInit2_` and C records one hook allocation where
+> this crate records none. `zlib.h` documents the triple as an input to the init
+> call and never sanctions changing it afterwards, so no conforming caller is
+> affected — and matching C here would be **less** sound, not merely more work: in
+> that same measurement C's ledger shows **one** allocation taken from the caller's
+> `zalloc` against **two** pointers handed back to the caller's `zfree`, because
+> the stream state came from C's internal `zcalloc` before the hooks existed. C
+> thus mixes two allocators inside one stream and passes a foreign pointer to a
+> caller-supplied deallocator. Here every buffer frees through the hook that
+> allocated it, so **one buffer, one allocator** holds by construction rather than
+> by convention. The decompressed payload is byte-identical either way.
 
 Build the shared and static objects:
 
@@ -1020,7 +1065,7 @@ a C call site.
 ### Portability: what CI actually exercises
 
 Platform claims deserve platform coverage, so here is the boundary, drawn honestly.
-`.github/workflows/ci.yml` runs **twelve jobs**:
+`.github/workflows/ci.yml` runs **fourteen jobs**:
 
 - **Natively executed, full test suite:** `ubuntu-latest` across five feature rows
   (default, `--all-features`, `std,gzip,gz-io`, `std,simd`, and `--no-default-features`
@@ -1035,42 +1080,103 @@ Platform claims deserve platform coverage, so here is the boundary, drawn honest
   step runs that test **by name** and asserts exactly one test passed, so the
   coverage cannot regress into a mere compile check. The macOS row exercises
   `OS_CODE = 19` and aarch64.
-- **Cross type-checked and cross-linted, not natively run:** four triples —
-  `aarch64-unknown-linux-gnu`, `i686-unknown-linux-gnu` (32-bit),
+- **Cross type-checked and cross-linted:** four triples in the `cross-targets`
+  job — `aarch64-unknown-linux-gnu`, `i686-unknown-linux-gnu` (32-bit),
   `s390x-unknown-linux-gnu` (**big-endian**), and `x86_64-pc-windows-msvc`. Each
   gets both `cargo check` and `cargo clippy -D warnings` with `--all-targets
   --all-features`; neither command links, which is why no cross linker, emulator
-  or MSVC toolchain is needed. The Windows-MSVC row is a *cross* lane and is not
-  the same claim as the native `windows-latest` row above: that one is native and
-  narrow (one OS, one feature selection, and it **runs** the suite), this one is
-  cross and wide (every feature on, nothing executed). Both are kept because a
+  or MSVC toolchain is needed here. The Windows-MSVC row is a *cross* lane and is
+  not the same claim as the native `windows-latest` row above: that one is native
+  and narrow (one OS, one feature selection, and it **runs** the suite), this one
+  is cross and wide (every feature on, nothing executed). Both are kept because a
   regression has to evade both — `c_ulong` is 32-bit on MSVC and 64-bit on LP64,
   so a `uLong as u32` cast is a real truncation on Linux and an identity cast
-  there, and `unnecessary_cast` fires on exactly one of the two. The
+  there, and `unnecessary_cast` fires on exactly one of the two. The first three
+  triples are additionally **executed** by `cross-run`, described below; this job
+  is what covers them at `--all-features`, which `cross-run` cannot execute
+  because the live C-oracle tests want a host-native C compiler. The
   `build-script-tests` job additionally type-checks the
   library and test profile for s390x specifically so the big-endian CRC braid arms
   are compiled — on a little-endian runner they otherwise never are, and a wrong
   index in one of them would go unnoticed until somebody built for big-endian
   hardware. A unit test asserts the endian-selected table anchors match the active
   target's values on **every** target, so the relationship is checked at run time
-  even where the big-endian arms themselves are not executed.
-- **Built, not run:** the bare-metal `thumbv7em-none-eabihf` target, in both
-  `--no-default-features` and `--features no-std` configurations, with an assertion
-  that the freestanding runtime block was genuinely compiled.
+  wherever the suite runs at all.
+- **Cross EXECUTED under emulation:** the `cross-run` job runs the test suite on
+  `aarch64-unknown-linux-gnu`, on 32-bit `i686-unknown-linux-gnu` and on
+  **big-endian** `s390x-unknown-linux-gnu` through `qemu-user`, across the default
+  row and both std-off rows (`--no-default-features` and
+  `--no-default-features --features no-std`). Each matrix row declares **both** its
+  endianness and its pointer width and asserts them against `rustc --print cfg`, so
+  a triple swapped in without those fields being updated fails the job rather than
+  reporting a little-endian run as big-endian coverage or a 64-bit run as 32-bit
+  coverage; a dedicated step then runs the four endian-critical CRC tests **by
+  name** and asserts exactly four passed, so this coverage cannot decay into a
+  mere compile check. The job resolves its emulator binary by trying
+  `qemu-<arch>-static` and then `qemu-<arch>`, because the statically linked
+  emulators are packaged differently across Ubuntu releases — on 25.10
+  `qemu-user-static` is a *pure virtual* package and the binaries ship inside
+  `qemu-user` without the suffix, so a job that hard-codes one spelling breaks on
+  a runner-image bump. `--all-features` is deliberately **excluded** from these
+  rows: `tests/c_oracle.rs` classifies a toolchain probe by the `ErrorKind` of a
+  failed `Command` spawn, and under user-mode emulation "command absent" and
+  "command present but broken" both surface as a child exiting 127, so four
+  self-tests of that classifier cannot distinguish the two. Weakening a
+  deliberately loud classifier to suit an emulator would be the wrong trade.
+- **Bare metal, EXECUTED under emulation:** `bare-metal-no-std` builds the
+  `thumbv7em-none-eabihf` library in both `--no-default-features` and
+  `--features no-std` configurations and asserts from the archive's symbol table
+  that the freestanding runtime block was genuinely compiled and is crate-owned.
+  `bare-metal-run` then links that same staticlib into a firmware image and
+  **runs it on a no-OS Cortex-M4 under `qemu-system-arm`**, which is what turns
+  the libc-backed `GlobalAlloc`, the 32-bit `MIN_ALIGN = 8` arm and the
+  `#[panic_handler]` from linked code into executed code. No hosted test can reach
+  that block — `cargo test` sets `test` and forces `panic = "unwind"`, failing two
+  of the three terms in its own `cfg`. The row that matters most drains the heap
+  and asserts `deflateInit2` returns `Z_MEM_ERROR` rather than aborting: on a
+  device with no OOM killer and no swap, that is the difference between a
+  recoverable error and a dead board. Both feature rows run, and they assert
+  **opposite** things about `windowBits = 31` — accepted with `gzip` on, rejected
+  with `Z_STREAM_ERROR` when it is off, matching a C zlib compiled without
+  `GZIP` (`deflate.c` lines 428-433) — so the feature gate itself is covered
+  rather than merely present.
 - **Also gated:** the C-ABI linkage contract on four feature rows, the `unsafe`
   boundary, MSRV 1.85.0, benchmark compilation, `cargo package` verification, and a
   blocking `docs` job that runs rustdoc with `RUSTDOCFLAGS: -D warnings` and builds
   the published MkDocs site with `--strict` in a version-pinned Python environment.
 
-So: a 32-bit, big-endian, or bare-metal build is **compile-verified**, not
-runtime-verified, and this README does not claim otherwise. The two mechanisms that
-make the distinction matter are concrete, and both are resolved **at compile time**
-from the target triple rather than probed at run time — `src/checksum/crc32.rs`
-chooses its braid tables with `cfg!(target_endian)` (both arms are compiled and
-type-checked; only the selected one reaches codegen), and `src/util/mod.rs` selects
-the gzip header's `OS_CODE` per platform (10 on Windows, 19 on non-Windows Apple, 3
-otherwise). Reference C zlib probes endianness at execution time instead; that
-divergence is documented and cannot change a checksum.
+So: **big-endian, 32-bit and bare-metal are all executed** — under emulation
+rather than on IBM Z, i686 or Cortex-M silicon, which is a real distinction and is
+stated as such. Emulation reproduces the instruction set, the endianness, the
+pointer width and the absence of an operating system; it does not reproduce a
+device, its timing or its memory controller, so real-hardware validation remains
+genuinely open and this README does not claim otherwise. The two mechanisms that
+make the endianness and platform distinctions
+matter are concrete, and both are resolved **at compile time** from the target
+triple rather than probed at run time — `src/checksum/crc32.rs` chooses its braid
+tables with `cfg!(target_endian)` (both arms are compiled and type-checked; only
+the selected one reaches codegen), and `src/util/mod.rs` selects the gzip header's
+`OS_CODE` per platform (10 on Windows, 19 on non-Windows Apple, 3 otherwise).
+Reference C zlib probes endianness at execution time instead; that divergence is
+documented and cannot change a checksum.
+
+Two of those three `OS_CODE` arms are the ones a compile-time cascade most easily
+gets wrong, because nothing on the build host exercises them. Both have now been
+observed in an emitted gzip member rather than inferred from the source: the
+Windows row writes `os_byte = 0x0a` (10), and the bare-metal row — a target that
+is neither Windows nor Apple, and has no operating system at all — writes
+`os_byte = 0x03`, taking the `#ifndef OS_CODE` fallback. Reference C selects 10
+under Windows too, because mingw-w64 defines `WIN32`/`_WIN32` and `zutil.h`
+branches on them, so the values agree rather than merely both being defensible.
+The Apple arm (19) is reached by CI's native `macos-latest` row.
+
+The big-endian row is the one worth dwelling on, because it was for a long time the
+project's largest unexercised claim. `crc32fast` has no accelerated backend on
+s390x, so even the SIMD-enabled default row selects the scalar braid there: the
+`CRC_BIG_TABLE` and `CRC_BRAID_BIG_TABLE` arms are not merely compiled on that
+row, they are the arms that serve every bulk call. Running that row is therefore
+what turns "the big-endian tables are byte-swapped companions of the little-endian
+ones" from a type-checked assertion into an executed one.
 
 ## Roadmap
 
@@ -1086,7 +1192,7 @@ that were previously tracked as open items are now closed:
   [Compatibility and RFCs](#compatibility-and-rfcs) for the full grid.
 - **`no_std` test coverage (done).** The full test suite compiles and passes
   under `cargo test --locked --no-default-features` (and `--features no-std`) —
-  **713 tests, 0 failed, 0 ignored** in both rows — and CI runs both as blocking
+  **737 tests, 0 failed, 0 ignored** in both rows — and CI runs both as blocking
   gates, plus a bare-metal `thumbv7em-none-eabihf` build job.
 - **Cross-platform CI (done).** Native Windows and macOS rows run the real suite;
   four further triples — aarch64, 32-bit x86, big-endian s390x, and
@@ -1114,33 +1220,78 @@ Remaining, workload-dependent work:
   migration, not its objective.** This is explicitly not a performance refactor,
   and no optimisation may be introduced at the cost of byte-identity.
 
-  The plan-recorded aggregate position against C zlib 1.3.2.1-motley is
-  **compression ≈ 85%** and **decompression 107–127%** of C throughput — so
-  decompression is at or above parity, and compression is the interesting side.
-  Treat both as attributed context rather than as properties this repository
-  re-checks on demand: the Criterion suite links no C library, and there is no
-  in-tree *performance* oracle (`tests/c_oracle.rs` is a *conformance* oracle for
-  byte-identity, which is a different job).
+  The position against C zlib 1.3.2.1-motley is **measured**, per profile and per
+  level, by the differential harness described under
+  [Measured evidence](#measured-evidence) — median of five interleaved A/B rep
+  pairs at ≥ 0.30 s each, 64 KiB payload, reference C built from the retained
+  in-tree `*.c` baseline with `gcc -O2 -D_LARGEFILE64_SOURCE=1 -DHAVE_UNISTD_H`.
+  Every cell is RS as a percentage of C; higher is faster than C.
 
-  A per-profile comparison against a reference C build sharpened the picture, and
-  **inverted the intuitive reading of the compression gap**. An earlier revision of
-  this README and of `benches/deflate_bench.rs` attributed the shortfall to the
-  incompressible-input path, "where the match finder does the most fruitless work".
-  That was plausible and wrong:
-  - Incompressible input is the profile **closest** to C, at roughly **82–86%**.
-    The match finder fails *fast* there — `longest_match`'s two-byte prefilter
-    rejects nearly every candidate before the comparison loop, and
-    `_tr_flush_block` then selects stored blocks because a dynamic tree cannot pay
-    for itself — so both implementations do similar and rather little work per byte.
-  - Compressible profiles are the **furthest**, at roughly **58–64%**. That is where
-    hash chains are genuinely walked, lazy matching is evaluated, and Huffman trees
-    are built and emitted.
-  - Decompression measured **104–125%** per profile, which *overlaps* the quoted
-    107–127% aggregate on 107–125% without containing it: the per-profile floor
-    sits three points below the aggregate's and the ceiling two points below, so
-    neither range brackets the other. What survives contact with measurement is
-    the load-bearing half of the claim — decompression is at or above parity on
-    every profile.
+  **Compression** — one-call `compress2`:
+
+  | profile | level 1 | level 6 | level 9 |
+  |---------|---------|---------|---------|
+  | `text` | 113% | 161% | 157% |
+  | `repetitive` | 146% | 131% | 138% |
+  | `incompressible` | 90% | 82% | 92% |
+
+  **Decompression** — one-call `uncompress`, and separately the `inflateBack`
+  decoder, each cell being the range across source levels 1, 6 and 9:
+
+  | profile | `uncompress` | `inflateBack` |
+  |---------|--------------|---------------|
+  | `text` | 141–154% | 216–312% |
+  | `repetitive` | 154–160% | 248–344% |
+  | `incompressible` | 101–114% | 86–102% |
+
+  Three things in those tables replace claims earlier revisions of this README made,
+  and each earlier claim is named here rather than quietly dropped:
+
+  - **The compressible profiles are now above C, not below it.** An earlier revision
+    quoted an aggregate "compression ≈ 85%" and localised the shortfall to the
+    compressible profiles at "roughly 58–64%", with incompressible input the
+    *closest* to C at "roughly 82–86%". Both halves of that are retired: nothing
+    measures in the 58–64% band, and the localisation is the other way round.
+  - **The one profile still below C is `incompressible`, at 82–94%** across levels.
+    Incompressible input pays for one *failed* match-finder search per literal and
+    has no long match to amortise it over — `longest_match`'s two-byte prefilter
+    rejects nearly every candidate before the comparison loop, and `_tr_flush_block`
+    then selects stored blocks because a dynamic tree cannot pay for itself — so
+    throughput there is set almost entirely by per-literal bookkeeping. It is
+    therefore both the slowest workload in absolute terms (≈ 39 MiB/s against
+    ≈ 309 MiB/s for `text` and ≈ 316 MiB/s for `repetitive` at the same level,
+    a factor of roughly eight) and the only C-relative deficit that remains.
+  - **Decompression is at or above parity on every `uncompress` profile**, which was
+    the load-bearing half of the old claim and is now true without qualification.
+    Earlier revisions quoted a "104–125% per profile" range that did not include
+    `inflateBack` at all; measured on its own, `inflateBack` runs 216–344% of C on
+    input that actually decodes Huffman symbols. Its one sub-parity cell —
+    `incompressible` at 86–102% — is not a decode-logic figure: an incompressible
+    payload is emitted as *stored* blocks, so that case is a `memcpy` running at
+    roughly 19 GiB/s on both sides and the spread is host and `memcpy` variance.
+
+  Two narrower measured positions are worth recording because they were previously
+  unmeasured and each turned out to hide a real regression:
+
+  - **Short-distance LZ77 copies.** `inflate` on streams whose matches are dominated
+    by one distance runs at 132–433% of C across distances 1, 3, 4, 8, 16, 32 and
+    128 — the worst of those being 132% at distance 8. No Criterion case reached
+    this path before the `repetitive` profile was added to
+    `benches/inflate_bench.rs`.
+  - **Caller-supplied `zalloc`/`zfree` hooks.** A stream driven through caller hooks
+    now runs at 98–102% of the same stream on the global allocator (reference C
+    measures 93–96% on the same comparison), and at 159–162% of C's own hook path.
+    Allocation counts are identical to C in all thirteen measured lifecycle
+    families, and `zalloc`/`zfree` remain balanced with zero live bytes at teardown.
+  - **Non-default `memLevel`.** At level 6 the tuning sweep runs 108–158% of C
+    across `memLevel` 1, 8 and 9. The residual deficit is at **level 1 with a
+    non-default `memLevel`** — 70–74% of C on a 64 KiB payload — and it is a
+    per-stream *initialisation* cost, not a compression cost: this crate's owned
+    buffers are zero-filled when they are created (a safe `Vec` always is, and
+    `alloc_zeroed` would require an `unsafe` carve-out outside the FFI boundary,
+    which `#![deny(unsafe_code)]` forbids) whereas C's `ZALLOC` is a plain `malloc`.
+    It amortises away with payload size: the same case reaches 87% at 1 MiB, and the
+    `memLevel = 9` variant reaches 149%.
 
   No CRC-32 multiplier is quoted here. The difference between the `crc32fast` hot
   path and the scalar braid is CPU- and build-dependent, and — as
@@ -1169,16 +1320,43 @@ Remaining, workload-dependent work:
   stream — bounds-check elision, memory-access patterns, inlining, and buffer-copy
   strategy.
 
-  The three Criterion harnesses are `benches/deflate_bench.rs`,
-  `benches/inflate_bench.rs`, and `benches/checksum_bench.rs`. The deflate harness
-  carries an explicit **incompressible-input profile** so that the slowest *absolute*
-  Rust workload is measured rather than assumed — that profile is, per the ratios
-  above, simultaneously the one *closest* to C, and this harness links no C library
-  so it cannot produce a ratio at all — every case validates its own output before it
-  is timed, and
-  the noise thresholds are set above the run-to-run spread actually observed on the
-  measuring host rather than at Criterion's unusable 1% default. That folder
-  measures; it does not authorise.
+  The three Criterion harnesses are `benches/deflate_bench.rs` (621 lines),
+  `benches/inflate_bench.rs` (460), and `benches/checksum_bench.rs` (186) — the
+  file names, since the plan's own inventory once listed them as
+  `compress.rs`/`decompress.rs`/`checksum.rs`, which never existed. They cover, and
+  the coverage list is deliberately explicit because every gap in it once hid a
+  regression:
+
+  - `deflate_levels/<0..9>` — all ten levels on text.
+  - `deflate_profiles/level6/{text,repetitive,incompressible}` — the three shapes.
+  - `deflate_incompressible_guard/{1,6,9}` — the **incompressible-input guard**, so
+    that the slowest *absolute* Rust workload is measured rather than assumed. Per
+    the tables above that profile is now also the only C-relative deficit, so the
+    guard brackets both readings at once. Note that this harness links no C library
+    and therefore prints no ratio of its own.
+  - `deflate_tuning/mem_level/{1,8,9}`, `deflate_tuning/window_bits/{-15,9,15,31}`,
+    and `deflate_tuning/strategy/{default,filtered,huffman_only,rle,fixed}` — added
+    because `compress2` hard-codes `windowBits = 15`, `memLevel = 8` and the default
+    strategy, so *every* pre-existing case measured exactly one point of that space.
+    The `memLevel` dimension was holding a real regression at the time it was added.
+  - `inflate_by_level/{1,6,9}` and
+    `inflate_by_profile/level6/{text,repetitive,incompressible}` — the `repetitive`
+    profile being what drives the short-distance overlapping-copy path.
+  - `inflate_back_by_profile/level6/{text,repetitive,incompressible}` — the
+    `infback.c` decoder, which no case reached before and which was consequently
+    free to regress unobserved.
+  - `adler32/<size>` and `crc32/<size>`.
+
+  Every case validates its own output before it is timed — one untimed
+  round-trip asserting exact length and byte-for-byte equality, which Criterion
+  never folds into a sample — and the noise thresholds are set above the
+  run-to-run spread actually observed on the measuring host rather than at
+  Criterion's unusable 1% default. Even so, 8 of the Criterion ids on this host are
+  noise-dominated (worst observed: `crc32/16384` at a 138.6% coefficient of
+  variation, and `deflate_levels/6` at R² = 0.32), which is the same shared-host
+  caveat recorded under [Measured evidence](#measured-evidence) and another reason
+  the C-relative claims are taken from interleaved medians rather than from
+  Criterion. That folder measures; it does not authorise.
 
 ## Contributing
 

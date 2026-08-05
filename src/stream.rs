@@ -156,6 +156,47 @@
 //!   `u16`. Sealing keeps the set fixed and auditable inside this crate — see that
 //!   trait for exactly what it does and does not assert.
 //!
+//! ## When the allocator is bound — a documented divergence from C
+//!
+//! **The allocator is captured once, at initialization, and never re-read.** A
+//! stream's `zalloc`/`zfree`/`opaque` triple is read by `deflateInit*` /
+//! `inflateInit*` / `inflateBackInit*` and stored in the buffers those calls
+//! create. Mutating `strm.zalloc` or `strm.zfree` *after* a successful init has no
+//! effect: allocations that happen later — most visibly inflate's window, which is
+//! deferred until the first block that needs it — still go through whatever
+//! allocator was in force at init.
+//!
+//! Reference C behaves differently. Its `ZALLOC` macro expands to
+//! `(*((strm)->zalloc))((strm)->opaque, …)`, re-reading the field on every call, so
+//! a hook installed after init *does* serve a later allocation. The divergence is
+//! therefore real and measurable: install a counting `zalloc` after
+//! `inflateInit2_` and drive a stream far enough to need its window, and C reports
+//! one hook allocation where this crate reports none.
+//!
+//! **This is out of contract, and the divergence is deliberate.** `zlib.h`
+//! documents the fields as inputs to the init call; it never sanctions changing
+//! them on a live stream. Honouring a late change is not merely unnecessary, it is
+//! unsound in a way C demonstrates on itself. In the measured comparison above,
+//! C's own ledger records **one** allocation from the caller's `zalloc` but
+//! **two** pointers handed back to the caller's `zfree` — because the stream's
+//! internal state had already been allocated by C's built-in `zcalloc` before the
+//! hooks were installed. C thus mixes two allocators inside a single stream and
+//! passes a foreign pointer to a caller-supplied deallocator, which is undefined
+//! behaviour for any allocator that validates its arguments.
+//!
+//! This crate cannot reproduce that outcome, and the reason is structural rather
+//! than a policy choice: **one buffer, one allocator.** Every [`AllocBuffer`]
+//! frees through the very hook that allocated it, so there is no representation in
+//! which a buffer is allocated by one allocator and released by another. Rebinding
+//! mid-stream would require exactly that.
+//!
+//! Nothing observable to a conforming caller changes. Every supported path — hooks
+//! installed *before* init, which is the only way `zlib.h` describes — allocates,
+//! frees and decodes identically to C, and the decompressed payload is
+//! byte-identical in the divergent case too. See also the corresponding note on
+//! [`crate::ffi::types::alloc_hook_from_parts`] and the divergence list in
+//! `README.md`.
+//!
 //! # Safety, `no_std`
 //!
 //! This module contains **no executable `unsafe`** — no `unsafe` block, no
@@ -1182,6 +1223,45 @@ impl<T: Copy + Default + ZeroValid> AllocBuffer<T> {
     #[must_use]
     pub(crate) const fn is_foreign(&self) -> bool {
         matches!(self, AllocBuffer::Foreign(_))
+    }
+
+    /// Materialize the backing store as a shared slice.
+    ///
+    /// Identical to `&*self` through [`Deref`], and offered as a named method so
+    /// that a hot loop can state at its head that it is materializing the buffer
+    /// **once** for the whole loop.
+    ///
+    /// # Why materializing once matters
+    ///
+    /// On the [`Owned`](Self::Owned) arm this resolves to a `Vec` pointer load
+    /// that the optimizer hoists on its own. On the [`Foreign`](Self::Foreign)
+    /// arm — the caller-supplied `zalloc`/`zfree` path — it is a *dynamic* call
+    /// through `Box<dyn ForeignBuffer<T>>`, which no inliner can remove because
+    /// the concrete implementor is not known until the C caller installs its
+    /// hooks. A loop that indexes the buffer through [`Deref`] therefore pays one
+    /// virtual call per element, which is what made the caller-hook deflate path
+    /// run at roughly half the speed of the global-allocator path.
+    ///
+    /// The rule the engines follow, per AAP §0.6.3: **bind the slice once outside
+    /// the loop, index the binding inside it.** Because the borrow is held for
+    /// the loop's duration the compiler enforces that nothing reallocates or
+    /// re-tags the buffer underneath it, so the transformation is observably
+    /// identical — it cannot move a single emitted byte (§0.8.1 directive D-1).
+    #[inline]
+    #[must_use]
+    pub fn as_slice(&self) -> &[T] {
+        self
+    }
+
+    /// Materialize the backing store as a mutable slice.
+    ///
+    /// The [`DerefMut`] counterpart of [`as_slice`](Self::as_slice); see that
+    /// method for why hot loops bind the slice once rather than indexing through
+    /// [`Deref`] per element.
+    #[inline]
+    #[must_use]
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        self
     }
 }
 

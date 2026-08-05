@@ -28,13 +28,24 @@
 #                 Linux. That fourth row is not redundant with the native
 #                 `windows-latest` row in `build-test`: this one is cross and
 #                 wide (`--all-features`), that one is native and narrow, and
-#                 neither links (gap D3)
+#                 neither links (gap D3). It type-checks `--all-features`, which
+#                 `cross-run` cannot execute because the live C-oracle tests want
+#                 a host-native C compiler
+#   cross-run     the test suite EXECUTED on the aarch64, 32-bit i686 and
+#                 BIG-ENDIAN s390x Linux triples under qemu-user, which is what
+#                 turns the endian-sensitive CRC braid selection, the OS_CODE
+#                 cascade and the 32-bit pointer width from compiled code into
+#                 run code (gap D3, execution half)
 #   bare-metal-no-std  library build for thumbv7em-none-eabihf: the only
 #                 configuration that compiles `mod no_std_support` for
 #                 `target_os = "none"` and reaches its 32-bit `MIN_ALIGN = 8`
 #                 arm (gap D10). The block itself also compiles in any std-off
 #                 LIBRARY build, including on the host - see the note on the
 #                 `no_std library (build only)` row.
+#   bare-metal-run  that same staticlib LINKED INTO FIRMWARE and EXECUTED on a
+#                 no-OS Cortex-M4 under qemu-system-arm, so the libc-backed
+#                 GlobalAlloc and the fallible-allocation path run for real
+#                 rather than merely linking (gap D10, execution half)
 #   package-verify  `cargo package --list` checked against Cargo.toml's
 #                 `exclude` contract, plus the packaging build AND the unpacked
 #                 archive's own `cargo test` run, so the published crate is
@@ -352,7 +363,7 @@ jobs:
             arch: X64
             features: ''
             test: true
-            min_tests: 1015
+            min_tests: 1039
           # Every feature turned on at once.
           - name: All features
             os: ubuntu-latest
@@ -360,7 +371,7 @@ jobs:
             arch: X64
             features: '--all-features'
             test: true
-            min_tests: 1028
+            min_tests: 1052
           # gzip framing + gz file-I/O layer on top of std.
           - name: gzip + gz-io
             os: ubuntu-latest
@@ -368,7 +379,7 @@ jobs:
             arch: X64
             features: '--no-default-features --features std,gzip,gz-io'
             test: true
-            min_tests: 1015
+            min_tests: 1039
           # simd-enabled CRC-32 on top of std, with the gzip framing and gz
           # file-I/O layers OFF. That combination is what makes this row distinct
           # rather than a second copy of another one: `Default features` already
@@ -397,7 +408,7 @@ jobs:
             # ubuntu rows because `gz-io` is off: `tests/gzip_compat.rs`
             # contributes nothing and the `cfg(feature = "gzip")` /
             # `cfg(feature = "gz-io")` unit tests do not exist.
-            min_tests: 721
+            min_tests: 745
           # Core-only (no_std) LIBRARY build. `test: false` is what makes this row
           # distinct rather than redundant: `mod no_std_support` in `src/lib.rs` is
           # gated on `all(not(feature = "std"), not(test), panic = "abort")`, so a
@@ -789,7 +800,7 @@ jobs:
     # bare numeric floor comes back.
     env:
       RUSTUP_TOOLCHAIN: stable
-      STD_OFF_FLOOR: 713
+      STD_OFF_FLOOR: 737
     steps:
     - name: Checkout repository
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -1755,8 +1766,13 @@ jobs:
         echo "$installed"
         case "$installed" in
           *s390x-unknown-linux-gnu*) ;;
+          # The backticks below are escaped on purpose. Inside a double-quoted
+          # shell string an unescaped pair is command substitution, so bash would
+          # try to run `targets:`, print "command not found", and *delete* the word
+          # from the diagnostic - corrupting the message at the moment an operator
+          # most needs it. `actionlint` does not flag this class.
           *) echo "::error::s390x-unknown-linux-gnu is not installed on the stable"\
-             " toolchain. The `targets:` input on the install step above was lost."; exit 1 ;;
+             " toolchain. The \`targets:\` input on the install step above was lost."; exit 1 ;;
         esac
     - name: Compile and run the build-script test binary
       run: |
@@ -2563,6 +2579,289 @@ jobs:
         fi
         echo "Cargo.lock unchanged."
 
+  # Cross RUNTIME execution under qemu-user (gap D3, the execution half).
+  #
+  # `cross-targets` above proves the non-host `cfg` arms COMPILE and lint clean.
+  # It cannot prove they COMPUTE THE RIGHT ANSWER, and for this crate that gap has
+  # a name: `src/checksum/crc32.rs` picks `CRC_BIG_TABLE` / `CRC_BRAID_BIG_TABLE`
+  # with `cfg!(target_endian)`, so on every little-endian runner the big-endian
+  # braid arms are type-checked and then never executed. A wrong index in one of
+  # them survives `check`, `clippy` and the whole hosted suite. This job closes
+  # that by RUNNING the suite for the target, which is what makes the portability
+  # claim in `README.md` a measurement rather than an inference.
+  #
+  # HOW, in one sentence: `qemu-user-static` supplies a user-mode emulator, the
+  # matching `gcc-<arch>-linux-gnu` supplies the cross linker and sysroot, and
+  # Cargo is pointed at both through the two per-target environment variables it
+  # reads for exactly this purpose - `CARGO_TARGET_<TRIPLE>_LINKER` and
+  # `CARGO_TARGET_<TRIPLE>_RUNNER`. Nothing about the crate changes: no feature,
+  # no `cfg`, no `.cargo/config.toml` table. That file stays deliberately inert
+  # (gap D7), because a `runner` key committed there would silently apply to
+  # every contributor's `cargo test --target`, including those without qemu
+  # installed.
+  #
+  # THREE ROWS, one per property that only execution can check, and each row
+  # DECLARES the property it covers so the declaration can be asserted:
+  #
+  #   * `s390x-unknown-linux-gnu` - the only BIG-ENDIAN configuration anywhere in
+  #     this workflow, and therefore the row that exists to execute the big-endian
+  #     braid. `crc32fast` ships no accelerated backend for s390x, so the scalar
+  #     braid is what serves every bulk call there even on this SIMD-enabled row:
+  #     `CRC_BIG_TABLE` and `CRC_BRAID_BIG_TABLE` are not merely compiled, they are
+  #     the arms under test.
+  #   * `aarch64-unknown-linux-gnu` - a second 64-bit little-endian ISA whose
+  #     `c_char` is unsigned and whose `crc32fast` backend is the AArch64 CRC
+  #     instruction path rather than x86 `pclmulqdq`, so it executes a different
+  #     accelerated arm than any other row in this file.
+  #   * `i686-unknown-linux-gnu` - 32-bit `usize`/`isize`, the only row on which the
+  #     narrow-pointer arms run at all: every `usize` bound in the window and table
+  #     sizing, and the `u64`-vs-`usize` narrowing in `compressBound`/`deflateBound`,
+  #     are width-sensitive. EXPECT A LOWER TEST TOTAL HERE, and do not read it as a
+  #     row that silently skipped something: exactly five library tests are
+  #     `#[cfg(target_pointer_width = "64")]` because they mirror LP64 C struct
+  #     offsets, so they cannot mean anything on ILP32 -
+  #     `deflate::state::tests::c_layout_{mirror_reproduces_every_c_deflate_state_offset,
+  #     size_matches_the_measured_c_deflate_state}`, the two `inflate::state`
+  #     counterparts, and `ffi::types::tests::abi_exact_field_offsets_lp64` (whose
+  #     name says so). Measured: 792 library tests here against 797 on the two LP64
+  #     rows, and the endian-critical assertion below passes on all three.
+  #
+  # Between them the three rows retire the whole of gap D3's execution half: after
+  # this job, no cross triple named by `cross-targets` is type-checked without also
+  # being run.
+  #
+  # WHAT IS DELIBERATELY NOT RUN HERE, and why - do not "fix" this by widening the
+  # feature flags. `--all-features` enables `c-oracle`, whose harness self-tests in
+  # `tests/c_oracle.rs` classify a compiler probe by the ERROR KIND that
+  # `std::process::Command` reports: a genuinely missing command must surface
+  # `ErrorKind::NotFound` (read as `Probe::Absent`), and a present-but-unrunnable
+  # one must surface a different kind (read as `Probe::Unusable`, which can never
+  # become a skip). qemu-user emulates `execve` inside the guest, so BOTH
+  # conditions collapse into a child that exits 127, and four of those self-tests
+  # fail for a reason that has nothing to do with this crate's behaviour on the
+  # target. Measured under `qemu-s390x`: the default row, `--no-default-features`
+  # and `--no-default-features --features no-std` all pass in full, and the live
+  # oracle sweep itself passes; only the probe-classification self-tests fail.
+  # The classification is correct for real hosts and must not be weakened to suit
+  # an emulator, so the emulated rows stop short of `--all-features` instead.
+  #
+  # ADDITIVE to `cross-targets`, never a replacement: that job still owns
+  # `--all-features --all-targets` type-checking and clippy for these triples,
+  # which is the coverage this job stops short of for the reason above.
+  cross-run:
+    name: Cross runtime suite under qemu-user (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Rank-2 override: beats the rank-4 `rust-toolchain.toml` repository pin, for
+    # the same reason `cross-targets` carries it - the target below is installed
+    # for the toolchain the action selects, so a silent fall back to the MSRV
+    # floor would fail on a missing target rather than on anything real.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    strategy:
+      # A big-endian failure must not hide an aarch64 or 32-bit one, or the
+      # reverse. Each row answers a different question, so each verdict is wanted
+      # even when a sibling row is already red.
+      fail-fast: false
+      matrix:
+        include:
+          # THE BIG-ENDIAN ROW. `endian` and `pointer_width` are both asserted
+          # against `rustc --print cfg` below, so a triple swapped in here without
+          # its declared properties being updated fails the job instead of quietly
+          # reporting a little-endian run as big-endian coverage.
+          - target: s390x-unknown-linux-gnu
+            cross_gcc: gcc-s390x-linux-gnu
+            linker: s390x-linux-gnu-gcc
+            qemu: qemu-s390x
+            sysroot: /usr/s390x-linux-gnu
+            endian: big
+            pointer_width: 64
+          - target: aarch64-unknown-linux-gnu
+            cross_gcc: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+            qemu: qemu-aarch64
+            sysroot: /usr/aarch64-linux-gnu
+            endian: little
+            pointer_width: 64
+          # THE 32-BIT ROW. `qemu-i386` rather than the host's own 32-bit support,
+          # deliberately: it needs only the same `qemu-user-static` package the
+          # other rows install and the same cross sysroot, so all three rows are
+          # provisioned identically instead of this one needing `gcc-multilib` and
+          # a working `linux32` personality.
+          - target: i686-unknown-linux-gnu
+            cross_gcc: gcc-i686-linux-gnu
+            linker: i686-linux-gnu-gcc
+            qemu: qemu-i386
+            sysroot: /usr/i686-linux-gnu
+            endian: little
+            pointer_width: 32
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        persist-credentials: false
+    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS - the contract every job in this
+    # file holds to, asserted by `src/lib.rs`. Three witnesses, checked against
+    # each other, so a log that reports a green cross-architecture run can be
+    # attributed to one commit.
+    - name: Record the commit under test
+      run: |
+        set -euo pipefail
+        head="$(git rev-parse HEAD)"
+        echo "event sha : ${{ github.sha }}"
+        echo "head sha  : $head"
+        echo "tree hash : $(git rev-parse 'HEAD^{tree}')"
+        echo "ref       : ${{ github.ref }}"
+        echo "job       : ${{ github.workflow }} / ${{ github.job }}"
+        case "$head" in
+          "${{ github.sha }}"|"${{ github.event.pull_request.head.sha }}") ;;
+          *) echo "::error::checked-out HEAD $head is neither the event sha nor the"\
+             " pull-request head sha, so this job's verdict would describe a commit"\
+             " nobody asked about."; exit 1 ;;
+        esac
+    # The cross target arrives through this action's `targets:` input, the same
+    # single sanctioned mechanism `cross-targets` uses.
+    - name: Install Rust stable toolchain
+      uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, 2026-07-16
+      with:
+        toolchain: stable
+        targets: ${{ matrix.target }}
+    - name: Verify the resolved toolchain is stable
+      run: |
+        set -euo pipefail
+        rustc --version --verbose
+        active="$(rustup show active-toolchain)"
+        echo "active toolchain: $active"
+        case "$active" in
+          stable-*) ;;
+          *) echo "::error::expected the stable toolchain, but resolved '$active'."\
+             " The RUSTUP_TOOLCHAIN override was lost and rust-toolchain.toml won."; exit 1 ;;
+        esac
+    # The emulators are statically linked, which is what makes them usable as a
+    # plain `runner` without registering binfmt handlers; the cross gcc brings the
+    # linker AND the target sysroot the emulator loads shared objects from.
+    #
+    # TWO PACKAGE NAMES ON PURPOSE. `qemu-user-static` is the name on the Ubuntu
+    # release GitHub currently labels `ubuntu-latest`. On newer Ubuntu it is a PURE
+    # VIRTUAL package - `apt-cache showpkg qemu-user-static` reports no versions at
+    # all - and the same statically linked emulators ship inside `qemu-user`
+    # instead, whose own description is "QEMU user mode emulation (static
+    # binaries)". Pinning either name alone makes this job fail on a runner-image
+    # bump for a reason that has nothing to do with the crate, so try the
+    # historical name and fall back. Verified on Ubuntu 25.10, where the virtual
+    # package is what a bare install resolves against.
+    - name: Install the user-mode emulator and the cross linker
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        if ! sudo apt-get install --no-install-recommends -y qemu-user-static; then
+          echo "qemu-user-static did not resolve here; falling back to qemu-user"
+          sudo apt-get install --no-install-recommends -y qemu-user
+        fi
+        sudo apt-get install --no-install-recommends -y '${{ matrix.cross_gcc }}'
+        '${{ matrix.linker }}' --version | head -n 1
+    # Point Cargo at both halves. The variable names are the triple upper-cased
+    # with `-` turned into `_`, which is why they are derived rather than written
+    # out: a hand-written name that drifts from the triple is silently ignored,
+    # and the run would then fail on a missing host linker instead.
+    - name: Point cargo at the cross linker and the qemu runner
+      run: |
+        set -euo pipefail
+        # The emulator is `qemu-<arch>-static` when it came from
+        # `qemu-user-static` and plain `qemu-<arch>` when it came from `qemu-user`.
+        # Resolve which one exists instead of assuming: a hardcoded name that the
+        # runner image stops shipping would surface three steps later as a test
+        # binary that cannot be executed, which reads like a crate failure.
+        emulator=""
+        for candidate in '${{ matrix.qemu }}-static' '${{ matrix.qemu }}'; do
+          if command -v "$candidate" >/dev/null 2>&1; then
+            emulator="$candidate"
+            break
+          fi
+        done
+        if [ -z "$emulator" ]; then
+          echo "::error::neither ${{ matrix.qemu }}-static nor ${{ matrix.qemu }} is on"\
+            " PATH, so nothing here can execute ${{ matrix.target }} binaries."
+          exit 1
+        fi
+        "$emulator" --version | head -n 1
+        key="$(printf '%s' '${{ matrix.target }}' | tr '[:lower:]-' '[:upper:]_')"
+        echo "CARGO_TARGET_${key}_LINKER=${{ matrix.linker }}" >> "$GITHUB_ENV"
+        echo "CARGO_TARGET_${key}_RUNNER=$emulator -L ${{ matrix.sysroot }}" >> "$GITHUB_ENV"
+        echo "derived variable prefix: CARGO_TARGET_${key}_ / emulator: $emulator"
+    # The row's own claims about its target, asserted rather than assumed. This is
+    # the step that keeps `endian: big` and `pointer_width: 32` honest: a row that
+    # silently stopped covering the property it names would otherwise still report
+    # green, which is the exact failure this whole job exists to retire.
+    - name: Report and assert the target's compilation properties
+      run: |
+        set -euo pipefail
+        rustc +stable --print cfg --target '${{ matrix.target }}' \
+          | grep -E 'target_(arch|endian|pointer_width|env|os|vendor)='
+        for property in endian pointer_width; do
+          case "$property" in
+            endian) declared='${{ matrix.endian }}' ;;
+            pointer_width) declared='${{ matrix.pointer_width }}' ;;
+          esac
+          actual="$(rustc +stable --print cfg --target '${{ matrix.target }}' \
+            | sed -n "s/^target_$property=\"\(.*\)\"\$/\1/p")"
+          echo "declared target_$property: $declared / reported: $actual"
+          if [ "$actual" != "$declared" ]; then
+            echo "::error::matrix row claims target_$property=$declared but"\
+              " ${{ matrix.target }} reports $actual, so this row is not covering"\
+              " what it says it covers."
+            exit 1
+          fi
+        done
+    # THE GATE THIS JOB EXISTS FOR: the whole default-feature suite, executed on
+    # the target rather than type-checked for it.
+    - name: Run the default-feature test suite on the target
+      run: |
+        cargo +stable test --locked --target '${{ matrix.target }}' --verbose
+    # std-off and `no-std`, executed too: `--no-default-features` also drops
+    # `simd`, so on these two rows the braided scalar CRC path is the ONLY thing
+    # that can serve a bulk call - `crc32fast` is not even linked. (On the s390x
+    # row the braid serves every bulk call on the default row as well, because
+    # `crc32fast` has no accelerated backend for that architecture; on aarch64 and
+    # i686 it does, which is what makes these two rows add coverage there.)
+    - name: Run the std-off test suites on the target
+      run: |
+        set -euo pipefail
+        cargo +stable test --locked --target '${{ matrix.target }}' --no-default-features
+        cargo +stable test --locked --target '${{ matrix.target }}' \
+          --no-default-features --features no-std
+    # A passing suite is necessary but not sufficient evidence: it does not say
+    # that the endian-critical tests were among the ones that ran. Naming them and
+    # asserting the count is what stops this row from degrading into "the suite
+    # happened to be green" - the same shape as the Windows `gzopen_w` assertion
+    # in `build-test`.
+    - name: Assert the endian-critical CRC tests actually executed
+      run: |
+        set -euo pipefail
+        log="$(cargo +stable test --locked --target '${{ matrix.target }}' --lib -- --exact \
+          checksum::crc32::tests::endian_selected_generated_anchors_are_the_active_target_values \
+          checksum::crc32::tests::the_selected_backend_agrees_with_the_braid_for_every_length \
+          checksum::crc32::tests::the_braid_reproduces_the_canonical_vectors_independently \
+          checksum::crc32::tests::generated_big_endian_tables_are_byte_swapped_companions 2>&1)"
+        printf '%s\n' "$log"
+        if ! printf '%s\n' "$log" | grep -qE '^test result: ok\. 4 passed; 0 failed'; then
+          echo "::error::expected exactly 4 endian-critical CRC tests to run and pass"\
+            " on ${{ matrix.target }}. Either a test was renamed, or this row stopped"\
+            " executing the arms it exists to execute."
+          exit 1
+        fi
+    - name: Assert Cargo.lock is unchanged
+      if: ${{ !cancelled() }}
+      run: |
+        set -euo pipefail
+        if [ -n "$(git status --porcelain Cargo.lock)" ]; then
+          echo "::error::Cargo.lock was modified by this job. A --locked command"\
+            " cannot rewrite it, so a command is missing the flag."
+          git --no-pager diff -- Cargo.lock
+          exit 1
+        fi
+        echo "Cargo.lock unchanged."
+
   # Bare-metal no_std library build (gap D10).
   #
   # `src/lib.rs` gates its freestanding runtime block on
@@ -2753,6 +3052,413 @@ jobs:
         fi
         echo "Cargo.lock unchanged."
 
+  # Bare-metal no_std EXECUTION under qemu-system-arm (gap D10, execution half).
+  #
+  # `bare-metal-no-std` above proves the freestanding runtime block COMPILES and
+  # that its symbols are present and crate-owned. It cannot prove the block WORKS,
+  # and the distinction is not academic: `mod no_std_support` hands `core`'s
+  # allocator over to libc `malloc`/`calloc`/`realloc`/`free`/`posix_memalign`, and
+  # a wrong size, a wrong alignment predicate or a mismatched free would produce a
+  # library that links perfectly and corrupts the heap on first use. No hosted test
+  # can reach it, because `cargo test` sets `test` and forces `panic = "unwind"`,
+  # which fails two of the three terms in that block's own `cfg`.
+  #
+  # WHAT THIS JOB ADDS, precisely: it links the bare-metal staticlib into a real
+  # firmware image for a Cortex-M4 with no operating system, runs it under
+  # `qemu-system-arm`, and reads the results back over ARM semihosting. The
+  # 32-bit `MIN_ALIGN = 8` arm, the libc-backed `GlobalAlloc` and the fallible
+  # allocation path all execute for real.
+  #
+  # THE ASSERTION THAT MATTERS MOST is the heap-exhaustion one. zlib-rs allocates
+  # FALLIBLY - `AllocBuffer::try_zeroed` returns `Option`, and an exhausted heap
+  # must surface as `Z_MEM_ERROR` to the caller. On a device with no OOM killer
+  # and no swap that is the difference between a recoverable error and a dead
+  # board, and it is the single property an embedded consumer most needs to hold.
+  # The job drains the heap, asserts `deflateInit2` returns -4 rather than
+  # aborting, releases the memory and asserts the engine initialises again.
+  #
+  # THE HARNESS IS WRITTEN AT RUN TIME, ON PURPOSE. A linker script, a vector
+  # table, a semihosting write path and a `posix_memalign` shim (newlib ships
+  # `memalign` but not the POSIX form this crate calls) are all build-system
+  # scaffolding for ONE job. Committing them as repository files would add four
+  # artifacts that nothing else in the tree reads, that no other job builds, and
+  # that would silently rot. They live in heredocs below instead, so the whole
+  # gate is reviewable in one place and the repository gains no orphan files.
+  #
+  # TWO FEATURE ROWS, and the pair is the point. `--no-default-features` drops the
+  # `gzip` feature, and `deflate.c` lines 428-433 gate the `windowBits > 15` ->
+  # gzip conversion behind `#ifdef GZIP`, so that row must REJECT `windowBits=31`
+  # with `Z_STREAM_ERROR` exactly as a C zlib compiled without GZIP does. Only the
+  # `--features gzip` row can check the RFC 1952 OS byte, which on a target that is
+  # neither Windows nor Apple must be 3 - the `#ifndef OS_CODE` fallback in
+  # `zutil.h` line 188. Asserting both directions is what makes the feature gate
+  # itself covered rather than merely present.
+  #
+  # NOT REAL HARDWARE, and the documentation says so. `qemu-system-arm` reproduces
+  # the ISA, the memory map and the absence of an OS; it does not reproduce a
+  # device. Gap D10 asks for real-hardware validation and stays open on that point.
+  bare-metal-run:
+    name: Bare-metal no_std execution under qemu-system-arm (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Rank-2 override, for the same reason every other target-bearing job carries
+    # it - the bare-metal target is installed for the toolchain the action selects.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    strategy:
+      # A gzip-off failure must not hide a gzip-on one; the rows assert opposite
+      # things about the same entry point.
+      fail-fast: false
+      matrix:
+        include:
+          - features: --no-default-features
+            expect_gzip: 0
+          - features: --no-default-features --features gzip
+            expect_gzip: 1
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        persist-credentials: false
+    # PROVENANCE, EMITTED BEFORE ANY GATE RUNS - the contract every job in this
+    # file holds to, asserted by `src/lib.rs`.
+    - name: Record the commit under test
+      run: |
+        set -euo pipefail
+        head="$(git rev-parse HEAD)"
+        echo "event sha : ${{ github.sha }}"
+        echo "head sha  : $head"
+        echo "tree hash : $(git rev-parse 'HEAD^{tree}')"
+        echo "ref       : ${{ github.ref }}"
+        echo "job       : ${{ github.workflow }} / ${{ github.job }}"
+        case "$head" in
+          "${{ github.sha }}"|"${{ github.event.pull_request.head.sha }}") ;;
+          *) echo "::error::checked-out HEAD $head is neither the event sha nor the"\
+             " pull-request head sha, so this job's verdict would describe a commit"\
+             " nobody asked about."; exit 1 ;;
+        esac
+    - name: Install Rust stable toolchain
+      uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, 2026-07-16
+      with:
+        toolchain: stable
+        targets: thumbv7em-none-eabihf
+    - name: Verify the resolved toolchain is stable
+      run: |
+        set -euo pipefail
+        rustc --version --verbose
+        active="$(rustup show active-toolchain)"
+        echo "active toolchain: $active"
+        case "$active" in
+          stable-*) ;;
+          *) echo "::error::expected the stable toolchain, but resolved '$active'."\
+             " The RUSTUP_TOOLCHAIN override was lost and rust-toolchain.toml won."; exit 1 ;;
+        esac
+    # `libnewlib-arm-none-eabi` is what supplies libc for a no-OS target; without
+    # it the link fails on `malloc`, which is precisely the symbol under test.
+    - name: Install the ARM bare-metal toolchain and the system emulator
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends -y \
+          gcc-arm-none-eabi libnewlib-arm-none-eabi qemu-system-arm
+        arm-none-eabi-gcc --version | head -n 1
+        qemu-system-arm --version | head -n 1
+    - name: Assert the target is genuinely bare metal and 32-bit
+      run: |
+        set -euo pipefail
+        cfg="$(rustc +stable --print cfg --target thumbv7em-none-eabihf)"
+        printf '%s\n' "$cfg" | grep -E 'target_(arch|os|pointer_width|abi|endian)='
+        printf '%s\n' "$cfg" | grep -qx 'target_os="none"' || {
+          echo "::error::thumbv7em-none-eabihf no longer reports target_os=none,"\
+            " so this job is not covering a no-OS target."; exit 1; }
+        printf '%s\n' "$cfg" | grep -qx 'target_pointer_width="32"' || {
+          echo "::error::thumbv7em-none-eabihf no longer reports a 32-bit pointer"\
+            " width, so the MIN_ALIGN = 8 arm is not the one being exercised."; exit 1; }
+    - name: Build the bare-metal staticlib
+      run: |
+        set -euo pipefail
+        cargo +stable build --locked --release --verbose --lib \
+          --target thumbv7em-none-eabihf ${{ matrix.features }}
+        ls -l target/thumbv7em-none-eabihf/release/libzlib_rs.a
+    # Scaffolding, written to the runner temp dir so nothing lands in the tree.
+    - name: Write the firmware harness
+      run: |
+        set -euo pipefail
+        mkdir -p "$RUNNER_TEMP/bm"
+        cat > "$RUNNER_TEMP/bm/mps2.ld" <<'LDEOF'
+        MEMORY
+        {
+          FLASH (rx)  : ORIGIN = 0x00000000, LENGTH = 4M
+          RAM   (rwx) : ORIGIN = 0x20000000, LENGTH = 4M
+        }
+        ENTRY(Reset_Handler)
+        SECTIONS
+        {
+          .isr_vector : { KEEP(*(.isr_vector)) } > FLASH
+          .text   : { *(.text*) *(.rodata*) *(.glue_7) *(.glue_7t) *(.eh_frame) } > FLASH
+          .ARM.exidx : { __exidx_start = .; *(.ARM.exidx*) __exidx_end = .; } > FLASH
+          _sidata = LOADADDR(.data);
+          .data   : { _sdata = .; *(.data*) . = ALIGN(8); _edata = .; } > RAM AT > FLASH
+          .bss    : { _sbss = .; *(.bss*) *(COMMON) . = ALIGN(8); _ebss = .; } > RAM
+          . = ALIGN(8);
+          _heap_start = .;
+          _heap_end   = ORIGIN(RAM) + LENGTH(RAM) - 0x8000;
+          _estack     = ORIGIN(RAM) + LENGTH(RAM);
+        }
+        LDEOF
+        cat > "$RUNNER_TEMP/bm/rt.c" <<'RTEOF'
+        /* Vector table, reset handler, semihosting output, a heap for newlib
+         * malloc, and the posix_memalign newlib omits but this crate calls. */
+        #include <stddef.h>
+        #include <stdint.h>
+        #include <errno.h>
+        extern uint32_t _sidata, _sdata, _edata, _sbss, _ebss, _estack, _heap_start, _heap_end;
+        extern int main(void);
+        static inline int semihost(int op, void *arg) {
+            register int r0 __asm__("r0") = op;
+            register void *r1 __asm__("r1") = arg;
+            __asm__ volatile("bkpt 0xAB" : "+r"(r0) : "r"(r1) : "memory");
+            return r0;
+        }
+        static void sh_write0(const char *s) { semihost(0x04, (void *)s); }
+        static void sh_exit(int code) {
+            uint32_t block[2] = { 0x20026u, (uint32_t)code };
+            semihost(0x18, code == 0 ? (void *)0x20026u : (void *)block);
+            for (;;) { }
+        }
+        void *_sbrk(ptrdiff_t incr) {
+            static char *brk = 0;
+            if (brk == 0) brk = (char *)&_heap_start;
+            char *prev = brk;
+            if (brk + incr > (char *)&_heap_end) { errno = ENOMEM; return (void *)-1; }
+            brk += incr; return prev;
+        }
+        int _write(int fd, const char *buf, int len) {
+            (void)fd; char tmp[129]; int done = 0;
+            while (done < len) {
+                int n = len - done; if (n > 128) n = 128;
+                for (int i = 0; i < n; i++) tmp[i] = buf[done + i];
+                tmp[n] = '\0'; sh_write0(tmp); done += n;
+            }
+            return len;
+        }
+        int _close(int fd) { (void)fd; return -1; }
+        int _fstat(int fd, void *st) { (void)fd; (void)st; return 0; }
+        int _isatty(int fd) { (void)fd; return 1; }
+        long _lseek(int fd, long o, int w) { (void)fd; (void)o; (void)w; return 0; }
+        int _read(int fd, char *b, int l) { (void)fd; (void)b; (void)l; return 0; }
+        void _exit(int code) { sh_exit(code); }
+        int _kill(int p, int s) { (void)p; (void)s; errno = EINVAL; return -1; }
+        int _getpid(void) { return 1; }
+        extern void *memalign(size_t, size_t);
+        int posix_memalign(void **out, size_t align, size_t size) {
+            if (align == 0 || (align & (align - 1)) != 0 || align % sizeof(void *) != 0)
+                return EINVAL;
+            void *p = memalign(align, size);
+            if (p == NULL) return ENOMEM;
+            *out = p; return 0;
+        }
+        void Reset_Handler(void) {
+            uint32_t *src = &_sidata, *dst = &_sdata;
+            while (dst < &_edata) *dst++ = *src++;
+            for (dst = &_sbss; dst < &_ebss; dst++) *dst = 0;
+            /* CPACR CP10/CP11: this target emits hard-float instructions. */
+            *(volatile uint32_t *)0xE000ED88 |= (0xFu << 20);
+            __asm__ volatile("dsb; isb");
+            sh_exit(main());
+        }
+        void Default_Handler(void) { sh_write0("FAULT: unexpected exception\n"); sh_exit(97); }
+        __attribute__((section(".isr_vector"), used))
+        void *const g_vectors[] = {
+            (void *)&_estack, (void *)Reset_Handler,
+            (void *)Default_Handler, (void *)Default_Handler, (void *)Default_Handler,
+            (void *)Default_Handler, (void *)Default_Handler, 0, 0, 0, 0,
+            (void *)Default_Handler, (void *)Default_Handler, 0,
+            (void *)Default_Handler, (void *)Default_Handler,
+        };
+        RTEOF
+        cat > "$RUNNER_TEMP/bm/main.c" <<'MAINEOF'
+        /* Drives the zlib-rs C ABI on a Cortex-M4 with no operating system. */
+        #include <stdio.h>
+        #include <string.h>
+        #include <stdlib.h>
+        #include "zlib.h"
+        extern void *__real_malloc(size_t);
+        extern void *__real_calloc(size_t, size_t);
+        extern void *__real_realloc(void *, size_t);
+        extern void  __real_free(void *);
+        extern void *__real_memalign(size_t, size_t);
+        static int armed = 0;
+        static unsigned n_malloc, n_calloc, n_realloc, n_free, n_memalign;
+        static unsigned long bytes_alloc;
+        void *__wrap_malloc(size_t n) { if (armed) { n_malloc++; bytes_alloc += n; } return __real_malloc(n); }
+        void *__wrap_calloc(size_t a, size_t b) { if (armed) { n_calloc++; bytes_alloc += (unsigned long)a * b; } return __real_calloc(a, b); }
+        void *__wrap_realloc(void *p, size_t n) { if (armed) n_realloc++; return __real_realloc(p, n); }
+        void __wrap_free(void *p) { if (armed) n_free++; __real_free(p); }
+        void *__wrap_memalign(size_t a, size_t n) { if (armed) n_memalign++; return __real_memalign(a, n); }
+        static int failures = 0;
+        #define CHECK(c, fmt, ...) do { \
+            if (c) printf("PASS " fmt "\n", ##__VA_ARGS__); \
+            else { printf("FAIL " fmt "\n", ##__VA_ARGS__); failures++; } } while (0)
+        #define N 50000u
+        static unsigned char SRC[N];
+        static unsigned char DEC[N];
+        int main(void) {
+            const char *nine = "123456789";
+            printf("=== zlib-rs on bare metal: thumbv7em-none-eabihf, no OS ===\n");
+            printf("sizeof_void_p=%u sizeof_size_t=%u sizeof_uLong=%u\n",
+                   (unsigned)sizeof(void *), (unsigned)sizeof(size_t), (unsigned)sizeof(uLong));
+            CHECK(sizeof(void *) == 4, "the target is 32-bit, so MIN_ALIGN = 8 is the live arm");
+            const char *ver = zlibVersion();
+            printf("zlibVersion=%s\n", ver);
+            CHECK(strcmp(ver, "1.3.2.1-motley") == 0, "version is 1.3.2.1-motley");
+            uLong c = crc32(0L, (const Bytef *)nine, 9);
+            uLong a = adler32(1L, (const Bytef *)nine, 9);
+            printf("crc32=%08lx adler32=%08lx\n", (unsigned long)c, (unsigned long)a);
+            CHECK(c == 0xcbf43926UL, "crc32(\"123456789\") == cbf43926");
+            CHECK(a == 0x091e01deUL, "adler32(\"123456789\") == 091e01de");
+            CHECK(compressBound(9) == 22UL, "compressBound(9) == 22");
+            for (unsigned i = 0; i < N; i++) SRC[i] = (unsigned char)((i * 31u + (i >> 3)) & 0xff);
+            uLong whole = crc32(0L, SRC, N), step = 0L;
+            for (unsigned i = 0; i < N; i += 7u) {
+                unsigned k = (N - i) < 7u ? (N - i) : 7u;
+                step = crc32(step, SRC + i, k);
+            }
+            CHECK(whole == step, "chunked CRC equals one-shot CRC (%08lx)", (unsigned long)whole);
+            uLong clen = compressBound(N);
+            Bytef *comp = (Bytef *)malloc(clen);
+            CHECK(comp != NULL, "harness allocated a %lu-byte buffer", (unsigned long)clen);
+            n_malloc = n_calloc = n_realloc = n_free = n_memalign = 0; bytes_alloc = 0;
+            armed = 1;
+            int rc = compress2(comp, &clen, SRC, N, 9);
+            uLong dlen = N;
+            int rc2 = uncompress(DEC, &dlen, comp, clen);
+            armed = 0;
+            CHECK(rc == Z_OK, "compress2 returns Z_OK (rc=%d)", rc);
+            CHECK(rc2 == Z_OK, "uncompress returns Z_OK (rc=%d)", rc2);
+            CHECK(dlen == N && memcmp(SRC, DEC, N) == 0, "%u-byte round trip is byte-exact", N);
+            printf("compressed_len=%lu crc_of_compressed=%08lx\n",
+                   (unsigned long)clen, (unsigned long)crc32(0L, comp, (uInt)clen));
+            printf("ALLOC malloc=%u calloc=%u realloc=%u free=%u memalign=%u bytes=%lu\n",
+                   n_malloc, n_calloc, n_realloc, n_free, n_memalign, bytes_alloc);
+            CHECK(n_malloc + n_calloc + n_memalign > 0,
+                  "the crate's libc-backed GlobalAlloc served the engines");
+            CHECK(n_free >= n_malloc + n_calloc + n_memalign,
+                  "every block the crate took from the C heap was returned");
+            uLong glen = compressBound(N) + 64;
+            Bytef *gz = (Bytef *)malloc(glen);
+            z_stream probe; memset(&probe, 0, sizeof probe);
+            int prc = deflateInit2(&probe, 6, Z_DEFLATED, 31, 8, Z_DEFAULT_STRATEGY);
+            printf("deflateInit2(windowBits=31) rc=%d [gzip %s]\n", prc, EXPECT_GZIP ? "ON" : "OFF");
+        #if EXPECT_GZIP
+            CHECK(prc == Z_OK, "gzip wrapping is accepted when the feature is on (rc=%d)", prc);
+            probe.next_in = SRC; probe.avail_in = N;
+            probe.next_out = gz; probe.avail_out = (uInt)glen;
+            rc = deflate(&probe, Z_FINISH);
+            CHECK(rc == Z_STREAM_END, "deflate(Z_FINISH) returns Z_STREAM_END (rc=%d)", rc);
+            deflateEnd(&probe);
+            printf("gzip magic=%02x %02x os_byte=%02x\n", gz[0], gz[1], gz[9]);
+            CHECK(gz[0] == 0x1f && gz[1] == 0x8b, "gzip magic is 1f 8b");
+            CHECK(gz[9] == 3, "RFC 1952 OS byte is 3 on a no-OS target (saw %u)", (unsigned)gz[9]);
+        #else
+            CHECK(prc == Z_STREAM_ERROR,
+                  "windowBits=31 is rejected with Z_STREAM_ERROR when gzip is off, matching"
+                  " a C zlib built without GZIP (rc=%d)", prc);
+            z_stream s; memset(&s, 0, sizeof s);
+            rc = deflateInit2(&s, 6, Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY);
+            CHECK(rc == Z_OK, "deflateInit2(windowBits=15) returns Z_OK (rc=%d)", rc);
+            s.next_in = SRC; s.avail_in = N; s.next_out = gz; s.avail_out = (uInt)glen;
+            rc = deflate(&s, Z_FINISH);
+            CHECK(rc == Z_STREAM_END, "deflate(Z_FINISH) returns Z_STREAM_END (rc=%d)", rc);
+            deflateEnd(&s);
+            CHECK((gz[0] & 0x0f) == 8, "zlib CMF names the deflate method (CM=%u)", (unsigned)(gz[0] & 0x0f));
+            CHECK(((unsigned)gz[0] * 256u + gz[1]) % 31u == 0, "zlib header FCHECK is valid");
+        #endif
+            free(gz); free(comp);
+            /* THE EMBEDDED-CRITICAL PATH: an exhausted heap must be REPORTED. */
+            void *hog[512]; unsigned held = 0;
+            while (held < 512) { void *p = malloc(64u * 1024u); if (p == NULL) break; hog[held++] = p; }
+            printf("heap drained: held %u x 64KiB blocks\n", held);
+            CHECK(held > 0, "the harness was able to drain the heap");
+            z_stream m; memset(&m, 0, sizeof m);
+            int mrc = deflateInit2(&m, 9, Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY);
+            printf("deflateInit2 under exhaustion rc=%d (Z_MEM_ERROR=%d)\n", mrc, Z_MEM_ERROR);
+            CHECK(mrc == Z_MEM_ERROR, "an exhausted heap yields Z_MEM_ERROR, not an abort");
+            if (mrc == Z_OK) deflateEnd(&m);
+            for (unsigned i = 0; i < held; i++) free(hog[i]);
+            z_stream r; memset(&r, 0, sizeof r);
+            int rrc = deflateInit2(&r, 9, Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY);
+            CHECK(rrc == Z_OK, "the engine initialises again once memory is returned (rc=%d)", rrc);
+            if (rrc == Z_OK) CHECK(deflateEnd(&r) == Z_OK, "deflateEnd after recovery returns Z_OK");
+            printf("TOTAL_FAILURES=%d\n", failures);
+            return failures == 0 ? 0 : 1;
+        }
+        MAINEOF
+        sed -i 's/^        //' "$RUNNER_TEMP/bm/mps2.ld" "$RUNNER_TEMP/bm/rt.c" "$RUNNER_TEMP/bm/main.c"
+        wc -l "$RUNNER_TEMP/bm/mps2.ld" "$RUNNER_TEMP/bm/rt.c" "$RUNNER_TEMP/bm/main.c"
+    - name: Link the firmware image
+      run: |
+        set -euo pipefail
+        arm-none-eabi-gcc \
+          -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard \
+          -O2 -Wall -ffunction-sections -fdata-sections \
+          -DEXPECT_GZIP=${{ matrix.expect_gzip }} -I. \
+          -nostartfiles -T "$RUNNER_TEMP/bm/mps2.ld" -Wl,--gc-sections \
+          -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free,--wrap=memalign \
+          -o "$RUNNER_TEMP/bm/fw.elf" \
+          "$RUNNER_TEMP/bm/main.c" "$RUNNER_TEMP/bm/rt.c" \
+          target/thumbv7em-none-eabihf/release/libzlib_rs.a -lc -lm
+        arm-none-eabi-size "$RUNNER_TEMP/bm/fw.elf"
+        file "$RUNNER_TEMP/bm/fw.elf"
+    # THE GATE THIS JOB EXISTS FOR. `mps2-an386` is QEMU's Cortex-M4 MPS2 image,
+    # whose 4 MiB SSRAM banks are what let a level-9 deflate state (about 256 KiB)
+    # and its buffers fit; the 128 KiB-class STM32 boards QEMU also offers cannot
+    # hold one, which would turn a real gate into a permanent Z_MEM_ERROR.
+    - name: Execute the firmware under qemu-system-arm
+      run: |
+        set -euo pipefail
+        log="$RUNNER_TEMP/bm/run.log"
+        set +e
+        timeout 600 qemu-system-arm -M mps2-an386 -cpu cortex-m4 -m 16M \
+          -nographic -semihosting -kernel "$RUNNER_TEMP/bm/fw.elf" > "$log" 2>&1
+        rc=$?
+        set -e
+        cat "$log"
+        if [ "$rc" -ne 0 ]; then
+          echo "::error::the firmware did not exit cleanly under qemu (exit $rc)."
+          exit 1
+        fi
+        passes="$(grep -c '^PASS' "$log" || true)"
+        fails="$(grep -c '^FAIL' "$log" || true)"
+        echo "bare-metal assertions: $passes passed, $fails failed"
+        if ! grep -qx 'TOTAL_FAILURES=0' "$log"; then
+          echo "::error::the bare-metal harness reported failures, so the freestanding"\
+            " runtime does not behave correctly on a no-OS target."
+          exit 1
+        fi
+        if [ "$fails" -ne 0 ] || [ "$passes" -lt 12 ]; then
+          echo "::error::expected at least 12 passing assertions and zero failures,"\
+            " saw $passes/$fails. Either the harness stopped running what it claims"\
+            " to run, or its output format changed."
+          exit 1
+        fi
+        grep -q 'FAULT: unexpected exception' "$log" && {
+          echo "::error::the firmware took an unexpected exception."; exit 1; }
+        echo "freestanding runtime EXECUTED on a no-OS Cortex-M4:"\
+          "allocator, fallible allocation and the compression engines"\
+          "all behaved correctly ($passes assertions)."
+    - name: Assert Cargo.lock is unchanged
+      if: ${{ !cancelled() }}
+      run: |
+        set -euo pipefail
+        if [ -n "$(git status --porcelain Cargo.lock)" ]; then
+          echo "::error::Cargo.lock was modified by this job. A --locked command"\
+            " cannot rewrite it, so a command is missing the flag."
+          git --no-pager diff -- Cargo.lock
+          exit 1
+        fi
+        echo "Cargo.lock unchanged."
+
   # Packaging verification (gap D12).
   #
   # `exclude` in `Cargo.toml` keeps the retained C baseline - the cross-validation
@@ -2795,7 +3501,7 @@ jobs:
     # but contributes nothing, since `c-oracle` is not a default feature.
     env:
       RUSTUP_TOOLCHAIN: stable
-      PACKAGED_FLOOR: 1015
+      PACKAGED_FLOOR: 1039
     steps:
     - name: Checkout repository
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

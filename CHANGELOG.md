@@ -164,12 +164,12 @@ every entry in one would have to be invented.
   [`tests/gzip_compat.rs`](tests/gzip_compat.rs); checksum known-answer vectors
   in [`tests/checksum.rs`](tests/checksum.rs); and the two-tier byte-identity and
   wire-format gate in [`tests/interop.rs`](tests/interop.rs).
-  **1015 tests pass** by default — 854 in-crate unit tests, 132 integration tests
+  **1039 tests pass** by default — 867 in-crate unit tests, 143 integration tests
   (`checksum` 23, `gzip_compat` 17, `inflate_coverage` 30, `interop` 30,
   `regression` 13, `round_trip` 19), and 29 doctests (28 runnable plus one
   `compile_fail`) — with **0 failed and 0 ignored**. `--no-default-features`
-  passes **713** (587 unit + 99 integration + 27 doctests) and `--all-features`
-  passes **1028**. CI parses every
+  passes **737** (600 unit + 110 integration + 27 doctests) and `--all-features`
+  passes **1052**. CI parses every
   `test result:` line and fails on any failure, on any *ignored* test, or on a
   count below a per-row lower bound, because `cargo test` exits 0 when tests are
   skipped.
@@ -490,8 +490,8 @@ the security properties the initial release establishes.
   | `cargo fmt --all -- --check` | exit 0 |
   | `cargo clippy --locked --all-targets --all-features -- -D warnings` | exit 0 |
   | `cargo build --locked` | exit 0 |
-  | `cargo test --locked` | **1015 passed / 0 failed / 0 ignored** |
-  | `cargo test --locked --no-default-features` | **713 passed / 0 failed / 0 ignored** |
+  | `cargo test --locked` | **1039 passed / 0 failed / 0 ignored** |
+  | `cargo test --locked --no-default-features` | **737 passed / 0 failed / 0 ignored** |
   | `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features` | exit 0, 0 warnings |
   | `mkdocs build --strict --site-dir "$(mktemp -d)/site"` | exit 0, 0 strict diagnostics |
 
@@ -508,8 +508,8 @@ the security properties the initial release establishes.
   `#[ignore]`.
 - **Release artifacts** from `cargo build --locked --release` under **default**
   features on `x86_64-unknown-linux-gnu` with `rustc 1.97.1 (8bab26f4f 2026-07-14)`,
-  into the repository's default `target/release/`: `libzlib_rs.rlib` 2,930,500 bytes ·
-  `libzlib_rs.so` 667,552 · `libzlib_rs.a` 22,464,508, observed on **2026-08-04**.
+  into the repository's default `target/release/`: `libzlib_rs.rlib` 2,977,084 bytes ·
+  `libzlib_rs.so` 666,400 · `libzlib_rs.a` 22,468,092, observed on **2026-08-05**.
   Read those as a dated, environment-specific snapshot of one build — not a
   reproducible invariant and not a size budget: no gate asserts them, and they move
   with the compiler, the feature row, the profile, and any change to the crate's own
@@ -576,7 +576,12 @@ rather than here, because each is strictly stricter or strictly safer than C whi
 leaving the return-code set, the struct layout, and the emitted bytes untouched:
 opaque state is kind-tagged so a cross-engine `End` is a defined error rather than
 C's undefined reinterpretation; indexing is bounds-checked; allocation is
-fallible with no global fallback; and an **accepted** `inflateBackInit_` zero-fills
+fallible with no global fallback; the `zalloc`/`zfree`/`opaque` triple is captured
+once by the init call rather than re-read on every allocation, so **one buffer, one
+allocator** holds by construction and no region is ever released through a hook that
+did not provide it (C re-reads the fields inside `ZALLOC`, and its own ledger then
+shows one allocation from a late-installed `zalloc` against two pointers handed to
+that caller's `zfree`); and an **accepted** `inflateBackInit_` zero-fills
 the caller's window, where C's `state->window = window;` (`infback.c` L59) writes
 nothing. That last one is required by Rust's validity rules rather than chosen — a
 `&[u8]` over abstract-uninitialized bytes is undefined behaviour even unread
@@ -593,7 +598,7 @@ allocates nothing and still reports through C's exact `{Z_OK, Z_STREAM_ERROR}` s
 
 #### General limitations, which are not compatibility divergences
 
-- **Platform coverage, stated honestly.** CI runs **twelve jobs**. Windows
+- **Platform coverage, stated honestly.** CI runs **fourteen jobs**. Windows
   (x86_64) and macOS (aarch64) execute the real suite natively, which is what
   exercises `OS_CODE = 10`, `OS_CODE = 19`, and the `#[cfg(windows)]`-gated
   `gzopen_w` — the Windows row both compiles that symbol and **executes**
@@ -603,14 +608,30 @@ allocates nothing and still reports through C's exact `{Z_OK, Z_STREAM_ERROR}` s
   its own `rustc -vV` host triple and `runner.arch`, so a runner label that
   changes architecture fails the job rather than weakening the claim.
   Four further triples — `aarch64`, 32-bit `i686`, **big-endian** `s390x`, and
-  `x86_64-pc-windows-msvc` — are **cross type-checked and cross-linted, not
-  natively run**; that last one is the cross Windows lane and is not a second
+  `x86_64-pc-windows-msvc` — are **cross type-checked and cross-linted** by
+  `cross-targets`; that last one is the cross Windows lane and is not a second
   count of the native Windows row above, since it reaches the whole
-  `cfg(windows)` surface with every feature on while executing nothing. The
-  bare-metal `thumbv7em-none-eabihf`
-  target is **built, not run**. So a 32-bit, big-endian, or bare-metal build is
-  compile-verified rather than runtime-verified, and `no_std` has been validated on
-  a hosted target rather than on real embedded hardware. The declared lifecycle is
+  `cfg(windows)` surface with every feature on while executing nothing. The first
+  three are additionally **executed under `qemu-user`** by `cross-run`, over the
+  default row and both std-off rows, with every matrix row asserting its declared
+  `target_endian` and `target_pointer_width` against `rustc --print cfg` and a
+  dedicated step running the four endian-critical CRC tests by name — so the
+  32-bit and **big-endian** braid arms are arms that actually compute rather than
+  arms that merely type-check, and on s390x `crc32fast` offers no accelerated
+  backend, which makes the scalar braid serve every bulk call even with `simd`
+  enabled. The bare-metal `thumbv7em-none-eabihf` staticlib is built by
+  `bare-metal-no-std` and then **linked into firmware and executed on a no-OS
+  Cortex-M4 under `qemu-system-arm`** by `bare-metal-run`, across both std-off
+  feature rows — the only configuration in which the freestanding runtime block
+  can run at all, since `cargo test` forces `panic = "unwind"` and fails two of
+  the three terms in that block's own `cfg`. That job proves the libc-backed
+  `GlobalAlloc` serves the engines, that an exhausted heap yields `Z_MEM_ERROR`
+  rather than an abort, and that `windowBits = 31` is accepted with `gzip` on and
+  rejected with `Z_STREAM_ERROR` when it is off, matching a C zlib built without
+  `GZIP`. All of that execution is **emulation, not the hardware**: a 32-bit,
+  big-endian or bare-metal result is runtime-verified under QEMU rather than on
+  real silicon, so validation on IBM Z, on a 32-bit host and on embedded hardware
+  remains outstanding. The declared lifecycle is
   **experimental** while parity work continues; see
   [Portability](README.md#portability-what-ci-actually-exercises) for the exact
   boundary.
@@ -624,17 +645,22 @@ allocates nothing and still reports through C's exact `{Z_OK, Z_STREAM_ERROR}` s
   — [`tests/c_oracle.rs`](tests/c_oracle.rs) is a *conformance* oracle for
   byte-identity, which is a different job.
 
-  The aggregate position against C zlib `1.3.2.1-motley` is **compression ≈ 85%**
-  and **decompression 107–127%** of C throughput, so decompression is at or above
-  parity. Per-profile comparison refined the compression picture and inverted the
-  intuitive reading: incompressible input is the profile *closest* to C at roughly
-  82–86% (the match finder fails fast there — the two-byte prefilter rejects
-  nearly every candidate, and stored blocks get selected because a dynamic tree
-  cannot pay for itself), while compressible profiles are the *furthest* at
-  roughly 58–64% (hash chains genuinely walked, lazy matching evaluated, Huffman
-  trees built and emitted). Per-profile decompression measured 104–125%, which
-  *overlaps* the quoted 107–127% aggregate on 107–125% without containing it,
-  so parity holds throughout. **The hard rule:** any candidate compression speed-up
+  The measured position against C zlib `1.3.2.1-motley` is **compression
+  113–161%** of C on the compressible profiles and **82–94%** on incompressible
+  input, **`uncompress` 101–160%**, and **`inflateBack` 216–344%** on input that
+  decompresses well. Decompression is at or above parity on every profile, and
+  compression is *above* C on both compressible profiles — incompressible input
+  is now the one profile below it.
+
+  **This retires the figures earlier revisions carried.** An aggregate
+  "compression ≈ 85% / decompression 107–127%" pair was published alongside a
+  per-profile reading that placed incompressible input *closest* to C at 82–86%
+  and the compressible profiles *furthest* at 58–64%. Nothing measures in the
+  58–64% band, and the localisation runs the other way round: the compressible
+  profiles are the ones above C. The single residual deficit is per-stream
+  *initialisation* at level 1 with a non-default `memLevel` (70–74% at 64 KiB,
+  87% at 1 MiB), which is owned-buffer zero-filling rather than compression and
+  is accepted. **The hard rule:** any candidate compression speed-up
   must clear the byte-identity gate before it is viable, because the very
   heuristics that cost throughput are the ones that determine the output bytes —
   the chain-length **quartering** at `good_match` (`chain_length >>= 2`, which

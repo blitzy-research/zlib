@@ -361,11 +361,15 @@ There is no sixth.
 
 ### General limitations, which are not compatibility divergences
 
-- **Performance is not a security property here.** The crate is measurably slower
-  than C on compression (*attributed*: aggregate ≈ 85% of C throughput; per-profile
-  roughly 58–64% on compressible input and 82–86% on incompressible input) and at
-  or above parity on decompression (*attributed*: 107–127% aggregate, 104–125%
-  per profile). A performance report is welcome as an ordinary issue. It is a
+- **Performance is not a security property here.** Measured against C, compression
+  runs at **113–161%** on the compressible profiles and **82–94%** on incompressible
+  input, while decompression is at or above parity throughout (`uncompress`
+  **101–160%**, `inflateBack` **216–344%** on input that decompresses well). This
+  supersedes an earlier "aggregate ≈ 85%, per-profile 58–64% compressible / 82–86%
+  incompressible" reading, which was wrong in both magnitude and ordering. The one
+  place the crate is slower is per-stream *initialisation* at level 1 with a
+  non-default `memLevel` (70–74% at 64 KiB), which is owned-buffer zero-filling.
+  A performance report is welcome as an ordinary issue. It is a
   vulnerability only if the slowdown is *input-triggered and superlinear*, which
   makes it class 4 above. Any proposed speed-up must clear the byte-identity gate
   first: the heuristics that cost throughput are the same ones that determine the
@@ -649,9 +653,9 @@ derivation: [Exported symbol reconciliation](README.md#exported-symbol-reconcili
 
 | Command | Result |
 |---------|--------|
-| `cargo test --locked` | **1015 passed / 0 failed / 0 ignored** (854 unit, 132 integration, 29 doctests) |
-| `cargo test --locked --all-features` | **1028 passed / 0 failed / 0 ignored** (adds the 13 live C-oracle tests) |
-| `cargo test --locked --no-default-features` | **713 passed / 0 failed / 0 ignored** (587 unit, 99 integration, 27 doctests) |
+| `cargo test --locked` | **1039 passed / 0 failed / 0 ignored** (867 unit, 143 integration, 29 doctests) |
+| `cargo test --locked --all-features` | **1052 passed / 0 failed / 0 ignored** (adds the 13 live C-oracle tests) |
+| `cargo test --locked --no-default-features` | **737 passed / 0 failed / 0 ignored** (600 unit, 110 integration, 27 doctests) |
 
 The **ignored-test count is zero in every configuration and stays zero**. A
 capability that cannot be exercised in a given build is expressed by a feature
@@ -700,23 +704,35 @@ Each target's corpus is persisted between runs, and crash artifacts are uploaded
 on failure. The fuzz crate builds with `overflow-checks = true`, so an arithmetic
 overflow is a finding rather than a wrap.
 
-Campaign results — **attributed, not re-measured here** — record
-**1,674,289 executions with 0 crashes and 0 crash artifacts** for a single sweep
-that replicated this workflow's exact invocation on the pinned
-`nightly-2026-08-01` at the pull-request budget of 120 s per target
-(`fuzz_inflate` 912,404 · `fuzz_gzip` 318,608 · `fuzz_deflate_roundtrip` 226,262 ·
-`fuzz_ffi_roundtrip` 134,558 · `fuzz_checksum` 82,457). That is a single-campaign
-total at a stated budget, not a cumulative lifetime count, and it moves with the
-budget and the corpus; an earlier baseline's "roughly 1.13 million executions" is
-a historical datum no single command reproduces. What is durable is the mechanism:
-the cached per-target corpus means coverage accumulates across runs instead of
-restarting each week. `doc/technical-specifications.md` §0.6.7 records the same
-figure with its full invocation.
+Campaign results record **716,617 executions with 0 crashes and 0 crash
+artifacts**, every target exiting 0, for a single sweep that replicated this
+workflow's exact invocation on the pinned `nightly-2026-08-01` at a budget of
+60 s per target (`fuzz_inflate` 400,054 · `fuzz_gzip` 124,945 ·
+`fuzz_deflate_roundtrip` 116,425 · `fuzz_checksum` 40,505 · `fuzz_ffi_roundtrip`
+34,688). That is a single-campaign total at a stated budget, not a cumulative
+lifetime count, and it moves with the budget, the corpus and the host. What is
+durable is the mechanism: the cached per-target corpus means coverage accumulates
+across runs instead of restarting each week.
+`doc/technical-specifications.md` §0.6.7 records the same figure with its full
+invocation.
+
+**This supersedes a previously published total, for a reason that matters to
+anyone reading a fuzzing claim as a security assurance.** The earlier figure was
+recorded while `fuzz_ffi_roundtrip` leaked 32 bytes per hook-backed engine
+placement; under LeakSanitizer that target aborted deterministically at exit 77.
+A memory leak is neither a "crash" nor a crash *artifact*, so "0 crashes and 0
+crash artifacts" remained literally true of a run that was in fact failing — and
+because the run loop used `set -e`, the abort at the third of five targets left
+`fuzz_gzip` and `fuzz_inflate` with **zero** budget, so the published total never
+represented five targets. The leak is fixed, the loop now budgets every target
+regardless of an earlier failure, and a target-count guard fails the job on a
+short campaign. Treat "0 crashes" as insufficient on its own: require that every
+target exited 0 and that the target count is asserted.
 
 ### Honest limitations
 
 Everything above describes coverage that exists; this section describes coverage
-that does not. `.github/workflows/ci.yml` runs **twelve jobs**, and the boundary
+that does not. `.github/workflows/ci.yml` runs **fourteen jobs**, and the boundary
 sits here:
 
 - **Natively executed, full suite:** `ubuntu-latest` across five feature rows,
@@ -732,31 +748,52 @@ sits here:
   own `rustc -vV` host triple and `runner.arch`, so a mutable runner label that
   changes architecture underneath us fails the job instead of quietly invalidating
   this paragraph.
-- **Compile-verified only, never executed:** four triples —
+- **Cross type-checked and cross-linted:** four triples —
   `aarch64-unknown-linux-gnu`, `i686-unknown-linux-gnu` (32-bit `usize`),
   `s390x-unknown-linux-gnu` (**big-endian**), and `x86_64-pc-windows-msvc`
   (32-bit `c_ulong`) — are cross type-checked *and* cross-linted with
   `cargo check --locked --all-targets --all-features` and
   `cargo clippy --locked --all-targets --all-features -- -D warnings`, the
   `--all-features` spelling being what pulls the `c_oracle` harness and the
-  `inflate_strict` arms into the check rather than skipping them. So the
-  big-endian CRC braid arms and the 32-bit pointer-width arms are **compiled but
-  not run**, and this document does not claim otherwise. A unit test does assert
-  that the endian-selected table anchors match the active target's values on every
-  target, so the relationship is checked at run time even where those arms are
-  not. The Windows-MSVC entry here is the *cross* lane and does not double-count
-  the native `windows-latest` row above: that row executes the suite on Windows
-  with the default feature set, while this one reaches the whole `cfg(windows)`
+  `inflate_strict` arms into the check rather than skipping them. The
+  Windows-MSVC entry here is the *cross* lane and does not double-count the
+  native `windows-latest` row above: that row executes the suite on Windows with
+  the default feature set, while this one reaches the whole `cfg(windows)`
   surface with every feature on and executes nothing. Neither subsumes the other,
   which is why both exist.
-- **Built, not run:** the bare-metal `thumbv7em-none-eabihf` target, in both
-  `--no-default-features` and `--features no-std` configurations, with an `nm`
-  assertion that the freestanding runtime block — the libc-backed allocator, the
-  abort panic handler, the personality shim — was genuinely compiled. **`no_std`
-  has been validated on a hosted target and compile-verified for bare metal; it
-  has not been exercised on real embedded hardware.** 713 passing hosted tests do
-  not prove an embedded target works.
-- **Human code review across the full Rust surface — 78,457 lines across 40 files
+- **Executed under emulation, not on the hardware:** the `cross-run` job runs the
+  suite on `aarch64-unknown-linux-gnu`, on 32-bit `i686-unknown-linux-gnu` and on
+  **big-endian** `s390x-unknown-linux-gnu` through `qemu-user`, over the default row
+  and both std-off rows, so the **big-endian CRC braid arms are run, not merely
+  compiled** — on s390x `crc32fast` offers no accelerated backend, which makes the
+  scalar braid the arm that serves every bulk call even on the SIMD-enabled row.
+  The i686 row is what executes the 32-bit `usize` arms; the five layout tests
+  gated on `target_pointer_width = "64"` correctly do not run there, which is why
+  that row reports a smaller test count than the 64-bit rows rather than a failure.
+  Each row asserts its declared endianness **and** pointer width against
+  `rustc --print cfg`, and a dedicated step runs the four endian-critical CRC tests
+  by name and asserts exactly four passed. This is **emulation, not IBM Z, Intel or
+  ARM hardware**, and that distinction is deliberate: `qemu-user` reproduces the ISA
+  and the byte order but not the machine. A unit test asserts that the
+  endian-selected table anchors match the active target's values on every target, so
+  the relationship is checked at run time wherever the suite runs at all.
+- **Bare metal, executed under emulation:** `bare-metal-no-std` builds the
+  `thumbv7em-none-eabihf` library in both `--no-default-features` and
+  `--features no-std` configurations, with an `nm` assertion that the freestanding
+  runtime block — the libc-backed allocator, the abort panic handler, the
+  personality shim — was genuinely compiled and is crate-owned. `bare-metal-run`
+  then links that staticlib into firmware and **executes it on a no-OS Cortex-M4
+  under `qemu-system-arm`**, which is the only configuration in which that block
+  can run at all: `cargo test` sets `test` and forces `panic = "unwind"`, failing
+  two of the three terms in its own `cfg`, so no hosted test reaches it. The
+  security-relevant assertion is the fallible one — the job drains the heap and
+  requires `deflateInit2` to return `Z_MEM_ERROR` rather than abort, because on a
+  device with no OOM killer an allocator that aborts under pressure is a
+  denial-of-service primitive. **This is emulation, not real embedded hardware**:
+  QEMU reproduces the ISA, the memory map and the absence of an OS, but not a
+  device's timing, memory controller or peripheral behaviour, so validation on
+  real silicon remains genuinely outstanding.
+- **Human code review across the full Rust surface — 80,258 lines across 40 files
   under `src/`, measured on 2026-08-04 with
   `find src -name '*.rs' -print0 | xargs -0 wc -l` — is outstanding**, and it is
   the highest-severity remaining hardening item

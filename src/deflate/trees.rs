@@ -1325,12 +1325,14 @@ fn compress_block(s: &mut DeflateState, trees: TreeSet) {
     let mut sx = 0usize; // running index in the symbol region
     if s.sym_next != 0 {
         loop {
-            let mut dist = (s.sym(sx) as usize) & 0xff;
-            sx += 1;
-            dist += (s.sym(sx) as usize & 0xff) << 8;
-            sx += 1;
-            let lc = s.sym(sx) as usize;
-            sx += 1;
+            // C reads the triple with three `sym_buf[sx++]` steps; this reads the
+            // same three bytes, in the same order, by value through one buffer
+            // materialization (AAP §0.6.3).
+            let (d_lo, d_hi, lc_byte) = s.sym_triple(sx);
+            let mut dist = (d_lo as usize) & 0xff;
+            dist += (d_hi as usize & 0xff) << 8;
+            let lc = lc_byte as usize;
+            sx += 3;
             if dist == 0 {
                 send_tree_code(s, trees, false, lc); // send a literal byte
             } else {
@@ -1491,9 +1493,9 @@ pub(crate) fn _tr_flush_block(
 /// layout). Returns `true` when the symbol buffer is full.
 pub(crate) fn _tr_tally_lit(s: &mut DeflateState, c: u8) -> bool {
     let n = s.sym_next;
-    s.set_sym(n, 0);
-    s.set_sym(n + 1, 0);
-    s.set_sym(n + 2, c);
+    // C `s->sym_buf[s->sym_next++] = 0; ... = 0; ... = cc;` — the same three
+    // ascending bytes, written through one buffer materialization (AAP §0.6.3).
+    s.set_sym_triple(n, 0, 0, c);
     s.sym_next = n + 3;
     let cc = c as usize;
     let f = s.dyn_ltree[cc].freq();
@@ -1511,9 +1513,7 @@ pub(crate) fn _tr_tally_lit(s: &mut DeflateState, c: u8) -> bool {
 /// path is never taken. Returns `true` when the symbol buffer is full.
 pub(crate) fn _tr_tally_dist(s: &mut DeflateState, dist: usize, len: u8) -> bool {
     let n = s.sym_next;
-    s.set_sym(n, (dist & 0xff) as u8);
-    s.set_sym(n + 1, (dist >> 8) as u8);
-    s.set_sym(n + 2, len);
+    s.set_sym_triple(n, (dist & 0xff) as u8, (dist >> 8) as u8, len);
     s.sym_next = n + 3;
     let dist = dist - 1;
     let li = LENGTH_CODE[len as usize] as usize + LITERALS + 1;
@@ -1538,9 +1538,7 @@ pub(crate) fn _tr_tally_dist(s: &mut DeflateState, dist: usize, len: u8) -> bool
 #[allow(dead_code)]
 pub(crate) fn _tr_tally(s: &mut DeflateState, dist: usize, lc: usize) -> bool {
     let n = s.sym_next;
-    s.set_sym(n, (dist & 0xff) as u8);
-    s.set_sym(n + 1, (dist >> 8) as u8);
-    s.set_sym(n + 2, lc as u8);
+    s.set_sym_triple(n, (dist & 0xff) as u8, (dist >> 8) as u8, lc as u8);
     s.sym_next = n + 3;
     if dist == 0 {
         // lc is the unmatched char.

@@ -46,6 +46,32 @@
 //! allocation (the boxed engine state), so heap exhaustion there is reported as
 //! `Z_MEM_ERROR` instead of aborting the process.
 //!
+//! # One buffer, one allocator
+//!
+//! A [`CForeignBuffer`] stores the hook that produced it and releases its region
+//! through *that* hook's `zfree`. The pairing is therefore established when the
+//! buffer is created and cannot be changed afterwards, which has one consequence
+//! worth stating explicitly: the allocator a stream uses is fixed by its
+//! `deflateInit*` / `inflateInit*` / `inflateBackInit*` call, and rewriting
+//! `strm.zalloc` or `strm.zfree` on a live stream does not redirect later
+//! allocations — including inflate's window, which is deferred until a block needs
+//! it.
+//!
+//! Reference C re-reads those fields inside `ZALLOC`, so it *does* honour a late
+//! change. It is worth being precise about why this crate does not follow: doing
+//! so would require a buffer allocated by one allocator to be freed by another,
+//! and C demonstrates the hazard on itself. Install a counting hook after
+//! `inflateInit2_` and drive a stream to completion, and C's ledger records one
+//! allocation from the caller's `zalloc` against **two** pointers passed to the
+//! caller's `zfree` — the second being the stream state, which C's internal
+//! `zcalloc` had already provided. Any `zfree` that validates its argument sees a
+//! foreign pointer. Keeping the pairing immutable makes that state unrepresentable
+//! rather than merely unlikely, and costs nothing a conforming caller can observe:
+//! `zlib.h` describes the triple as an input to the init call and never sanctions
+//! mutating it later. The divergence is recorded on
+//! [`crate::ffi::types::alloc_hook_from_parts`] and in the [`crate::stream`]
+//! module documentation.
+//!
 //! # `ZALLOC` geometry
 //!
 //! C never flattens an allocation request: `ZALLOC(strm, items, size)` forwards

@@ -1020,6 +1020,116 @@ fn qc_compress_bound_is_sufficient() {
         .quickcheck(prop as fn(Vec<u8>, i32) -> TestResult);
 }
 
+/// The byte-reproducible replay arm of [`qc_compress_bound_is_sufficient`].
+///
+/// # Why this exists
+///
+/// `quickcheck 1.1.0` exposes no way to fix a generator's seed: `Gen::new` takes
+/// only a size bound and seeds itself from the thread RNG, and `QuickCheck::rng`
+/// accepts an already-constructed `Gen`, so there is no seam anywhere in the
+/// public API at which a seed could be supplied. A failing property therefore
+/// reports a shrunk counterexample but cannot be re-run to the same case, and
+/// re-running the suite explores different inputs.
+///
+/// The suite's answer — stated in this file's header — is that determinism lives
+/// in fixtures that build their data explicitly from `StdRng::seed_from_u64`.
+/// Every other `qc_*` property here already has such a twin. This one did not,
+/// which left `compress_bound`'s sufficiency contract as the single property with
+/// no reproducible companion: exactly the case where a rare, input-dependent
+/// failure would be hardest to bring back. The gap is closed here rather than by
+/// changing the property, because the property's randomness is what makes it
+/// valuable — the two arms are complementary, not redundant.
+///
+/// # What it pins
+///
+/// The same three obligations the property checks — the bound never
+/// under-reports, `compress2` into a bound-sized buffer never fails, and the
+/// bytes produced fit inside the bound — over a fixed matrix chosen to cover the
+/// shapes a bounded generator reaches only by chance:
+///
+/// * the boundary lengths of the `compress_bound` formula's shift terms
+///   (`>> 12`, `>> 14`), where each additional term first contributes;
+/// * incompressible data, the only input for which the bound's slack is actually
+///   consumed rather than merely reserved; and
+/// * the degenerate lengths 0 and 1, where the encoder emits a wrapper and an
+///   empty or single-literal block.
+///
+/// Every case is a pure function of a literal seed, so a failure here replays
+/// byte-for-byte on any machine, on any run.
+#[test]
+fn compress_bound_is_sufficient_explicit() {
+    // Lengths straddling the formula's term boundaries: `sourceLen + (n >> 12) +
+    // (n >> 14) + (n >> 25) + 13`. 4096 is where the `>> 12` term first adds a
+    // byte and 16384 where `>> 14` does, so each side of each step is covered.
+    const LENGTHS: [usize; 12] = [
+        0, 1, 2, 13, 4095, 4096, 4097, 16_383, 16_384, 16_385, 40_000, 100_000,
+    ];
+
+    for &len in &LENGTHS {
+        // Three input shapes per length. Incompressible data is the case that
+        // actually consumes the bound's slack — a compressible input never
+        // approaches it, so a bound that was too small would go unnoticed.
+        let incompressible = seeded_random_bytes(0x0BAD_F00D, len);
+        let repetitive: Vec<u8> = b"the quick brown fox "
+            .iter()
+            .copied()
+            .cycle()
+            .take(len)
+            .collect();
+        let constant = vec![0xA5u8; len];
+
+        for (shape, data) in [
+            ("incompressible", &incompressible),
+            ("repetitive", &repetitive),
+            ("constant", &constant),
+        ] {
+            assert_eq!(
+                data.len(),
+                len,
+                "{shape} fixture must be exactly the requested length"
+            );
+
+            let bound = compress_bound(len);
+            assert!(
+                bound >= len,
+                "compress_bound({len}) = {bound} under-reports: incompressible input \
+                 can only grow, so the bound can never be below the input length"
+            );
+
+            for &level in &ALL_LEVELS {
+                let mut dest = vec![0u8; bound];
+                let produced = compress2(&mut dest, data, level).unwrap_or_else(|err| {
+                    panic!(
+                        "compress2 into a compress_bound({len})={bound} buffer must never \
+                         fail, but returned {err:?} (shape={shape}, level={level})"
+                    )
+                });
+                assert!(
+                    produced <= bound,
+                    "compress2 produced {produced} bytes into a buffer sized by \
+                     compress_bound({len}) = {bound} (shape={shape}, level={level})"
+                );
+                // Sufficiency is only meaningful if the bytes are also correct, so
+                // the round trip is closed rather than assumed.
+                dest.truncate(produced);
+                let mut recovered = vec![0u8; len];
+                let restored = uncompress(&mut recovered, &dest).unwrap_or_else(|err| {
+                    panic!(
+                        "a stream written inside compress_bound({len}) must decode, but \
+                         uncompress returned {err:?} (shape={shape}, level={level})"
+                    )
+                });
+                assert_eq!(
+                    (restored, &recovered[..restored]),
+                    (len, data.as_slice()),
+                    "round trip through a bound-sized buffer must recover the input \
+                     exactly (shape={shape}, level={level}, len={len})"
+                );
+            }
+        }
+    }
+}
+
 /// The degenerate inputs — empty, and every interesting single byte — round-trip
 /// under every level, every strategy, every framing, and every `memLevel`.
 ///

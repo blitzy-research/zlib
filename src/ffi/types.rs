@@ -294,6 +294,24 @@ pub type gz_headerp = *mut gz_header;
 /// prefix with the idiomatic cursor on entry to every shim and re-syncs it on
 /// exit, giving true macro fast-path parity. `gzgetc`/`gzgetc_` remain exported
 /// as real functions for callers that take the function pointer.
+///
+/// # A freshly opened handle reads deterministically here
+///
+/// On a handle straight out of `gzopen`, [`next`](Self::next) is null and
+/// [`have`](Self::have) is zero. Reference C leaves `next` **uninitialized** in
+/// that state: `gzlib.c` allocates its state with plain `malloc`, never `calloc`,
+/// and the field is only ever assigned on the first fetch inside `gzread.c`. What
+/// a caller reads before that first fetch is therefore whatever the allocator
+/// happened to hand back — this was measured as null on glibc, whose fresh pages
+/// are zeroed, and as garbage on the Windows heap under the same driver.
+///
+/// The C `gzgetc` macro is unaffected, because it tests `have` first and `have` is
+/// genuinely zero, so it takes the function path. The exposure is to a caller that
+/// inspects the public prefix directly, which the struct's very existence invites.
+/// This crate initializes the whole prefix, so such a caller reads a defined value
+/// on every platform. Like the null-argument and use-after-close cases, this is a
+/// difference in *C's* favour being removed, not a compatibility risk: no
+/// conforming use can observe it.
 #[repr(C)]
 pub struct gzFile_s {
     /// Bytes currently available in [`next`](Self::next) (C `unsigned have`).
@@ -733,6 +751,26 @@ impl Allocator for CAllocator {
 /// crate: a misaligned region is handed straight back to `zfree` and the request
 /// is reported as an allocation failure, so a merely *unhelpful* hook produces
 /// `Z_MEM_ERROR` rather than undefined behavior.
+///
+/// # Binding time — a documented divergence from C
+///
+/// A hook is bound to the buffers it allocates **at initialization time only**.
+/// `deflateInit*` / `inflateInit*` / `inflateBackInit*` read the stream's
+/// `zalloc`/`zfree`/`opaque` triple once; every buffer those calls create — and
+/// every buffer created later on the same stream, such as inflate's deferred
+/// window — uses that captured hook. Writing new values into `strm.zalloc` or
+/// `strm.zfree` after a successful init has **no effect**.
+///
+/// Reference C re-reads the fields on every `ZALLOC`, so a hook installed after
+/// init does serve later allocations there. That difference is deliberate and is
+/// *sounder* than matching C, not merely cheaper: C's own accounting shows it
+/// handing a caller-supplied `zfree` a pointer that came from C's internal
+/// `zcalloc`, because the stream state predates the hook. This crate's
+/// [`AllocBuffer`] always frees through the hook that
+/// allocated it, so no such mismatch is representable. `zlib.h` documents these
+/// fields as init inputs and never sanctions changing them on a live stream, so no
+/// conforming caller is affected — see the fuller discussion in the
+/// [`crate::stream`] module documentation.
 ///
 /// # Examples
 ///
@@ -1299,19 +1337,22 @@ pub unsafe fn deflate_take(strm: &mut z_stream) -> Option<Box<DeflateHandle>> {
 /// carries a checksum value or a gzip header timestamp.
 ///
 /// C `unsigned long` is 64-bit on LP64 targets (e.g. 64-bit Linux) and 32-bit on
-/// LLP64 targets (e.g. 64-bit Windows), yet every value crossing this boundary —
+/// both LLP64 targets (e.g. 64-bit Windows) and ILP32 targets (e.g. `i686`), yet
+/// every value crossing this boundary —
 /// an Adler-32, a CRC-32, a `crc32_combine` operator, a `gz_header::time` — is
 /// defined by the format as exactly 32 bits. So the `as` cast is a genuine
-/// truncation on LP64 and the identity on LLP64, and it is correct on both:
+/// truncation on LP64 and the identity on LLP64 and ILP32, and it is correct on
+/// all three:
 /// reference zlib relies on the same property, its own `uLong` checksums never
 /// carrying more than 32 significant bits.
 ///
-/// Being the identity on LLP64 is precisely what makes
-/// [`clippy::unnecessary_cast`] fire there while staying silent on LP64 — a lint
+/// Being the identity on LLP64 and ILP32 is precisely what makes
+/// [`clippy::unnecessary_cast`] fire on those targets while staying silent on LP64
+/// — a lint
 /// that is right about the expression and wrong about the program, and one that
 /// a Linux-only CI lane never surfaces. Confining the conversion, and with it the
 /// single localized exemption, to one function keeps every checksum and header
-/// shim portable and lint-clean on both target families without scattering
+/// shim portable and lint-clean on all three target families without scattering
 /// `#[allow]` across eighteen call sites. This mirrors `off_to_i64` in
 /// `src/ffi/util.rs`, which solves the same problem in the widening direction for
 /// `z_off_t`.
@@ -1755,8 +1796,12 @@ pub(crate) unsafe fn read_gz_header_source(head: *const gz_header) -> Option<CGz
         text: text != 0,
         // C writes the low four bytes of `head->time` (`deflate.c` L1098-L1101),
         // so a 64-bit `uLong` is truncated exactly as C truncates it. The
-        // narrowing goes through `ulong_to_u32` because it is the identity on
-        // LLP64 targets, where a bare `as u32` trips `clippy::unnecessary_cast`.
+        // narrowing goes through `ulong_to_u32` because `uLong` is `c_ulong`,
+        // whose width is target-dependent: the cast genuinely truncates on LP64
+        // (x86_64/aarch64/s390x Linux) and is the identity on ILP32 (`i686`) and
+        // LLP64 (Windows), where a bare `as u32` trips
+        // `clippy::unnecessary_cast` — a diagnostic CI's cross-lint rows raise
+        // and a Linux-x86_64-only lane never would.
         time: ulong_to_u32(time),
         os,
         hcrc: hcrc != 0,

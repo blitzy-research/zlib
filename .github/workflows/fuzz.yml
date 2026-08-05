@@ -755,6 +755,26 @@ jobs:
       #    explicitly: with no argument cargo-fuzz creates its own default
       #    directory, but an explicit path that does not exist is an argument error
       #    on a cold cache - i.e. on the first run of any new branch.
+      #
+      #    EVERY TARGET IS FUZZED EVEN WHEN AN EARLIER ONE FAILS, and this is the
+      #    difference between one finding and a silent coverage hole. `set -e` makes
+      #    a failing command abort the whole step, so with a bare invocation the loop
+      #    stopped at the first red target and every target after it in
+      #    `cargo fuzz list` order received ZERO budget - a real leak in
+      #    `fuzz_ffi_roundtrip`, third of five, deleted `fuzz_gzip` and
+      #    `fuzz_inflate` from the run entirely while the job reported only the one
+      #    failure it happened to reach. The cost of a finding was therefore 40% of
+      #    the fuzzing surface, and nothing in the log said so.
+      #
+      #    The invocation is consequently placed in an `if` condition, which is the
+      #    one context `set -e` does not treat as fatal. A failure names its target
+      #    and its exit status, is accumulated, and the loop continues; the
+      #    accumulated list is re-raised after the loop so the step still exits
+      #    non-zero and the job is still red. The `::endgroup::` is emitted on both
+      #    paths so a failing target's log group closes properly. Ordering the
+      #    re-raise AFTER the seeded/available reconciliation keeps a harness
+      #    pairing bug - which invalidates the whole run - reported ahead of the
+      #    findings that run produced.
       - name: Run bounded fuzzing (all targets)
         env:
           MAX_TOTAL_TIME: ${{ (github.event_name == 'pull_request') && '120' || '600' }}
@@ -796,6 +816,11 @@ jobs:
           done
           echo "Committed seed directories under fuzz/seeds: ${available}"
           seeded=0
+          fuzzed=0
+          # Space-separated rather than an array: target names are crate binary
+          # names and cannot contain whitespace, and a plain string has no
+          # empty-expansion pitfall under `set -u`.
+          failures=""
           for target in ${targets}; do
             echo "::group::Fuzzing ${target}"
             corpus="fuzz/corpus/${target}"
@@ -807,15 +832,48 @@ jobs:
               corpora+=("${seeds}")
               seeded=$((seeded + 1))
             fi
-            cargo fuzz run "${target}" "${corpora[@]}" -- \
-              -max_total_time="${MAX_TOTAL_TIME}" -max_len=65536 -rss_limit_mb=2048
+            fuzzed=$((fuzzed + 1))
+            # `if <cmd>` is the one construct `set -e` does not treat as fatal, so
+            # this is what lets a red target be recorded instead of aborting the
+            # step and starving every target after it. `status=$?` must be the
+            # FIRST statement in the else branch - anything before it, `echo`
+            # included, would overwrite the status being captured.
+            if cargo fuzz run "${target}" "${corpora[@]}" -- \
+                 -max_total_time="${MAX_TOTAL_TIME}" -max_len=65536 -rss_limit_mb=2048; then
+              echo "${target}: spent its ${MAX_TOTAL_TIME}s budget with no finding"
+            else
+              status=$?
+              failures="${failures} ${target}(exit ${status})"
+              echo "::error::fuzz target ${target} failed with exit ${status}. Its"\
+                   " reproducer, if libFuzzer wrote one, is under fuzz/artifacts and is"\
+                   " published by the 'Upload crash artifacts' step. The remaining"\
+                   " targets are still being fuzzed, so this run reports every finding"\
+                   " rather than stopping at the first."
+            fi
             echo "::endgroup::"
           done
+          echo "targets fuzzed: ${fuzzed} of $(echo "${targets}" | wc -w)"
+          if [ "${fuzzed}" -ne "$(echo "${targets}" | wc -w)" ]; then
+            echo "::error::only ${fuzzed} of the $(echo "${targets}" | wc -w) target(s)"\
+                 " reported by 'cargo fuzz list' were reached. Every target must receive"\
+                 " its budget on every run; a short count means the loop exited early and"\
+                 " the missing targets were not fuzzed at all."
+            exit 1
+          fi
           if [ "${seeded}" -ne "${available}" ]; then
             echo "::error::${available} seed directory(ies) exist under fuzz/seeds but only"\
                  " ${seeded} reached libFuzzer, which the pre-flight check above should have"\
                  " made impossible. The loop and the pre-flight disagree about the"\
                  " directory-name-to-target pairing; fix that before trusting this run."
+            exit 1
+          fi
+          # Re-raise the accumulated findings last, so a harness pairing bug above -
+          # which invalidates the whole campaign - is reported before the findings
+          # that campaign produced.
+          if [ -n "${failures}" ]; then
+            echo "::error::bounded fuzzing finished with finding(s) in:${failures}."\
+                 " Every target received its full ${MAX_TOTAL_TIME}s budget, so this list"\
+                 " is complete rather than truncated at the first failure."
             exit 1
           fi
           echo "fuzzing complete; ${seeded} of ${available} committed seed directory(ies) used"

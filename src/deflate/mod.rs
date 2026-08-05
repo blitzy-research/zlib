@@ -528,13 +528,16 @@ pub fn deflate_set_dictionary<A: Allocator>(
         let mut io = IoContext::new(dict, &mut empty);
         s.fill_window(&mut io);
         while s.lookahead >= MIN_MATCH {
-            let mut str_idx = s.strstart;
+            let str_idx = s.strstart;
             let n = s.lookahead - (MIN_MATCH - 1);
-            for _ in 0..n {
-                s.insert_string(str_idx);
-                str_idx += 1;
-            }
-            s.strstart = str_idx;
+            // C `do { INSERT_STRING(s, str, hash_head); str++; } while (--n);`
+            // over the consecutive positions `strstart .. strstart + n`. The bulk
+            // form is the same insertions in the same order with the same
+            // `prev`-before-`head` write order (AAP §0.6.4 decision (c)), paying
+            // one buffer materialization for the run rather than four per
+            // position (§0.6.3).
+            s.insert_string_run(str_idx, n);
+            s.strstart = str_idx + n;
             s.lookahead = MIN_MATCH - 1;
             s.fill_window(&mut io);
         }

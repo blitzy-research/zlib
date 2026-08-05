@@ -56,11 +56,11 @@ Know the scale of what you are touching:
 
 | Quantity | Measured value | How it was measured |
 |----------|----------------|---------------------|
-| Rust modules under `src/` | **40 files**, **78,457 lines** (2026-08-04) | `find src -name '*.rs' -print0 \| xargs -0 wc -l` — the `total` row, with the file count from the same listing |
+| Rust modules under `src/` | **40 files**, **80,258 lines** (2026-08-04) | `find src -name '*.rs' -print0 \| xargs -0 wc -l` — the `total` row, with the file count from the same listing |
 | Retained C baseline | **23,107 lines** across 26 root translation units and headers | `cat` of the 26 files piped to `wc -l` |
 | Public C entry points the baseline declares | **119** `ZEXTERN` declarations in `zlib.h` | the retained header |
 | Exported C symbols this crate emits | **95**, all type `T` | `nm -D --defined-only target/release/libzlib_rs.so` |
-| Tests, default features | **1015 passed / 0 failed / 0 ignored** | `cargo test --locked` |
+| Tests, default features | **1039 passed / 0 failed / 0 ignored** | `cargo test --locked` |
 
 Three companion documents carry things this one deliberately does not repeat:
 
@@ -494,18 +494,24 @@ different total is information, not noise — find out why before you push.
 
 | Command | Expected result |
 |---------|-----------------|
-| `cargo test --locked` | **1015 passed / 0 failed / 0 ignored** |
-| `cargo test --locked --all-features` | **1028 passed / 0 failed / 0 ignored** |
-| `cargo test --locked --no-default-features` | **713 passed / 0 failed / 0 ignored** |
-| `cargo test --locked --no-default-features --features no-std` | **713 passed / 0 failed / 0 ignored** |
+| `cargo test --locked` | **1039 passed / 0 failed / 0 ignored** |
+| `cargo test --locked --all-features` | **1052 passed / 0 failed / 0 ignored** |
+| `cargo test --locked --no-default-features` | **737 passed / 0 failed / 0 ignored** |
+| `cargo test --locked --no-default-features --features no-std` | **737 passed / 0 failed / 0 ignored** |
 
-The 1015 decompose as **854** in-crate unit tests, **132** integration tests
+The 1039 decompose as **867** in-crate unit tests, **143** integration tests
 (`checksum` 23, `gzip_compat` 17, `inflate_coverage` 30, `interop` 30, `regression`
 13, `round_trip` 19), and **29** doctests — 28 runnable plus one `compile_fail`.
 `--all-features` adds the **13** tests of the opt-in live C-oracle harness. Under
-`--no-default-features` the total is **587** unit + **99** integration + **27**
+`--no-default-features` the total is **600** unit + **110** integration + **27**
 doctests, and the `gzip_compat` suite correctly
 reports 0 because the whole `gz*` file API is feature-gated off.
+
+The two remaining CI feature rows measure **1039** (`--no-default-features --features
+std,gzip,gz-io`) and **745** (`--no-default-features --features std,simd`). Every
+row's floor is a `-ge` comparison, so adding a test can never break a gate — but a
+published number that no longer matches what the command prints is a defect in its
+own right, so update this table when you add one.
 
 These are not merely expectations — CI enforces them. Each test row is captured
 under `pipefail`, every `test result:` line is parsed, and the job fails if any row
@@ -537,6 +543,62 @@ source rather than only here:
 
 These are load-bearing. Weakening one does not just lower a coverage number, it
 withdraws the evidence for a constraint.
+
+### Line coverage is not measured, and that is a stated position rather than an oversight
+
+There is **no line- or branch-coverage number for this crate, and no coverage
+threshold gate.** Stating that plainly is the point of this section: a reviewer or
+contributor who assumes an unstated percentage exists will draw the wrong conclusion
+from a green CI run.
+
+Concretely, and verifiably: no coverage tool is installed in the reference
+environment or by any CI job — not `cargo-llvm-cov`, `cargo-tarpaulin`, `grcov`,
+`kcov`, `llvm-profdata` or `llvm-cov` — the `llvm-tools` rustup component is not
+added, and no workflow passes `-C instrument-coverage`. Nothing anywhere in the
+repository declares a percentage to meet. Any coverage figure you see quoted for
+this crate did not come from this repository.
+
+What *is* measured, and what the quality argument actually rests on, is **behavioural
+parity** rather than a percentage:
+
+* byte-identical compressed output against reference C zlib, gated on every commit
+  by tier 1 of [`tests/interop.rs`](tests/interop.rs) and swept live by
+  [`tests/c_oracle.rs`](tests/c_oracle.rs);
+* bidirectional decode interoperability against an independent Rust decoder;
+* the four ported official C drivers, which is what makes external constraint 4 a
+  demonstrated property rather than a claim; and
+* the exact, asserted test counts in the table above — a count check is the only
+  thing that notices a suite quietly shrinking, because `cargo test` exits 0 when
+  tests are skipped.
+
+That is a deliberate trade, not a preference for less rigour, and it has a limit
+worth knowing: a percentage would flag an *entirely unexercised* branch that parity
+testing happens not to reach. If you add coverage measurement, add it as a reported
+number first and leave it non-blocking until there is evidence for whatever threshold
+you would enforce — a threshold picked to match today's incidental result gates
+nothing and only manufactures the appearance of one.
+
+### Traceability markers: `TEST-nn` and how to use one
+
+Comments in the CI workflows carry markers of the form `(finding TEST-nn)`, which
+name the specific review or QA finding a gate was added to close. They exist so that
+a gate that looks like ceremony can be traced to the failure it prevents, and so that
+nobody deletes one without first learning what it was for. `git grep -n 'TEST-[0-9]'`
+enumerates them.
+
+Two properties of this scheme are worth stating, because both have caused confusion:
+
+1. **The numbering is not dense, and a gap is not a missing gate.** Markers appear
+   only where a finding produced a durable, checkable gate. Findings resolved by
+   changing code, by adding a test that documents itself, or by a decision recorded
+   in prose leave no marker — correctly, because there is nothing at that site for a
+   marker to protect. Some `TEST-nn` identifiers therefore have no in-tree anchor at
+   all, and their original text is not recoverable from this repository. Do **not**
+   reconstruct one from its number; an invented finding is worse than an absent one.
+2. **A marker annotates the gate, never the fix.** Put it in a comment beside the
+   check that enforces the property, not beside the code that satisfies it. If you
+   close a finding by adding a gate, cite it there; if you close one without adding a
+   gate, cite it in the commit message and leave the source clean.
 
 ### Supply-chain gates
 
@@ -612,9 +674,9 @@ extensive rationale in their own comments; the operating rules are:
 
 ### The other CI jobs worth knowing about
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs **twelve** jobs — count
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs **fourteen** jobs — count
 them with `grep -cE '^  [a-z0-9-]+:$' .github/workflows/ci.yml`. Beyond `build-test`,
-`no-std-tests`, `lint`, `msrv`, and `benches`, **seven** more exist because each guards
+`no-std-tests`, `lint`, `msrv`, and `benches`, **nine** more exist because each guards
 something the seven gates above cannot see:
 
 | Job | What it guards |
@@ -624,7 +686,9 @@ something the seven gates above cannot see:
 | `build-script-tests` | `build.rs` compiled as its own test binary — `cargo test` never compiles it — plus generated-table reproducibility and the big-endian (`s390x`) table selection |
 | `c-abi-linkage` | The emitted `cdylib`/`staticlib` linked, dynamically linked, and `dlopen`'d by a real C consumer on four feature rows, with the exported set checked against `zlib.map` |
 | `cross-targets` | Cross **type-check + Clippy only, nothing executed** for four triples: `aarch64`, 32-bit `i686`, big-endian `s390x`, and `x86_64-pc-windows-msvc` — the last being the *cross* Windows lane, distinct from `build-test`'s native `windows-latest` row, because neither `check` nor `clippy` links and so `--all-features` is reachable from Ubuntu (migration artifact `D3`) |
+| `cross-run` | The same suite **executed** under `qemu-user` for the three Linux triples of that four — `aarch64`, 32-bit `i686` and big-endian `s390x` — over the default row and both std-off rows, so the 32-bit and big-endian arms compute rather than merely type-check; every row asserts its declared `target_endian` and `target_pointer_width` against `rustc --print cfg` (the execution half of `D3`) |
 | `bare-metal-no-std` | Library build for `thumbv7em-none-eabihf`, the only configuration in which the freestanding runtime block compiles (migration artifact `D10`) |
+| `bare-metal-run` | That staticlib linked into a firmware image and **executed** on a no-OS Cortex-M4 under `qemu-system-arm`, across both std-off feature rows — the execution half of `D10`. The harness (linker script, vector table, semihosting glue, `posix_memalign` shim) is written by the job itself into `$RUNNER_TEMP`, deliberately, so the repository gains no orphan build files that nothing else reads |
 | `package-verify` | `cargo package --list` against the `exclude` contract, then the packaging build, then the **unpacked archive's own `cargo test` run** (migration artifact `D12`) |
 
 You can run the boundary gate locally:
@@ -1104,7 +1168,8 @@ contract and must be treated as one.
 ## Five divergences that must be preserved, not fixed
 
 Each of these looks like an unfinished job. None is. Closing any one of them would
-require a nightly compiler, break byte-identity, or bloat the published crate.
+require a nightly compiler, break byte-identity, bloat the published crate, or
+reintroduce an unsoundness that reference C exhibits on itself.
 
 The same five, numbered in the same order, appear in
 [`CHANGELOG.md`](CHANGELOG.md#the-five-divergences-a-c-caller-can-observe) and
@@ -1199,6 +1264,27 @@ just promoted it into the observable list.
   allocator. This is C's `ZALLOC` contract stated precisely, not a divergence from it —
   it is listed here only because a reader who knows the global allocator exists might
   reasonably expect a fallback that deliberately does not exist.
+- **The allocator hook is bound at init and never re-read.** A stream's
+  `zalloc`/`zfree`/`opaque` triple is captured by `deflateInit*` / `inflateInit*` /
+  `inflateBackInit*`, and every buffer the stream ever creates — including inflate's
+  window, which is deferred until a block needs it — uses that captured hook.
+  Mutating those fields on a *live* stream has no effect. C's `ZALLOC` macro re-reads
+  them on every call, so a hook installed after init does serve later allocations
+  there, which makes the difference real and measurable; it stays off the observable
+  list because `zlib.h` documents the triple as an input to the init call and never
+  sanctions changing it afterwards, exactly as it never sanctions a cross-engine
+  `End`. Matching C here would also be **less** sound rather than merely more work:
+  in that same measurement C's own ledger records **one** allocation from the
+  caller's `zalloc` against **two** pointers handed back to the caller's `zfree`,
+  because the stream state came from C's internal `zcalloc` before the hooks existed
+  — a foreign pointer passed to a caller-supplied deallocator. Every
+  [`AllocBuffer`](src/stream.rs) here frees through the hook that allocated it, so
+  **one buffer, one allocator** is structural rather than conventional, and the
+  mismatch is unrepresentable instead of merely unlikely. **Do not "fix" this by
+  re-reading the hook per allocation.** Documented in
+  [`src/stream.rs`](src/stream.rs), [`src/ffi/types.rs`](src/ffi/types.rs) and
+  [`src/ffi/alloc.rs`](src/ffi/alloc.rs); the decompressed payload is byte-identical
+  either way.
 - **An accepted `inflateBackInit_` zero-fills the caller's window.** C adopts the
   buffer with a bare `state->window = window;` (`infback.c` L59) and writes nothing, so
   the bytes stay whatever the caller left there. The shim instead zero-fills the whole
@@ -1231,26 +1317,35 @@ not a performance refactor. No throughput target was ever set for it, and no
 optimisation may be introduced at the cost of anything in
 [byte-identity](#-byte-identity-the-defining-acceptance-criterion).
 
-The recorded aggregate position against C zlib `1.3.2.1-motley` is **compression
-≈ 85%** and **decompression 107–127%** of C throughput — so decompression is at or
-above parity, and compression is the interesting side. Treat both as *attributed
-context* rather than as properties this repository re-checks on demand: the Criterion
-suite links no C library, and there is no in-tree **performance** oracle
-(`tests/c_oracle.rs` is a *conformance* oracle for byte-identity, which is a different
-job).
+The measured position against C zlib `1.3.2.1-motley` is **compression 113–161%** of
+C on the compressible profiles and **82–94%** on incompressible input, **`uncompress`
+101–160%**, and **`inflateBack` 216–344%** on input that decompresses well. The
+percentages come from an out-of-tree interleaved A/B differential harness that links
+the same C driver twice — once against a reference `libz` built from the retained
+in-tree baseline, once against this crate's `staticlib` — and *not* from this
+repository's bench folder, which links no C library and can therefore express no
+ratio at all (`tests/c_oracle.rs` is a *conformance* oracle for byte-identity, which
+is a different job).
 
-A per-profile comparison against a reference C build **inverted the intuitive reading
-of the compression gap**, and it is worth knowing before you go hunting:
+**The figures earlier revisions carried are retired**, and it is worth knowing before
+you go hunting:
 
-- **Incompressible input is the profile closest to C**, at roughly **82–86%**. The
-  match finder fails *fast* there — `longest_match`'s two-byte prefilter rejects nearly
-  every candidate before the comparison loop, and block-type selection then picks
-  stored blocks because a dynamic tree cannot pay for itself — so both implementations
-  do similar and rather little work per byte.
-- **Compressible profiles are the furthest**, at roughly **58–64%**. That is where hash
-  chains are genuinely walked, lazy matching is evaluated, and Huffman trees are built
-  and emitted.
-- **Decompression measured 104–125%** per profile, which *overlaps* the quoted 107–127% aggregate on 107–125% without containing it — parity holds throughout.
+- **Both compressible profiles are now *above* C**, at **113–161%**. An aggregate
+  "compression ≈ 85%" was published with a per-profile reading that put these
+  profiles *furthest* from C at "58–64%". Nothing measures in that band.
+- **Incompressible input is the one profile below C**, at **82–94%** — approximately
+  the magnitude the old "82–86%" claim gave it, but the opposite end of the ordering.
+  The match finder fails *fast* there: `longest_match`'s two-byte prefilter rejects
+  nearly every candidate before the comparison loop, and block-type selection then
+  picks stored blocks because a dynamic tree cannot pay for itself.
+- **Decompression is at or above parity everywhere** — `uncompress` 141–160% on the
+  compressible profiles and 101–114% on incompressible, `inflateBack` 216–344% and
+  86–102% respectively.
+- **The one residual deficit is per-stream *initialisation***, at level 1 with a
+  non-default `memLevel`: 70–74% at 64 KiB and 87% at 1 MiB. That is owned buffers
+  being zero-filled where C's `ZALLOC` is a plain `malloc`, not compression work, and
+  it is accepted rather than optimised away — a third `unsafe` carve-out is not on the
+  table, and `vec![]` is not either, because `Z_MEM_ERROR` has to stay fallible.
 
 ### The hard rule on optimisation
 
@@ -1282,12 +1377,14 @@ RUSTUP_TOOLCHAIN=stable cargo bench --locked --no-run            # what CI check
   explicit **incompressible-input guard** bracketed at levels 1, 6 and 9, so that
   the *slowest absolute* Rust
   workload is measured rather than assumed. Note what that profile is and is not. On
-  this measuring host, `deflate_profiles` at level 6 reports roughly **35 MiB/s** for
-  `incompressible` against **197 MiB/s** for `text` and **201 MiB/s** for
-  `repetitive` — so it is the lowest bytes-per-second case by about 5.6×, and
-  simultaneously the profile **closest** to C by ratio (~82–86%). It is *not* the
-  C-relative worst case; that is the compressible profiles at ~58–64%. The harness
-  links no C library, so it can produce the absolute column and never the ratio.
+  this measuring host, `deflate_profiles` at level 6 reports roughly **38.8 MiB/s**
+  for `incompressible` against **309 MiB/s** for `text` and **316 MiB/s** for
+  `repetitive` — so it is the lowest bytes-per-second case by about 8×, and it is
+  *also* the only profile below reference C by ratio (**82–94%**), the compressible
+  profiles measuring **113–161%**. Both readings therefore agree for once, which
+  they did not under the retired "closest at 82–86% / furthest at 58–64%" ordering.
+  The harness links no C library, so it can produce the absolute column and never
+  the ratio.
   Every case validates its own output before it is timed.
 - [`benches/inflate_bench.rs`](benches/inflate_bench.rs) — pre-compress, then measure
   throughput over decompressed bytes.
@@ -1325,7 +1422,7 @@ by a command that was actually run. Hold your pull request to the same bar:
 Concretely, paste **the observed output of the gates you ran** into the pull request
 description — the test totals, the exit codes, and, if you touched any of the seven
 byte-identity-risk files, the byte-identity result. "Tests pass" is an assertion;
-`1015 passed / 0 failed / 0 ignored` is evidence.
+`1039 passed / 0 failed / 0 ignored` is evidence.
 
 ### Import conventions
 
@@ -1465,24 +1562,47 @@ portability that CI has not exercised, and know where the line currently sits:
   `ffi::gz::tests::wide_path_open_round_trip` by name (UTF-16 path through `gzopen_w`,
   write, close, reopen, read back, `gzerror` state) and asserts exactly one test
   passed. The macOS row covers `OS_CODE = 19` and aarch64.
-- **Cross type-checked and cross-linted, not natively run:** four triples —
+- **Cross type-checked and cross-linted, nothing executed:** four triples —
   `aarch64-unknown-linux-gnu`, `i686-unknown-linux-gnu` (32-bit),
   `s390x-unknown-linux-gnu` (**big-endian**), and `x86_64-pc-windows-msvc` (32-bit
   `c_ulong`) — each with `cargo check --locked --all-targets --all-features` *and*
   `cargo clippy --locked --all-targets --all-features -- -D warnings`, so the
   `c_oracle` harness and the `inflate_strict` arms are type-checked rather than
-  skipped and a target-conditional lint cannot hide. Read the Windows-MSVC entry as
-  the *cross* lane, not a second count of the native `windows-latest` row above:
-  that row is native and narrow (it **runs** the suite, with default features
-  only), this one is cross and wide (every feature on, nothing executed), and a
-  `cfg(windows)` diagnostic reachable only under `--all-features` had no gate at
-  all before it existed. Neither `check` nor `clippy` links, which is why no MSVC
-  linker or cross toolchain is needed to reach it from Ubuntu.
-- **Built, not run:** the bare-metal `thumbv7em-none-eabihf` target, in both
-  `--no-default-features` and `--features no-std` configurations.
+  skipped and a target-conditional lint cannot hide (`cross-targets`). Read the
+  Windows-MSVC entry as the *cross* lane, not a second count of the native
+  `windows-latest` row above: that row is native and narrow (it **runs** the suite,
+  with default features only), this one is cross and wide (every feature on, nothing
+  executed), and a `cfg(windows)` diagnostic reachable only under `--all-features`
+  had no gate at all before it existed. Neither `check` nor `clippy` links, which is
+  why no MSVC linker or cross toolchain is needed to reach it from Ubuntu.
+- **Cross executed under emulation:** the three Linux triples of that four — so not
+  the Windows-MSVC one, which nothing can execute here — with their test suites RUN
+  under `qemu-user` in the `cross-run` job, over the default row plus both std-off
+  rows. Each matrix row declares its `endian` and `pointer_width` and has them
+  asserted against `rustc --print cfg`, and a dedicated step runs the four
+  endian-critical CRC tests by name and asserts exactly four passed. If you add a
+  triple here, add those two declarations with it; a row that stops covering the
+  property it names is worse than an absent row, because it reports green.
+  `--all-features` is deliberately excluded from these rows — `tests/c_oracle.rs`
+  classifies a toolchain probe by the `ErrorKind` of a failed spawn, and under
+  user-mode emulation "absent" and "present but broken" both arrive as exit 127, so
+  four self-tests of that classifier cannot tell them apart. Do not weaken the
+  classifier to suit the emulator. The 32-bit `i686` row also reports a smaller test
+  count than the 64-bit rows, because the five layout tests gated on
+  `target_pointer_width = "64"` correctly do not run there.
+- **Built and run:** the bare-metal `thumbv7em-none-eabihf` target, in both
+  `--no-default-features` and `--features no-std` configurations. `bare-metal-no-std`
+  builds it and asserts from the archive's symbol table that the freestanding runtime
+  block is present and crate-owned; `bare-metal-run` links it into firmware and
+  executes it on a no-OS Cortex-M4 under `qemu-system-arm`. If you touch
+  `mod no_std_support` in `src/lib.rs`, that second job is the one that will catch
+  you — no hosted test can, because `cargo test` sets `test` and forces
+  `panic = "unwind"`, failing two of the three terms in that block's own `cfg`. The
+  two feature rows assert **opposite** things about `windowBits = 31`; keep both.
 
-So a 32-bit, big-endian, or bare-metal build is **compile-verified, not
-runtime-verified**, and the documentation says so rather than rounding up. The two
+So big-endian, 32-bit and bare-metal builds are all **executed under emulation** —
+not on the hardware, which is a real distinction the documentation keeps and which
+leaves real-silicon validation genuinely open. The two
 mechanisms that make the distinction matter are concrete, and both resolve **at compile
 time** from the target triple rather than probing at run time: `src/checksum/crc32.rs`
 selects its braid tables with `cfg!(target_endian)` — an *expression* macro, so both arms
@@ -1622,12 +1742,25 @@ existing in a gzip-off build. `fuzz/Cargo.toml`'s `[lints.clippy]` table denies
 `fuzz_ffi_roundtrip` is the one place a fuzzer crosses the `unsafe` C ABI boundary —
 which is exactly why those lints need an enforcer rather than a declaration.
 
-Campaign results — attributed, not re-measured here — record **1,674,289 executions
-with 0 crashes and 0 crash artifacts** for a single sweep replicating this workflow's
-exact invocation on the pinned `nightly-2026-08-01` at the pull-request budget of
-120 s per target. That is a single-campaign total at a stated budget, not a cumulative
-lifetime count: a fresh run is bounded by the budgets above, not by that total, and
-the per-target breakdown lives in `doc/technical-specifications.md` §0.6.7.
+Campaign results record **716,617 executions with 0 crashes and 0 crash artifacts**,
+every target exiting 0, for a single sweep replicating this workflow's exact
+invocation on the pinned `nightly-2026-08-01` at a budget of 60 s per target. That is
+a single-campaign total at a stated budget, not a cumulative lifetime count: a fresh
+run is bounded by the budgets above, not by that total, and the per-target breakdown
+lives in `doc/technical-specifications.md` §0.6.7.
+
+That figure **replaces** a previously published 1,674,289-execution total, and the
+replacement is itself a lesson in how a true-sounding number goes wrong. At the time
+that total was recorded, `fuzz_ffi_roundtrip` leaked 32 bytes on every hook-backed
+engine placement, so under LeakSanitizer it aborted deterministically at exit 77 — and
+because a leak is neither a "crash" nor a crash *artifact*, the wording "0 crashes and
+0 crash artifacts" stayed literally defensible while describing a red run. The run
+loop's `set -e` then compounded it: aborting at the third of five targets left
+`fuzz_gzip` and `fuzz_inflate` with zero budget, so the total never covered five
+targets at all. Both defects are fixed, and the loop now carries a target-count guard
+so a short campaign fails the job rather than being reported as a whole one. When you
+publish a campaign number, state the budget, confirm every target exited 0, and do not
+let a narrowly-true phrase stand in for that check.
 
 **If a fuzz target finds a crash, treat it as a security report** and follow
 [`SECURITY.md`](SECURITY.md) rather than attaching the reproducer to a public thread.
@@ -1639,10 +1772,10 @@ Tick every line before you open the pull request.
 - [ ] `RUSTUP_TOOLCHAIN=stable cargo fmt --all -- --check` — exit 0
 - [ ] `RUSTUP_TOOLCHAIN=stable cargo clippy --locked --all-targets --all-features -- -D warnings` — exit 0
 - [ ] `RUSTUP_TOOLCHAIN=stable cargo build --locked` — exit 0
-- [ ] `RUSTUP_TOOLCHAIN=stable cargo test --locked` — **1015 passed / 0 failed / 0
+- [ ] `RUSTUP_TOOLCHAIN=stable cargo test --locked` — **1039 passed / 0 failed / 0
       ignored**, or higher with **zero** ignored
 - [ ] `RUSTUP_TOOLCHAIN=stable cargo test --locked --no-default-features` —
-      **713 passed**, same rule
+      **737 passed**, same rule
 - [ ] `RUSTUP_TOOLCHAIN=stable RUSTDOCFLAGS='-D warnings' cargo doc --locked
       --no-deps --all-features` — exit 0 with zero warnings
 - [ ] `mkdocs build --strict --site-dir "$(mktemp -d)/site"` — exit 0 with **zero

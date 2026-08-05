@@ -1066,6 +1066,77 @@ mod tests {
         );
     }
 
+    /// No allocation on the hook-backed placement path is ever *abandoned*.
+    ///
+    /// A caller that installs a `z_stream.zalloc`/`zfree` pair is charged for the
+    /// engine footprint at C's moment in the sequence, and that charge must travel
+    /// with the state until the matching `zfree`. Suppressing a destructor with
+    /// `core::mem::forget` is the wrong way to hold it: `forget` abandons the whole
+    /// value, so whatever else the value owned — a bookkeeping cell on the global
+    /// heap, or the charge itself — is silently leaked. An earlier revision of this
+    /// port shipped exactly that defect and leaked 32 bytes per engine handle on
+    /// every `deflateInit2_`, `inflateInit2_`, `inflateBackInit_`, `deflateCopy`
+    /// and `inflateCopy` a hook-installing C caller made. It was invisible to the
+    /// arena-accounting tests because the *caller's* counters balanced exactly;
+    /// only LeakSanitizer and process RSS showed it. AAP §0.6.3 requires that
+    /// replacing C's 22 `ZALLOC`/`ZFREE` sites with ownership leave "no free path
+    /// ... to forget", so the shipped path holds the charge by *moving* it into the
+    /// value that outlives it, and `forget` does not appear in either module at
+    /// all.
+    ///
+    /// Scoped to the two modules that own hook-backed placement, exactly as the
+    /// `Box::new` guard above is. `core::mem::forget` remains legitimate elsewhere
+    /// — dissolving an adopted `File` wrapper in `src/gz/open.rs`, for instance,
+    /// where there is no allocation to release.
+    #[test]
+    fn hook_backed_placement_never_abandons_an_allocation_with_forget() {
+        let sources = crate_sources();
+        let mut scanned = 0usize;
+
+        for (rel, text) in &sources {
+            if !matches!(rel.as_str(), "src/stream.rs" | "src/ffi/alloc.rs") {
+                continue;
+            }
+            scanned += 1;
+
+            let shipped = blank_cfg_test_items(&blank_comments_and_literals(text));
+            let hits = shipped.matches("forget").count();
+            assert_eq!(
+                hits, 0,
+                "{rel} has {hits} shipped `forget` occurrence(s) but must have none. \
+                 Hook-backed placement keeps the caller's charge by moving it into \
+                 the value that outlives it, never by abandoning an owner: \
+                 `mem::forget` would leak on every engine handle a C caller with an \
+                 installed allocator hook creates (AAP §0.6.3)."
+            );
+        }
+        assert_eq!(
+            scanned, 2,
+            "both placement modules must have been scanned; the paths in this test \
+             are stale if they were renamed"
+        );
+
+        // The hand-off must actually be present, so this test cannot pass
+        // vacuously against a `fill` that stopped transferring the charge at all.
+        let model = sources
+            .iter()
+            .find(|(rel, _)| rel.as_str() == "src/stream.rs")
+            .map(|(_, text)| blank_cfg_test_items(&blank_comments_and_literals(text)))
+            .expect("src/stream.rs is part of the crate");
+        let opens = model
+            .find("fn fill")
+            .expect("`EngineReservation::fill` must still exist");
+        let body = &model[opens..];
+        let at = body
+            .find("try_owned_charged")
+            .expect("`EngineReservation::fill` must hand the charge to `EngineBox`");
+        assert!(
+            body[..at].contains("Self::Charged(footprint)"),
+            "the charge must be moved out of the `Charged` arm and into the boxed \
+             engine, so it reaches the caller's `zfree` rather than being dropped"
+        );
+    }
+
     /// The enforcement attributes themselves are pinned: the crate root denies
     /// `unsafe_code`, nothing re-enables it crate- or module-wide, and exactly two
     /// narrowly scoped carve-outs exist — both in `src/lib.rs`.
@@ -2061,7 +2132,7 @@ mod tests {
     /// of these jobs silently runs on 1.85.0 instead of its intended channel —
     /// the stable rows would still pass while quietly not covering stable, and
     /// `cargo fuzz build` would fail outright because cargo-fuzz needs nightly.
-    const TOOLCHAIN_JOBS: [(&str, &str, &str); 10] = [
+    const TOOLCHAIN_JOBS: [(&str, &str, &str); 12] = [
         (".github/workflows/ci.yml", "build-test", "stable"),
         (".github/workflows/ci.yml", "no-std-tests", "stable"),
         (".github/workflows/ci.yml", "lint", "stable"),
@@ -2074,6 +2145,14 @@ mod tests {
         (".github/workflows/ci.yml", "build-script-tests", "stable"),
         (".github/workflows/ci.yml", "unsafe-boundary", "stable"),
         (".github/workflows/ci.yml", "c-abi-linkage", "stable"),
+        // The cross target is installed for whatever toolchain the action
+        // selects, so losing the override here would fail on a missing target
+        // rather than on anything the job exists to measure.
+        (".github/workflows/ci.yml", "cross-run", "stable"),
+        // Same reason: `thumbv7em-none-eabihf` is installed for the toolchain the
+        // action resolves, and this job's whole subject is the freestanding
+        // runtime block that only that target compiles.
+        (".github/workflows/ci.yml", "bare-metal-run", "stable"),
         (".github/workflows/fuzz.yml", "cargo-fuzz", "nightly"),
     ];
 
@@ -2221,12 +2300,13 @@ mod tests {
     /// commit. Hence the check is positional: checkout first, provenance second,
     /// gates afterwards.
     ///
-    /// SCOPED TO `ci.yml` DELIBERATELY. These twelve jobs are the ones whose
+    /// SCOPED TO `ci.yml` DELIBERATELY. These fourteen jobs are the ones whose
     /// output a reader attributes to a commit — the build, test, lint, MSRV,
-    /// symbol and oracle gates. `audit.yml` and `fuzz.yml` number their steps in
-    /// prose comments (`# 2.`, `# 3.`, …), so inserting a step there would mean
-    /// renumbering commentary unrelated to this contract — churn that buys no
-    /// additional attributability for the gates named.
+    /// symbol, cross-runtime, bare-metal and oracle gates, which is exactly the
+    /// set whose missing proof the finding enumerates. `audit.yml` and `fuzz.yml`
+    /// number their steps in prose comments (`# 2.`, `# 3.`, …), so inserting a
+    /// step there would mean renumbering commentary unrelated to this contract —
+    /// churn that buys no additional attributability for the gates named.
     ///
     /// The job list is read from the file, not hard-coded, so a newly added job
     /// cannot escape the requirement by not being mentioned here.
@@ -2236,8 +2316,8 @@ mod tests {
         let jobs = workflow_job_names(WORKFLOW);
         assert_eq!(
             jobs.len(),
-            12,
-            "expected 12 `ci.yml` jobs to hold to the provenance contract, found \
+            14,
+            "expected 14 `ci.yml` jobs to hold to the provenance contract, found \
              {}: {jobs:?}",
             jobs.len()
         );
@@ -2349,7 +2429,7 @@ mod tests {
     /// change.
     const ACTION_CENSUS: [(&str, usize, usize, usize, usize); 3] = [
         (".github/workflows/audit.yml", 4, 3, 0, 0),
-        (".github/workflows/ci.yml", 12, 12, 0, 1),
+        (".github/workflows/ci.yml", 14, 14, 0, 1),
         (".github/workflows/fuzz.yml", 1, 1, 5, 1),
     ];
 

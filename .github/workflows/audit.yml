@@ -324,10 +324,10 @@
 # mutable dependency - and in a workflow whose whole purpose is supply-chain
 # assurance that is the one dependency that must not be left implicit. It is a
 # convention shared with `ci.yml` and `fuzz.yml`: across the three files there are
-# 41 `uses:` references and all 41 are SHA-pinned, with zero mutable refs -
-# 17 `actions/checkout` (4 here, 12 in `ci.yml`, 1 in `fuzz.yml`),
-# 16 `dtolnay/rust-toolchain` (3 here - `policy-integrity` needs no Rust toolchain
-# at all - 12 in `ci.yml`, 1 in `fuzz.yml`), 5 `actions/cache` (all in `fuzz.yml`,
+# 45 `uses:` references and all 45 are SHA-pinned, with zero mutable refs -
+# 19 `actions/checkout` (4 here, 14 in `ci.yml`, 1 in `fuzz.yml`),
+# 18 `dtolnay/rust-toolchain` (3 here - `policy-integrity` needs no Rust toolchain
+# at all - 14 in `ci.yml`, 1 in `fuzz.yml`), 5 `actions/cache` (all in `fuzz.yml`,
 # for the per-target corpora), 2 `actions/upload-artifact` (1 in `ci.yml`, 1 in
 # `fuzz.yml`, both failure-only) and 1 `actions/setup-python` (`ci.yml`'s `docs`
 # job).
@@ -346,7 +346,7 @@
 #   * `dtolnay/rust-toolchain` derives its DEFAULT toolchain from
 #     `github.action_ref` - that is precisely how `@stable`, `@nightly` and
 #     `@1.85.0` selected what they selected. Once the ref is a commit SHA the
-#     requested toolchain would be the SHA itself, so all 16 of its call sites
+#     requested toolchain would be the SHA itself, so all 18 of its call sites
 #     across the three workflows pass an explicit `with: toolchain:` naming the
 #     channel, and every toolchain-sensitive job additionally ASSERTS the resolved
 #     channel via `rustup show active-toolchain` (the three jobs here pin
@@ -360,13 +360,13 @@
 # re-derives - it parses the rows below directly - so all three must be changed
 # together or not at all:
 #
-#   actions/checkout         11d5960a326750d5838078e36cf38b85af677262  v4.4.0  17x
-#   dtolnay/rust-toolchain   2c7215f132e9ebf062739d9130488b56d53c060c  master  16x
+#   actions/checkout         11d5960a326750d5838078e36cf38b85af677262  v4.4.0  19x
+#   dtolnay/rust-toolchain   2c7215f132e9ebf062739d9130488b56d53c060c  master  18x
 #   actions/cache            0057852bfaa89a56745cba8c7296529d2fc39830  v4.3.0   5x
 #   actions/upload-artifact  ea165f8d65b6e75b540449e92b4886f43607fa02  v4.6.2   2x
 #   actions/setup-python     ece7cb06caefa5fff74198d8649806c4678c61a1  v6.3.0   1x
 #                                                                             ---
-#                                                                             41x
+#                                                                             45x
 #
 # UPGRADING: resolve the new SHA from the upstream repository, change every
 # occurrence in all three workflows in a single commit, and move the trailing
@@ -860,8 +860,8 @@ jobs:
 
           # Expected `uses:` census: action prefix -> {workflow: count}. The totals
           # quoted in the ACTION PINNING section are the sums of these rows:
-          # 17 checkout, 16 rust-toolchain, 5 cache, 2 upload-artifact,
-          # 1 setup-python -- 41 `uses:` references in total.
+          # 19 checkout, 18 rust-toolchain, 5 cache, 2 upload-artifact,
+          # 1 setup-python -- 45 `uses:` references in total.
           #
           # The keys name the action only, NOT a version: every ref in this
           # repository is a 40-hex commit SHA, so a version-bearing prefix such as
@@ -870,12 +870,12 @@ jobs:
           # separately, below.
           EXPECTED_USES = {
               "actions/checkout@": {
-                  ".github/workflows/ci.yml": 12,
+                  ".github/workflows/ci.yml": 14,
                   ".github/workflows/audit.yml": 4,
                   ".github/workflows/fuzz.yml": 1,
               },
               "dtolnay/rust-toolchain@": {
-                  ".github/workflows/ci.yml": 12,
+                  ".github/workflows/ci.yml": 14,
                   # `policy-integrity` deliberately installs no toolchain.
                   ".github/workflows/audit.yml": 3,
                   ".github/workflows/fuzz.yml": 1,
