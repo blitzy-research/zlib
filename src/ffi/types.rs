@@ -3372,6 +3372,25 @@ mod tests {
     /// slice) and releases it through the caller's `zfree` on drop — the
     /// has-hook clause (AAP §0.6.3). Invocation counts are recorded via a global
     /// (`static`) counter because the C hooks receive only the `opaque` cookie.
+    ///
+    /// # Why the backing store carries a size header
+    ///
+    /// A C `free_func` is handed only the payload address, so a hook that gives
+    /// out a bare block keeps no way to rebuild the `Layout` its release needs.
+    /// This pair therefore reserves `HDR` bytes ahead of every region and
+    /// records the payload size there, exactly as the honest arena hooks in
+    /// [`crate::ffi::alloc`] do, so `zfree` can recover that layout and release
+    /// the whole block. The pair is consequently balanced **in bytes as well as
+    /// in calls**.
+    ///
+    /// That distinction is the point of the header. An earlier revision forgot
+    /// the payload rather than reclaiming it, which satisfied the call-count
+    /// assertions below while leaving the region permanently unreachable —
+    /// invisible to a plain `cargo test`, but reported by LeakSanitizer under
+    /// `-Zsanitizer=address`, where one leaked block fails the entire run even
+    /// though every test passed. Reclaiming precisely what was reserved keeps
+    /// the library suite clean under a leak checker, which AAP §0.7.2 S10
+    /// requires of every quality gate.
     #[test]
     fn callocator_active_hooks_are_invoked_and_balanced() {
         use core::sync::atomic::{AtomicUsize, Ordering};
@@ -3379,27 +3398,74 @@ mod tests {
         static ALLOCS: AtomicUsize = AtomicUsize::new(0);
         static FREES: AtomicUsize = AtomicUsize::new(0);
 
+        /// Bytes reserved in front of every payload so `zfree` can recover the
+        /// block's size. 16 is a power of two and no smaller than
+        /// `align_of::<usize>()` on any supported target, so the header write is
+        /// always aligned and the payload address it yields satisfies every
+        /// element type the crate asks for — `u16` here, and the engine states
+        /// elsewhere. It matches `HDR` in `crate::ffi::alloc`'s arena hooks.
+        const HDR: usize = 16;
+
+        /// Layout of the `HDR + bytes` block backing one hook allocation.
+        ///
+        /// Reports [`None`] instead of panicking when the total is not a valid
+        /// layout, because both callers are `extern "C"`: an unwind out of a C
+        /// hook is undefined behaviour, and this crate is built `panic =
+        /// "abort"`, so a panic here would take the process down. The size can
+        /// never be zero, since it always includes the header, which is
+        /// `alloc_zeroed`'s only requirement beyond validity.
+        fn block_layout(bytes: usize) -> Option<core::alloc::Layout> {
+            core::alloc::Layout::from_size_align(HDR.checked_add(bytes)?, HDR).ok()
+        }
+
         unsafe extern "C" fn zalloc(
             _opaque: *mut c_void,
             items: c_uint,
             size: c_uint,
         ) -> *mut c_void {
             ALLOCS.fetch_add(1, Ordering::SeqCst);
-            let bytes = (items as usize) * (size as usize);
-            // Delegate the actual bytes to the Rust global allocator; a
-            // `Vec<u8>` we forget and later reclaim in `zfree`.
-            let mut v = alloc::vec![0u8; bytes.max(1)];
-            let p = v.as_mut_ptr();
-            core::mem::forget(v);
-            p.cast()
+            let bytes = (items as usize).saturating_mul(size as usize);
+            let Some(layout) = block_layout(bytes) else {
+                return ptr::null_mut();
+            };
+            // SAFETY: `layout` has a non-zero size, because it always includes
+            // the `HDR` header bytes.
+            let base = unsafe { alloc::alloc::alloc_zeroed(layout) };
+            if base.is_null() {
+                return ptr::null_mut();
+            }
+            // SAFETY: `base` owns `HDR + bytes` writable bytes and is
+            // `HDR`-aligned, so the `usize` header write is in bounds and
+            // aligned, and `base + HDR` begins the payload inside that same
+            // allocation.
+            unsafe {
+                base.cast::<usize>().write(bytes);
+                base.add(HDR).cast::<c_void>()
+            }
         }
         unsafe extern "C" fn zfree(_opaque: *mut c_void, address: *mut c_void) {
             FREES.fetch_add(1, Ordering::SeqCst);
-            // We cannot recover the exact length here, so this test backing
-            // store intentionally leaks the bytes (the process ends promptly);
-            // the assertion of interest is that `zfree` is invoked exactly once
-            // per `zalloc`. This keeps the test allocator trivially sound.
-            let _ = address;
+            if address.is_null() {
+                return;
+            }
+            // SAFETY: `address` is a payload pointer `zalloc` returned, so it
+            // sits one header inside a live block and `base` addresses that
+            // block's start.
+            let base = unsafe { address.cast::<u8>().sub(HDR) };
+            // SAFETY: `base` addresses the `usize` header `zalloc` wrote, which
+            // is in bounds and aligned for the same reasons the write was.
+            let bytes = unsafe { base.cast::<usize>().read() };
+            let Some(layout) = block_layout(bytes) else {
+                // Unreachable: `zalloc` only returns a payload once
+                // `block_layout` accepted this very `bytes`, so the same call
+                // accepts it here. Returning rather than unwrapping keeps the
+                // hook panic-free across the C ABI.
+                return;
+            };
+            // SAFETY: `base` and `layout` are exactly the pair `zalloc`
+            // allocated with, and the buffer's owner calls `zfree` once, so this
+            // is that block's single release.
+            unsafe { alloc::alloc::dealloc(base, layout) };
         }
 
         let alloc = CAllocator {

@@ -125,9 +125,9 @@ except the two MSRV rows.
 | Live byte-identity sweep | `cargo test --locked --features c-oracle --test c_oracle` | **3750/3750** and **50/50** byte-identical |
 
 The 1039 default-feature tests decompose as **867** in-crate unit tests, **143**
-integration tests (`checksum` 23, `gzip_compat` 17, `inflate_coverage` 30,
-`interop` 30, `regression` 13, `round_trip` 19), and **29** doctests (28
-runnable plus one `compile_fail`).
+integration tests (`checksum` 23, `ffi_alloc_balance` 10, `gzip_compat` 17,
+`inflate_coverage` 30, `interop` 30, `regression` 13, `round_trip` 20), and **29**
+doctests (28 runnable plus one `compile_fail`).
 `--all-features` adds the 13 tests of the opt-in live C-oracle harness. Under
 `--no-default-features` the total is **600** unit + **110** integration + **27**
 doctests; the `gzip_compat` suite correctly reports 0 because the whole `gz*`

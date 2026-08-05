@@ -34,21 +34,21 @@ Every figure in this subsection was produced by the command beside it, on stable
 | Default test suite | **1039** passed, 0 failed, **0 ignored** | `RUSTUP_TOOLCHAIN=stable cargo test --locked` |
 | All features | **1052** passed, 0 failed, 0 ignored | `… cargo test --locked --all-features` |
 | `no_std` rows | **737** passed, 0 failed, 0 ignored (each) | `… cargo test --locked --no-default-features [--features no-std]` |
-| Rust source | **40** files, **80,286** lines | `git ls-files src \| grep '\.rs$' \| xargs wc -l` |
-| Integration tests | 8 files, **19,452** lines | `wc -l tests/*.rs` |
+| Rust source | **40** files, **80,352** lines | `git ls-files src \| grep '\.rs$' \| xargs wc -l` |
+| Integration tests | 8 files, **19,480** lines | `wc -l tests/*.rs` |
 | Benchmarks | 3 files, **1,267** lines | `wc -l benches/*.rs` |
 | Fuzz targets | 5 files, 8,852 lines | `wc -l fuzz/fuzz_targets/*.rs` |
 | Retained C baseline | 15 `.c` + 11 `.h` = **23,107** lines, 0 modified | `cat *.c *.h \| wc -l` |
 | Dependency closure | **89** root + **13** fuzz = 102 packages | `grep -c '^\[\[package\]\]' Cargo.lock fuzz/Cargo.lock` |
 | Cargo features | **7** named (`std`, `gzip`, `gz-io`, `no-std`, `simd`, `inflate_strict`, `c-oracle`) plus the `default` meta-key | Section 9.2 |
-| `// SAFETY:` comments | **592**, zero undocumented | `grep -rn '// SAFETY:' src \| wc -l` + Clippy (`-rc` prints per-file counts, not a total) |
+| `// SAFETY:` comments | **597**, zero undocumented | `grep -rn '// SAFETY:' src \| wc -l` + Clippy (`-rc` prints per-file counts, not a total) |
 | CI jobs | **12** in `ci.yml`, **4** in `audit.yml`, **1** in `fuzz.yml` | `awk '/^jobs:/{f=1;next} f&&/^[^ #]/{f=0} f&&/^  [a-z0-9_-]+:[[:space:]]*$/{n++} END{print n+0}' .github/workflows/ci.yml` |
 
 **Provenance.** Every figure above was measured against this repository's working tree with `rustc 1.97.1 (8bab26f4f 2026-07-14)` on `x86_64-unknown-linux-gnu`, default features unless a row says otherwise. Each command in the right-hand column is exact and self-contained: running it reproduces the value in the same row. That property is the point of the column, and it is worth stating why the job-count command is shaped the way it is — the obvious shorter form `grep -cE '^  [a-z0-9-]+:'` returns 15 rather than 12, because at two-space indentation it also matches the children of the top-level `permissions:` and `concurrency:` blocks (`contents:`, `group:`, `cancel-in-progress:`). The `awk` form brackets the `jobs:` mapping specifically and therefore agrees with the `EXPECTED_JOBS` table that the `policy-integrity` job in `audit.yml` asserts on every run. Every *line count* in the table is a **dated snapshot** rather than a contract: it moves with the next test, doc comment or workflow step added, which is why the reproducing command sits beside each figure instead of behind it. The rows that must never move are the invariants — *zero failed and zero ignored* in every test row, and *0 modified* against the retained C baseline.
 
 **Key achievements:**
 
-- 80,286 lines of Rust across 40 `.rs` files, standing alongside — not replacing in-tree — the 23,107 lines of retained C
+- 80,352 lines of Rust across 40 `.rs` files, standing alongside — not replacing in-tree — the 23,107 lines of retained C
 - Complete DEFLATE compression engine with all five block producers (stored, fast, slow, huff, rle)
 - Complete DEFLATE decompression engine with a 32-mode state machine
 - Adler-32 and CRC-32 checksum engines with combine operations
@@ -234,7 +234,7 @@ pie title Completed Work Distribution (240 hours)
 > **Mixed content, by design.** The **Hours** column is the original effort-estimate snapshot and is
 > *historical*: it sums to 240 h and is retained for planning history. The **Files** and **Lines** columns are
 > *current*, refreshed to values measured on this tree, so the columns describe different points in the
-> timeline. The **seven** `src/` component rows sum exactly to 40 files and 80,286 lines; the Test, Benchmark,
+> timeline. The **seven** `src/` component rows sum exactly to 40 files and 80,352 lines; the Test, Benchmark,
 > Architecture, Documentation, CI/CD and Fuzzing rows are outside `src/` and are excluded from that total.
 > Section 8.5 is the authoritative code-metrics summary.
 
@@ -243,17 +243,17 @@ pie title Completed Work Distribution (240 hours)
 | Deflate Engine | 9 files (`src/deflate/`) | 11,622 | 60h | 5 block producers, state machine, hash chains, Huffman trees — most complex module |
 | Inflate Engine | 6 files (`src/inflate/`) | 12,047 | 45h | 32-mode state machine, fast-path decode loop, callback API, Huffman table builder |
 | Gzip File I/O | 6 files (`src/gz/`) | 11,386 | 32h | stdio-like interface: open/read/write/close/seek with the LOOK/COPY/GZIP pipeline |
-| FFI Boundary | 7 files (`src/ffi/`) | 31,067 | — | `#[unsafe(no_mangle)] extern "C"` drop-in shims + `#[repr(C)]` mirrors; the sole `unsafe` module (effort folded into the Public API Types and Quality rows) |
+| FFI Boundary | 7 files (`src/ffi/`) | 31,133 | — | `#[unsafe(no_mangle)] extern "C"` drop-in shims + `#[repr(C)]` mirrors; the sole `unsafe` module (effort folded into the Public API Types and Quality rows) |
 | Public API Types | 5 files (`lib.rs`, `error.rs`, `constants.rs`, `stream.rs`, `gz_header.rs`) | 9,890 | 20h | Foundational types, error handling, streaming interface, version constants |
 | Checksum Engines | 3 files (`src/checksum/`) | 2,549 | 12h | Adler-32 with combine, CRC-32 with combine/gen/op over `build.rs`-generated tables |
 | Utilities | 4 files (`src/util/`) | 1,725 | 6h | `compress`/`uncompress` wrappers, `zutil.h` internals, version and compile flags |
-| **Subtotal (`src/` only)** | **40 `.rs`** | **80,286** | — | The **seven** rows above, which sum exactly: 11,622 + 12,047 + 11,386 + 31,067 + 9,890 + 2,549 + 1,725. This is the figure Section 9.1's tree reproduces |
-| Test Suite | 8 files (`tests/`) | 19,452 | 28h | Ports of C `test/example.c`, `infcover.c`, `minigzip.c`, plus property tests, the two-tier interop gate, the FFI allocation-balance gate, and the opt-in `c_oracle` sweep |
+| **Subtotal (`src/` only)** | **40 `.rs`** | **80,352** | — | The **seven** rows above, which sum exactly: 11,622 + 12,047 + 11,386 + 31,133 + 9,890 + 2,549 + 1,725. This is the figure Section 9.1's tree reproduces |
+| Test Suite | 8 files (`tests/`) | 19,480 | 28h | Ports of C `test/example.c`, `infcover.c`, `minigzip.c`, plus property tests, the two-tier interop gate, the FFI allocation-balance gate, and the opt-in `c_oracle` sweep |
 | Quality & Debugging | — | — | 16h | Blitzy Agent commits: formatting, Clippy compliance, `// SAFETY:` documentation, bug fixes |
 | Architecture/Config | `Cargo.toml`, `build.rs`, `rust-toolchain.toml`, `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.cargo/config.toml`, `.gitignore` | 4,570 | 8h | Manifest, CRC table generation, feature flags, profiles, lint/format/supply-chain policy |
 | Benchmarks | 3 files (`benches/`) | 1,267 | 6h | Criterion deflate/inflate/checksum throughput, including the incompressible profile |
-| Documentation | `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, `doc/index.md`, `docs/index.md` | 5,197 | 6h | Crate docs, release history, contribution workflow, disclosure policy, published landing pages. This row deliberately **excludes** `doc/technical-specifications.md` and this file: a page cannot stably state its own length, so quoting one guarantees a stale number. This row and the Architecture/Config row above are the two most volatile figures in this guide — any prose or policy commit moves them — which is why `ci.yml`'s `docs` job recomputes both and fails on a mismatch rather than leaving them to be noticed |
-| CI/CD | `ci.yml`, `audit.yml`, `fuzz.yml` | 7,209 | 1h | 14-job Rust CI pipeline, 4-job supply-chain audit, 1-job `cargo-fuzz` workflow. `mkdocs.yml` (93 lines) is documentation tooling rather than CI and is counted in neither row |
+| Documentation | `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, `doc/index.md`, `docs/index.md` | 5,201 | 6h | Crate docs, release history, contribution workflow, disclosure policy, published landing pages. This row deliberately **excludes** `doc/technical-specifications.md` and this file: a page cannot stably state its own length, so quoting one guarantees a stale number. This row and the Architecture/Config row above are the two most volatile figures in this guide — any prose or policy commit moves them — which is why `ci.yml`'s `docs` job recomputes both and fails on a mismatch rather than leaving them to be noticed |
+| CI/CD | `ci.yml`, `audit.yml`, `fuzz.yml` | 7,525 | 1h | 14-job Rust CI pipeline, 4-job supply-chain audit, 1-job `cargo-fuzz` workflow. `mkdocs.yml` (129 lines) is documentation tooling rather than CI and is counted in neither row |
 | Fuzzing | 5 targets (`fuzz/fuzz_targets/`) + `fuzz/{Cargo.toml,Cargo.lock}` | 9,143 | — | Detached libFuzzer workspace, carrying no policy file of its own (effort folded into the Quality row). The single root `deny.toml` governs that 13-package graph as well as the 89-package root graph, so the two invocations of one policy together cover the 102-package closure — see Section 9.2 |
 | **Historical hours total** | — | — | **240h** | Spans every component; see Section 3 |
 
@@ -282,7 +282,7 @@ Everything on that list except the human half of the security audit, real-hardwa
 | 3 | Performance benchmarking vs C zlib | Done, and it corrected a misconception. **There is no numeric throughput requirement anywhere in `technical-specifications.md`** — §0.8.3 states that performance is a constraint on the work, not its objective. An earlier revision of this guide attributed an "≥80% of C" requirement to the plan; that requirement was invented and has been removed. Attributed measured position: compression ≈ 85%, decompression 107–127% of C. Per profile the ordering *inverts* the intuitive reading — incompressible input is **closest** to C (~82–86%) and compressible input **furthest** (~58–64%). | Optional follow-up: profile the *compressible* paths — hash-chain traversal and `longest_match` in `deflate_slow` — and gate any change behind the byte-identity suite. | 8h | ✅ Done |
 | 4 | Byte-identical compression verification | Done. `technical-specifications.md` §0.8.1 directive **D-1** requires byte-identical output for the same input × level × strategy × `windowBits` × `memLevel`. Verified by tier 1 of `tests/interop.rs` (baked C-encoder vectors, no C toolchain required) and by `tests/c_oracle.rs` under `--features c-oracle`, which compiles a reference library from the retained in-tree C sources and diffs live output: **3,750/3,750** and **50/50** byte-identical. `flate2` does **not** establish this — it is a different encoder and only proves wire-format interoperability. | Complete. Re-run `cargo test --locked --features c-oracle` after any change under `src/deflate/**`. | 6h | ✅ Done |
 | 5 | `cargo-fuzz` targets | Resolved. Five targets under `fuzz/fuzz_targets/` in a detached workspace with its own `Cargo.toml` and `Cargo.lock` but **no policy file of its own** — the single root `deny.toml` governs this 13-package graph as well, aimed at it by `audit.yml`'s `cargo-deny-fuzz` job with `--manifest-path fuzz/Cargo.toml --config deny.toml`; `fuzz.yml` builds all five and runs each on a **weekly** `cron: '0 3 * * 1'`, alongside `pull_request` and `workflow_dispatch` triggers. | None. The two former follow-ups have both landed: each target now has its own `actions/cache` step keyed `fuzz-corpus-<target>-${{ github.run_id }}` with prefix-matching `restore-keys`, so corpora persist across runs and any crash input is preserved by an `actions/upload-artifact` step; and the budget is now `MAX_TOTAL_TIME` — **120 s** per target on pull requests, **600 s** on schedule or manual dispatch. | 0h | ✅ Resolved |
-| 6 | Unsafe code security audit | Structurally complete; human sign-off outstanding. `unsafe` is confined to `src/ffi/**` and one private runtime block in `src/lib.rs`, and confinement is a **hard compile error** — `#![deny(unsafe_code)]` crate-wide with exactly two `#[allow(unsafe_code)]` carve-outs, plus a dedicated `unsafe-boundary` CI job. The eight core module groups measure **zero**. All **592** `// SAFETY:` comments are present and `clippy::undocumented_unsafe_blocks` is clean under `-D warnings`. Section 8.5 gives the counts and the exact counting method. | 1. Human review of each `unsafe` site and its `// SAFETY:` invariant 2. Keep the boundary job blocking 3. Continue fuzzing the FFI round trip | 3h | ⚠️ Human review |
+| 6 | Unsafe code security audit | Structurally complete; human sign-off outstanding. `unsafe` is confined to `src/ffi/**` and one private runtime block in `src/lib.rs`, and confinement is a **hard compile error** — `#![deny(unsafe_code)]` crate-wide with exactly two `#[allow(unsafe_code)]` carve-outs, plus a dedicated `unsafe-boundary` CI job. The eight core module groups measure **zero**. All **597** `// SAFETY:` comments are present and `clippy::undocumented_unsafe_blocks` is clean under `-D warnings`. Section 8.5 gives the counts and the exact counting method. | 1. Human review of each `unsafe` site and its `// SAFETY:` invariant 2. Keep the boundary job blocking 3. Continue fuzzing the FFI round trip | 3h | ⚠️ Human review |
 | 7 | `no_std` integration testing on hardware | Partially open. Hosted `no_std` passes 737 tests, and the bare-metal target now both **builds** and **runs**: `bare-metal-run` executes it on an emulated no-OS Cortex-M4, exercising the private libc-backed allocator, the fallible-allocation path (`Z_MEM_ERROR` rather than an abort on an exhausted heap) and the gzip feature gate in both directions. What is still unproven is behaviour on a real device — emulation reproduces the ISA, not the silicon. | 1. Flash the `thumbv7em-none-eabihf` build to a real device 2. Exercise compress/decompress/checksum with the caller-hook allocator 3. Confirm the abort panic handler behaves as intended on silicon | 3h | ⚠️ Open |
 | 8 | Production edge-case hardening | Largely covered by the suite: `tests/inflate_coverage.rs` (**30** tests, one of them gated on the `gzip` feature so 29 run under `--no-default-features`) ports C `test/infcover.c`'s malformed-stream table, `compress_bound` is verified against the C formula including the saturating-overflow path, and the flush modes and preset dictionaries are exercised by `tests/regression.rs` and `tests/round_trip.rs`. | Remaining: adversarial-input soak time via the fuzz corpus rather than new unit tests. | 4h | ✅ Largely done |
 | 9 | Documentation refinement | Done for the mechanical part: **29** doc tests run in the default row (28 runnable + 1 `compile_fail`), `cargo doc --locked` exits 0, `missing_docs` is an error under `-D warnings`, and the MkDocs site builds under `--strict`. | Remaining: editorial review. | 2h | ✅ Largely done |
@@ -611,7 +611,7 @@ command has not been run.
 | A change to the match finder silently alters output while still round-tripping | **Open by nature — Medium** | A different-but-valid Huffman tree or token stream breaks byte-identity without breaking decodability, so a round-trip test would not catch it | Any edit to `src/deflate/{state,slow,fast,rle,stored,trees,strategy}.rs` must clear the byte-identity gate before merge. This is why no compression "optimisation" is accepted on benchmark evidence alone |
 | Compression throughput sits below C on incompressible input | **Accepted — Low** | Slower compression on high-entropy input only | **There is no numeric throughput requirement to miss.** The plan states performance is a *constraint* on the refactor, not its objective; no percentage target exists in it, and an earlier revision of this guide invented an "≥ 80% of C" bar that was never a requirement. Measured position: compression **113–161%** of C on compressible input and **82–94%** on incompressible input; decompression **101–160%** (`uncompress`) and **216–344%** (`inflateBack`, on input that decodes Huffman symbols). The earlier "compression ≈ 85% / decompression 107–127%" aggregate is retired. Permissible tuning is limited to work that provably cannot change the token stream |
 | Per-stream initialisation cost at level 1 with a non-default `memLevel` | **Accepted — Low** | 70–74% of C on a 64 KiB payload; 87% at 1 MiB | Structural, not a defect: owned buffers are zero-filled when created (a safe `Vec` always is), whereas C's `ZALLOC` is a plain `malloc`. Skipping the fill would need an `unsafe` carve-out outside `src/ffi/**`, which `#![deny(unsafe_code)]` forbids, or an abort-on-OOM allocation that breaks the fallible `Z_MEM_ERROR` contract. It amortises with payload size, and the `memLevel = 9` variant reaches 149% at 1 MiB |
-| `unsafe` code hides an unsound invariant | **Open — High impact, Low likelihood** | A memory-safety defect would defeat the point of the rewrite | Containment is structural, not aspirational: `#![deny(unsafe_code)]` crate-wide with exactly **two** `#[allow(unsafe_code)]` carve-outs, so a violation in a core module is a compile error. All **1,265** `unsafe { … }` blocks live in `src/ffi/**` (1,250) and `src/lib.rs` (15 — 14 in the private no-`std` runtime block, one a string fixture inside the boundary test); the eight core module groups measure **zero**. **592** `// SAFETY:` comments, enforced by `clippy::undocumented_unsafe_blocks` under `-D warnings`. Residual risk is *human review* of the boundary, not its location |
+| `unsafe` code hides an unsound invariant | **Open — High impact, Low likelihood** | A memory-safety defect would defeat the point of the rewrite | Containment is structural, not aspirational: `#![deny(unsafe_code)]` crate-wide with exactly **two** `#[allow(unsafe_code)]` carve-outs, so a violation in a core module is a compile error. All **1,270** `unsafe { … }` blocks live in `src/ffi/**` (1,255) and `src/lib.rs` (15 — 14 in the private no-`std` runtime block, one a string fixture inside the boundary test); the eight core module groups measure **zero**. **597** `// SAFETY:` comments, enforced by `clippy::undocumented_unsafe_blocks` under `-D warnings`. Residual risk is *human review* of the boundary, not its location |
 | `no_std` rows break CI | **Resolved** | Two of the test configurations would not build | `alloc` imports fixed; `--no-default-features` and `--no-default-features --features no-std` each pass **737** tests, with a dedicated blocking `no-std-tests` job |
 
 ### 7.2 Security Risks
@@ -798,15 +798,15 @@ cargo package --locked --list | grep -cE '\.(c|h|in|map|pc)$|^(contrib|examples|
 | Metric | Value | Reproduce with |
 |--------|-------|----------------|
 | Rust files | **52** = 40 `src/` + 8 `tests/` + 3 `benches/` + 1 `build.rs`. The command yields **51**; `build.rs` is the 52nd and lives at the repository root, outside all three directories | `git ls-files src tests benches \| grep -c '\.rs$'` (plus `build.rs`) |
-| Source lines (`src/`) | **80,286** | `git ls-files src \| grep '\.rs$' \| xargs wc -l \| tail -1` |
-| Test lines (`tests/`) | **19,452** (8 files) | same form over `tests` |
+| Source lines (`src/`) | **80,352** | `git ls-files src \| grep '\.rs$' \| xargs wc -l \| tail -1` |
+| Test lines (`tests/`) | **19,480** (8 files) | same form over `tests` |
 | Benchmark lines (`benches/`) | **1,267** (3 files) | same form over `benches` |
 | Build script (`build.rs`) | **2,397** | `wc -l build.rs` |
 | Fuzz target lines | **8,852** (5 targets) | same form over `fuzz/fuzz_targets` |
-| `unsafe { … }` blocks | **1,265** — `src/ffi/**` 1,250 (`inflate` 474, `deflate` 335, `gz` 134, `types` 132, `util` 130, `alloc` 41, `mod` 4) and `src/lib.rs` 15. **Zero** in `deflate/`, `inflate/`, `checksum/`, `gz/`, `util/`, `error.rs`, `constants.rs`, `gz_header.rs` | `find src -name '*.rs' \| while read f; do sed 's://.*::' "$f" \| grep -cE 'unsafe \{'; done` |
+| `unsafe { … }` blocks | **1,270** — `src/ffi/**` 1,255 (`inflate` 474, `deflate` 335, `gz` 134, `types` 137, `util` 130, `alloc` 41, `mod` 4) and `src/lib.rs` 15. **Zero** in `deflate/`, `inflate/`, `checksum/`, `gz/`, `util/`, `error.rs`, `constants.rs`, `gz_header.rs` | `find src -name '*.rs' \| while read f; do sed 's://.*::' "$f" \| grep -cE 'unsafe \{'; done` |
 | `unsafe fn` declarations | **72** | `sed 's://.*::' \| grep -cE 'unsafe fn'` over `src/**` |
 | `extern "C"` sites | **258** | same form for `extern "C"` |
-| `// SAFETY:` comments | **592**, with zero undocumented unsafe blocks | `grep -rn '// SAFETY:' src \| wc -l`, enforced by `clippy::undocumented_unsafe_blocks` under `-D warnings` |
+| `// SAFETY:` comments | **597**, with zero undocumented unsafe blocks | `grep -rn '// SAFETY:' src \| wc -l`, enforced by `clippy::undocumented_unsafe_blocks` under `-D warnings` |
 | Unit tests | **867** | `cargo test --locked --lib` |
 | Integration tests | **143** default (+13 `c_oracle` under `--features c-oracle`) | `cargo test --locked --tests` reports **1010** = 867 lib + 143 |
 | Doc tests | **29** (28 runnable + 1 `compile_fail`) | `cargo test --locked --doc` |
@@ -816,7 +816,7 @@ cargo package --locked --list | grep -cE '\.(c|h|in|map|pc)$|^(contrib|examples|
 > them.** The row above counts `unsafe { … }` *blocks*, which is what the command beside it measures.
 > `technical-specifications.md` §0.6.2 instead counts comment-stripped `\bunsafe\b` **construct lines** —
 > a wider net that also catches `unsafe extern`, `unsafe fn` and `unsafe impl` — and therefore reports
-> **1,662** for `src/ffi/**` against the 1,250 here. Both are correct for their own definition. Match a
+> **1,667** for `src/ffi/**` against the 1,255 here. Both are correct for their own definition. Match a
 > document's own command before changing one of its numbers. A third variant exists and is also not
 > interchangeable: a scan that drops only *whole-line* comments reports **51** construct lines for
 > `src/lib.rs` where the comment-stripped scan reports **49**, the two-line gap being the string-literal
@@ -843,7 +843,7 @@ Line counts below are current and every subtotal sums exactly to its children; t
 to the seven groups. Regenerate the whole block with:
 
 ```sh
-git ls-files src | grep '\.rs$' | xargs wc -l | tail -1          # 80286 total
+git ls-files src | grep '\.rs$' | xargs wc -l | tail -1          # 80352 total
 for d in deflate inflate checksum gz util ffi; do
   printf '%-10s %s\n' "$d" "$(git ls-files "src/$d" | grep '\.rs$' | xargs wc -l | tail -1)"
 done
@@ -854,7 +854,7 @@ intervening path component and so silently drops the five files directly under `
 `git ls-files src | grep '\.rs$'`.
 
 ```text
-src/                                  (40 files, 80,286 lines)
+src/                                  (40 files, 80,352 lines)
 ├── lib.rs           (4,285 lines) — Crate root, curated re-exports, version constants,
 │                                     #![deny(unsafe_code)] plus the two carve-outs, and the
 │                                     private no_std libc allocator + abort panic handler
@@ -900,9 +900,9 @@ src/                                  (40 files, 80,286 lines)
 │   ├── uncompress.rs  (216 lines) — the uncompr.c driver loop, engine-agnostic behind
 │                                     the OneCallInflate port trait
 │   └── mod.rs          (335 lines) — Shared internals and OS_CODE selection
-└── ffi/                              (7 files, 31,067 lines) — the SOLE unsafe module
+└── ffi/                              (7 files, 31,133 lines) — the SOLE unsafe module
     ├── inflate.rs   (8,855 lines) — extern "C" inflate* / inflateBack* entry points (22)
-    ├── types.rs     (5,698 lines) — #[repr(C)] mirrors, HandleKind, the guard_* helpers
+    ├── types.rs     (5,764 lines) — #[repr(C)] mirrors, HandleKind, the guard_* helpers
     ├── gz.rs        (5,080 lines) — extern "C" gz* entry points (34)
     ├── deflate.rs   (5,070 lines) — extern "C" deflate* entry points (17)
     ├── alloc.rs     (2,446 lines) — CForeignBuffer / try_alloc_foreign zalloc-zfree bridge

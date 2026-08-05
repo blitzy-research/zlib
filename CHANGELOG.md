@@ -165,9 +165,9 @@ every entry in one would have to be invented.
   in [`tests/checksum.rs`](tests/checksum.rs); and the two-tier byte-identity and
   wire-format gate in [`tests/interop.rs`](tests/interop.rs).
   **1039 tests pass** by default — 867 in-crate unit tests, 143 integration tests
-  (`checksum` 23, `gzip_compat` 17, `inflate_coverage` 30, `interop` 30,
-  `regression` 13, `round_trip` 19), and 29 doctests (28 runnable plus one
-  `compile_fail`) — with **0 failed and 0 ignored**. `--no-default-features`
+  (`checksum` 23, `ffi_alloc_balance` 10, `gzip_compat` 17, `inflate_coverage` 30,
+  `interop` 30, `regression` 13, `round_trip` 20), and 29 doctests (28 runnable
+  plus one `compile_fail`) — with **0 failed and 0 ignored**. `--no-default-features`
   passes **737** (600 unit + 110 integration + 27 doctests) and `--all-features`
   passes **1052**. CI parses every
   `test result:` line and fails on any failure, on any *ignored* test, or on a
@@ -308,7 +308,7 @@ the security properties the initial release establishes.
   aliases only** — `ZallocFn` and `ZfreeFn`, which merely *name* the C hook
   signatures the crate must interoperate with. `grep -c "unsafe {"` on that file
   returns 0, and the module carries its own `#![deny(unsafe_code)]`.)
-- **Every `unsafe` block that does exist is justified in place.** **592
+- **Every `unsafe` block that does exist is justified in place.** **597
   `// SAFETY:` comments** across `src/`, with
   `#![warn(clippy::undocumented_unsafe_blocks)]` and `#![warn(missing_docs)]`
   promoted to hard errors by the `-D warnings` lint gate. Containment is checked

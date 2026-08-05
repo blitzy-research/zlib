@@ -57,7 +57,7 @@ Know the scale of what you are touching:
 
 | Quantity | Measured value | How it was measured |
 |----------|----------------|---------------------|
-| Rust modules under `src/` | **40 files**, **80,286 lines** (2026-08-04) | `find src -name '*.rs' -print0 \| xargs -0 wc -l` — the `total` row, with the file count from the same listing |
+| Rust modules under `src/` | **40 files**, **80,352 lines** (2026-08-04) | `find src -name '*.rs' -print0 \| xargs -0 wc -l` — the `total` row, with the file count from the same listing |
 | Retained C baseline | **23,107 lines** across 26 root translation units and headers | `cat` of the 26 files piped to `wc -l` |
 | Public C entry points the baseline declares | **119** `ZEXTERN` declarations in `zlib.h` | the retained header |
 | Exported C symbols this crate emits | **95**, all type `T` | `nm -D --defined-only target/release/libzlib_rs.so` |
@@ -501,8 +501,9 @@ different total is information, not noise — find out why before you push.
 | `cargo test --locked --no-default-features --features no-std` | **737 passed / 0 failed / 0 ignored** |
 
 The 1039 decompose as **867** in-crate unit tests, **143** integration tests
-(`checksum` 23, `gzip_compat` 17, `inflate_coverage` 30, `interop` 30, `regression`
-13, `round_trip` 19), and **29** doctests — 28 runnable plus one `compile_fail`.
+(`checksum` 23, `ffi_alloc_balance` 10, `gzip_compat` 17, `inflate_coverage` 30,
+`interop` 30, `regression` 13, `round_trip` 20), and **29** doctests — 28 runnable
+plus one `compile_fail`.
 `--all-features` adds the **13** tests of the opt-in live C-oracle harness. Under
 `--no-default-features` the total is **600** unit + **110** integration + **27**
 doctests, and the `gzip_compat` suite correctly
@@ -1047,11 +1048,11 @@ reports, so the two documents report the same numbers.
 | `src/ffi/inflate.rs` | 538 | `extern "C"` entry points, pointer validation |
 | `src/ffi/deflate.rs` | 373 | as above |
 | `src/ffi/gz.rs` | 212 | gzip file API, C strings, descriptors, the raw-descriptor owners |
-| `src/ffi/types.rs` | 188 | ABI mirrors, hook aliases, handle tagging, raw header descriptors |
+| `src/ffi/types.rs` | 193 | ABI mirrors, hook aliases, handle tagging, raw header descriptors |
 | `src/ffi/util.rs` | 184 | one-call wrappers, checksums, version, compile flags |
 | `src/ffi/mod.rs` | 113 | wiring plus the ABI-drift guard |
 | `src/ffi/alloc.rs` | 54 | the `zcalloc` / `zcfree` bridge |
-| **`src/ffi/**` total** | **1,662** | the designated boundary |
+| **`src/ffi/**` total** | **1,667** | the designated boundary |
 | `src/lib.rs` | 51 | the freestanding runtime block described above (**22** of the 51, `mod no_std_support` at L210-L425) plus the **29** in the in-crate boundary tests that police it |
 | `src/stream.rs` | 2 | **type aliases only** |
 | All eight core module groups | **0** | — |
@@ -1082,7 +1083,7 @@ It is not trusted, and it is not a review convention:
    make the two boundary carve-outs inexpressible.
 2. **`#![warn(clippy::undocumented_unsafe_blocks)]`** alongside
    `#![warn(missing_docs)]`, both promoted to hard errors by the `-D warnings` lint
-   gate. There are **592** `// SAFETY:` comments in `src/`, and every `unsafe` block in
+   gate. There are **597** `// SAFETY:` comments in `src/`, and every `unsafe` block in
    shipped code must carry one, immediately adjacent, where a reader will meet it.
 3. **In-crate boundary tests** that re-derive the boundary from the source text —
    blanking comments and literals, classifying each `unsafe` token, and treating a

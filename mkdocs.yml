@@ -63,12 +63,46 @@ nav:
   - Project Guide: project-guide.md
   - Technical Specifications: technical-specifications.md
 
-# `techdocs-core` supplies the Backstage-compatible theme, the Markdown extension
-# set, and search, which is why no `theme:` and no `markdown_extensions:` block
+# `techdocs-core` supplies the Backstage-compatible theme and the Markdown
+# extension set, which is why no `theme:` and no `markdown_extensions:` block
 # appears here: the preset replaces a foreign `theme:` outright, resets the
 # palette, and merely logs when overridden theme settings are in use, so
 # declaring either block competes with it and is a known way to break TechDocs
 # rendering.
+#
+# SEARCH IS THE ONE THING THE PRESET DOES NOT SUPPLY WORKING, and the two keys
+# below are both required to get it. Left alone, the preset produces a site with
+# no search at all -- silently, with `--strict` still exiting 0:
+#
+#   1. `techdocs-core`'s own `use_material_search` option defaults to FALSE. In
+#      that state the preset installs MkDocs' DEFAULT-THEME search plugin
+#      (`mkdocs.contrib.search.SearchPlugin`), which appends `search/main.js` to
+#      `extra_javascript`. That script is written for the default theme and
+#      dereferences a `base_url` global which the Material theme never defines,
+#      so every built page threw `ReferenceError: base_url is not defined` at
+#      `search/main.js` line 106 and no worker, index or lunr resource ever
+#      loaded. Setting the option to `true` swaps in Material's own search plugin
+#      and stops the legacy script being injected.
+#   2. That alone is still not enough. The preset registers whichever plugin it
+#      chose under the dict key `search`, never under `material/search` -- and
+#      Material's header partial gates the entire searchbox on
+#      `{% if "material/search" in config.plugins %}`. With only key 1 applied,
+#      the ReferenceError disappears but the markup is still absent: no
+#      `.md-search`, no textbox, no search landmark, and `/`, `s` and `f` are
+#      inert. Declaring `material/search` here is what puts the canonical key in
+#      `config.plugins` and makes the header render the field.
+#
+# ORDER IS LOAD-BEARING: `material/search` must stay AFTER `techdocs-core`.
+# MkDocs dispatches `on_config` in declaration order, Material's search plugin
+# resolves its default `lang`, `separator` and `pipeline` by translating against
+# `config.theme`, and `techdocs-core` is what swaps `theme` from `mkdocs` to
+# `material` inside its own `on_config`. Listing the search plugin first would
+# make it translate against the wrong theme.
+#
+# Judge any future change here the way the defect was found -- on a BUILT page,
+# not from the config or the build log. Assert
+# `document.querySelectorAll('.md-search__input').length === 1`, that no request
+# for `search/main.js` is made, and that the console is clean.
 #
 # `mermaid2` is declared, so `mkdocs build --strict` needs the
 # `mkdocs-mermaid2-plugin` package installed -- ci.yml's `docs` job pins it at
@@ -89,5 +123,7 @@ nav:
 # change here by asserting `document.querySelectorAll('pre.mermaid').length > 0`
 # on a built page, never by that log line.
 plugins:
-  - techdocs-core
+  - techdocs-core:
+      use_material_search: true
+  - material/search
   - mermaid2

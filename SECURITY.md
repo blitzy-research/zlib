@@ -621,8 +621,8 @@ contain `unsafe` at all:
 
 | Location | Unsafe-bearing code lines |
 |----------|---------------------------|
-| `src/ffi/` (carve-out 1 — the designated boundary) | **1,662** — `inflate.rs` 538, `deflate.rs` 373, `gz.rs` 212, `types.rs` 188, `util.rs` 184, `mod.rs` 113, `alloc.rs` 54 |
-| `src/lib.rs` (carve-out 2 — the freestanding runtime block, plus the boundary tests that police it) | **51**, split **22 / 29**. The **22** sit inside the private `mod no_std_support` (L207–L422): the libc-backed `#[global_allocator]`, the `#[panic_handler]`, and the personality symbol. The other **29** are all inside `#[cfg(test)] mod tests` — the boundary scanner's own parsing logic, its assertion messages, and the deliberately adversarial corpus it is fed. **No executable `unsafe` exists anywhere else in the file**, and an in-crate test asserts precisely that rather than trusting it |
+| `src/ffi/` (carve-out 1 — the designated boundary) | **1,667** — `inflate.rs` 538, `deflate.rs` 373, `gz.rs` 212, `types.rs` 193, `util.rs` 184, `mod.rs` 113, `alloc.rs` 54 |
+| `src/lib.rs` (carve-out 2 — the freestanding runtime block, plus the boundary tests that police it) | **51**, split **22 / 29**. The **22** sit inside the private `mod no_std_support` (L210–L425): the libc-backed `#[global_allocator]`, the `#[panic_handler]`, and the personality symbol. The other **29** are all inside `#[cfg(test)] mod tests` — the boundary scanner's own parsing logic, its assertion messages, and the deliberately adversarial corpus it is fed. **No executable `unsafe` exists anywhere else in the file**, and an in-crate test asserts precisely that rather than trusting it |
 | `src/deflate/`, `src/inflate/`, `src/checksum/`, `src/gz/`, `src/util/`, `src/error.rs`, `src/constants.rs`, `src/gz_header.rs` | **0** |
 | `src/stream.rs` | **2**, and both are `type` aliases only — `ZallocFn` and `ZfreeFn` merely *name* the C hook signatures the crate interoperates with. `grep -c "unsafe {"` on that file returns **0**, and the module carries its own `#![deny(unsafe_code)]` |
 
@@ -639,14 +639,17 @@ done
 One reconciliation is worth stating explicitly, because a slightly different
 scan yields a slightly different number for `src/lib.rs` and neither is wrong.
 A stricter variant that *also* discards text following a trailing `//` reports
-**47** instead of 49. The two lines that drop out are the string literals
-`"// unsafe\n"` and `"//! unsafe\n"` inside the boundary test's corpus, which
+**49** instead of the **51** in the table above — reproduce that variant with
+`sed 's://.*::' src/lib.rs | grep -c '\bunsafe\b'`. The two lines that drop out
+are the string literals `"// unsafe\n"` and `"//! unsafe\n"` at `src/lib.rs`
+L4222 and L4225, inside the boundary test's corpus, which
 exist for the sole purpose of proving that the scanner ignores commented-out
-`unsafe`. The table quotes the whole-line-comment variant throughout so that
+`unsafe`. The split follows the same rule: **22 / 27** under the stricter scan
+against the **22 / 29** quoted in the table. The table quotes the whole-line-comment variant throughout so that
 `src/ffi/`, `src/lib.rs`, and `src/stream.rs` are all measured by one identical
 method; a mixed methodology would make the rows incomparable.
 
-Every `unsafe` block that does exist is justified in place: **592** `// SAFETY:`
+Every `unsafe` block that does exist is justified in place: **597** `// SAFETY:`
 comments across `src/`, with `#![warn(clippy::undocumented_unsafe_blocks)]` and
 `#![warn(missing_docs)]` promoted to hard errors by the `-D warnings` lint gate.
 Containment is checked four independent ways — the `deny` attribute, that lint
@@ -826,7 +829,7 @@ sits here:
   QEMU reproduces the ISA, the memory map and the absence of an OS, but not a
   device's timing, memory controller or peripheral behaviour, so validation on
   real silicon remains genuinely outstanding.
-- **Human code review across the full Rust surface — 80,286 lines across 40 files
+- **Human code review across the full Rust surface — 80,352 lines across 40 files
   under `src/`, measured on 2026-08-04 with
   `find src -name '*.rs' -print0 | xargs -0 wc -l` — is outstanding**, and it is
   the highest-severity remaining hardening item

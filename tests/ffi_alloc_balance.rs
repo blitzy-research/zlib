@@ -201,9 +201,9 @@ fn heap_delta_after_warmup(mut body: impl FnMut()) -> (isize, isize) {
 ///
 /// `what` names the lifecycle under test so a failure identifies the leaking
 /// entry point rather than merely the fact that something leaked. The reported
-/// per-block average is what makes the diagnosis immediate: a 32-byte average is
-/// the `CEngineHome` cell, and the block count is the number of engines that
-/// leaked one.
+/// per-block average is what makes the diagnosis immediate: an average of four
+/// pointer-sized words — 32 bytes on LP64, 16 on ILP32 — is the `CEngineHome`
+/// cell, and the block count is the number of engines that leaked one.
 fn assert_global_heap_balanced(what: &str, body: impl FnMut()) {
     let (bytes, blocks) = heap_delta_after_warmup(body);
     assert_eq!(
@@ -513,26 +513,54 @@ fn inflate_round(hook: &Hook, compressed: &[u8], expected: &[u8]) {
 /// The meter observes a deliberate leak of exactly the defect's size and shape.
 ///
 /// Without this, every assertion in this file could pass because the meter never
-/// counts anything. It plants one 32-byte allocation — the size of the
-/// `CEngineHome` cell that leaked — confirms the meter reports exactly
-/// `(32, 1)`, and then reclaims it so the process stays clean.
+/// counts anything. It plants one allocation shaped exactly like the
+/// `CEngineHome` cell that leaked — one pointer plus a three-word hook, so four
+/// pointer-sized words — confirms the meter reports precisely that many bytes in
+/// one block, and then reclaims it so the process stays clean.
+///
+/// # Why the planted size is derived rather than written down
+///
+/// Four pointer-sized words measure **32 bytes on LP64 and 16 on ILP32**. A
+/// hard-coded 32 therefore made this self-check — and *only* this self-check —
+/// fail on `i686-unknown-linux-gnu` while all nine real balance assertions in
+/// this file passed, which is exactly the wrong way round: a portability defect
+/// in the meter's own proof of liveness must never be able to masquerade as, or
+/// mask, a leak in the product. So the expected delta comes from
+/// [`size_of`](core::mem::size_of) applied to the probe itself, and the
+/// width-keyed geometry assertions below still pin both layouts so the probe
+/// cannot silently stop mirroring the real cell. AAP standard S8: a platform
+/// claim is only worth what the platform actually runs.
 #[test]
 fn the_meter_observes_a_deliberate_leak() {
     /// Same shape as the cell that leaked: one pointer plus a three-word hook.
-    struct Cell32 {
+    ///
+    /// Named for what it is rather than for how wide it happens to be on the
+    /// host, because its width is the whole point of this test.
+    struct HomeCell {
         _ptr: *mut u8,
         _zalloc: Option<unsafe extern "C" fn(*mut c_void, c_uint, c_uint) -> *mut c_void>,
         _zfree: Option<unsafe extern "C" fn(*mut c_void, *mut c_void)>,
         _opaque: *mut c_void,
     }
+
+    // `NonNull<E>` plus `AllocHook`'s three words: four pointer-sized fields,
+    // none of them padded, on every target this crate builds for.
+    let cell_size = core::mem::size_of::<HomeCell>();
+    let words = 4 * core::mem::size_of::<usize>();
     assert_eq!(
-        core::mem::size_of::<Cell32>(),
-        32,
-        "the probe must mirror the 32-byte cell the defect leaked"
+        cell_size, words,
+        "the probe must mirror the leaked cell's four pointer-sized words, \
+         which is {words} byte(s) on this target"
     );
+    // The two geometries that exist in CI, pinned explicitly so a change in the
+    // real cell's shape is caught rather than absorbed by the derivation above.
+    #[cfg(target_pointer_width = "64")]
+    assert_eq!(cell_size, 32, "LP64 geometry: four 8-byte words");
+    #[cfg(target_pointer_width = "32")]
+    assert_eq!(cell_size, 16, "ILP32 geometry: four 4-byte words");
 
     let (before_bytes, before_blocks) = reading();
-    let leaked = Box::into_raw(Box::new(Cell32 {
+    let leaked = Box::into_raw(Box::new(HomeCell {
         _ptr: ptr::null_mut(),
         _zalloc: Some(hook_zalloc),
         _zfree: Some(hook_zfree),
@@ -541,9 +569,9 @@ fn the_meter_observes_a_deliberate_leak() {
     let (during_bytes, during_blocks) = reading();
     assert_eq!(
         (during_bytes - before_bytes, during_blocks - before_blocks),
-        (32, 1),
-        "the meter must observe a 32-byte, one-block leak; if it cannot see this, \
-         every balance assertion in this file is vacuous"
+        (cell_size as isize, 1),
+        "the meter must observe a {cell_size}-byte, one-block leak; if it cannot \
+         see this, every balance assertion in this file is vacuous"
     );
 
     // SAFETY: `leaked` came from `Box::into_raw` on this same thread and has not

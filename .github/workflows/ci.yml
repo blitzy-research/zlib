@@ -1560,8 +1560,8 @@ jobs:
     #
     # THREE `unsafe` COUNTS ARE IN CIRCULATION AND THEY ARE NOT INTERCHANGEABLE,
     # which is why they are gated separately rather than folded together:
-    #   * `unsafe { .. }` blocks, comment-stripped              -> 1,265 crate-wide
-    #   * `\bunsafe\b` construct lines, comment-stripped        -> 1,662 in src/ffi
+    #   * `unsafe { .. }` blocks, comment-stripped              -> 1,270 crate-wide
+    #   * `\bunsafe\b` construct lines, comment-stripped        -> 1,667 in src/ffi
     #   * `\bunsafe\b` construct lines, whole-line strip only   -> differs from the
     #     stripped scan by exactly two lines, and only in `src/lib.rs`, where the
     #     boundary test carries the string literals "// unsafe" and "//! unsafe"
@@ -1779,6 +1779,45 @@ jobs:
             return lines_of([p for p in SRC if p.startswith("src/%s/" % name)])
 
 
+        # The cfg gate that makes a test LP64-and-not-Windows only. `cross-run`'s
+        # commentary depends on how many tests carry it, because the i686 row's library
+        # total is lower than the LP64 rows' by exactly that many tests, and that
+        # sentence went stale by 70 tests before anything checked it.
+        LP64_GATE = r'#\[cfg\(all\(target_pointer_width = "64", not\(windows\)\)\)\]'
+
+
+        def lp64_only_tests():
+            """`#[test]` functions that exist only on 64-bit non-Windows targets.
+
+            Counted structurally, not by eye. An occurrence qualifies only when the
+            contiguous attribute block it belongs to also carries `#[test]` and the item
+            that block introduces is a `fn`. Both halves matter: the block scan runs in
+            BOTH directions because this tree writes the gate above `#[test]` in
+            `src/ffi/types.rs` and below it in the two `state.rs` pairs, and the `fn`
+            requirement is what excludes the `const _` layout assertion in
+            `src/ffi/types.rs` that carries the very same gate.
+            """
+            n = 0
+            for p in SRC:
+                with open(os.path.join(ROOT, p), encoding="utf-8") as fh:
+                    lines = fh.read().split("\n")
+                for i, ln in enumerate(lines):
+                    if not re.search(LP64_GATE, ln):
+                        continue
+                    lo = i
+                    while lo > 0 and lines[lo - 1].lstrip().startswith("#["):
+                        lo -= 1
+                    hi = i
+                    while hi + 1 < len(lines) and lines[hi + 1].lstrip().startswith("#["):
+                        hi += 1
+                    block = lines[lo:hi + 1]
+                    item = lines[hi + 1] if hi + 1 < len(lines) else ""
+                    if (any(a.lstrip().startswith("#[test]") for a in block)
+                            and item.lstrip().startswith("fn ")):
+                        n += 1
+            return n
+
+
         MEASURE = {
             "src_files":            lambda: len(SRC),
             "src_lines":            lambda: lines_of(SRC),
@@ -1873,6 +1912,10 @@ jobs:
             "env_keys_ci":          lambda: grep_count(WORKFLOWS[:1], r"^ +RUSTUP_TOOLCHAIN:"),
             "env_keys_audit":       lambda: grep_count(WORKFLOWS[1:2], r"^ +RUSTUP_TOOLCHAIN:"),
             "env_keys_fuzz":        lambda: grep_count(WORKFLOWS[2:3], r"^ +RUSTUP_TOOLCHAIN:"),
+            # Cross-row test-count arithmetic. Not the totals themselves - this gate
+            # never runs cargo - but the invariant the totals must satisfy, which is the
+            # durable half of the claim and the half that can be checked statically.
+            "lp64_only_tests":      lp64_only_tests,
             # AAP citation census
             "cite_scanned":         lambda: len(CITE_POP),
             "cite_citing":          lambda: sum(
@@ -1951,6 +1994,17 @@ jobs:
             ([PG], r"\*whole-line\* comments reports \*\*(\d+)\*\* construct lines", "construct_lib_whole", 1),
             (["CONTRIBUTING.md"], r"only \*whole-line\* comments reports \*\*(\d+)\*\* rather than", "construct_lib_whole", 1),
             (["SECURITY.md"], r"police it\) \| \*\*(\d+)\*\*, split \*\*22 / 29\*\*", "construct_lib_whole", 1),
+            # SECURITY.md's stricter-scan reconciliation sentence was the one `unsafe`
+            # figure no claim covered, and it drifted two revisions without anything
+            # noticing: it read 47 against a table saying 49 while the tree measured
+            # 49 stricter / 51 looser. Both halves of that one sentence are gated now,
+            # so neither number can go stale again while the other is corrected.
+            (["SECURITY.md"],
+             r"discards text following a trailing `//` reports\n\*\*(\d+)\*\* instead of the",
+             "construct_lib_strip", 1),
+            (["SECURITY.md"],
+             r"reports\n\*\*\d+\*\* instead of the \*\*(\d+)\*\* in the table above",
+             "construct_lib_whole", 1),
             ([BPG], r"\*\*(\d+)\*\* in `src/lib\.rs`, of which 22", "construct_lib_whole", 1),
             ([PG], r"comment-stripped scan reports \*\*(\d+)\*\*", "construct_lib_strip", 1),
             (["CONTRIBUTING.md"], r"rather than the canonical \*\*(\d+)\*\*", "construct_lib_strip", 1),
@@ -2053,6 +2107,260 @@ jobs:
         ]
 
 
+        # ---------------------------------------------------------------------------
+        # Structural checks. A CLAIMS row gates ONE number against ONE counter, which is
+        # the right shape for a total but the wrong shape for a list: a decomposition can
+        # be individually plausible in every figure it prints and still be wrong, because
+        # it left a member out. The two checks below gate shape and arithmetic instead.
+        # ---------------------------------------------------------------------------
+        DECOMP_FILES = ["README.md", "CHANGELOG.md", "CONTRIBUTING.md", TS, BPG]
+
+        # One `<suite> <count>` pair as any of these documents writes it: bare in the
+        # specification's tables, backticked in the prose files.
+        SUITE_PAIR = re.compile(r"`?([a-z_][a-z_0-9]*)`? (\d+)")
+
+
+        def default_suites():
+            """The integration suites that run under the default feature set.
+
+            Derived from the tree rather than transcribed, which is the entire point:
+            adding `tests/<new>.rs` immediately makes every published decomposition that
+            omits it a failure. `c_oracle` is excluded because it is gated behind the
+            opt-in `c-oracle` feature and so is absent from a default run.
+            """
+            return {os.path.basename(p)[:-3] for p in TESTS} - {"c_oracle"}
+
+
+        def decomp_blobs(body):
+            """Every per-suite integration decomposition in `body`, as (offset, text).
+
+            Recognised by its first and last suite as published: one opens at a
+            `checksum <n>` mention and closes at the `round_trip <n>` ending the same
+            parenthetical. Returning the raw span lets the caller parse whatever
+            separator that document happens to use - commas in the prose files, middle
+            dots in the Project Guide - without this gate having to know which.
+            """
+            out = []
+            for m in re.finditer(r"`?checksum`? \d+", body):
+                window = body[m.start():m.start() + 500]
+                end = re.search(r"`?round_trip`? \d+", window)
+                if end:
+                    out.append((m.start(), window[:end.end()]))
+            return out
+
+
+        def check_decompositions():
+            """Assert every published per-suite decomposition is complete and consistent.
+
+            Two properties, neither of which needs a test run:
+
+            * COMPLETE - it names every suite that runs by default, each exactly once.
+              This is the check that would have caught three public documents printing
+              six suites while claiming a seven-suite total, their visible lists summing
+              to 132 against a stated 143.
+            * CONSISTENT - all default-feature decompositions agree suite by suite, and
+              each sums to the total published immediately beside it. Cross-document
+              agreement is what catches one document drifting alone, which is how
+              `round_trip` came to read 19 in three files and 20 in two others.
+
+            A span is treated as a decomposition only once it names at least four default
+            suites, so an incidental `checksum <n>` mention elsewhere in the prose cannot
+            be mistaken for one.
+            """
+            want = default_suites()
+            bad = 0
+            profiles = {}
+            for f in DECOMP_FILES:
+                with open(os.path.join(ROOT, f), encoding="utf-8") as fh:
+                    body = fh.read()
+                for off, blob in decomp_blobs(body):
+                    pairs = [(n, int(v)) for n, v in SUITE_PAIR.findall(blob) if n in want]
+                    named = [n for n, _ in pairs]
+                    if len(set(named)) < 4:
+                        continue
+                    line = body[:off].count("\n") + 1
+                    missing = sorted(want - set(named))
+                    dupes = sorted({n for n in named if named.count(n) > 1})
+                    if missing or dupes:
+                        print("::error::%s:%d: the integration decomposition is not a"
+                              " census of the suites that run by default - missing %s,"
+                              " duplicated %s. Every suite in tests/ except the opt-in"
+                              " c_oracle must appear exactly once."
+                              % (f, line, missing or "nothing", dupes or "nothing"))
+                        bad += 1
+                        continue
+                    total = sum(v for _, v in pairs)
+                    before = re.findall(r"\d[\d,]*", body[max(0, off - 160):off])
+                    stated = int(before[-1].replace(",", "")) if before else 0
+                    if stated >= 100 and stated != total:
+                        print("::error::%s:%d: the integration decomposition sums to %d,"
+                              " but the total published beside it is %d."
+                              % (f, line, total, stated))
+                        bad += 1
+                        continue
+                    counts = dict(pairs)
+                    # Only default-feature rows are comparable across documents; the
+                    # std-off row legitimately has a different shape (gzip_compat 0).
+                    if counts.get("gzip_compat", 0) > 0:
+                        key = (total, tuple(sorted(counts.items())))
+                        profiles.setdefault(key, []).append("%s:%d" % (f, line))
+            if not profiles:
+                print("::error::no default-feature integration decomposition was found"
+                      " across %s. Move the wording if it changed; do not drop it."
+                      % DECOMP_FILES)
+                bad += 1
+            elif len(profiles) > 1:
+                print("::error::published default-feature integration decompositions"
+                      " disagree with one another: %s. They all describe one command, so"
+                      " they must be identical."
+                      % "; ".join("%s at %s" % (dict(k[1]), ", ".join(v))
+                                  for k, v in sorted(profiles.items())))
+                bad += 1
+            # The unanimous default integration total identifies the default feature
+            # row for check_cross_run, so no row total has to be hardcoded there.
+            integ = next(iter(profiles))[0] if len(profiles) == 1 else None
+            return bad, integ
+
+
+        CROSS_RUN = re.compile(
+            r"Measured: (\d+) library tests here against (\d+) on the two LP64")
+        CROSS_PAIR_DOC = re.compile(
+            r"measured \*\*(\d+)\*\* library tests on 32-bit i686 against"
+            r" \*\*(\d+)\*\* on the two LP64")
+        UNIT_TOTAL = [
+            re.compile(r"\*{0,2}(\d+)\*{0,2} in-crate unit tests, \*{0,2}(\d+)\*{0,2}"),
+            re.compile(r"\((\d+) unit, (\d+) integration"),
+            re.compile(r"(\d+) unit \+ (\d+) integration"),
+        ]
+        UNIT_FILES = ["README.md", "CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md",
+                      PG, TS, BPG]
+
+
+        def published_unit_totals():
+            """Bucket every published (unit, integration) test pair by its row.
+
+            Returns {integration_total: {unit_total: ["<file>:<line>", ...]}}.
+
+            Bucketing matters because the documents publish the same shape for more
+            than one feature row - the default row and the two std-off rows - and a
+            flat scan conflates them. The integration half identifies the row, so no
+            row total has to be hardcoded here.
+
+            The unit count itself cannot be recomputed by this gate, which never
+            runs cargo. Statically re-deriving it would mean hand-evaluating `cfg`
+            predicates plus module-level gates; that drifts on innocent refactors
+            and would be a worse hazard than the staleness it prevents. What IS
+            checkable, and what actually failed in practice, is agreement: the
+            figure is published in seven documents, so any single copy going stale
+            is caught by unanimity within its bucket.
+            """
+            seen = {}
+            for rel in UNIT_FILES:
+                path = os.path.join(ROOT, rel)
+                if not os.path.exists(path):
+                    continue
+                with open(path, encoding="utf-8") as fh:
+                    body = fh.read()
+                for pat in UNIT_TOTAL:
+                    for m in pat.finditer(body):
+                        line = body[:m.start()].count("\n") + 1
+                        unit, integ = int(m.group(1)), int(m.group(2))
+                        (seen.setdefault(integ, {}).setdefault(unit, [])
+                         .append("%s:%d" % (rel, line)))
+            return seen
+
+
+        def check_cross_run(measured, integ_total):
+            """Assert the ILP32-vs-LP64 library-test commentary is self-consistent.
+
+            Three independent invariants, because the first one alone proved too
+            weak - a pair that was stale in BOTH numbers preserved the difference
+            and slipped through:
+
+            1. DELTA. The i686 row is lower by exactly the number of tests gated to
+               LP64 non-Windows targets, and that gate count IS measurable here.
+            2. ABSOLUTE. The LP64 half must equal the in-crate unit-test total
+               published across the seven documents that name it, which pins the
+               pair to a figure the rest of the tree already agrees on. `integ_total`
+               selects the default feature row, so no row total is hardcoded.
+            3. AGREEMENT. Every document that publishes the pair must publish the
+               same pair. This is the invariant that the original drift violated:
+               the workflow comment went stale while the prose stayed current.
+
+            Self-match note: these patterns are applied to the file they live in,
+            but every literal above holds `(\\d+)` rather than digits, so none can
+            match its own source line. Any pattern added here must preserve that.
+            """
+            want = measured["lp64_only_tests"]
+            bad = 0
+            pairs = []
+            with open(os.path.join(ROOT, WORKFLOWS[0]), encoding="utf-8") as fh:
+                body = fh.read()
+            for m in CROSS_RUN.finditer(body):
+                pairs.append((WORKFLOWS[0], body[:m.start()].count("\n") + 1,
+                              int(m.group(1)), int(m.group(2))))
+            for rel in UNIT_FILES:
+                path = os.path.join(ROOT, rel)
+                if not os.path.exists(path):
+                    continue
+                with open(path, encoding="utf-8") as fh:
+                    doc = fh.read()
+                for m in CROSS_PAIR_DOC.finditer(doc):
+                    pairs.append((rel, doc[:m.start()].count("\n") + 1,
+                                  int(m.group(1)), int(m.group(2))))
+            if not pairs:
+                print("::error::the ILP32-vs-LP64 library-test sentence was not found"
+                      " in %s or any document. Move these patterns with the wording;"
+                      " do not drop them." % WORKFLOWS[0])
+                return bad + 1
+
+            # (1) delta
+            for rel, line, lo, hi in pairs:
+                if hi - lo != want:
+                    print("::error::%s:%d: publishes %d ILP32 against %d LP64 library"
+                          " tests, a delta of %d, but %d test(s) under src/ are gated to"
+                          " LP64 non-Windows targets."
+                          % (rel, line, lo, hi, hi - lo, want))
+                    bad += 1
+
+            # (2) absolute, against the unit total the rest of the tree publishes
+            buckets = published_unit_totals()
+            for integ, units in sorted(buckets.items()):
+                if len(units) > 1:
+                    print("::error::the in-crate unit-test total for the row with %d"
+                          " integration tests is published inconsistently: %s. Every"
+                          " copy must name the same number."
+                          % (integ, "; ".join("%d at %s" % (v, ", ".join(s))
+                                              for v, s in sorted(units.items()))))
+                    bad += 1
+            default_units = None
+            if integ_total is not None and len(buckets.get(integ_total, {})) == 1:
+                default_units = next(iter(buckets[integ_total]))
+            if default_units is None:
+                print("::error::could not identify the default-row in-crate unit-test"
+                      " total (integration total %s, buckets %s). The cross-run pair"
+                      " cannot be pinned without it."
+                      % (integ_total, sorted(buckets)))
+                bad += 1
+            else:
+                for rel, line, lo, hi in pairs:
+                    if hi != default_units:
+                        print("::error::%s:%d: publishes %d LP64 library tests, but the"
+                              " default-row in-crate unit-test total published across the"
+                              " tree is %d. These are the same quantity and must agree."
+                              % (rel, line, hi, default_units))
+                        bad += 1
+
+            # (3) agreement between every document that names the pair
+            distinct = {(lo, hi) for _, _, lo, hi in pairs}
+            if len(distinct) > 1:
+                print("::error::the ILP32-vs-LP64 pair is published inconsistently:"
+                      " %s. Every copy must name the same pair."
+                      % "; ".join("%s:%d says %d/%d" % p for p in sorted(pairs)))
+                bad += 1
+            return bad
+
+
         def main():
             measured = {}
             for k, fn in MEASURE.items():
@@ -2087,7 +2395,15 @@ jobs:
                     bad += 1
                 checked += hits
 
-            print("checked %d published figure(s) across %d claim group(s)" % (checked, len(CLAIMS)))
+            # Shape and arithmetic, which a single-number claim cannot express.
+            decomp_bad, integ_total = check_decompositions()
+            bad += decomp_bad
+            bad += check_cross_run(measured, integ_total)
+
+            print("checked %d published figure(s) across %d claim group(s), plus the"
+                  " integration-decomposition census and the cross-run ILP32/LP64"
+                  " delta, absolute and cross-document agreement"
+                  % (checked, len(CLAIMS)))
             if bad:
                 print("::error::%d documented metric(s) disagree with the tree." % bad)
                 return 1
@@ -3269,7 +3585,7 @@ jobs:
   #     `deflate::state::tests::c_layout_{mirror_reproduces_every_c_deflate_state_offset,
   #     size_matches_the_measured_c_deflate_state}`, the two `inflate::state`
   #     counterparts, and `ffi::types::tests::abi_exact_field_offsets_lp64` (whose
-  #     name says so). Measured: 792 library tests here against 797 on the two LP64
+  #     name says so). Measured: 862 library tests here against 867 on the two LP64
   #     rows, and the endian-critical assertion below passes on all three.
   #
   # Between them the three rows retire the whole of gap D3's execution half: after
