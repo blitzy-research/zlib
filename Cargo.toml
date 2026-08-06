@@ -40,21 +40,98 @@ authors = [
 # `keywords` is capped at 5 entries by crates.io.
 keywords = ["zlib", "deflate", "gzip", "compression", "codec"]
 categories = ["compression", "no-std", "encoding", "api-bindings"]
+# PUBLICATION IS DISABLED, DELIBERATELY, AND NOT BECAUSE THE CRATE IS UNFINISHED.
+#
+# The `name` above collides with a crate that already exists on crates.io.
+# `zlib-rs` there is an unrelated, independently developed Rust zlib
+# implementation from the Trifecta Tech Foundation, published across 24 versions
+# (0.6.7 at the time of writing). This crate is a different lineage with a
+# different API and a different version scheme - it reports `1.3.2` here and
+# `"1.3.2.1-motley"` through `zlibVersion()` - so publishing under that name is
+# not merely unavailable, it would be actively misleading to anyone resolving the
+# dependency by name.
+#
+# Leaving `publish` unset means "publishable", which is the wrong default for a
+# package in that position: `cargo publish` would run its full archive-and-verify
+# pass and then attempt an upload. Ownership of the registry name is what would
+# actually stop it, i.e. an external control rather than a decision recorded in
+# this repository. `publish = false` moves the decision here, where it is
+# reviewable, and makes `cargo publish` refuse before it does any work at all.
+#
+# WHAT THIS DOES NOT AFFECT. `cargo package` is untouched: it still builds the
+# `.crate` archive, still honours the `exclude` contract below, and still runs
+# the packaged crate's own verification build. That is exactly what the
+# `package-verify` job in `ci.yml` invokes - deliberately `cargo package` rather
+# than `cargo publish --dry-run`, so the job stays entirely off the publishing
+# path - and it keeps working unchanged with this key set.
+#
+# TO PUBLISH LATER: decide the registry identity first (claim a free name, or
+# obtain ownership of this one), update `name` to match, then remove this key in
+# the same commit as that decision. Do not remove it on its own.
+publish = false
 # Explicitly declare the build script (Cargo also auto-detects `build.rs`).
 # `build.rs` regenerates the CRC-32 lookup tables into `OUT_DIR` at build time,
 # replacing the checked-in `crc32.h` tables from the C baseline.
 build = "build.rs"
-# The C baseline co-exists in this repository during the migration but must not
-# ship inside the published crate. Keep the C sources/headers, the contributed
-# subtrees, the legacy platform directories, and the C build/packaging files out
-# of the packaged `.crate`. (`exclude` only affects `cargo package`/`publish`;
-# it never affects `cargo build`/`test`/`bench` in the workspace.)
+# The retained C baseline lives beside the Rust crate in this repository but must
+# not ship inside the published archive: the C sources and headers, the contributed
+# subtrees, the legacy platform directories, the C build and packaging files, the
+# upstream C documentation, and the engagement material all stay out of the packaged
+# `.crate`. `exclude` affects only `cargo package`/`publish`, never
+# `cargo build`/`test`/`bench`, so the C tree remains fully available in-repository
+# as the cross-validation oracle.
+#
+# GLOB SUBTLETY — do NOT "simplify" the suffix patterns below. Cargo matches
+# `exclude` entries with gitignore semantics, so a `*.<suffix>` pattern matches
+# only that exact trailing suffix: `*.in` catches `zlib.pc.in`, `zconf.h.in`,
+# `zlibConfig.cmake.in`, and `Makefile.in`, but it does NOT catch
+# `zlib.pc.cmakein`, because `.cmakein` is a different suffix. That is why
+# `*.cmakein` is listed separately. A bare name such as `README` matches a path
+# component at any depth, which is why `README.md` (the `readme = ` target) is
+# unaffected by it.
+#
+# THE ACCEPTANCE GATE FOR THIS LIST IS AUTOMATED. The `package-verify` job in
+# `.github/workflows/ci.yml` runs `cargo +stable package --locked --list` and
+# asserts both directions against that listing: 19 anchored MUST-NOT-SHIP patterns
+# (no `*.c`/`*.h`/`*.map`/`*.in`/`*.cmakein`, no upstream C docs, no legacy platform
+# tree, no `contrib`/`examples`/`test` directory, no engagement material) and 17
+# MUST-SHIP patterns. It then packages for real and runs the UNPACKED archive's own
+# `cargo test`, so an `exclude` entry that removes something the crate reads fails
+# there rather than in a consumer's build. Run `cargo package --list` locally after
+# any edit here as well.
+#
+# NEVER add to this list — these ARE the crate, and every one is an asserted
+# MUST-SHIP pattern in that job: `src/**`, `tests/**`, `benches/**`, `build.rs`,
+# `Cargo.toml`, `Cargo.lock`, `README.md`, `LICENSE`, `deny.toml`, `clippy.toml`,
+# `rustfmt.toml`, `rust-toolchain.toml`, `.cargo/config.toml`,
+# `.github/workflows/ci.yml`, `CHANGELOG.md`, `SECURITY.md`, `CONTRIBUTING.md`.
+#
+# The non-source entries in that list are not documentation polish.
+# `.cargo/config.toml`, `.github/workflows/ci.yml` and `rust-toolchain.toml` are
+# read by the packaged crate's OWN test suite
+# (`the_lint_job_runs_the_documented_clippy_gate`,
+# `every_toolchain_specific_ci_job_pins_and_asserts_its_toolchain`,
+# `every_graph_resolving_ci_command_is_locked`, and the toolchain-pin test), so
+# excluding one turns that suite red on a missing path; `clippy.toml` and
+# `rustfmt.toml` are what make a downstream `-D warnings` run the same gate this
+# repository passes; `deny.toml` lets an auditor reproduce the supply-chain verdict
+# from the crate alone; and `CHANGELOG.md`, `SECURITY.md` and `CONTRIBUTING.md`
+# supply the release history, disclosure policy and contribution contract a
+# consumer of a memory-safety replacement for `libz` needs (AAP gaps D5 and D6).
+#
+# Note especially that the `test/**` entry below is the *C driver* directory
+# (`test/example.c`, `test/infcover.c`, `test/minigzip.c`) and is a DIFFERENT
+# path from the Rust integration suite `tests/**`, which must remain packaged.
+# Do not conflate the two.
 exclude = [
     "*.c",
     "*.h",
     "*.in",
     "*.map",
     "*.pc.in",
+    # `*.in` does not match a `.cmakein` suffix — see the GLOB SUBTLETY note
+    # above. Without this entry `zlib.pc.cmakein` ships in the `.crate`.
+    "*.cmakein",
     "contrib/**",
     "examples/**",
     "test/**",
@@ -72,6 +149,43 @@ exclude = [
     "treebuild.xml",
     "BUILD.bazel",
     "MODULE.bazel",
+    # CMake's own formatter config — tooling for the retained C build only.
+    ".cmake-format.yaml",
+    # Upstream C documentation. The bare `README` and `ChangeLog` names below are
+    # the *upstream C* files, and a bare name matches a path component without
+    # matching a `.md` suffix — which is why this group leaves the two Rust-facing
+    # documents alone: `README.md` (this crate's `readme = ` target) and
+    # `CHANGELOG.md` (the crate's own release history, which supersedes `ChangeLog`
+    # for crate consumers). Both are asserted MUST-SHIP patterns in the
+    # `package-verify` job, so excluding either fails CI rather than shipping
+    # quietly. The pairs coexist deliberately: `ChangeLog` is the C baseline's
+    # history and is excluded, `CHANGELOG.md` is this crate's and ships. Adding a
+    # `*.md` pattern or a `CHANGELOG*` entry to this group removes the wrong one.
+    "ChangeLog",
+    "FAQ",
+    "INDEX",
+    "README",
+    "README-cmake.md",
+    "zlib.3",
+    "zlib.3.pdf",
+    # Normative wire-format references and the heavy binary CRC monograph. These
+    # are indispensable in-repository (they are the RFC 1950/1951/1952 sources
+    # this port is verified against) but are dead weight in a published crate:
+    # no Rust source, test, bench, doctest, or `include_str!`/`include_bytes!`
+    # site reads any of them, and `mkdocs.yml` builds only `doc/index.md`,
+    # `doc/project-guide.md`, and `doc/technical-specifications.md` — all three
+    # of which stay packaged. Excluding this group alone removes ~873 KB,
+    # dominated by `doc/crc-doc.1.0.pdf`.
+    "doc/algorithm.txt",
+    "doc/crc-doc.1.0.pdf",
+    "doc/rfc1950.txt",
+    "doc/rfc1951.txt",
+    "doc/rfc1952.txt",
+    "doc/txtvsbin.txt",
+    # Migration engagement documentation and presentation assets — process
+    # artifacts, not product, and never of use to a crate consumer.
+    "blitzy/**",
+    "blitzy-deck/**",
 ]
 
 [lib]
@@ -87,13 +201,39 @@ crate-type = ["lib", "cdylib", "staticlib"]
 # Ergonomic multi-branch conditional compilation — replaces the C `#if`/`#ifdef`
 # preprocessor nests. Pure Rust; adds no C dependency.
 cfg-if = "1.0.4"
-# SIMD-accelerated CRC-32 backing the `checksum::crc32` hot path. `optional` so
-# it is pulled in only by the `simd` feature; `default-features = false` keeps
-# it `no_std`-compatible when the crate's own `std` feature is disabled.
+# Optional hardware CRC-32 backend for `checksum::crc32`; pulled into the graph
+# only by the `simd` feature. `default-features = false` drops `crc32fast`'s own
+# `std` feature so the crate can still be linked freestanding.
+#
+# That flag alone is not sufficient. `crc32fast/std` decides which body of
+# `specialized::…::State::new` is compiled: with it, a RUN-TIME
+# `is_x86_feature_detected!` / `is_aarch64_feature_detected!` probe; without it, a
+# COMPILE-TIME `cfg!(target_feature = …)` test, which is false on a stock
+# `x86_64-unknown-linux-gnu` build (only `sse2` is baseline there) so `State::new`
+# returns `None` and execution uses `crc32fast`'s own software table instead of
+# its accelerated code. The crate's own `std` feature therefore re-enables it
+# through the weak `crc32fast?/std` entry under `[features]` below.
 crc32fast = { version = "1.5.0", optional = true, default-features = false }
 
 [dev-dependencies]
 # Statistical benchmarking harness driving `benches/*.rs`.
+#
+# HELD AT 0.5.1 DELIBERATELY, and this pin is the reason six other packages in the
+# lockfile are also old: `anes`, `same-file` (via `walkdir`), `tinytemplate`, `cast`,
+# `criterion-plot` and `itertools` all reach this crate through THIS edge and no
+# other, so they move only when it does. `criterion` 0.8.x declares
+# `rust-version = "1.86"`, above this crate's 1.85.0 MSRV, so the newest release is
+# unreachable without trading a consumer-facing compatibility promise for a
+# development convenience. 0.7.0 declares 1.80 and so is MSRV-compatible, but brings
+# breaking API changes that would require rewriting all three `benches/` files, and
+# the committed lockfiles are refreshed only under advisory pressure - of which
+# there is none: the RustSec database carries zero advisories for any of the seven,
+# under a policy where `unmaintained = "all"` and `unsound = "all"` would already
+# make an informational one blocking.
+#
+# The full evaluation, the measured version table and the re-evaluation triggers are
+# in `CONTRIBUTING.md` under "Dependency freshness, and the aged benchmark chain".
+# Do not bump this line without reading it.
 criterion = "0.5.1"
 # Reference DEFLATE implementation for interop / round-trip cross-checks. Its
 # DEFAULT features select the pure-Rust `miniz_oxide` backend, so the test suite
@@ -108,12 +248,29 @@ rand = "0.9.4"
 
 [features]
 # The default build is a full, std-backed zlib replacement: gzip framing, the
-# gzip file-I/O layer, and the SIMD CRC-32 hot path.
+# gzip file-I/O layer, and the optional hardware CRC-32 backend.
 default = ["std", "gzip", "gz-io", "simd"]
 # Standard-library build: enables `std::io`/`std::fs` for the gz layer and the
 # `catch_unwind` panic guards at the FFI boundary. When this feature is OFF the
 # crate is `#![no_std]` + `alloc` (built via `--no-default-features`).
-std = []
+#
+# The `crc32fast?/std` forward is weak on purpose. `?` enables that feature only
+# if some other entry (i.e. `simd`) has already pulled the optional dependency in,
+# so `--no-default-features --features std` keeps the runtime closure at `cfg-if`
+# alone. With both on, the shipped library gets `crc32fast`'s run-time CPU probe
+# rather than the compile-time `cfg!(target_feature = …)` test, which makes the
+# effective `crc32fast` configuration identical across the release, test, and
+# bench builds — the dev-dependency graph (`flate2` -> `crc32fast/default`)
+# unifies `crc32fast/std` on for the latter two regardless.
+#
+# A `no_std` build (`--no-default-features [--features simd]`) links `crc32fast`
+# without its `std` feature, so reachability is decided by the compile-time
+# target-feature test rather than a run-time probe: false on a stock target, true
+# when the caller compiles the required features in. Either way
+# `src/checksum/crc32.rs` reports the outcome through `crc32_backend()` and uses
+# its own braid whenever the accelerated path is not selected. Features are
+# resolution inputs only, so this line cannot alter either lockfile.
+std = ["crc32fast?/std"]
 # gzip framing within deflate/inflate (maps the C `#ifdef GZIP`).
 gzip = []
 # gzip file-I/O layer (the `gz*` API; maps the C `#ifndef NO_GZCOMPRESS`).
@@ -126,21 +283,43 @@ gz-io = ["std", "gzip"]
 # `#![cfg_attr(all(not(feature = "std"), not(test), panic = "abort"), no_std)]`
 # in `src/lib.rs`: the crate is genuinely `#![no_std]` for the shipped artifact
 # (`cargo build --no-default-features`, which the profiles compile with
-# `panic = "abort"`), while `cargo test --no-default-features` keeps `std`
-# linked so the libtest harness builds — yet still exercises every
-# `not(feature = "std")` code path because the `std` feature gates stay off.
-# The full test suite therefore compiles and PASSES under
+# `panic = "abort"`), while `cargo test --no-default-features` keeps `std` linked
+# so the libtest harness builds. Those tests exercise the `not(feature = "std")`
+# code paths EXCEPT `mod no_std_support`, whose `not(test)` term excludes it under
+# a harness — the std-off library builds are what compile that block. The full
+# test suite compiles and PASSES under
 # `cargo test --no-default-features [--features no-std]`; this flag remains a
 # convenience marker documenting intent for a core-only build.
 no-std = []
-# SIMD-accelerated CRC-32 hot path via the optional `crc32fast` dependency.
+# Makes the hardware CRC-32 backend available by pulling in the optional
+# `crc32fast` dependency. It puts the crate in the graph; whether its accelerated
+# code is then selected is a target/CPU question that `crc32_backend()` reports.
+#
+# Deliberately just `dep:crc32fast`, NOT `["dep:crc32fast", "crc32fast/std"]`:
+# spelling the `std` forward here would force `crc32fast`'s `std` feature on in a
+# `--no-default-features --features simd` build, i.e. break the freestanding
+# build this crate supports. The forward therefore lives on the crate's own `std`
+# feature above (as the weak `crc32fast?/std`), which is exactly the
+# "gate it as `std` + `simd`" shape: the run-time CPU probe appears precisely
+# when both features are active, and `src/checksum/crc32.rs` falls back to its
+# braided scalar path whenever the probe is unavailable or negative.
 simd = ["dep:crc32fast"]
 #
-# `inflate_strict` below is an intentional, documented opt-in extra beyond the
-# AAP core set (`std`/`gzip`/`gz-io`/`no-std`/`simd`). It defaults to OFF and is
-# fully stable-buildable, so `cargo build --all-features` succeeds on the stable
-# toolchain (and thus on the pinned MSRV). It is mirrored in the README feature
-# table.
+# `inflate_strict` below is one of the feature rows the migration plan's feature
+# matrix enumerates in its own right — `std`/`gzip`/`gz-io`/`simd` default ON,
+# `no-std` and `inflate_strict` default OFF — not an extra bolted on beside that
+# set. Like every other row it has a C provenance (`INFLATE_STRICT`, 4 sites), and
+# its default-OFF state is a requirement rather than a preference: switching it on
+# changes which streams inflate accepts, so the DEFAULT build must leave it off to
+# stay byte-exact and acceptance-exact with reference zlib.
+#
+# It is fully stable-buildable, so `cargo build --all-features` succeeds on the
+# stable toolchain. Whether the same holds on the pinned MSRV is a separate
+# question with its own evidence: the `msrv` job in `.github/workflows/ci.yml`
+# builds the crate and then runs `check --locked --all-targets --all-features` on
+# `rust-version` below, so the MSRV verdict covers every feature this manifest
+# declares — `inflate_strict` and `c-oracle` included — and stable success does
+# not imply it. The feature is mirrored in the README feature table.
 #
 # The `gzprintf`/`gzvprintf` FFI symbols are always exported for ABI
 # completeness, but — because rendering a C `va_list` requires the unstable
@@ -155,6 +334,33 @@ simd = ["dep:crc32fast"]
 # with reference zlib; enable only to reject out-of-window distances early.
 # Referenced by `src/inflate/fast.rs`.
 inflate_strict = []
+#
+# Opt-in live C-oracle conformance harness (`tests/c_oracle.rs`), which makes the
+# full byte-identity sweep against a locally built reference C zlib reproducible
+# inside this repository instead of only in an ad-hoc environment.
+#
+# It expands to `[]` DELIBERATELY: it adds NO dependency of any kind, so
+# `Cargo.lock` and `cargo metadata` are completely unaffected by it and the
+# crate keeps its defining "the test suite requires no C toolchain" property.
+# The feature's only effect is to unlock the `[[test]]` target declared further
+# down, which shells out to whatever system C compiler is present via
+# `std::process::Command` — never through the `cc` crate. There is deliberately
+# no `cc`/`bindgen`/`pkg-config` dependency, no `[build-dependencies]` table,
+# and no `links =` key anywhere in this manifest: `build.rs` is pure `std` with
+# no external crates, and that property is load-bearing.
+#
+# This harness is strictly ADDITIVE. Tier 1 of `tests/interop.rs` — byte-identity
+# against deterministic vectors baked from the genuine C encoder — remains the
+# always-on, toolchain-free release gate and is never replaced or weakened by
+# this feature.
+#
+# CONTRACT the harness itself must honour (do NOT "simplify" this away): the
+# `build-test` matrix in `.github/workflows/ci.yml` includes an `--all-features`
+# row, and `--all-features` enables `c-oracle`. The harness must therefore probe
+# for a usable C compiler at RUN TIME and, when none is available, print a
+# capability notice and PASS. It must not fail, and it must not be `#[ignore]`d —
+# the suite's ignored-test count is zero and stays zero.
+c-oracle = []
 
 # Three criterion benchmarks. Each disables the built-in libtest harness so that
 # criterion supplies its own `main` via `criterion_main!` (AAP §0.3.1 / §0.4.1).
@@ -170,10 +376,50 @@ harness = false
 name = "checksum_bench"
 harness = false
 
+# The live C-oracle conformance harness is declared explicitly ONLY so that
+# `required-features` can gate it: without this block Cargo would auto-discover
+# `tests/c_oracle.rs` and compile it on every plain `cargo test`, which would
+# drag a C-toolchain requirement into the default suite. With the block, the
+# target is not even compiled unless `--features c-oracle` (or `--all-features`)
+# is passed, so the default `cargo test` run stays C-toolchain-free and the
+# `c_oracle` binary never appears in it.
+#
+# `autotests` is intentionally left at its default (`true`, for edition 2024), so
+# the other six integration tests — `checksum`, `gzip_compat`, `inflate_coverage`,
+# `interop`, `regression`, `round_trip` — continue to be auto-discovered from
+# `tests/`. An explicit `[[test]]` whose `name` matches an auto-discovered target
+# simply overrides that target's settings rather than suppressing discovery of
+# its siblings, which is exactly the behaviour relied on here.
+#
+# `path` is REQUIRED to exist, and that is not a formality: with `tests/c_oracle.rs`
+# absent, `cargo check --all-targets --all-features` and `cargo test --all-features`
+# both abort with "can't find integration-test `c_oracle` at path
+# …/tests/c_oracle.rs" — which is the `--all-features` row of the `build-test`
+# matrix. So this declaration and that file are a single unit: neither may be
+# removed without the other. This manifest owns only the target's gating; the
+# harness body documents its own contracts.
+[[test]]
+name = "c_oracle"
+path = "tests/c_oracle.rs"
+required-features = ["c-oracle"]
+
 [profile.release]
-# The release build is optimized with LTO (project-guide §6.4).
 opt-level = 3
-lto = true
+# `codegen-units = 1` is the whole-crate optimization this crate can actually
+# have, and it is deliberately NOT accompanied by an `lto` key.
+#
+# NO `lto` KEY — DO NOT ADD ONE. `[lib] crate-type` emits `lib` (rlib) alongside
+# `cdylib` and `staticlib`, and Cargo builds all three from one rustc invocation.
+# rustc cannot run LTO for a unit that also emits an rlib, so Cargo silently drops
+# any LTO-enabling value instead of reporting it: an `lto` key here would be an
+# inert declaration that invites performance reasoning from a flag that never
+# reached the compiler. Dropping `lib` to buy LTO back is not an option — the
+# three-artifact triple is a migration requirement, and `benches/`, `tests/` and
+# every Rust consumer link the rlib.
+#
+# `src/lib.rs`'s `the_release_profile_declares_no_inert_lto_setting` fails the
+# build if an `lto` key reappears while `lib` is still in the crate-type list, so
+# this cannot silently drift back.
 codegen-units = 1
 # `panic = "abort"` is REQUIRED (not merely preferred): a `--no-default-features`
 # (`no_std`) build emits the `cdylib`/`staticlib` without an unwinding runtime,
@@ -195,6 +441,82 @@ codegen-units = 1
 # aborts the process (a sound, non-UB outcome) instead of being caught and
 # converted to a `Z_*` error code.
 panic = "abort"
+# Drop the STATIC symbol table from linked release artifacts. A shared library
+# shipped as a drop-in `libz` replacement has no use for it: the only symbols a
+# consumer can reach are the ones in `.dynsym`, and those are unaffected.
+#
+# WHAT IT REMOVES, MEASURED. `.symtab` and `.strtab` disappear from
+# `libzlib_rs.so`, taking the static symbol-table entries from 1368 to 147 (the
+# remainder being `.dynsym` itself) and the file from 666,400 to 551,760 bytes.
+# The internal Rust symbol names and the relative source-location strings that
+# came with them go too. There was never any DWARF to remove - `debug` is off in
+# this profile, so the release `.so` carried no `.debug_*` section before or
+# after - and there were no absolute build paths, no secrets, and no internal
+# symbols in the dynamic table to begin with. So this is a reduction in incidental
+# metadata, not a fix for a leak.
+#
+# WHAT IT DOES NOT REMOVE, ALSO MEASURED, AND THIS IS THE PART THAT MATTERS.
+# Cargo's `strip` reaches only LINKED outputs. The `staticlib` and the `lib`
+# (rlib) are archives, not link products, so `libzlib_rs.a` is byte-for-byte as
+# before: 2311 `T` symbols, unchanged. That is load-bearing, because
+# `ci.yml`'s `bare-metal-no-std` job proves the freestanding runtime block was
+# compiled by reading `nm` output from the `thumbv7em-none-eabihf` archive, and
+# `c-abi-linkage` links that archive from C. Both were verified against a strip-on
+# build - including a `--release` bare-metal archive, which is not even the
+# profile that job uses - and all six of its symbol assertions still hold
+# (`no_std_support`, the `calloc`/`realloc`/`posix_memalign`/`abort` references,
+# and crate-owned `rust_eh_personality`/`rust_begin_unwind`).
+#
+# THE EXPORT CONTRACT IS UNCHANGED, verified by set comparison rather than by
+# count: the stripped and unstripped `.so` export exactly the same 95 `T`
+# symbols, covering 54/54 of `zlib.map`'s `global:` names with 0/10 of its
+# `local:` names leaked. ELF hardening survives too (`BIND_NOW`, `FLAGS_1: NOW`,
+# `GNU_RELRO`, a non-executable `GNU_STACK`, and no `RPATH`/`RUNPATH`), and a C
+# consumer linked both statically and dynamically against the stripped artifacts
+# round-trips 50,000 bytes byte-exactly with correct `1f 8b` gzip framing.
+#
+# COST TO DEBUGGING, STATED HONESTLY. CI runs `cargo test --release` on three
+# rows, and a stripped test binary yields a panic backtrace without symbol names.
+# All four feature rows were re-run under this setting and are unaffected in
+# outcome (1039 default, 1052 all-features, 737 no-default-features, 737
+# no-std - all passing, none ignored), because harness names and panic messages
+# are compiled-in strings rather than symbol-table entries. Anyone who needs the
+# names back gets them from the debug profile, or with `--config
+# profile.release.strip=false` on a one-off build; nothing here is baked into a
+# published artifact, since `publish = false` above means there is none.
+#
+# THE BASELINE THIS IS MEASURED AGAINST, STATED PRECISELY, because "666,400
+# bytes" reads like "unstripped" and it is not. Cargo's own default for a
+# release profile with `debug = 0` is `strip = "debuginfo"`, so every figure
+# above compares two *stripping* modes rather than stripping against none. All
+# three, measured on the default feature row with one `readelf` methodology
+# (`-SW` for sections, `-sW` for per-table entry counts):
+#
+#   strip        bytes   .symtab  .debug_*  .symtab  .dynsym  exported
+#                        sections sections  entries  entries  `T`
+#   none       4,578,272     1        6       1,221     147      95
+#   debuginfo    666,400     1        0       1,221     147      95   <- cargo default
+#   symbols      551,760     0        0           0     147      95   <- this key
+#
+# The last column is the point: all three builds export the identical 95-name
+# set (compared as sets, not counted), so the choice is invisible to every
+# consumer and costs only local debuggability.
+#
+# ONE CI ASSERTION HAD TO MOVE WITH THIS KEY, and a reader who changes the key
+# needs to know which. `c-abi-linkage`'s personality-symbol assertion has two
+# axes: `rust_eh_personality` must be DEFINED exactly once - read from
+# `.symtab` - and EXPORTED zero times - read from `.dynsym`. Removing `.symtab`
+# silently zeroed axis 1, which would have let a genuine regression through as
+# a vacuous pass. That job now builds a `strip = "debuginfo"` probe into a
+# separate `CARGO_TARGET_DIR`, refuses to proceed if the probe has no `.symtab`
+# either, reads axis 1 from the probe and axis 2 from the SHIPPED artifact,
+# cross-checks that both agree on the exported count, and `diff`s the two
+# dynamic export sets to prove the probe is ABI-identical to what ships. A
+# companion step asserts the shipped `.so` carries NO `.symtab`, so this key
+# cannot be dropped - or overridden by `RUSTFLAGS` or
+# `CARGO_PROFILE_RELEASE_STRIP` - without CI going red. Deliberately retiring
+# the hardening therefore means deleting that assertion in the same commit.
+strip = "symbols"
 
 [profile.dev]
 # The panic strategy MUST match `[profile.release]`. The reproduction command
@@ -203,3 +525,31 @@ panic = "abort"
 # (see the detailed rationale in `[profile.release]` above). Setting it here
 # keeps debug and release builds consistent for both the std and no_std targets.
 panic = "abort"
+
+# `target_os = "cygwin"` IS A REAL VALUE THAT THE MSRV COMPILER HAS NOT HEARD OF.
+#
+# The platform-constant cascades name every unix family explicitly rather than
+# guessing: `src/gz/open.rs` places cygwin in the newlib `O_NONBLOCK` family
+# (`0x4000`) and the POSIX `FD_CLOEXEC` family (`1`), and `src/ffi/gz.rs` places it
+# in the POSIX `fcntl` command family. Those three arms are load-bearing — delete
+# them and cygwin falls through to the terminal "do not guess" arm, which is safe
+# but silently stops requesting the nonblocking open that mode `"rbN"` asked for.
+#
+# `cygwin` became a known `target_os` after 1.85.0, the MSRV this crate declares
+# and CI pins, so current stable compiles those arms silently while 1.85.0 emits
+# three `unexpected_cfgs` warnings for a value that is entirely correct. Declaring
+# the value here is the narrowest possible answer: it teaches the lint this ONE
+# extra `target_os` and nothing else.
+#
+# What it deliberately does NOT do is switch the lint off. `level = "warn"` keeps
+# the lint at its default severity, so `-D warnings` in the `lint` and
+# `cross-targets` jobs still promotes it to an error and every OTHER unknown `cfg`
+# value is still reported. That distinction is what makes the lint worth keeping:
+# it is the only mechanism that rejects a misspelled `target_os`/`target_arch`,
+# whose arm would otherwise compile silently and simply never be taken. An
+# `#[allow(unexpected_cfgs)]` on the cascades would silence such a typo along with
+# this legitimate value. Verify with `RUSTUP_TOOLCHAIN=1.85.0 cargo check --locked
+# --all-targets`, which must report zero warnings.
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ['cfg(target_os, values("cygwin"))']

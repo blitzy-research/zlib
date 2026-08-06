@@ -1,9 +1,16 @@
-//! Cargo build script for the `zlib-rs` crate: regenerates the CRC-32 lookup
-//! tables at build time.
+//! Cargo build script for the `zlib-rs` crate.
 //!
-//! # Why this exists
+//! It has two jobs. The first always runs: it regenerates the CRC-32 lookup
+//! tables into `${OUT_DIR}`. The second is opt-in: when `ZLIB_RS_VERSION_SCRIPT`
+//! is set to a truthy value it applies the retained C baseline's `zlib.map`
+//! symbol-version script to the emitted `cdylib`. With that variable unset this
+//! script writes nothing outside `${OUT_DIR}`, emits no link argument, and
+//! produces artifacts identical to a build with no such capability at all. See
+//! "Optional cdylib symbol versioning" below.
 //!
-//! In the C zlib baseline the header `crc32.h` (~9,400 lines) is a checked-in,
+//! # Why the tables are generated rather than checked in
+//!
+//! In the C baseline the header `crc32.h` (~9,400 lines) is a checked-in,
 //! machine-generated set of CRC-32 lookup tables produced by the
 //! `make_crc_table()` routine in `crc32.c`. Rather than ship a giant literal
 //! table file, this build script reimplements `make_crc_table()` in safe,
@@ -20,32 +27,203 @@
 //! `crc32fast` crate behind the `simd` feature; these tables back the scalar
 //! fallback and the combine operations.)
 //!
-//! # Emitted contract (consumed by `src/checksum/crc32.rs`)
+//! # Emitted contract
 //!
-//! The generated `${OUT_DIR}/crc32_tables.rs` defines exactly these items — the
-//! names and shapes are a stable contract; do not rename without updating the
-//! consuming module:
+//! The generated `${OUT_DIR}/crc32_tables.rs` defines exactly the seven items
+//! below, and `src/checksum/crc32.rs` is their sole consumer. The names and
+//! shapes are a stable contract: do not rename one without updating that module.
 //!
-//! | Symbol                 | Type                 | Meaning                                                   |
-//! |------------------------|----------------------|-----------------------------------------------------------|
-//! | `CRC_BRAID_N`          | `usize` (= 5)        | Number of interleaved braids used by the braided path.    |
-//! | `CRC_BRAID_W`          | `usize` (= 8)        | Bytes per CRC word for the braided path (64-bit words).    |
-//! | `CRC_TABLE`            | `[u32; 256]`         | Byte-wise CRC-32 table (`crc_table` in `crc32.h`).         |
-//! | `X2N_TABLE`            | `[u32; 32]`          | Powers of x (`x^(2^n) mod p`) for `crc32_combine`.         |
-//! | `CRC_BIG_TABLE`        | `[u64; 256]`         | Byte-swapped table for big-endian word processing.         |
-//! | `CRC_BRAID_TABLE`      | `[[u32; 256]; 8]`    | Little-endian braid table (`crc_braid_table`, W=8).        |
-//! | `CRC_BRAID_BIG_TABLE`  | `[[u64; 256]; 8]`    | Big-endian braid table (`crc_braid_big_table`, W=8).       |
+//! | Symbol                 | Type                 | Consumed by / C counterpart                                          |
+//! |------------------------|----------------------|----------------------------------------------------------------------|
+//! | `CRC_TABLE`            | `[u32; 256]`         | The scalar reflected byte-wise loop and `get_crc_table` (`crc_table`). |
+//! | `X2N_TABLE`            | `[u32; 32]`          | `crc32_combine`'s GF(2) arithmetic (`x^(2^n) mod p`).                  |
+//! | `CRC_BRAID_N`          | `usize` (= 5)        | `N`, the braid count of the braided word loop.                        |
+//! | `CRC_BRAID_W`          | `usize` (= 8)        | `W`, bytes per CRC word in that loop.                                 |
+//! | `CRC_BIG_TABLE`        | `[u64; 256]`         | `crc_big_table`, the big-endian word companion.                       |
+//! | `CRC_BRAID_TABLE`      | `[[u32; 256]; 8]`    | `crc_braid_table` (W = 8), little-endian braid.                       |
+//! | `CRC_BRAID_BIG_TABLE`  | `[[u64; 256]; 8]`    | `crc_braid_big_table` (W = 8), big-endian braid.                      |
+//!
+//! All seven are consumed: `CRC_TABLE` and `X2N_TABLE` by the byte-wise loop,
+//! `get_crc_table`, and the combine routines; the remaining five by the braided
+//! word-at-a-time path (`crc32.rs`'s `braid` module, the port of the `#ifdef W`
+//! fast path in `crc32.c`). No item is emitted with an `#[allow(dead_code)]`
+//! attribute — suppressing that warning is the consuming module's decision, and
+//! it grants the allowance only in the `simd` configuration, where the braided
+//! path is not compiled because the hot loop is `crc32fast`'s. Consequently a
+//! `--no-default-features` build **proves** every generated artifact is
+//! consumed: dropping one produces a warning, which the `-D warnings` gate
+//! promotes to an error.
+//!
+//! Emitting all seven keeps this script a complete, auditable port of C
+//! `make_crc_table()` — every table the C header contains is reproduced and can
+//! be diffed against it.
 //!
 //! # Determinism
 //!
 //! The tables are pure mathematical constants derived from the reflected
 //! CRC-32/IEEE polynomial `0xEDB88320`. This script performs **no** host or
 //! target detection: it always emits the fixed `N = 5`, `W = 8` configuration
-//! (the zlib default for 64-bit targets) and generates **both** the
-//! little-endian and big-endian braid tables so the runtime can select the
-//! correct one via `cfg!(target_endian = ...)`. Output is therefore byte-for-byte
-//! identical on every build and every platform. The byte-wise `CRC_TABLE` is
-//! endianness- and word-size-independent and always provides a correct fallback.
+//! (the zlib default for 64-bit targets) and generates both braid tables
+//! unconditionally, so its output is byte-for-byte identical on every build and
+//! every platform. Endianness is therefore not a *generation-time* concern: both
+//! braid variants are always emitted, and the choice between them is made by
+//! `crc32.rs` with `cfg!(target_endian)`, a compile-time constant for the target
+//! being built. The byte-wise `CRC_TABLE` is endianness- and
+//! word-size-independent, so it needs no variant.
+//!
+//! That determinism carries through to the artifacts a C consumer links against:
+//! two clean release builds of one source tree into different target directories
+//! produce a bit-identical `libzlib_rs.a` and `libzlib_rs.so`. It does **not**
+//! extend to `libzlib_rs.rlib`, whose `lib.rmeta` member records the absolute
+//! path of the file this script generates — `${OUT_DIR}/crc32_tables.rs`, named
+//! by the `include!` above — so two such builds differ there in exactly the bytes
+//! that spell that path while the compiled object member stays bit-identical. An
+//! rlib is a Rust-internal intermediate rather than a C-consumer artifact, so the
+//! difference is inert; a consumer who needs identical metadata too can normalise
+//! it with a `--remap-path-prefix` that maps both directories to one replacement.
+//! That belongs on the consumer's side rather than being baked in here, because
+//! `RUSTFLAGS` itself feeds Cargo's unit hash — `.cargo/config.toml` gives the
+//! reasoning.
+//!
+//! # Optional cdylib symbol versioning (AAP §0.8.2 Divergence 4 / gap D8)
+//!
+//! The C build links `libz.so` through `zlib.map`, a GNU-ld *version script* that
+//! distributes the exported symbols across sixteen ELF version nodes
+//! (`ZLIB_1.2.0` through `ZLIB_1.3.2`). This script can reproduce those nodes on
+//! the `cdylib`, and by default **does not**.
+//!
+//! ## Off by default, and neutral when off
+//!
+//! With `ZLIB_RS_VERSION_SCRIPT` unset the emitted `cdylib` carries an
+//! unversioned symbol table, which is precisely the state AAP §0.8.2 records as
+//! Divergence 4 and instructs be *kept* rather than "fixed": the symbol *set* is
+//! exactly right — 54/54 `global:` coverage, 0/10 `local:` leakage — and only the
+//! version tags are absent. AAP §0.10.1 ranks the gap **Low** because a drop-in
+//! replacement links successfully without the tags, while applying them carries
+//! linker-portability risk that belongs behind the expanded CI matrix (gap D3).
+//!
+//! Neutrality is a contract, not an intention. When the variable is unset this
+//! script emits exactly the two [`unconditional_directives`] and nothing else: no
+//! link argument, no `cargo:warning`, no additional `rerun-if-changed`. It writes
+//! nothing into `OUT_DIR` beyond the byte-for-byte identical `crc32_tables.rs`,
+//! and reads nothing from the filesystem. Nothing is lost by that default: every
+//! `global:` name in `zlib.map` is already exported and every `local:` name is
+//! already hidden, and an unversioned symbol table satisfies ordinary linking,
+//! `pkg-config` consumption and `LD_PRELOAD` injection alike — see the
+//! "`zlib.map` symbol-versioning contract" section of `src/ffi/mod.rs`.
+//!
+//! ## Turning it on
+//!
+//! ```text
+//! ZLIB_RS_VERSION_SCRIPT=1 cargo build --release
+//! ```
+//!
+//! `1`, `true`, `yes` and `on` enable it; `0`, `false`, `no`, `off`, an empty
+//! value and an absent variable disable it; **anything else is a hard error**
+//! rather than a quiet "off", so a typo cannot silently fail to enable the thing
+//! it was meant to enable. The value is compared case-insensitively after
+//! trimming. `zlib.map` is located from `CARGO_MANIFEST_DIR` rather than from any
+//! caller-supplied path, so there is no way to point the capability at an
+//! arbitrary file.
+//!
+//! ## Why substitution rather than addition
+//!
+//! `rustc` always passes a version script of its own, to export the
+//! `#[unsafe(no_mangle)]` shims, and that script uses an **anonymous** version
+//! node — `{ global: …; local: *; };`. Build-script link arguments land *after*
+//! `rustc`'s own, so a second script can neither replace nor outrank the first.
+//! Adding one is therefore not a route to versioned symbols, and which way it
+//! goes wrong depends only on the linker the active toolchain drives: GNU `ld`
+//! refuses an anonymous version tag combined with named ones and fails the link
+//! outright, while a linker that accepts the pair emits the `ZLIB_*` definitions
+//! into `.gnu.version_d` and binds no symbol to any of them.
+//!
+//! So the linker has to be made to see exactly *one* script, and that script has
+//! to be ours. Three things are therefore produced inside `${OUT_DIR}` when the
+//! opt-in is on:
+//!
+//! 1. `zlib_rs_version_script/zlib_rs.map` — `zlib.map` byte-for-byte plus
+//!    exactly one extra pattern, `rust_*;`, added to the *existing* `local:` list
+//!    of the base `ZLIB_1.2.0` node. `zlib.map` itself is a read-only reference
+//!    artifact of the retained C baseline (AAP §0.4.1.12, preservation directive
+//!    D-7) and is never rewritten.
+//! 2. `zlib_rs_version_script/ld.bfd` — a POSIX `sh` shim, mode `0o700`. It
+//!    replaces the first `--version-script` argument with the derived script,
+//!    drops any further ones, turns `--no-undefined-version` into
+//!    `--undefined-version`, and `exec`s the real `ld.bfd`, which it resolves from
+//!    `PATH` itself while skipping its own directory. If the derived script is
+//!    unreadable, or if the caller passed no version script at all, it forwards
+//!    the argument list untouched, so any problem inside the shim degrades to an
+//!    ordinary unversioned link rather than to a wrong one.
+//! 3. The `cdylib`-scoped link arguments `-B<OUT_DIR>/zlib_rs_version_script` and
+//!    `-fuse-ld=bfd`. `-B` is how a `cc`/`clang` driver is told where to find its
+//!    subprograms; the flavour flag is what stops a toolchain whose default is
+//!    `rust-lld` from never consulting the shim at all, since `rustc` may pass
+//!    `-fuse-ld=lld` itself and the driver takes the last one it is given. Both
+//!    use `rustc-cdylib-link-arg`, never the unscoped `rustc-link-arg`, so no test
+//!    or bench binary is affected.
+//!
+//! With the opt-in on the exported symbol set is unchanged name for name, all
+//! sixteen `ZLIB_*` definitions appear with the inheritance chain from
+//! `ZLIB_1.2.0` intact, and exactly the `global:` names carry an `@@ZLIB_x.y.z`
+//! tag while the rest stay unversioned-global — which is how a distribution
+//! `libz.so.1` built from the same script behaves, down to what a linked C
+//! consumer records in its own `.gnu.version_r`.
+//!
+//! ## Four details that are easy to get wrong
+//!
+//! * Substituting `zlib.map` wholesale exports one symbol too many.
+//!   `zlib.map`'s only wildcard is `local: _*;`, which hides Rust's mangled names
+//!   (`_ZN…`, `_R…`) and the `__rust_*` hooks but not `rust_eh_personality`. (A
+//!   `panic = "unwind"` build would also leak `rust_begin_unwind` and
+//!   `rust_panic`; this crate is `panic = "abort"`, so `rust_eh_personality` is
+//!   the only survivor.) The one added `rust_*;` pattern restores the exact
+//!   baseline set. A `local: *;` catch-all must **not** be used instead:
+//!   `zlib.map` does not name `deflate`, `inflate`, `compress`, `gzopen`,
+//!   `adler32`, `crc32` or 35 other entry points at all, so a catch-all would
+//!   hide every one of them.
+//! * A `local:` section may not precede `global:` inside a version node — GNU
+//!   `ld` reports a syntax error in the script — so the pattern has to be
+//!   inserted into the existing `local:` list. A brand-new trailing node holding
+//!   only a `local:` list does parse, but adds a seventeenth version definition
+//!   that `zlib.map` does not declare, so `.gnu.version_d` would no longer match
+//!   a distribution `libz.so.1`.
+//! * `--undefined-version` is required, though not for the obvious reason. With
+//!   `--no-undefined-version` left in place the **default** feature row links
+//!   perfectly well, because every `global:` name is defined. The row that fails
+//!   is `--no-default-features`, where the `gz*` entry points are feature-gated
+//!   away and `ld` rejects each name the script versions but that build does not
+//!   define. With the rewrite that row links cleanly and versions the globals it
+//!   does have.
+//! * The capability must tolerate `zlib.map` being absent. `Cargo.toml`'s
+//!   `exclude` list contains `*.map`, so the file is not in the published
+//!   `.crate` at all; that case prints a notice and links unversioned.
+//!
+//! ## Supported targets, and what happens elsewhere
+//!
+//! The opt-in applies only where it is established to work, and every clause is
+//! checked rather than inferred from a neighbouring one: a Unix host, a
+//! `target_os` of `linux` or `android`, `target_env` of `gnu`, host triple equal
+//! to target triple, an `ld.bfd` discoverable on `PATH`, and a readable
+//! `zlib.map` carrying a `local:` list. `target_os` alone is not sufficient
+//! evidence that a linker is capable, because the same `target_os` gives opposite
+//! outcomes on toolchains that default to different linkers. `musl` is excluded
+//! because it emits no shared object here at all, so there is nothing to version;
+//! Mach-O wants `-exported_symbols_list` and MSVC wants a `.def` file, neither of
+//! which a version script can express.
+//!
+//! When any clause fails the capability is **inert**: it prints a
+//! `cargo:warning` naming the clause and the build continues, unversioned. It
+//! never fails the build over a capability it cannot provide, because AAP §0.10.1
+//! ranks D8 **Low** and no consumer should lose a working build to it. The one
+//! thing that does abort is a genuine `OUT_DIR` I/O failure, which is treated
+//! exactly as `write_tables` treats it — if Cargo's own scratch directory cannot
+//! be written to, the generated CRC tables are already in doubt.
+//!
+//! The capability stays off in CI, and landing a row that links and inspects the
+//! versioned artifact belongs with gap D3, the cross-platform matrix.
+//! `.cargo/config.toml` states the companion half of the boundary: the wiring
+//! lives here, in one tested place, and not in ambient global rustflags.
 //!
 //! # Constraints
 //!
@@ -191,8 +369,13 @@ fn make_x2n_table() -> [u32; 32] {
 /// Port of `braid()` in `crc32.c`. Each of the `w` sub-tables holds, for every
 /// possible byte value, the sparse CRC contribution of that byte at the braid's
 /// position. The big-endian sub-tables are stored in reverse position order and
-/// byte-swapped, matching the C layout so the runtime big-endian path indexes
-/// them identically.
+/// byte-swapped, reproducing the C layout so the emitted tables can be diffed
+/// against `crc32.h` entry for entry.
+///
+/// Both results are emitted unconditionally and both are read by
+/// `src/checksum/crc32.rs`'s `braid` module, which picks the little- or
+/// big-endian set at consumption time with `cfg!(target_endian)` (see the
+/// "Emitted contract" section above).
 fn braid(n: usize, w: usize, x2n_table: &[u32; 32]) -> (Vec<[u32; 256]>, Vec<[u64; 256]>) {
     let mut ltl = vec![[0u32; 256]; w];
     let mut big = vec![[0u64; 256]; w];
@@ -227,23 +410,31 @@ const GENERATED_HEADER: &str = "\
 // make_crc_table() routine in crc32.c). The values are bit-identical to the
 // checked-in C header crc32.h and must remain so for wire-format compatibility.
 //
-// Consumed by src/checksum/crc32.rs via:
+// Included by src/checksum/crc32.rs via:
 //     include!(concat!(env!(\"OUT_DIR\"), \"/crc32_tables.rs\"));
 //
-// Emitted symbols:
-//   CRC_BRAID_N:         usize            number of braids (5)
-//   CRC_BRAID_W:         usize            bytes per CRC word (8)
-//   CRC_TABLE:           [u32; 256]       byte-wise CRC-32 table
-//   X2N_TABLE:           [u32; 32]        powers of x for crc32_combine
-//   CRC_BIG_TABLE:       [u64; 256]       byte-swapped table (big-endian words)
-//   CRC_BRAID_TABLE:     [[u32; 256]; 8]  little-endian braid table
-//   CRC_BRAID_BIG_TABLE: [[u64; 256]; 8]  big-endian braid table
+// Emitted symbols. All seven are imported by that module: the first two below
+// are read in every configuration, and the remaining five drive the braided
+// word-at-a-time path, which is compiled whenever the `simd` feature is off. No
+// item carries #[allow(dead_code)] -- the consuming module grants that allowance
+// itself, and only for the `simd` configuration.
+//   CRC_TABLE:           [u32; 256]       byte-wise CRC-32 table       [always]
+//   X2N_TABLE:           [u32; 32]        powers of x for crc32_combine[always]
+//   CRC_BRAID_N:         usize            number of braids (5)         [no-simd]
+//   CRC_BRAID_W:         usize            bytes per CRC word (8)       [no-simd]
+//   CRC_BIG_TABLE:       [u64; 256]       byte-swapped table (BE words)[no-simd]
+//   CRC_BRAID_TABLE:     [[u32; 256]; 8]  little-endian braid table    [no-simd]
+//   CRC_BRAID_BIG_TABLE: [[u64; 256]; 8]  big-endian braid table       [no-simd]
 
 ";
 
 /// Append a `[u32; N]` static array literal to `out`, eight values per line.
+///
+/// No `#[allow(dead_code)]` is emitted: whether an unconsumed table is a
+/// warning is the consuming module's decision, and `src/checksum/crc32.rs`
+/// grants that allowance only in the `simd` configuration (see the
+/// "Emitted contract" note above).
 fn write_u32_array(out: &mut String, name: &str, vals: &[u32]) {
-    let _ = writeln!(out, "#[allow(dead_code)]");
     let _ = writeln!(out, "pub(crate) static {}: [u32; {}] = [", name, vals.len());
     for chunk in vals.chunks(8) {
         out.push_str("    ");
@@ -260,7 +451,6 @@ fn write_u32_array(out: &mut String, name: &str, vals: &[u32]) {
 
 /// Append a `[u64; N]` static array literal to `out`, four values per line.
 fn write_u64_array(out: &mut String, name: &str, vals: &[u64]) {
-    let _ = writeln!(out, "#[allow(dead_code)]");
     let _ = writeln!(out, "pub(crate) static {}: [u64; {}] = [", name, vals.len());
     for chunk in vals.chunks(4) {
         out.push_str("    ");
@@ -277,7 +467,6 @@ fn write_u64_array(out: &mut String, name: &str, vals: &[u64]) {
 
 /// Append a `[[u32; 256]; W]` static braid table literal to `out`.
 fn write_braid_u32(out: &mut String, name: &str, tbl: &[[u32; 256]]) {
-    let _ = writeln!(out, "#[allow(dead_code)]");
     let _ = writeln!(
         out,
         "pub(crate) static {}: [[u32; 256]; {}] = [",
@@ -303,7 +492,6 @@ fn write_braid_u32(out: &mut String, name: &str, tbl: &[[u32; 256]]) {
 
 /// Append a `[[u64; 256]; W]` static braid table literal to `out`.
 fn write_braid_u64(out: &mut String, name: &str, tbl: &[[u64; 256]]) {
-    let _ = writeln!(out, "#[allow(dead_code)]");
     let _ = writeln!(
         out,
         "pub(crate) static {}: [[u64; 256]; {}] = [",
@@ -331,14 +519,42 @@ fn write_braid_u64(out: &mut String, name: &str, tbl: &[[u64; 256]]) {
 // Entry point
 // ---------------------------------------------------------------------------
 
-fn main() {
-    // The tables are pure constants, so we only need to regenerate them when
-    // this script itself changes.
-    println!("cargo:rerun-if-changed=build.rs");
+/// Name of the generated file written into `OUT_DIR`.
+const GENERATED_FILE: &str = "crc32_tables.rs";
 
-    let out_dir = env::var("OUT_DIR").expect("OUT_DIR environment variable not set by Cargo");
-    let dest = Path::new(&out_dir).join("crc32_tables.rs");
+/// The Cargo directives this build script emits on **every** invocation,
+/// in order.
+///
+/// There are exactly **two**, and that narrowness is a contract rather than an
+/// omission:
+///
+/// * `rerun-if-changed=build.rs` — the tables are pure constants, so they only
+///   need regenerating when this script itself changes.
+/// * `rerun-if-env-changed=ZLIB_RS_VERSION_SCRIPT` — so that flipping the
+///   symbol-versioning opt-in described in the "Optional cdylib symbol
+///   versioning" section takes effect without a `cargo clean`. Declaring the
+///   dependency is not the same as acting on it: with the variable unset this
+///   script emits nothing further, so the default build's directive set is these
+///   two lines and the emitted artifacts are identical to what they were before
+///   the capability existed.
+///
+/// Everything else this script can emit is conditional on that opt-in, lives in
+/// [`emit_version_script`], and is scoped to the `cdylib` link only.
+fn unconditional_directives() -> [String; 2] {
+    [
+        "cargo:rerun-if-changed=build.rs".to_owned(),
+        format!("cargo:rerun-if-env-changed={VERSION_SCRIPT_ENV}"),
+    ]
+}
 
+/// Render the complete text of `${OUT_DIR}/crc32_tables.rs`.
+///
+/// Pure: no environment, no filesystem, no randomness, and no dependence on the
+/// host or target configuration — both endian forms of every table are always
+/// emitted and the consumer selects between them with `cfg!(target_endian)`
+/// (AAP §0.3.1). Two calls therefore always produce byte-identical output, which
+/// is what makes the generated artifact reproducible.
+fn render_tables() -> String {
     // Build every table in memory.
     let (crc_table, crc_big_table) = make_crc_tables();
     let x2n_table = make_x2n_table();
@@ -347,6 +563,11 @@ fn main() {
     // Emit the Rust source.
     let mut out = String::with_capacity(384 * 1024);
     out.push_str(GENERATED_HEADER);
+    // No `#[allow(dead_code)]` is emitted for any item. Whether an unconsumed
+    // table is a warning is the *consuming* module's decision, and
+    // `src/checksum/crc32.rs` grants that allowance only in the `simd`
+    // configuration — with `simd` off its braided word-at-a-time path reads all
+    // seven of these, so the compiler itself proves nothing generated is unused.
     let _ = writeln!(out, "pub(crate) const CRC_BRAID_N: usize = {BRAID_N};");
     let _ = writeln!(out, "pub(crate) const CRC_BRAID_W: usize = {BRAID_W};");
     out.push('\n');
@@ -357,5 +578,1820 @@ fn main() {
     write_braid_u32(&mut out, "CRC_BRAID_TABLE", &braid_ltl);
     write_braid_u64(&mut out, "CRC_BRAID_BIG_TABLE", &braid_big);
 
-    fs::write(&dest, out).unwrap_or_else(|e| panic!("failed to write {}: {e}", dest.display()));
+    out
+}
+
+/// Render the tables and write them into `dir`, returning the path written.
+///
+/// Panics only on a genuine I/O failure, which must fail the build: a missing or
+/// truncated generated file would produce a confusing `include!` error much
+/// later in the compilation.
+fn write_tables(dir: &Path) -> std::path::PathBuf {
+    let dest = dir.join(GENERATED_FILE);
+    fs::write(&dest, render_tables())
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", dest.display()));
+    dest
+}
+
+// ---------------------------------------------------------------------------
+// Optional cdylib symbol versioning (AAP §0.8.2 Divergence 4 / gap D8)
+// ---------------------------------------------------------------------------
+
+/// The opt-in variable. Unset — the default — leaves the emitted `cdylib` with
+/// an unversioned symbol table, which is exactly the state AAP §0.8.2
+/// Divergence 4 records and instructs be kept.
+const VERSION_SCRIPT_ENV: &str = "ZLIB_RS_VERSION_SCRIPT";
+
+/// Subdirectory of `OUT_DIR` holding the derived script and the shim.
+const VERSION_SCRIPT_DIR: &str = "zlib_rs_version_script";
+
+/// Basename of the shim, which must be exactly this.
+///
+/// The shim is installed by handing the compiler driver `-B<dir>`, and a driver
+/// looks up a *subprogram name* there. `-fuse-ld=bfd` makes that name `ld.bfd`,
+/// and passing the flavour flag is also what steers a toolchain whose default is
+/// `rust-lld` into consulting the shim at all — on stable, `rustc` itself passes
+/// `-fuse-ld=lld`, and the driver takes the last one it is given.
+const VERSION_SCRIPT_SHIM: &str = "ld.bfd";
+
+/// Basename of the derived script, written next to the shim.
+const VERSION_SCRIPT_DERIVED: &str = "zlib_rs.map";
+
+/// The one pattern the derived script adds to the base node's `local:` list.
+///
+/// Substituting `zlib.map` wholesale exports **96** symbols rather than the
+/// baseline 95: `zlib.map`'s only wildcard is `local: _*;`, which hides Rust's
+/// mangled names and the `__rust_*` hooks but not `rust_eh_personality`. (A
+/// build with `panic = "unwind"` would also leak `rust_begin_unwind` and
+/// `rust_panic`; this crate is `panic = "abort"`, so `rust_eh_personality` is the
+/// only one that survives.) One `rust_*;` pattern restores the exact baseline
+/// set. A `local: *;` catch-all must **not** be used instead: `zlib.map` does
+/// not name `deflate`, `inflate`, `compress`, `gzopen`, `adler32`, `crc32` or 35
+/// other entry points at all, so a catch-all would hide every one of them.
+const VERSION_SCRIPT_HIDE_PATTERN: &str = "rust_*;";
+
+/// The substituting shim, POSIX `sh`, with the derived script's path
+/// interpolated at `__ZLIB_RS_DERIVED_SCRIPT__`.
+///
+/// `rustc` always passes a `--version-script` of its own, and that script uses an
+/// **anonymous** version node — `{ global: <no_mangle names>; local: *; };`. GNU
+/// `ld` refuses to combine an anonymous node with named ones, so a second script
+/// can never simply be appended; and because build-script link arguments land
+/// *after* `rustc`'s own, ours could never win on ordering even where a linker
+/// tolerated the combination. The linker therefore has to see exactly one script
+/// and it has to be ours, which is what this shim arranges.
+///
+/// It resolves the real linker itself, by walking `PATH` and skipping its own
+/// directory. That is deliberate: it keeps this build script free of any
+/// `Command`, shell-out or process spawn, so the "pure `std`" constraint below
+/// holds in the strong sense rather than only in the dependency sense.
+///
+/// Every path that is not "substitute exactly one script" forwards the original
+/// argument list untouched, reproducing the ordinary unversioned link. That
+/// includes the case where the derived script has gone missing, and the case
+/// where the caller passed no version script at all — a shim that *introduced*
+/// one would hide symbols the caller expected to export, which is far worse than
+/// leaving them unversioned.
+const VERSION_SCRIPT_SHIM_SOURCE: &str = r#"#!/bin/sh
+# Substituting version-script shim for zlib-rs, generated by build.rs.
+# See the "Optional cdylib symbol versioning" section of build.rs for why this
+# exists and why it is shaped this way. Do not edit: it is regenerated.
+set -u
+
+script='__ZLIB_RS_DERIVED_SCRIPT__'
+marker='@@zlib_rs_argv_end@@'
+
+# Resolve the real linker, skipping this shim's own directory so it cannot
+# re-invoke itself.
+self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || self_dir=''
+real=''
+oldifs=$IFS
+IFS=:
+for d in $PATH; do
+    [ -n "$d" ] || d=.
+    if [ -n "$self_dir" ] && [ "$d" = "$self_dir" ]; then continue; fi
+    if [ -x "$d/ld.bfd" ]; then real="$d/ld.bfd"; break; fi
+done
+IFS=$oldifs
+[ -n "$real" ] || real=ld.bfd
+
+# No usable script: forward untouched.
+if [ ! -r "$script" ]; then
+    exec "$real" "$@"
+fi
+
+# Nothing to substitute: forward untouched. Never introduce a version script the
+# caller did not ask for.
+have=0
+for a in "$@"; do
+    case "$a" in
+        --version-script | --version-script=*) have=1 ;;
+    esac
+done
+if [ "$have" -eq 0 ]; then
+    exec "$real" "$@"
+fi
+
+# Rewrite. The marker terminates the rotation however many arguments a branch
+# consumes or appends.
+seen=0
+set -- "$@" "$marker"
+while :; do
+    a=$1
+    shift
+    if [ "$a" = "$marker" ]; then
+        break
+    fi
+    case "$a" in
+        --version-script=*)
+            if [ "$seen" -eq 0 ]; then
+                seen=1
+                set -- "$@" "--version-script=$script"
+            fi
+            ;;
+        --version-script)
+            if [ "$#" -gt 0 ] && [ "$1" != "$marker" ]; then
+                shift
+            fi
+            if [ "$seen" -eq 0 ]; then
+                seen=1
+                set -- "$@" "--version-script=$script"
+            fi
+            ;;
+        --no-undefined-version)
+            set -- "$@" --undefined-version
+            ;;
+        *)
+            set -- "$@" "$a"
+            ;;
+    esac
+done
+
+exec "$real" "$@"
+"#;
+
+/// Interpret the opt-in variable's value strictly.
+///
+/// Unset, empty, and the four falsey spellings mean off. The four truthy
+/// spellings mean on. **Anything else is an error**, not a quiet "off": silently
+/// ignoring a typo in an opt-in is how a build ends up not doing what its
+/// operator believes it is doing, and an operator who asked for versioned symbols
+/// has no other signal that they did not get them.
+fn parse_opt_in(raw: Option<&str>) -> Result<bool, String> {
+    let Some(raw) = raw else {
+        return Ok(false);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        "1" | "true" | "yes" | "on" => Ok(true),
+        // `raw` rather than the normalized form: an operator needs to see exactly
+        // what they typed, not a lowercased echo of it.
+        _ => Err(format!(
+            "{VERSION_SCRIPT_ENV}={raw:?} is not a recognized boolean. Use 1, true, yes or on \
+             to apply the zlib.map symbol-version script to the cdylib, or 0, false, no, off — \
+             or leave it unset — for the default unversioned symbol table. An unrecognized \
+             value is rejected rather than treated as off, so a typo cannot silently disable \
+             the capability it was meant to enable."
+        )),
+    }
+}
+
+/// Explain why this build cannot apply the version script, or [`None`] when it
+/// can.
+///
+/// Each clause is checked on its own rather than inferred from a neighbouring
+/// one. `target_os` in particular is not sufficient evidence that a linker can
+/// apply a version script: the same `target_os` yields opposite outcomes on
+/// toolchains that default to different linkers, one failing the link outright
+/// and the other binding no symbol at all.
+///
+/// * The host must be Unix, because the shim is a `sh` script.
+/// * `target_os` must be `linux` or `android`, and `target_env` must be `gnu`.
+///   `macos`/`ios` want `-exported_symbols_list` and `windows`/MSVC wants a
+///   `.def` file, neither of which a version script can express. `musl` is
+///   excluded because it emits no shared object here at all, so there is nothing
+///   to version.
+/// * Host and target triples must match. The shim resolves `ld.bfd` from the
+///   *build host's* `PATH`, so a cross build would hand the wrong linker a
+///   correctly derived script.
+fn unsupported_reason(
+    target_os: &str,
+    target_env: &str,
+    host: &str,
+    target: &str,
+    host_is_unix: bool,
+) -> Option<String> {
+    if !host_is_unix {
+        return Some(
+            "the build host is not a Unix system, and the substituting linker shim this \
+             capability installs is a POSIX `sh` script"
+                .to_owned(),
+        );
+    }
+    if target_os != "linux" && target_os != "android" {
+        return Some(format!(
+            "target_os = {target_os:?} does not use GNU-style version scripts (Mach-O wants \
+             -exported_symbols_list and MSVC wants a .def file)"
+        ));
+    }
+    if target_env != "gnu" {
+        return Some(format!(
+            "target_env = {target_env:?} is not `gnu`; in particular a musl target emits no \
+             shared object at all, so there would be nothing to version"
+        ));
+    }
+    if host != target {
+        return Some(format!(
+            "this is a cross build (host {host:?}, target {target:?}), and the shim resolves \
+             its linker from the build host's PATH"
+        ));
+    }
+    None
+}
+
+/// Derive the script to substitute: `map` verbatim plus exactly one
+/// [`VERSION_SCRIPT_HIDE_PATTERN`] line inside the first node's existing
+/// `local:` list.
+///
+/// Returns [`None`] when there is no `local:` list to extend, because the
+/// alternatives are both wrong. A fresh `local:` section placed before a node's
+/// `global:` section is a syntax error to GNU `ld` 2.45; and a brand-new trailing
+/// node carrying only a `local:` list does parse, but adds a version definition
+/// that `zlib.map` does not contain, so the emitted `.gnu.version_d` would no
+/// longer match a distribution `libz.so.1`.
+///
+/// `zlib.map` itself is a read-only reference artifact of the retained C baseline
+/// (AAP §0.4.1.12, preservation directive D-7) and is never rewritten.
+fn derive_version_script(map: &str) -> Option<String> {
+    let mut out = String::with_capacity(map.len() + VERSION_SCRIPT_HIDE_PATTERN.len() + 8);
+    let mut inserted = false;
+    for line in map.split_inclusive('\n') {
+        out.push_str(line);
+        if !inserted && line.trim() == "local:" {
+            // Match the indentation the existing entries use: the label's own
+            // indent plus one level, which is two spaces in `zlib.map`.
+            let indent = &line[..line.len() - line.trim_start().len()];
+            out.push_str(indent);
+            out.push_str("  ");
+            out.push_str(VERSION_SCRIPT_HIDE_PATTERN);
+            out.push('\n');
+            inserted = true;
+        }
+    }
+    inserted.then_some(out)
+}
+
+/// The shim's text with `derived` interpolated as its script path.
+fn shim_source(derived: &str) -> String {
+    VERSION_SCRIPT_SHIM_SOURCE.replace("__ZLIB_RS_DERIVED_SCRIPT__", derived)
+}
+
+/// Whether `path` may be interpolated into a Cargo directive and into the shim.
+///
+/// Cargo directives are line-oriented, so a newline or carriage return in a path
+/// would end the directive early and let the remainder be read as a new one. The
+/// shim embeds the derived script's path inside single quotes, so an apostrophe
+/// would end the quoting. A NUL cannot reach a syscall at all. None of these is
+/// reachable through any supported layout, but interpolating an ambient path into
+/// a structured line without checking it is a defect whether or not it is
+/// currently exploitable.
+fn path_is_interpolation_safe(path: &str) -> bool {
+    !path.is_empty() && !path.contains(['\n', '\r', '\'', '\0'])
+}
+
+/// Whether `path` names an existing file with at least one execute bit.
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Whether `path` names an existing file. Non-Unix hosts have no execute bit,
+/// and are excluded by [`unsupported_reason`] regardless.
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|m| m.is_file())
+}
+
+/// Find `name` on a colon-separated `PATH`, using an empty entry to mean `.` as
+/// a POSIX shell does.
+///
+/// `:` is correct here rather than platform-dependent: this is only ever reached
+/// on a Unix host, which [`unsupported_reason`] enforces.
+fn find_executable(name: &str, path_var: &str) -> Option<std::path::PathBuf> {
+    path_var
+        .split(':')
+        .map(|dir| if dir.is_empty() { "." } else { dir })
+        .map(|dir| Path::new(dir).join(name))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+/// The two link arguments that install the shim, given the directory holding it.
+///
+/// `rustc-cdylib-link-arg`, never the unscoped `rustc-link-arg`: the unscoped
+/// form applies to every link in the package, so it would push `-B` and a linker
+/// flavour onto every test and bench binary as well — turning an opt-in that is
+/// meant to touch one artifact into one that touches all of them.
+fn version_script_directives(dir: &str) -> [String; 2] {
+    [
+        format!("cargo:rustc-cdylib-link-arg=-B{dir}"),
+        "cargo:rustc-cdylib-link-arg=-fuse-ld=bfd".to_owned(),
+    ]
+}
+
+/// The `cargo:warning` line explaining that the opt-in was requested but not
+/// applied.
+///
+/// Flattened to a single line because `cargo:warning=` is itself line-oriented:
+/// an embedded newline would end the warning and let the remainder be read as a
+/// fresh directive.
+fn version_script_notice_line(reason: &str) -> String {
+    let reason: String = reason
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    format!(
+        "cargo:warning=zlib-rs: {VERSION_SCRIPT_ENV} is set but cdylib symbol versioning was \
+         not applied: {reason}. The build continues and produces the ordinary unversioned \
+         symbol table."
+    )
+}
+
+/// Write the derived script and the shim into `dir`, creating it if needed.
+///
+/// `create_dir_all` is right here and is deliberately *not* the create-new
+/// pattern a shared temporary directory would require: `dir` lives inside
+/// `OUT_DIR`, Cargo's own per-package scratch space, which is not
+/// attacker-guessable and which must survive being recreated on every
+/// incremental build.
+fn install_version_script(dir: &Path, derived: &str) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let derived_path = dir.join(VERSION_SCRIPT_DERIVED);
+    fs::write(&derived_path, derived)?;
+    let embedded = derived_path
+        .to_str()
+        .ok_or_else(|| std::io::Error::other("derived script path is not valid UTF-8"))?;
+    write_executable(&dir.join(VERSION_SCRIPT_SHIM), &shim_source(embedded))
+}
+
+/// Print a `cargo:warning` explaining that the opt-in was requested but not
+/// applied.
+///
+/// `#[cfg(not(test))]` for the same reason [`main`] carries it: this is reachable
+/// only from [`emit_version_script`], which in turn is reachable only from
+/// `main`, so under `rustc --test build.rs` it would be reported as dead code.
+/// Its whole body other than the `println!` lives in the directly tested
+/// [`version_script_notice_line`].
+#[cfg(not(test))]
+fn version_script_notice(reason: &str) {
+    println!("{}", version_script_notice_line(reason));
+}
+
+/// Apply `zlib.map` to the emitted `cdylib`, when asked to and when possible.
+///
+/// Does nothing at all unless [`VERSION_SCRIPT_ENV`] is set to a truthy value, so
+/// the default build is byte-for-byte the build that existed before this function
+/// did.
+///
+/// # Failure policy
+///
+/// Two kinds of condition are treated differently on purpose:
+///
+/// * A **capability** condition — an unsupported target, a `zlib.map` that is
+///   absent (as it legitimately is inside a packaged `.crate`, since the
+///   manifest's `exclude` list contains `*.map`) or has no `local:` list, no
+///   `ld.bfd` on `PATH`, or a path that cannot be safely interpolated — prints a
+///   notice and leaves the build unversioned. It never fails the build, because
+///   the capability is ranked Low by AAP §0.10.1 and no consumer should lose a
+///   working build over it.
+/// * An **I/O failure inside `OUT_DIR`** panics, exactly as `write_tables` does.
+///   `OUT_DIR` is Cargo's own scratch space; if it cannot be written to then the
+///   generated CRC tables are already in doubt and a quiet downgrade would be
+///   the wrong answer.
+///
+/// `#[cfg(not(test))]` for the same reason [`main`] carries it: this is the one
+/// function here that reads the process environment, it is reachable only from
+/// `main`, and under `rustc --test build.rs` there is no `main`. Every decision it
+/// makes is delegated to a pure helper that the emission-contract tests exercise
+/// directly — [`parse_opt_in`], [`unsupported_reason`], [`derive_version_script`],
+/// [`find_executable`], [`path_is_interpolation_safe`], [`shim_source`],
+/// [`version_script_directives`], [`version_script_notice_line`] and
+/// [`install_version_script`] — so what remains unexercised is the wiring
+/// between them and nothing else.
+#[cfg(not(test))]
+fn emit_version_script(out_dir: &Path) {
+    let enabled = parse_opt_in(env::var(VERSION_SCRIPT_ENV).ok().as_deref())
+        .unwrap_or_else(|message| panic!("{message}"));
+    if !enabled {
+        return;
+    }
+
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let host = env::var("HOST").unwrap_or_default();
+    let target = env::var("TARGET").unwrap_or_default();
+    if let Some(reason) = unsupported_reason(&target_os, &target_env, &host, &target, cfg!(unix)) {
+        version_script_notice(&reason);
+        return;
+    }
+
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    let map_path = Path::new(&manifest_dir).join("zlib.map");
+    let Some(map_display) = map_path.to_str().filter(|p| path_is_interpolation_safe(p)) else {
+        version_script_notice("the path of zlib.map cannot be placed in a Cargo directive");
+        return;
+    };
+    let Ok(map_text) = fs::read_to_string(&map_path) else {
+        version_script_notice(&format!(
+            "{map_display} is not readable, so there is no symbol-version script to apply \
+             (expected inside a packaged crate, where the manifest excludes *.map)"
+        ));
+        return;
+    };
+    let Some(derived) = derive_version_script(&map_text) else {
+        version_script_notice(&format!(
+            "{map_display} has no `local:` list to extend, so no derived script can be built \
+             from it without changing the set of version definitions it declares"
+        ));
+        return;
+    };
+
+    let path_var = env::var("PATH").unwrap_or_default();
+    if find_executable(VERSION_SCRIPT_SHIM, &path_var).is_none() {
+        version_script_notice(
+            "no `ld.bfd` was found on PATH, and GNU ld is the linker that turns a version \
+             script into per-symbol version tags",
+        );
+        return;
+    }
+
+    let dir = out_dir.join(VERSION_SCRIPT_DIR);
+    let derived_path = dir.join(VERSION_SCRIPT_DERIVED);
+    let (Some(dir_str), Some(derived_str)) = (dir.to_str(), derived_path.to_str()) else {
+        version_script_notice("OUT_DIR is not valid UTF-8");
+        return;
+    };
+    if !path_is_interpolation_safe(dir_str) || !path_is_interpolation_safe(derived_str) {
+        version_script_notice(
+            "OUT_DIR contains a character that cannot be placed in a Cargo directive or in a \
+             single-quoted shell word",
+        );
+        return;
+    }
+
+    install_version_script(&dir, &derived)
+        .unwrap_or_else(|e| panic!("failed to write the version-script shim into {dir_str}: {e}"));
+
+    for directive in version_script_directives(dir_str) {
+        println!("{directive}");
+    }
+    println!("cargo:rerun-if-changed={map_display}");
+}
+
+/// Write `body` to `path` and make it executable by its owner.
+///
+/// The existing file is removed first so a stale entry — including a symbolic
+/// link left by an earlier tool — is replaced rather than written through, and so
+/// the mode is applied to a file this call created.
+#[cfg(unix)]
+fn write_executable(path: &Path, body: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _ = fs::remove_file(path);
+    fs::write(path, body)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+/// Write `body` to `path`. Non-Unix hosts have no execute bit, and are excluded
+/// by [`unsupported_reason`] before this can be reached.
+#[cfg(not(unix))]
+fn write_executable(path: &Path, body: &str) -> std::io::Result<()> {
+    let _ = fs::remove_file(path);
+    fs::write(path, body)
+}
+
+// `#[cfg(not(test))]` rather than an `allow`: compiling this file with
+// `rustc --test build.rs` supplies its own entry point, and a `main` the harness
+// never calls would be reported as dead code.
+#[cfg(not(test))]
+fn main() {
+    for directive in unconditional_directives() {
+        println!("{directive}");
+    }
+
+    let out_dir = env::var("OUT_DIR").expect("OUT_DIR environment variable not set by Cargo");
+    let out_dir = Path::new(&out_dir);
+    write_tables(out_dir);
+    emit_version_script(out_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+//
+// This file is a build script, so `cargo test` never compiles it. The tests
+// below are reached by compiling it as its own test binary:
+//
+//     rustc --edition 2024 --test build.rs -o <bin> && <bin>
+//
+// which is exactly what the `build-script-tests` CI job does. Everything here
+// is pure `std` and creates files only under a uniquely named subdirectory of
+// the system temporary directory, which it removes on the way out.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// This build script's own source, for the emission-contract tests below.
+    const SELF_SRC: &str = include_str!("build.rs");
+
+    /// The part of `SELF_SRC` that Cargo actually compiles and runs, i.e.
+    /// everything above the `cfg(test)` module, with every whole-line comment
+    /// removed.
+    ///
+    /// Both halves matter. Excluding the test module keeps a test's own scratch
+    /// helpers out of the answer, and excluding comments means a directive
+    /// spelling cannot be found — or hidden — in prose. This file documents the
+    /// directives it deliberately does *not* emit, at length, so a naive
+    /// substring search over the raw text would be satisfied by the very
+    /// documentation that explains the absence.
+    fn script_body() -> String {
+        SELF_SRC
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // -----------------------------------------------------------------------
+    // Emission contract
+    //
+    // Two properties have to hold at once and they pull in opposite directions.
+    // AAP §0.8.2 Divergence 4 keeps cdylib symbol versioning UNAPPLIED by
+    // default, and §0.10.1 ranks gap D8 Low and defers it behind the
+    // cross-platform CI matrix (gap D3); but the capability has to exist, off by
+    // default and tested, rather than be absent. So these tests pin BOTH halves:
+    // that the default build emits exactly two directives and no link wiring
+    // whatsoever, and that when the opt-in is enabled the wiring it emits is the
+    // measured-correct one and is scoped to the `cdylib` alone.
+    //
+    // Wiring `zlib.map` in naively, by adding a second version script, is not a
+    // route to the second half: it fails the MSRV build outright and binds zero
+    // symbols where it does link. The substitution route these tests cover is
+    // the one measured to work on both toolchains. None of it is observable to
+    // any other gate in this repository, because `cargo test` never compiles
+    // `build.rs`, so a build script that quietly grows an unscoped link
+    // argument, a second opt-in variable, or a stray `cargo:warning` is
+    // precisely the change nothing else would catch.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_unconditional_directives_are_exactly_the_two_documented_ones() {
+        let directives = unconditional_directives();
+        assert_eq!(
+            directives.len(),
+            2,
+            "the emission contract is exactly two directives; a third changes what \
+             every consumer's build depends on"
+        );
+        assert_eq!(directives[0], "cargo:rerun-if-changed=build.rs");
+        assert_eq!(
+            directives[1],
+            format!("cargo:rerun-if-env-changed={VERSION_SCRIPT_ENV}"),
+            "declaring the opt-in variable as an input is what lets it be flipped \
+             without a `cargo clean`; declaring it is not the same as acting on it"
+        );
+        // Neither unconditional directive may be link wiring: with the opt-in
+        // unset the build must be neutral.
+        for directive in &directives {
+            assert!(
+                directive.starts_with("cargo:rerun-if-"),
+                "unconditional directive `{directive}` is not a rerun declaration, so \
+                 the default build is no longer neutral"
+            );
+        }
+    }
+
+    #[test]
+    fn the_opt_in_is_off_by_default_and_rejects_unrecognized_values() {
+        assert_eq!(
+            parse_opt_in(None),
+            Ok(false),
+            "an absent variable is the default, and the default is off"
+        );
+        for off in ["", " ", "0", "false", "FALSE", "no", "off", " Off "] {
+            assert_eq!(
+                parse_opt_in(Some(off)),
+                Ok(false),
+                "`{off:?}` must mean off"
+            );
+        }
+        for on in ["1", "true", "TRUE", "yes", "on", " On "] {
+            assert_eq!(parse_opt_in(Some(on)), Ok(true), "`{on:?}` must mean on");
+        }
+        for bogus in ["2", "tru", "enabled", "ON!", "zlib.map", "-1"] {
+            let outcome = parse_opt_in(Some(bogus));
+            assert!(
+                outcome.is_err(),
+                "`{bogus:?}` must be rejected, not silently treated as off: quietly \
+                 ignoring a typo in an opt-in is how a build ends up not doing what \
+                 its operator believes it is doing"
+            );
+            let message = outcome.unwrap_err();
+            assert!(
+                message.contains(VERSION_SCRIPT_ENV) && message.contains(bogus),
+                "the rejection must name the variable and the offending value, got: \
+                 {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_script_never_emits_an_unscoped_link_arg() {
+        let code = script_body();
+        // Assembled at run time from fragments so this test's own source cannot
+        // satisfy the search it performs.
+        let unscoped = format!("rustc-{}link-arg", "");
+        assert!(
+            !code.contains(&unscoped),
+            "build.rs must never emit `{unscoped}`: the unscoped form applies to \
+             every link in the package, so it would push a linker prefix and a \
+             linker flavour onto every test and bench binary as well"
+        );
+        // The scoped form is the one that must be present.
+        let scoped = format!("rustc-{}link-arg", "cdylib-");
+        assert!(
+            code.contains(&scoped),
+            "the symbol-versioning opt-in is wired through `{scoped}`; if that is \
+             gone, the capability is gone"
+        );
+    }
+
+    #[test]
+    fn the_enabled_link_arguments_are_cdylib_scoped_and_steer_the_linker_flavour() {
+        let directives = version_script_directives("/some/out/dir/zlib_rs_version_script");
+        assert_eq!(
+            directives,
+            [
+                "cargo:rustc-cdylib-link-arg=-B/some/out/dir/zlib_rs_version_script".to_owned(),
+                "cargo:rustc-cdylib-link-arg=-fuse-ld=bfd".to_owned(),
+            ],
+            "`-B` installs the shim as the driver's `ld.bfd` subprogram, and the \
+             flavour flag is what makes the driver look for that name at all — on \
+             stable, rustc itself passes `-fuse-ld=lld` and the driver takes the \
+             last one it is given"
+        );
+    }
+
+    #[test]
+    fn the_derived_script_adds_exactly_one_hide_pattern_to_the_first_local_list() {
+        let map = "ZLIB_1.2.0 {\n  global:\n    compressBound;\n  local:\n    zcalloc;\n\
+                   \n};\n\nZLIB_1.2.9 {\n  global:\n    deflateGetDictionary;\n\
+                   } ZLIB_1.2.0;\n";
+        let derived = derive_version_script(map).expect("the base node has a `local:` list");
+
+        let added: Vec<&str> = derived
+            .lines()
+            .filter(|l| l.trim() == VERSION_SCRIPT_HIDE_PATTERN)
+            .collect();
+        assert_eq!(
+            added.len(),
+            1,
+            "exactly one hide pattern, no more: a second would be redundant and a \
+             zeroth would export `rust_eh_personality`"
+        );
+        assert_eq!(
+            added[0], "    rust_*;",
+            "the pattern must adopt the indentation the existing entries use"
+        );
+
+        // The derived script is the original plus that one line, in place.
+        let stripped: String = derived
+            .lines()
+            .filter(|l| l.trim() != VERSION_SCRIPT_HIDE_PATTERN)
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(
+            stripped, map,
+            "nothing but the one added line may differ; `zlib.map` is a read-only \
+             reference artifact of the retained C baseline (preservation directive D-7)"
+        );
+
+        // And it lands inside the FIRST `local:` list, not appended to the file
+        // and not before a `global:` section — GNU ld 2.45 rejects the latter
+        // with `syntax error in VERSION script`.
+        let lines: Vec<&str> = derived.lines().collect();
+        let local_at = lines
+            .iter()
+            .position(|l| l.trim() == "local:")
+            .expect("a `local:` label survives");
+        assert_eq!(lines[local_at + 1].trim(), VERSION_SCRIPT_HIDE_PATTERN);
+        assert!(
+            lines[..local_at].iter().any(|l| l.trim() == "global:"),
+            "the extended `local:` list must follow a `global:` section in the same node"
+        );
+    }
+
+    #[test]
+    fn the_derived_script_is_refused_when_there_is_no_local_list() {
+        // Refusal is correct rather than conservative: the alternatives are a
+        // fresh `local:` before `global:` (a syntax error) or a brand-new
+        // trailing node (a seventeenth version definition `zlib.map` does not
+        // declare, so `.gnu.version_d` would stop matching a distribution libz).
+        assert_eq!(
+            derive_version_script("ZLIB_1.2.0 {\n  global:\n    compressBound;\n};\n"),
+            None
+        );
+        assert_eq!(derive_version_script(""), None);
+        // A `local:` sharing its line with an entry is not a label this can
+        // safely extend, so it is refused too.
+        assert_eq!(
+            derive_version_script("V { global: a; local: b; };\n"),
+            None,
+            "only a `local:` label on a line of its own is extended"
+        );
+    }
+
+    #[test]
+    fn deriving_from_the_real_zlib_map_keeps_every_declared_name_and_adds_one_line() {
+        let map = include_str!("zlib.map");
+        let derived = derive_version_script(map).expect("the real zlib.map has a `local:` list");
+
+        assert_eq!(
+            derived.lines().count(),
+            map.lines().count() + 1,
+            "exactly one line is added to the real script"
+        );
+        for line in map.lines() {
+            assert!(
+                derived.contains(line),
+                "every line of zlib.map must survive verbatim; `{line}` did not"
+            );
+        }
+        // Sanity-check the two ends of the symbol contract this script exists to
+        // preserve: a `global:` name that must stay exported, and a `local:` name
+        // that must stay hidden.
+        assert!(derived.contains("compressBound;"));
+        assert!(derived.contains("inflate_table;"));
+        // And the sixteen version nodes are untouched.
+        let nodes = derived.matches("ZLIB_1.").count();
+        assert_eq!(
+            nodes,
+            map.matches("ZLIB_1.").count(),
+            "no version node may be added or removed"
+        );
+    }
+
+    #[test]
+    fn the_shim_embeds_the_derived_path_and_degrades_to_a_plain_link() {
+        let body = shim_source("/out/zlib_rs_version_script/zlib_rs.map");
+        assert!(
+            body.starts_with("#!/bin/sh\n"),
+            "the shim must be executable as POSIX sh"
+        );
+        assert!(
+            !body.contains("__ZLIB_RS_DERIVED_SCRIPT__"),
+            "the placeholder must be fully substituted"
+        );
+        assert!(
+            body.contains("script='/out/zlib_rs_version_script/zlib_rs.map'"),
+            "the derived path is embedded as a single-quoted shell word"
+        );
+        // The three behaviours the measurements depend on.
+        assert!(
+            body.contains("--version-script=$script"),
+            "the shim substitutes rustc's script rather than adding to it: GNU ld \
+             refuses to combine rustc's anonymous version node with named ones"
+        );
+        assert!(
+            body.contains("--undefined-version"),
+            "`--no-undefined-version` must be rewritten, or a feature row that gates \
+             away the gz* entry points fails to link"
+        );
+        assert!(
+            body.contains("if [ ! -r \"$script\" ]"),
+            "an unreadable derived script must degrade to an ordinary unversioned \
+             link, not to a wrong one"
+        );
+        assert!(
+            body.contains("if [ \"$have\" -eq 0 ]"),
+            "the shim must never introduce a version script the caller did not pass"
+        );
+        // It resolves its own linker, so this build script spawns no process.
+        assert!(
+            !script_body().contains(&format!("{}::Command", "process")),
+            "locating the real linker is the shim's job at link time; this script \
+             must stay free of any process spawn"
+        );
+    }
+
+    #[test]
+    fn paths_that_would_break_a_directive_or_a_shell_word_are_rejected() {
+        assert!(path_is_interpolation_safe(
+            "/tmp/out/zlib_rs_version_script"
+        ));
+        assert!(path_is_interpolation_safe("/tmp/a b/c-d.e_f"));
+        assert!(!path_is_interpolation_safe(""));
+        // Cargo directives are line-oriented, so a newline would end the
+        // directive early and let the remainder be read as a new one.
+        assert!(!path_is_interpolation_safe(
+            "/tmp/x\ncargo:rustc-link-lib=evil"
+        ));
+        assert!(!path_is_interpolation_safe("/tmp/x\r"));
+        // The shim embeds the path inside single quotes.
+        assert!(!path_is_interpolation_safe("/tmp/x'; rm -rf /; '"));
+        assert!(!path_is_interpolation_safe("/tmp/x\0y"));
+    }
+
+    #[test]
+    fn find_executable_honours_the_execute_bit_and_the_posix_empty_entry() {
+        let scratch = Scratch::new("find-exec");
+        let bin = scratch.path.join("zlib-rs-probe-tool");
+        let plain = scratch.path.join("zlib-rs-plain-file");
+        fs::write(&bin, "#!/bin/sh\nexit 0\n").expect("write probe tool");
+        fs::write(&plain, "not a program\n").expect("write plain file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o700))
+                .expect("mark probe tool executable");
+            fs::set_permissions(&plain, fs::Permissions::from_mode(0o600))
+                .expect("mark plain file non-executable");
+        }
+
+        let dir = scratch.path.to_str().expect("scratch path is UTF-8");
+        let path_var = format!("/nonexistent-zlib-rs:{dir}");
+        assert_eq!(
+            find_executable("zlib-rs-probe-tool", &path_var).as_deref(),
+            Some(bin.as_path()),
+            "a later PATH entry must still be searched"
+        );
+        assert_eq!(find_executable("zlib-rs-absent-tool", &path_var), None);
+        #[cfg(unix)]
+        assert_eq!(
+            find_executable("zlib-rs-plain-file", &path_var),
+            None,
+            "a readable but non-executable file is not a linker"
+        );
+        assert_eq!(
+            find_executable("zlib-rs-probe-tool", ""),
+            None,
+            "an entirely empty PATH resolves nothing but `.`"
+        );
+        // A directory is not a program, however it is named.
+        assert_eq!(find_executable(".", &path_var), None);
+    }
+
+    #[test]
+    fn the_generated_artifact_names_are_the_ones_the_driver_and_the_shim_expect() {
+        // `-B<dir>` makes a cc/clang driver look for a *subprogram* in `dir`, and
+        // `-fuse-ld=bfd` is what names that subprogram `ld.bfd`. If the shim were
+        // written under any other name the driver would never find it and the
+        // link would silently fall back to the real linker — a successful build
+        // with no version tags, which is the hardest kind of failure to notice.
+        assert_eq!(VERSION_SCRIPT_SHIM, "ld.bfd");
+        assert!(
+            version_script_directives("/d")
+                .iter()
+                .any(|d| d.ends_with("-fuse-ld=bfd")),
+            "the flavour flag and the shim's name must agree"
+        );
+        // The shim also resolves the *real* linker by that same name while
+        // skipping its own directory, so the two must not drift apart.
+        let body = shim_source("/d/zlib_rs.map");
+        assert!(
+            body.contains(&format!("$d/{VERSION_SCRIPT_SHIM}")),
+            "the shim searches PATH for `{VERSION_SCRIPT_SHIM}`; renaming the constant \
+             without renaming it in the shim would make it exec itself"
+        );
+        assert_eq!(VERSION_SCRIPT_DERIVED, "zlib_rs.map");
+        assert_eq!(VERSION_SCRIPT_DIR, "zlib_rs_version_script");
+    }
+
+    #[test]
+    fn installing_the_version_script_writes_a_readable_map_and_an_executable_shim() {
+        let scratch = Scratch::new("install");
+        let dir = scratch.path.join(VERSION_SCRIPT_DIR);
+        let derived =
+            derive_version_script(include_str!("zlib.map")).expect("the real zlib.map derives");
+
+        // Idempotent: an incremental build re-runs this over an existing
+        // directory and an existing, already-executable shim.
+        for round in 0..2 {
+            install_version_script(&dir, &derived)
+                .unwrap_or_else(|e| panic!("round {round} failed: {e}"));
+
+            let map_path = dir.join(VERSION_SCRIPT_DERIVED);
+            assert_eq!(
+                fs::read_to_string(&map_path).expect("derived script is readable"),
+                derived
+            );
+
+            let shim_path = dir.join(VERSION_SCRIPT_SHIM);
+            let shim = fs::read_to_string(&shim_path).expect("shim is readable");
+            assert!(shim.starts_with("#!/bin/sh\n"));
+            assert!(
+                shim.contains(&format!(
+                    "script='{}'",
+                    map_path.to_str().expect("scratch path is UTF-8")
+                )),
+                "the shim must point at the derived script it was installed beside"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = fs::metadata(&shim_path)
+                    .expect("shim metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(
+                    mode, 0o700,
+                    "round {round}: the shim must be executable by its owner and by \
+                     nobody else — a driver cannot run a non-executable subprogram, \
+                     and nothing outside this build has any business running it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn write_executable_replaces_a_stale_entry_rather_than_writing_through_it() {
+        let scratch = Scratch::new("stale");
+        let target = scratch.path.join("decoy.txt");
+        fs::write(&target, "must not be modified\n").expect("write decoy");
+        let shim = scratch.path.join(VERSION_SCRIPT_SHIM);
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &shim).expect("plant a symlink");
+        #[cfg(not(unix))]
+        fs::write(&shim, "stale\n").expect("plant a stale file");
+
+        write_executable(&shim, "#!/bin/sh\nexit 0\n").expect("write the shim");
+
+        assert_eq!(
+            fs::read_to_string(&target).expect("decoy is readable"),
+            "must not be modified\n",
+            "a planted symlink must be replaced, not followed and written through"
+        );
+        assert_eq!(
+            fs::read_to_string(&shim).expect("shim is readable"),
+            "#!/bin/sh\nexit 0\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let meta = fs::symlink_metadata(&shim).expect("shim metadata");
+            assert!(
+                meta.is_file(),
+                "the shim must be a regular file, not a link"
+            );
+            assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        }
+    }
+
+    #[test]
+    fn the_notice_is_a_single_actionable_cargo_warning_line() {
+        let line = version_script_notice_line("something\nspanning\rlines");
+        assert!(
+            line.starts_with(&format!("cargo:{}=", "warning")),
+            "the notice must be a Cargo warning directive, or nobody sees it"
+        );
+        assert!(
+            !line[..line.len() - 1].contains('\n') && !line.contains('\r'),
+            "`cargo:warning=` is line-oriented: an embedded newline would end the \
+             warning and let the remainder be read as a fresh directive; got {line:?}"
+        );
+        assert!(
+            line.contains("something spanning lines"),
+            "the reason must survive flattening, got {line:?}"
+        );
+        assert!(
+            line.contains(VERSION_SCRIPT_ENV),
+            "the notice must name the variable whose request was refused"
+        );
+        assert!(
+            line.contains("build continues"),
+            "the notice must say the build is not failing, so it is not mistaken for \
+             an error"
+        );
+    }
+
+    #[test]
+    fn the_supported_target_predicate_accepts_only_a_native_linux_gnu_build() {
+        const NATIVE: &str = "x86_64-unknown-linux-gnu";
+        assert_eq!(
+            unsupported_reason("linux", "gnu", NATIVE, NATIVE, true),
+            None,
+            "the one configuration the capability was measured on must be accepted"
+        );
+        assert_eq!(
+            unsupported_reason(
+                "android",
+                "gnu",
+                "aarch64-linux-android",
+                "aarch64-linux-android",
+                true
+            ),
+            None
+        );
+
+        // Every rejection must explain itself, so a `cargo:warning` naming it is
+        // actionable rather than merely present.
+        let rejected = [
+            (
+                "a non-Unix host",
+                unsupported_reason("linux", "gnu", NATIVE, NATIVE, false),
+            ),
+            (
+                "a Mach-O target",
+                unsupported_reason("macos", "", NATIVE, "x86_64-apple-darwin", true),
+            ),
+            (
+                "an MSVC target",
+                unsupported_reason("windows", "msvc", NATIVE, "x86_64-pc-windows-msvc", true),
+            ),
+            (
+                "a musl target, which emits no shared object at all",
+                unsupported_reason("linux", "musl", NATIVE, "x86_64-unknown-linux-musl", true),
+            ),
+            (
+                "a cross build, where the host PATH holds the wrong linker",
+                unsupported_reason("linux", "gnu", NATIVE, "i686-unknown-linux-gnu", true),
+            ),
+        ];
+        for (what, outcome) in rejected {
+            let reason =
+                outcome.unwrap_or_else(|| panic!("{what} must be refused, it was not measured"));
+            assert!(
+                !reason.trim().is_empty() && !reason.contains('\n'),
+                "the reason for refusing {what} must be a non-empty single line, so it \
+                 can be flattened into a `cargo:warning`; got {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_script_itself_is_pure_std_with_no_build_dependencies_and_no_unsafe() {
+        let code = script_body();
+        // Assembled at run time so this test's own source cannot satisfy it.
+        assert!(
+            !code.contains(&format!("extern {}", "crate")),
+            "AAP §0.5.2 requires this script to be pure `std`: no external crate \
+             may be linked into it"
+        );
+        assert!(
+            !code.contains(&format!("un{}", "safe")),
+            "AAP §0.5.2 requires ZERO unsafe in this script; the generated tables \
+             are produced with plain integer arithmetic"
+        );
+
+        // The other half of "no build-dependencies" lives in the manifest: a
+        // `[build-dependencies]` table would link a crate into this script no
+        // matter what its own source says.
+        let manifest = include_str!("Cargo.toml");
+        let table = format!("[{}-dependencies]", "build");
+        for line in manifest.lines() {
+            assert_ne!(
+                line.trim(),
+                table,
+                "AAP §0.5.2 forbids a `{table}` table; `cc`, `bindgen`, and \
+                 `pkg-config` are rejected additions, and this script must keep \
+                 needing none of them"
+            );
+        }
+    }
+
+    #[test]
+    fn the_emitted_file_name_is_the_one_the_consumer_includes() {
+        // Producer/consumer drift is the whole reason this job exists: `cargo
+        // test` never compiles `build.rs`, so a rename here and a stale
+        // `include!` there would only surface as a confusing compile error in an
+        // unrelated module.
+        let consumer = include_str!("src/checksum/crc32.rs");
+        let needle = alloc_format(&GENERATED_FILE.to_owned());
+        assert!(
+            consumer.contains(&needle),
+            "src/checksum/crc32.rs must `include!` `{GENERATED_FILE}` out of \
+             OUT_DIR; found no `{needle}`"
+        );
+        // And the writer must put it exactly there.
+        let scratch = Scratch::new("dest-name");
+        let dest = write_tables(&scratch.path);
+        assert_eq!(
+            dest.file_name().and_then(|n| n.to_str()),
+            Some(GENERATED_FILE)
+        );
+    }
+
+    /// The `concat!` argument `src/checksum/crc32.rs` uses to name the generated
+    /// file, built here rather than written out so the two cannot drift.
+    fn alloc_format(name: &str) -> String {
+        format!("\"/{name}\"")
+    }
+
+    #[test]
+    fn the_environment_variables_this_script_reads_are_exactly_the_documented_set() {
+        let code = script_body();
+        let reads: BTreeSet<&str> = code
+            .match_indices("env::var(")
+            .map(|(i, _)| {
+                let rest = &code[i + "env::var(".len()..];
+                rest.split(')').next().unwrap_or_default().trim()
+            })
+            .collect();
+
+        // Every entry is here for a stated reason. A read that is not on this
+        // list makes the build depend on ambient state no CI row sets and no
+        // other gate observes, which is why the set is pinned rather than
+        // bounded.
+        //
+        //   OUT_DIR              - where the generated tables and, when the
+        //                          opt-in is on, the derived script and shim go.
+        //   VERSION_SCRIPT_ENV   - the opt-in itself.
+        //   CARGO_CFG_TARGET_OS  - version scripts are a GNU-ld concept.
+        //   CARGO_CFG_TARGET_ENV - musl emits no shared object to version.
+        //   HOST / TARGET        - the shim resolves its linker from the host's
+        //                          PATH, so a cross build must be refused.
+        //   CARGO_MANIFEST_DIR   - where zlib.map is, derived internally so no
+        //                          caller-supplied path is ever opened.
+        //   PATH                 - probing for `ld.bfd` rather than assuming it.
+        let expected: BTreeSet<&str> = [
+            "\"OUT_DIR\"",
+            "VERSION_SCRIPT_ENV",
+            "\"CARGO_CFG_TARGET_OS\"",
+            "\"CARGO_CFG_TARGET_ENV\"",
+            "\"HOST\"",
+            "\"TARGET\"",
+            "\"CARGO_MANIFEST_DIR\"",
+            "\"PATH\"",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            reads, expected,
+            "the set of environment variables this script reads is part of its \
+             contract; every addition needs a `rerun-if-env-changed` and a reason"
+        );
+
+        // The opt-in is read through the constant, so pin the constant too —
+        // otherwise renaming it would silently rename the public opt-in.
+        assert_eq!(VERSION_SCRIPT_ENV, "ZLIB_RS_VERSION_SCRIPT");
+        // Only the opt-in is declared as a rerun trigger, and it is the only one
+        // that can change the emitted artifacts: the other seven are fixed for a
+        // given Cargo invocation and Cargo already reruns the script when they
+        // change.
+        assert!(
+            unconditional_directives()
+                .iter()
+                .any(|d| d == &format!("cargo:rerun-if-env-changed={VERSION_SCRIPT_ENV}")),
+            "reading the opt-in without declaring it would leave a stale artifact \
+             behind when it is flipped"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Generated-table schema
+    // -----------------------------------------------------------------------
+
+    /// Reduce an arbitrary ambient string to a single safe path component.
+    ///
+    /// `CLONE_INDEX` is ambient input: it is read from the environment, so its
+    /// value is outside this build script's control. Interpolating it into a path
+    /// unfiltered is a directory-traversal defect (CWE-22) — a value such as
+    /// `slot/../../security_target` escapes the temporary directory lexically and
+    /// resolves somewhere else entirely.
+    ///
+    /// Only ASCII alphanumerics, `_`, and `-` survive. That drops every character
+    /// which could end the component or refer to a parent: `/`, `\`, `.`
+    /// (so `..` collapses away entirely), `:`, NUL, and every non-ASCII byte. The
+    /// result is truncated so an absurdly long value cannot push the path past a
+    /// filesystem limit, and an input that filters down to nothing becomes `x`, so
+    /// the caller always receives a usable component.
+    fn safe_component(raw: &str) -> String {
+        let filtered: String = raw
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .take(32)
+            .collect();
+        if filtered.is_empty() {
+            "x".to_owned()
+        } else {
+            filtered
+        }
+    }
+
+    /// Create `path` as a new, private directory, failing if anything is already
+    /// there.
+    ///
+    /// Non-recursive on purpose: unlike `create_dir_all`, this reports
+    /// `AlreadyExists` when the name is taken — including when it is taken by a
+    /// symlink somebody planted — which is what lets [`Scratch::new`] skip to
+    /// the next candidate instead of adopting or following what is already there.
+    /// On Unix the `0o700` mode is handed to `mkdir(2)` itself, so the directory
+    /// carries owner-only permissions from the moment it exists rather than
+    /// acquiring them afterwards through `set_permissions`.
+    fn create_private_dir(path: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            fs::DirBuilder::new().mode(0o700).create(path)
+        }
+        #[cfg(not(unix))]
+        {
+            fs::DirBuilder::new().create(path)
+        }
+    }
+
+    /// A scratch directory unique to this process and call, so the schema tests
+    /// are safe to run in parallel and alongside sibling clones of this
+    /// repository (each of which sets its own `CLONE_INDEX`).
+    ///
+    /// The directory is created with create-new semantics inside the system
+    /// temporary directory, and its name is assembled only from a
+    /// [`safe_component`]-sanitized `CLONE_INDEX`, the process id, a monotonic
+    /// counter, and a caller tag — so the name is always a single path component
+    /// and cannot traverse out of the temporary directory (CWE-22).
+    ///
+    /// The guarantee this provides is about the moment of creation, and it is
+    /// worth stating no more than that: the `mkdir(2)` either takes a free name
+    /// or fails, so nothing pre-existing is ever adopted, followed, or removed —
+    /// an occupied candidate is skipped rather than deleted. It does not pin the
+    /// path afterwards. Nothing here re-verifies that the name still resolves to
+    /// the same directory later on, so this is initial-adoption safety plus
+    /// Unix creation-time permissions, not a lifetime guarantee.
+    struct Scratch {
+        path: std::path::PathBuf,
+    }
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            static CTR: AtomicU32 = AtomicU32::new(0);
+            let n = CTR.fetch_add(1, Ordering::Relaxed);
+            let clone = safe_component(&env::var("CLONE_INDEX").unwrap_or_default());
+            let tag = safe_component(tag);
+            let pid = std::process::id();
+            let base = env::temp_dir();
+
+            // Retry only advances the candidate name; it never deletes.
+            for attempt in 0..64u32 {
+                let candidate = base.join(format!(
+                    "blitzy_adhoc_test_buildrs_{tag}_{clone}_{pid}_{n}_{attempt}"
+                ));
+                match create_private_dir(&candidate) {
+                    Ok(()) => return Self { path: candidate },
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("failed to create the scratch directory: {e}"),
+                }
+            }
+            panic!("could not find an unused scratch directory name after 64 attempts");
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            // The removal set is a path this guard brought into existence:
+            // `Scratch::new` created it with create-new semantics, so it was not
+            // adopted from anything pre-existing, and on Unix it was owner-only
+            // from `mkdir(2)` onward. Those are creation-time facts rather than a
+            // lifetime guarantee about the path, which is why the recursion is
+            // best effort and its result is discarded on every path, including a
+            // panicking one: leaving a directory behind is not worth masking the
+            // original failure.
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// `safe_component` must collapse every traversal and separator form to a
+    /// single harmless component.
+    ///
+    /// The first case is the one that matters most: interpolated raw,
+    /// `slot/../../security_target` escapes the temporary directory lexically and
+    /// resolves to `/security_target_<pid>_0`. Sanitized, it can only ever name a
+    /// child of the temporary directory.
+    #[test]
+    fn safe_component_neutralizes_traversal_and_separators() {
+        for raw in [
+            "slot/../../security_target",
+            "../../../etc/passwd",
+            "..",
+            ".",
+            "/absolute",
+            "back\\slash",
+            "c:\\windows\\system32",
+            "with space",
+            "semi;colon",
+            "new\nline",
+            "nul\0byte",
+            "tilde~",
+            "dollar$sign",
+            "\u{00e9}\u{4f60}\u{597d}",
+        ] {
+            let got = safe_component(raw);
+            assert!(!got.is_empty(), "{raw:?} must yield a usable component");
+            assert!(
+                got.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "{raw:?} yielded {got:?}, which still contains a disallowed character"
+            );
+            assert!(
+                !got.contains(".."),
+                "{raw:?} yielded {got:?}, still traversing"
+            );
+            // The decisive property: joining it descends exactly one level.
+            let joined = Path::new("/tmp").join(&got);
+            assert_eq!(
+                joined.parent(),
+                Some(Path::new("/tmp")),
+                "{raw:?} yielded {got:?}, which does not stay one level below the base"
+            );
+        }
+    }
+
+    /// Inputs that filter down to nothing, and inputs that are far too long, must
+    /// still produce a usable bounded component.
+    #[test]
+    fn safe_component_is_total_and_bounded() {
+        assert_eq!(safe_component(""), "x", "an unset variable must still work");
+        assert_eq!(safe_component("///"), "x", "separators only");
+        assert_eq!(safe_component("...."), "x", "dots only");
+        assert_eq!(safe_component("\u{4f60}\u{597d}"), "x", "non-ASCII only");
+
+        let long = "a".repeat(4096);
+        let got = safe_component(&long);
+        assert_eq!(got.len(), 32, "an over-long value must be truncated");
+
+        // Characters that are safe are preserved in order.
+        assert_eq!(safe_component("clone-07_b"), "clone-07_b");
+    }
+
+    /// A `Scratch` must be a freshly created, private, single-level child of the
+    /// system temporary directory — never a pre-existing path.
+    #[test]
+    fn scratch_creates_a_private_new_directory_under_temp() {
+        let a = Scratch::new("hygiene");
+        assert!(a.path.is_dir(), "the scratch directory must exist");
+        assert_eq!(
+            a.path.parent(),
+            Some(env::temp_dir().as_path()),
+            "the scratch directory must sit directly under the temp directory"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(&a.path)
+                .expect("stat scratch")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o700,
+                "the scratch directory must be owner-only from the moment it exists"
+            );
+        }
+
+        // Two scratches taken back to back must never collide, and creating one
+        // must never adopt an existing directory.
+        let b = Scratch::new("hygiene");
+        assert_ne!(a.path, b.path, "concurrent scratches must be distinct");
+
+        // Create-new semantics: the name `Scratch` chose is now taken, so a second
+        // attempt at exactly that path must be refused rather than reused.
+        let err = create_private_dir(&a.path).expect_err("the path is already taken");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "an occupied name must report AlreadyExists so the caller can skip it"
+        );
+
+        let path_a = a.path.clone();
+        drop(a);
+        assert!(!path_a.exists(), "Drop must remove the scratch directory");
+    }
+
+    /// Parse every `pub(crate) const|static NAME: TYPE = ...;` declaration out of
+    /// the generated source, returning `(keyword, name, type)` triples in
+    /// declaration order.
+    fn declared_items(src: &str) -> Vec<(String, String, String)> {
+        let mut items = Vec::new();
+        for line in src.lines() {
+            let line = line.trim_start();
+            let Some(rest) = line.strip_prefix("pub(crate) ") else {
+                continue;
+            };
+            let (keyword, rest) = if let Some(r) = rest.strip_prefix("const ") {
+                ("const", r)
+            } else if let Some(r) = rest.strip_prefix("static ") {
+                ("static", r)
+            } else {
+                continue;
+            };
+            let Some((name, rest)) = rest.split_once(':') else {
+                continue;
+            };
+            let Some((ty, _)) = rest.split_once('=') else {
+                continue;
+            };
+            items.push((
+                keyword.to_owned(),
+                name.trim().to_owned(),
+                ty.trim().to_owned(),
+            ));
+        }
+        items
+    }
+
+    /// Every `0x…` literal appearing in the generated source, in order.
+    fn hex_literals(src: &str) -> Vec<u64> {
+        let bytes = src.as_bytes();
+        let mut out = Vec::with_capacity(4096);
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'0' && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X') {
+                let start = i + 2;
+                let mut end = start;
+                while end < bytes.len() && (bytes[end].is_ascii_hexdigit() || bytes[end] == b'_') {
+                    end += 1;
+                }
+                let digits: String = src[start..end].chars().filter(|c| *c != '_').collect();
+                if !digits.is_empty() {
+                    out.push(
+                        u64::from_str_radix(&digits, 16)
+                            .unwrap_or_else(|e| panic!("bad hex literal {digits:?}: {e}")),
+                    );
+                }
+                i = end;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Slice out the hex literals belonging to a single named declaration.
+    fn literals_of(src: &str, name: &str) -> Vec<u64> {
+        let start = src
+            .find(&format!("pub(crate) const {name}:"))
+            .or_else(|| src.find(&format!("pub(crate) static {name}:")))
+            .unwrap_or_else(|| panic!("{name} is missing from the generated source"));
+        // A declaration runs until whichever comes first: the next declaration or
+        // the attribute introducing it.
+        let body = &src[start..];
+        let end = ["\npub(crate) const ", "\npub(crate) static ", "\n#[allow("]
+            .iter()
+            .filter_map(|sep| body[1..].find(sep))
+            .min()
+            .map_or(body.len(), |off| off + 1);
+        hex_literals(&body[..end])
+    }
+
+    #[test]
+    fn the_generated_file_declares_exactly_the_seven_promised_items() {
+        let scratch = Scratch::new("schema");
+        let dest = write_tables(&scratch.path);
+        assert_eq!(
+            dest,
+            scratch.path.join("crc32_tables.rs"),
+            "the generated file name is part of the contract with the `include!` in \
+             src/checksum/crc32.rs"
+        );
+        assert_eq!(GENERATED_FILE, "crc32_tables.rs");
+
+        let src = fs::read_to_string(&dest).expect("failed to read the generated file");
+        let items = declared_items(&src);
+
+        // Order, names and types are all pinned: the consumer's `use` list and its
+        // compile-time schema contract depend on every one of them.
+        assert_eq!(
+            items,
+            vec![
+                ("const", "CRC_BRAID_N", "usize"),
+                ("const", "CRC_BRAID_W", "usize"),
+                ("static", "CRC_TABLE", "[u32; 256]"),
+                ("static", "X2N_TABLE", "[u32; 32]"),
+                ("static", "CRC_BIG_TABLE", "[u64; 256]"),
+                ("static", "CRC_BRAID_TABLE", "[[u32; 256]; 8]"),
+                ("static", "CRC_BRAID_BIG_TABLE", "[[u64; 256]; 8]"),
+            ]
+            .into_iter()
+            .map(|(k, n, t)| (k.to_owned(), n.to_owned(), t.to_owned()))
+            .collect::<Vec<_>>(),
+            "the seven promised outputs, their storage class, their order and their \
+             types are all part of the contract with src/checksum/crc32.rs"
+        );
+
+        // No item may be emitted twice, and nothing beyond the seven may appear.
+        let names: BTreeSet<&str> = items.iter().map(|(_, n, _)| n.as_str()).collect();
+        assert_eq!(names.len(), 7, "the seven names must be distinct");
+
+        // Suppression is per item and confined to the five contract-only outputs.
+        // `CRC_TABLE` and `X2N_TABLE` must carry none: both are read at run time,
+        // so a dead-code warning on either is a signal, not noise.
+        // No item may be suppressed. All seven generated artifacts are consumed by
+        // src/checksum/crc32.rs (the braided word-at-a-time path reads five of
+        // them whenever `simd` is off), so the allowance decision belongs to that
+        // module -- which grants it only for the `simd` configuration. Count
+        // attribute LINES, not raw substring hits: the generated header's own
+        // prose names the attribute, and a substring count would include it.
+        assert_eq!(
+            src.lines()
+                .filter(|l| l.trim() == "#[allow(dead_code)]")
+                .count(),
+            0,
+            "the generated file must not suppress dead-code warnings for any item"
+        );
+        for (name, allowed) in [
+            ("CRC_BRAID_N", false),
+            ("CRC_BRAID_W", false),
+            ("CRC_TABLE", false),
+            ("X2N_TABLE", false),
+            ("CRC_BIG_TABLE", false),
+            ("CRC_BRAID_TABLE", false),
+            ("CRC_BRAID_BIG_TABLE", false),
+        ] {
+            let decl = src
+                .find(&format!("pub(crate) const {name}:"))
+                .or_else(|| src.find(&format!("pub(crate) static {name}:")))
+                .unwrap_or_else(|| panic!("{name} is missing"));
+            // The attribute, if present, is the line immediately above.
+            let has_allow = src[..decl].trim_end().ends_with("#[allow(dead_code)]");
+            assert_eq!(has_allow, allowed, "dead-code suppression on {name}");
+        }
+        assert!(
+            !src.contains("#![allow"),
+            "the generated file must not carry an inner allow attribute: it is \
+             included into a module that denies unsafe code and warns on missing docs"
+        );
+        assert!(
+            !src.contains("unsafe"),
+            "the generated tables must be plain constants (AAP §0.6.2)"
+        );
+    }
+
+    #[test]
+    fn the_generated_tables_have_the_promised_dimensions() {
+        let scratch = Scratch::new("dims");
+        let src = fs::read_to_string(write_tables(&scratch.path)).expect("read");
+
+        assert_eq!(literals_of(&src, "CRC_TABLE").len(), 256);
+        assert_eq!(literals_of(&src, "X2N_TABLE").len(), 32);
+        assert_eq!(literals_of(&src, "CRC_BIG_TABLE").len(), 256);
+        assert_eq!(literals_of(&src, "CRC_BRAID_TABLE").len(), 8 * 256);
+        assert_eq!(literals_of(&src, "CRC_BRAID_BIG_TABLE").len(), 8 * 256);
+
+        // The braid geometry constants must agree with the emitted dimensions, or
+        // a consumer indexing by `CRC_BRAID_W` would run off the end.
+        assert!(src.contains(&format!("pub(crate) const CRC_BRAID_N: usize = {BRAID_N};")));
+        assert!(src.contains(&format!("pub(crate) const CRC_BRAID_W: usize = {BRAID_W};")));
+        assert_eq!(BRAID_N, 5, "crc32.c's N (AAP §0.3.1)");
+        assert_eq!(BRAID_W, 8, "crc32.c's W (AAP §0.3.1)");
+        assert_eq!(literals_of(&src, "CRC_BRAID_TABLE").len(), BRAID_W * 256);
+    }
+
+    #[test]
+    fn the_generated_tables_carry_the_reference_anchor_entries() {
+        let scratch = Scratch::new("anchors");
+        let src = fs::read_to_string(write_tables(&scratch.path)).expect("read");
+
+        // Reflected CRC-32 table, verified against crc32.h in the retained C
+        // baseline and against `crc32("123456789") == 0xcbf43926`.
+        let crc = literals_of(&src, "CRC_TABLE");
+        for (index, expected) in [
+            (0_usize, 0x0000_0000_u64),
+            (1, 0x7707_3096),
+            (2, 0xee0e_612c),
+            (3, 0x9909_51ba),
+            (255, 0x2d02_ef8d),
+        ] {
+            assert_eq!(crc[index], expected, "CRC_TABLE[{index}]");
+        }
+
+        // x^(2^n) mod p(x), the operators `crc32_combine_gen` selects from.
+        let x2n = literals_of(&src, "X2N_TABLE");
+        for (index, expected) in [
+            (0_usize, 0x4000_0000_u64),
+            (1, 0x2000_0000),
+            (2, 0x0800_0000),
+            (3, 0x0080_0000),
+            (4, 0x0000_8000),
+            (30, 0xc40b_a6d0),
+            (31, 0xc4e2_2c3c),
+        ] {
+            assert_eq!(x2n[index], expected, "X2N_TABLE[{index}]");
+        }
+
+        let big = literals_of(&src, "CRC_BIG_TABLE");
+        assert_eq!(big[1], 0x9630_0777_0000_0000);
+        assert_eq!(big[255], 0x8def_022d_0000_0000);
+
+        let braid = literals_of(&src, "CRC_BRAID_TABLE");
+        assert_eq!(braid[1], 0xaf44_9247, "CRC_BRAID_TABLE[0][1]");
+        assert_eq!(braid[7 * 256 + 1], 0x36f2_90f3, "CRC_BRAID_TABLE[7][1]");
+        assert_eq!(braid[7 * 256 + 255], 0xf437_7108, "CRC_BRAID_TABLE[7][255]");
+
+        let braid_big = literals_of(&src, "CRC_BRAID_BIG_TABLE");
+        assert_eq!(
+            braid_big[1], 0xf390_f236_0000_0000,
+            "CRC_BRAID_BIG_TABLE[0][1]"
+        );
+        assert_eq!(
+            braid_big[7 * 256 + 1],
+            0x4792_44af_0000_0000,
+            "CRC_BRAID_BIG_TABLE[7][1]"
+        );
+        assert_eq!(
+            braid_big[7 * 256 + 255],
+            0x6575_94e9_0000_0000,
+            "CRC_BRAID_BIG_TABLE[7][255]"
+        );
+    }
+
+    #[test]
+    fn the_big_endian_tables_are_byte_swapped_companions_of_the_little_endian_ones() {
+        let scratch = Scratch::new("swap");
+        let src = fs::read_to_string(write_tables(&scratch.path)).expect("read");
+
+        let crc = literals_of(&src, "CRC_TABLE");
+        let big = literals_of(&src, "CRC_BIG_TABLE");
+        for i in 0..256 {
+            assert_eq!(big[i], crc[i].swap_bytes(), "CRC_BIG_TABLE[{i}]");
+        }
+
+        // `braid()` emits the big-endian tables with the word index reversed, so
+        // that both forms are indexed identically by the consumer.
+        let braid = literals_of(&src, "CRC_BRAID_TABLE");
+        let braid_big = literals_of(&src, "CRC_BRAID_BIG_TABLE");
+        for k in 0..BRAID_W {
+            for i in 0..256 {
+                assert_eq!(
+                    braid_big[(BRAID_W - 1 - k) * 256 + i],
+                    braid[k * 256 + i].swap_bytes(),
+                    "CRC_BRAID_BIG_TABLE[{}][{i}]",
+                    BRAID_W - 1 - k
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rendering_is_deterministic_and_independent_of_the_destination() {
+        // Reproducibility of the generated artifact: two renders in the same
+        // process, and two writes into different directories, must agree exactly.
+        assert_eq!(
+            render_tables(),
+            render_tables(),
+            "render_tables must be pure"
+        );
+
+        let a = Scratch::new("det_a");
+        let b = Scratch::new("det_b");
+        let first = fs::read_to_string(write_tables(&a.path)).expect("read");
+        let second = fs::read_to_string(write_tables(&b.path)).expect("read");
+        assert_eq!(first, second);
+        assert_eq!(first, render_tables());
+
+        // Writing twice into the same directory must overwrite, not append.
+        let again = fs::read_to_string(write_tables(&a.path)).expect("read");
+        assert_eq!(again, first);
+    }
+
+    #[test]
+    fn the_generated_header_documents_its_provenance_and_forbids_editing() {
+        let scratch = Scratch::new("header");
+        let src = fs::read_to_string(write_tables(&scratch.path)).expect("read");
+
+        assert!(src.starts_with("//"), "the file must open with its banner");
+
+        // Scope every banner assertion to the banner itself — everything before the
+        // first emitted item — so a name that survives only in its own declaration
+        // cannot stand in for its documentation.
+        let banner_end = ["\n#[allow(", "\npub(crate) const ", "\npub(crate) static "]
+            .iter()
+            .filter_map(|sep| src.find(sep))
+            .min()
+            .expect("the generated file must contain at least one item");
+        let banner = &src[..banner_end];
+        assert!(
+            !banner.contains("pub(crate)"),
+            "the banner slice must stop before the first item"
+        );
+
+        for fragment in ["build.rs", "crc32.c", "DO NOT EDIT", "crc32.h", "OUT_DIR"] {
+            assert!(
+                banner.contains(fragment),
+                "the generated banner must mention {fragment:?}"
+            );
+        }
+        // The banner must name every symbol it promises, so a reader of the
+        // generated file sees the same seven-item contract the consumer imports.
+        for (name, ty) in [
+            ("CRC_BRAID_N", "usize"),
+            ("CRC_BRAID_W", "usize"),
+            ("CRC_TABLE", "[u32; 256]"),
+            ("X2N_TABLE", "[u32; 32]"),
+            ("CRC_BIG_TABLE", "[u64; 256]"),
+            ("CRC_BRAID_TABLE", "[[u32; 256]; 8]"),
+            ("CRC_BRAID_BIG_TABLE", "[[u64; 256]; 8]"),
+        ] {
+            let line = banner
+                .lines()
+                .find(|l| l.contains(&format!("{name}:")))
+                .unwrap_or_else(|| panic!("the banner must document the emitted symbol {name}"));
+            assert!(
+                line.contains(ty),
+                "the banner entry for {name} must record its type {ty}, got {line:?}"
+            );
+        }
+        // Several of the promised names are substrings of one another
+        // (`CRC_TABLE` of `CRC_BIG_TABLE`, `CRC_BRAID_TABLE` of
+        // `CRC_BRAID_BIG_TABLE`), so a `contains` check alone could be satisfied by
+        // a neighbouring line. Require exactly one banner line per symbol, so a
+        // dropped line cannot be absorbed by another.
+        assert_eq!(
+            banner
+                .lines()
+                .filter(|l| l.contains("CRC_") || l.contains("X2N_"))
+                .count(),
+            7,
+            "the banner must carry exactly one line per emitted symbol"
+        );
+        // The generated tables are only meaningful for zlib's reflected
+        // polynomial; a different one would silently produce valid-looking but
+        // incompatible checksums.
+        assert_eq!(POLY, 0xedb8_8320, "crc32.c's reflected polynomial");
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-checks against the algorithms the tables are derived from
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_generated_crc_table_reproduces_the_canonical_check_value() {
+        // `crc32("123456789") == 0xcbf43926` is the standard CRC-32 check value
+        // and the vector the C baseline is verified against, so computing it from
+        // the emitted table proves the table itself, not just its anchors.
+        let (table, _) = make_crc_tables();
+        let mut crc = 0xffff_ffff_u32;
+        for byte in b"123456789" {
+            crc = table[usize::from((crc as u8) ^ byte)] ^ (crc >> 8);
+        }
+        assert_eq!(crc ^ 0xffff_ffff, 0xcbf4_3926);
+    }
+
+    #[test]
+    fn the_generated_x2n_table_matches_repeated_squaring() {
+        // X2N_TABLE[n] is x^(2^n) mod p(x); each entry must therefore be the
+        // square of its predecessor under the same modulus.
+        let table = make_x2n_table();
+        assert_eq!(table.len(), 32);
+        for n in 1..table.len() {
+            assert_eq!(
+                table[n],
+                multmodp(table[n - 1], table[n - 1]),
+                "X2N_TABLE[{n}] must be X2N_TABLE[{}] squared",
+                n - 1
+            );
+        }
+        // `x2nmodp` starts from x^0 == 1, which in this reflected representation is
+        // the high bit, and multiplies in one table entry per set bit of `n`.
+        const IDENTITY: u32 = 1 << 31;
+        assert_eq!(
+            x2nmodp(0, 0, &table),
+            IDENTITY,
+            "x^(2^k * 0) is the multiplicative identity"
+        );
+        for entry in table {
+            assert_eq!(
+                multmodp(entry, IDENTITY),
+                entry,
+                "x^0 must be a true identity under multmodp"
+            );
+        }
+
+        // One set bit selects exactly one table entry, offset by `k`. `k == 3` is
+        // the byte-shift step `crc32_combine_gen` uses, because a length in bytes
+        // is a length in bits times 2^3.
+        assert_eq!(x2nmodp(1, 0, &table), table[0]);
+        assert_eq!(x2nmodp(2, 0, &table), table[1]);
+        assert_eq!(x2nmodp(1, 3, &table), table[3]);
+        assert_eq!(x2nmodp(1 << 28, 3, &table), table[31]);
+
+        // Two set bits compose the two corresponding entries, in either order.
+        assert_eq!(x2nmodp(3, 0, &table), multmodp(table[0], table[1]));
+        assert_eq!(x2nmodp(3, 0, &table), multmodp(table[1], table[0]));
+    }
+
+    #[test]
+    fn byte_swapping_is_an_involution_on_the_emitted_words() {
+        let (table, big) = make_crc_tables();
+        for i in 0..256 {
+            assert_eq!(byte_swap64(big[i]), u64::from(table[i]));
+            assert_eq!(byte_swap64(byte_swap64(big[i])), big[i]);
+        }
+    }
 }

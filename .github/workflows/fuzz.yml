@@ -2,32 +2,248 @@
 #
 # Fuzzing pipeline for the zlib-rs crate (C -> Rust migration of zlib 1.3.2.1).
 #
-# MIGRATION NOTE:
-#   This workflow was retargeted from the previous C-oriented fuzzing-service
-#   integration (which exercised the original C library) to a pure-Rust
-#   `cargo-fuzz` (libFuzzer) pipeline. There is intentionally no C toolchain
-#   here and no external fuzzing service: everything runs through Cargo,
-#   consistent with the crate's Cargo-only CI (see ci.yml).
+# SCOPE
+#   A pure-Rust `cargo-fuzz` (libFuzzer) pipeline: no C toolchain and no external
+#   fuzzing service, consistent with the crate's Cargo-only CI (see ci.yml). The
+#   in-repo `fuzz/` crate is a DETACHED workspace (its own `[workspace]` table, so
+#   root `cargo build`/`test`/`clippy`/`fmt` never touch it) shipping five
+#   libFuzzer targets: `fuzz_inflate`, `fuzz_deflate_roundtrip`, `fuzz_gzip`,
+#   `fuzz_checksum`, `fuzz_ffi_roundtrip`. The `cargo-fuzz` job builds all of them
+#   and fuzzes each for a bounded budget; a crash or timeout writes a reproducer
+#   under `fuzz/artifacts` and fails the pipeline.
 #
+#   THE DETACHED WORKSPACE HAS NO OTHER QUALITY GATE. Detachment is what keeps
+#   the nightly-only, C-toolchain-dependent harness graph out of the crate's own
+#   build, but it also means ci.yml's `cargo fmt --all -- --check` and
+#   `cargo clippy --locked --all-targets --all-features -- -D warnings` cannot
+#   reach `fuzz/` at all - `--all` and `--all-targets` are workspace-scoped, and
+#   this is a different workspace. Every gate that covers the harnesses therefore
+#   has to live in this file and has to pass `--manifest-path fuzz/Cargo.toml`
+#   explicitly. That is why the job below runs, BEFORE it builds anything: a
+#   nightly `fmt --check`, clippy with `-D warnings` at default features, clippy
+#   with `-D warnings` at `--no-default-features`, and a `--no-default-features`
+#   build that asserts all five harness binaries still link. The `[lints.clippy]`
+#   deny table in `fuzz/Cargo.toml` (`undocumented_unsafe_blocks`,
+#   `multiple_unsafe_ops_per_block`) is only a rule if something evaluates it,
+#   and `fuzz_ffi_roundtrip` is the one place a fuzzer crosses the `unsafe` C ABI
+#   boundary, so those two lints are exactly the ones that must not go
+#   unenforced. Do NOT move these steps after the build or the fuzzing loop: they
+#   cost seconds against tens of minutes, and running them first is what turns a
+#   lint regression into a fast, legible failure.
+
+# ACTION PINNING
+# ==============
+#   Every action used below is pinned to a verified 40-character commit SHA with
+#   its version in a trailing comment; `audit.yml`'s "ACTION PINNING" section
+#   records the pinned set and the upgrade procedure. Because the pin removes the
+#   `@<ref>` signal `dtolnay/rust-toolchain` normally reads its channel from, the
+#   nightly install below names its channel explicitly with `with: toolchain:`.
+#
+# TOOLCHAIN SELECTION - THIS WORKFLOW MUST OPT OUT OF THE REPOSITORY PIN
+# ======================================================================
 #   cargo-fuzz builds libFuzzer harnesses and therefore REQUIRES a Rust
-#   *nightly* toolchain: it relies on `-Z` sanitizer / coverage instrumentation
+#   *nightly* toolchain: it injects `-Z` sanitizer / coverage instrumentation
 #   that is not available on stable.
 #
-#   The in-repo `fuzz/` crate is a DETACHED workspace (it carries its own
-#   `[workspace]` table, so root `cargo build`/`test`/`clippy`/`fmt` never touch
-#   it). It ships five libFuzzer targets: `fuzz_inflate`,
-#   `fuzz_deflate_roundtrip`, `fuzz_gzip`, `fuzz_checksum`, and
-#   `fuzz_ffi_roundtrip`. The job below builds all of them and then fuzzes each
-#   for a bounded budget; a discovered crash/timeout writes a reproducer under
-#   `fuzz/artifacts` and fails the pipeline.
+#   INSTALLING NIGHTLY IS NOT SELECTING IT. The repository root carries a
+#   `rust-toolchain.toml` pinning `channel = "1.85.0"`, and rustup resolves a
+#   toolchain FILE (precedence rank 4) BEFORE the `rustup default` that
+#   `dtolnay/rust-toolchain` sets (rank 5). That file is discovered by walking UP
+#   from the working directory, so it reaches the detached `fuzz/` workspace too,
+#   and cargo-fuzz resolves its toolchain from the repository root in any case.
+#   Without an override, `cargo install cargo-fuzz`, `cargo fuzz build` and
+#   `cargo fuzz run` all execute on the pinned MSRV and fail with "the option
+#   `Z` is only accepted on the nightly compiler".
+#
+#   THE OVERRIDE IS THE JOB-LEVEL `RUSTUP_TOOLCHAIN: nightly-2026-08-01`, AND IT
+#   IS THE ONLY ONE. It is rustup override rank 2, which beats the rank-4
+#   toolchain file, and being an environment variable it is inherited by the
+#   nested `cargo build` invocations cargo-fuzz spawns - which a per-command
+#   `+nightly` shorthand is NOT. The cargo invocations in this workflow are
+#   therefore deliberately UNPREFIXED, and the "Verify the resolved toolchain is
+#   nightly" step asserts the ambient resolution before anything is built - both
+#   that it is *a* nightly and that it is that exact dated channel - so a lost
+#   override fails loudly instead of surfacing as an opaque `-Z` parse error
+#   part-way through. Do NOT add `+nightly` back: a prefix on each command would
+#   make that assertion vacuous for the commands carrying it, while cargo-fuzz's
+#   own child processes stayed governed by the env var anyway, so two mechanisms
+#   would have to be kept in step for no gain.
+#
+#   LOCALLY there is no job-level env, so a contributor does have to say it once,
+#   per command or per shell: either `RUSTUP_TOOLCHAIN=nightly-2026-08-01 cargo
+#   fuzz build` or the `cargo +nightly-2026-08-01 fuzz ...` shorthand. That is
+#   the whole of the local/CI difference - CI states the selection once at job
+#   level and repeats it nowhere, local runs state it themselves. See the header
+#   of `fuzz/Cargo.toml` and the "THIS FILE IS NOT A STRAITJACKET" section of
+#   `rust-toolchain.toml`.
+#
+#   BOTH PINS ARE DATED, deliberately: the toolchain is `nightly-2026-08-01`
+#   rather than the floating `nightly` channel, and `cargo-fuzz` is pinned to
+#   0.13.2 with an assertion. A floating channel moves the sanitizer flags and
+#   the `-Z` surface underneath a WEEKLY job, which is the one place in this
+#   repository where a red build can be caused by something that is in no commit
+#   and whose cause has already moved on by the time anyone looks. The date must
+#   move in the install step's `with: toolchain:` input and in the
+#   `expected_nightly` assertion together, and `CONTRIBUTING.md` names the same
+#   date for local reproducers.
+#
+#   Do NOT "fix" any of this by deleting the repository pin or by pointing
+#   `channel` at nightly: the first reopens the local/CI MSRV asymmetry, the
+#   second puts every contributor's ordinary library build on an unstable
+#   compiler.
+#
+# SUPPLY-CHAIN POLICY - OWNED BY `audit.yml`, NOT BY THIS FILE
+# ============================================================
+#   `fuzz/Cargo.lock` pins 13 packages that the ROOT `cargo deny check` never
+#   resolves, precisely because `fuzz/` is a detached workspace. They are governed
+#   by the SAME reviewed policy the root graph is - the root `deny.toml` - aimed at
+#   this graph with `--manifest-path fuzz/Cargo.toml --config deny.toml`. Naming
+#   the config is MANDATORY there: `fuzz/` holds no policy of its own, so without
+#   the flag cargo-deny would fall back to built-in defaults and report `ok` over
+#   13 unreviewed packages.
+#
+#   That one file can govern both graphs is a property of how it states the
+#   C-toolchain boundary. The harness legitimately needs a C-toolchain build
+#   dependency (`cc`, for the libFuzzer runtime shim) and an NCSA-licensed
+#   `libfuzzer-sys`, neither of which the crate proper may ever acquire - so the
+#   root policy SCOPES the `cc` ban with `wrappers = ["libfuzzer-sys"]` and grants
+#   NCSA through a crate-scoped `[[licenses.exceptions]]` entry. Both graphs are
+#   held to one written boundary rather than to two that could drift apart.
+#
+#   THE POLICY IS ENFORCED IN `audit.yml`, AND NOWHERE ELSE. ONE policy file, one
+#   evaluator: `deny.toml` governs the root graph AND these 13, and
+#   `.github/workflows/audit.yml` is the workflow that evaluates both -
+#   `cargo-deny` for the root graph, `cargo-deny-fuzz` for this one, `cargo-audit`
+#   for advisories over both lockfiles, and `policy-integrity` for that policy's
+#   structural integrity plus the assertion that it is the ONLY policy file in the
+#   tree. THIS workflow builds and fuzzes; it runs no `cargo-deny` and no
+#   `cargo-audit` job, and it must not grow one. A second copy of the GATE is not
+#   defence in depth: it is a second place for the tool pin, the `--locked`
+#   discipline and the lockfile assertion to drift out of step with the first.
+#
+#   WHAT THE SPLIT COSTS. A policy job living here could be a `needs:`
+#   predecessor of `cargo-fuzz`, so that a policy failure blocked fuzzing within
+#   the same run; a job in another workflow cannot, so that intra-run SEQUENCING
+#   is genuinely given up. What stands in its place is broader TRIGGER coverage
+#   rather than a weaker gate: `audit.yml` evaluates the policy over BOTH graphs
+#   on `push`, on `pull_request`, on a daily 05:00 cron and on
+#   `workflow_dispatch`, which is a superset of this workflow's triggers. Both are
+#   blocking, so a policy regression fails the same pull request - in a sibling
+#   check rather than as an upstream job of this one. Do NOT "restore the
+#   sequencing" by re-adding a cargo-deny job here, and do NOT add a `push:`
+#   trigger to this workflow to compensate: that would launch the full sequential
+#   fuzzing campaign - about 50 minutes of runner time - on every push, for a
+#   verdict `audit.yml` already produces in under a minute.
+#
+#   THE TOOL PIN AND THE `--locked` DISCIPLINE LIVE WITH THE GATE. `cargo-deny`
+#   is pinned to 0.20.2 in `audit.yml` because that is the release the policy
+#   file was authored and validated against, and every invocation there passes
+#   `--locked` and then asserts that neither lockfile moved. That matters: without
+#   `--locked`, cargo-deny re-resolves the graph, may REWRITE `fuzz/Cargo.lock` on
+#   the runner, and still report `ok` - a green log over a graph no commit
+#   contains. The reasoning is recorded once, in `audit.yml` and in the policy
+#   file itself; it is deliberately not duplicated here.
+#
+#   `cargo-fuzz` - the one tool this workflow DOES install - is PINNED to 0.13.2,
+#   installed from an integrity-verified source tree, and asserted after install.
+#   A floating version would mean every run builds and executes an unreviewed
+#   binary; an upstream break under a pin is loud, diagnosable, and fixed by one
+#   deliberate commit. That trade is why the pin is preferred even though
+#   cargo-fuzz tracks whatever the current nightly accepts. See its install step.
+#
+# BUDGET
+# ======
+#   The per-target budget is EVENT-CONDITIONAL, because the callers want
+#   opposite things. A `pull_request` run sits on the critical path of a merge,
+#   so it gets 120s/target; `schedule` and `workflow_dispatch` have nothing
+#   waiting on them, so they get 600s/target. The loop is SEQUENTIAL over the
+#   five targets, so the fuzzing wall clock is the per-target budget times five:
+#   about 10 minutes on a pull request and about 50 on the weekly run.
+#
+#   Only `-max_total_time` varies. The other two flags are fixed for DIFFERENT
+#   reasons, and conflating them is how one of them ends up changed carelessly:
+#
+#     * `-max_len=65536` is an INPUT-SIZE ceiling that the harnesses are written
+#       against. `fuzz/fuzz_targets/fuzz_deflate_roundtrip.rs` sizes
+#       `OUTPUT_GROWTH_LIMIT` and its pass budget relative to it and then ASSERTS
+#       on them, so raising `max_len` without revisiting those constants turns a
+#       harness limit into something that looks like a genuine finding. Keep the
+#       two synchronized.
+#     * `-rss_limit_mb=2048` is not harness sizing at all. It is libFuzzer's
+#       per-PROCESS memory cap, set below the runner's available RAM so that a
+#       genuine leak is reported as a libFuzzer OOM with a reproducer rather than
+#       the whole job being killed by the runner. The harnesses treat an
+#       allocation failure under this ceiling as an environment condition, not a
+#       library defect.
+#
+# CORPUS PERSISTENCE
+# ==================
+#   Each target's libFuzzer corpus is cached under its OWN key, so one target's
+#   growth does not displace another's THROUGH THE KEY. That is the only coupling
+#   separate keys remove: every entry still competes for the repository-wide cache
+#   quota, which GitHub reclaims by evicting least-recently-used entries across
+#   ALL keys, so a large or idle corpus can still be dropped. `cargo fuzz` keys
+#   corpora by target name under `fuzz/corpus/<target>/`, which is why the five
+#   cache entries below are spelled out one per target, and why renaming a target
+#   would silently orphan its corpus rather than fail loudly.
+#
+#   The keys are ROLLING - they carry `github.run_id` - so a NEW workflow run
+#   normally misses on the primary key, `restore-keys` restores the most recent
+#   prefix match, and `actions/cache`'s post-job hook then saves the grown corpus.
+#   "Normally", not "always": a rerun of the SAME run reuses that run id, so its
+#   primary key can hit and save nothing, and a failed or cancelled job may never
+#   reach the save hook at all. Add `github.run_attempt` to the key if each rerun
+#   must also start from a fresh primary key. Cache entries are immutable, so a
+#   stable or content-hashed key would hit, save nothing, and freeze the corpus at
+#   its first-ever contents - which is why the run id is there. A persisted corpus
+#   lets successive runs build on previously discovered inputs instead of
+#   restarting from empty.
+#
+#   Cache entries are BRANCH-SCOPED: a branch reads its own and the default
+#   branch's, but a pull request's entries are not visible to other pull
+#   requests. The weekly run on the default branch is therefore what accumulates
+#   the durable corpus, and pull requests read from it. A total cache MISS is a
+#   fully supported path and not an error: `fuzz/corpus` is gitignored (root
+#   `.gitignore`), so a cold run is both the normal first execution and the
+#   permanent fallback. Because the run step below names the corpus directory
+#   EXPLICITLY - so the committed seeds can follow it as read-only inputs - it
+#   also creates `fuzz/corpus/<target>/` with `mkdir -p` first: an explicitly
+#   named corpus directory that does not exist is an argument error, whereas an
+#   implicit default path is one cargo-fuzz creates for itself.
+#
+# COMMITTED SEEDS ARE READ-ONLY CORPUS INPUTS
+# ===========================================
+#   `fuzz/seeds/**` is a SEPARATE, committed tree, and it is deliberately NOT
+#   part of any cache entry here - it is version-controlled, never accumulated.
+#   It IS, however, handed to libFuzzer on every run as a trailing, read-only
+#   corpus argument that follows the writable cached corpus:
+#
+#       cargo fuzz run <target> fuzz/corpus/<target> fuzz/seeds/<target>
+#
+#   libFuzzer treats the FIRST corpus directory as writable and every later one
+#   as read-only input, so newly discovered units land in the cached corpus while
+#   the committed seeds are never mutated, minimised away, or deleted. That
+#   ordering is a contract, not a preference - swapping the two paths would let a
+#   fuzzing run rewrite version-controlled inputs.
+#
+#   `fuzz_inflate` is the only target that ships seeds, so the run step appends
+#   `fuzz/seeds/<target>` for whichever targets actually have a directory. It
+#   fails if a seed directory exists but is empty, and it fails if any committed
+#   seed directory did not match a `cargo fuzz list` target: a directory whose
+#   name does not match a target would otherwise be skipped in silence, leaving
+#   the seeds tracked, documented, and inert while the job still reported
+#   success. See the "Committed seed corpus" section in the header of
+#   `fuzz/fuzz_targets/fuzz_inflate.rs` for the provenance of the individual seed
+#   files and for the local `cargo fuzz coverage` invocation that consumes the
+#   same tree.
 
 name: Fuzz
 
-# Triggers:
-#   * pull_request      - hard requirement carried over from the original file.
-#   * workflow_dispatch - allow maintainers to launch a fuzz run on demand.
-#   * schedule          - a weekly bounded run (Mondays 03:00 UTC) for drift
-#                         detection across the fuzz targets.
+# Triggers. `pull_request` runs on the shorter per-target budget because it sits on
+# the critical path of a merge; `workflow_dispatch` and the weekly Monday 03:00 UTC
+# `schedule` get the longer one, and the scheduled run on the default branch is what
+# accumulates the durable, branch-scoped corpus. See "BUDGET" and "CORPUS
+# PERSISTENCE" in the header.
 on:
   pull_request:
   workflow_dispatch:
@@ -46,52 +262,644 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The only job in this workflow. Building and fuzzing the harnesses is all this
+  # file does: the supply-chain policy over both graphs -- the single root
+  # `deny.toml`, aimed at the root graph and at this workspace -- is owned and
+  # enforced by `audit.yml`, so there is deliberately no `cargo-deny` job here and
+  # no `needs:` on one. See "SUPPLY-CHAIN POLICY" in the header for what that
+  # trade-off costs and what it buys.
   cargo-fuzz:
     name: cargo-fuzz (libFuzzer)
     runs-on: ubuntu-latest
+    # Backstop against a pathological hang consuming a full runner slot, sized so
+    # it can NEVER truncate a scheduled campaign: the longest budget is 600s over
+    # five sequential targets (50 minutes), plus the cargo-fuzz install, the
+    # detached-workspace quality gates, the harness build and the corpus
+    # restore/save, which lands the worst realistic case around 60-65 minutes. 120
+    # leaves roughly a 2x margin. The quality gates in step 4 are a rounding error
+    # against that arithmetic and do not move it: measured cold on a fresh target
+    # directory, `clippy --all-targets` took 11s and the `--no-default-features`
+    # build of all five harnesses took 8s, with `fmt --check` effectively
+    # instantaneous. A timeout that
+    # cut fuzzing short would be a silent coverage reduction reported as a red
+    # build with no finding, so this number must stay well above the arithmetic
+    # above if the budget is ever raised again.
+    timeout-minutes: 120
+    # MANDATORY, and set at JOB level so it also covers the nested `cargo build`
+    # invocations cargo-fuzz spawns. Without it every cargo call here resolves to the
+    # 1.85.0 pin in `rust-toolchain.toml` and fails on the nightly-only `-Z` flags.
+    # See "TOOLCHAIN SELECTION" in the header.
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-08-01
     steps:
       # 1. Fetch the crate sources.
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Do NOT leave the `GITHUB_TOKEN` behind in `.git/config`. By default
+          # `actions/checkout` writes it there as an `http.extraheader`, where it
+          # survives this step and stays readable to every later step in the job -
+          # including anything a build script or third-party action runs. Nothing
+          # here pushes, tags or authenticates, so the credential has no reader.
+          # This is separate from the top-level `permissions:` ceiling: that bounds
+          # what the token MAY DO, this bounds how long it EXISTS on disk.
+          persist-credentials: false
 
       # 2. cargo-fuzz / libFuzzer require a nightly toolchain for the sanitizer
       #    and coverage instrumentation it injects into the harness.
+      #
+      #    THE DATE IS PART OF THE PIN. A bare `nightly` is whatever was published
+      #    the morning the job happened to run, which makes this the one job in the
+      #    repository whose compiler changes without a commit. Two consequences, both
+      #    real rather than theoretical: a nightly regression turns the weekly
+      #    campaign red for a reason that is not in this repository and cannot be
+      #    reproduced later, because the floating `nightly` has already moved on; and
+      #    a crash reproducer under `fuzz/artifacts` is only meaningful if the
+      #    compiler that produced it can be named. `cargo-fuzz` is pinned in step 3
+      #    for the same reason, and the two pins reinforce each other -- a fixed
+      #    cargo-fuzz built by a moving compiler is still not a reproducible install.
+      #
+      #    REFRESHING IT is expected maintenance, not a violation: bump this date and
+      #    the `expected_nightly` assertion below in the same commit, run the campaign
+      #    once, and record nothing else. The dated channels stay downloadable
+      #    indefinitely, so an old pin fails by going stale, never by disappearing.
       - name: Install Rust nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, 2026-07-16
+        with:
+          # The channel MUST be named here. Pinning this action to a commit means
+          # the `@<ref>` no longer selects a toolchain: the pinned tree is the
+          # `stable` branch, whose `toolchain` input merely DEFAULTS to `stable`,
+          # so relying on the default would silently install stable wherever
+          # another channel was intended.
+          toolchain: nightly-2026-08-01
+          # AND THE COMPONENTS MUST BE NAMED TOO. This step provisions exactly what
+          # it is asked for and nothing more: a channel installed without this input
+          # carries `rustc`, `cargo` and `rust-std` alone, so `cargo fmt` and
+          # `cargo clippy` have no shim to dispatch to. That is not a nightly
+          # peculiarity - `ci.yml` names the same pair on both of its STABLE
+          # toolchain steps for the same reason.
+          #
+          # Omitting this input does not fail here; it fails in step 4, which runs
+          # one `cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check` and two
+          # `cargo clippy ... -- -D warnings` gates over the detached fuzz
+          # workspace, resolved against THIS toolchain because of the job-level
+          # `RUSTUP_TOOLCHAIN: nightly-2026-08-01`. Each would report
+          # `error: 'cargo-fmt' is not installed for the toolchain
+          # 'nightly-2026-08-01-x86_64-unknown-linux-gnu'` several minutes and one
+          # cargo-fuzz build later, and the harness code those gates exist to check
+          # would go unexamined - which is precisely the condition that leaves the
+          # `[lints.clippy]` table in `fuzz/Cargo.toml` a rule with no enforcer.
+          #
+          # Step 2a therefore probes both shims before anything else is built, so a
+          # missing component fails in seconds with a named cause. Both ship for
+          # nightly channels, so requesting them cannot make the install fail; if a
+          # future dated nightly ever drops one, this step fails loudly at install
+          # time instead of the quality gate silently ceasing to exist.
+          components: clippy, rustfmt
 
-      # 3. Install the cargo-fuzz subcommand (the libFuzzer front-end).
-      #    `--locked` keeps the install reproducible against cargo-fuzz's own
-      #    lockfile.
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+      # 2a. Fail loudly if the nightly override is ever lost, instead of meeting it
+      #     as an opaque `-Z` parse error part-way through the build.
+      #
+      #     It checks the CHANNEL and then the COMPONENTS, because "the toolchain we
+      #     asked for" means both and each fails differently. A lost channel fails at
+      #     the first nightly-only flag; a lost component fails in step 4 with
+      #     `error: 'cargo-fmt' is not installed`, minutes later and worded as though
+      #     the toolchain were fine and the request unreasonable. Probing the two
+      #     shims here converts that into a named failure at second fifteen, and it
+      #     does so through the shims rather than a `rustup component list` entry
+      #     because the shims are what step 4 actually dispatches to. `ci.yml`'s
+      #     `lint` job probes the same pair in the same place for the same reason.
+      - name: Verify the resolved toolchain is nightly
+        run: |
+          set -euo pipefail
+          rustc --version --verbose
+          cargo --version
+          active="$(rustup show active-toolchain)"
+          echo "active toolchain: $active"
+          case "$active" in
+            nightly-*) ;;
+            *) echo "::error::cargo-fuzz requires nightly (RUSTUP_TOOLCHAIN=nightly-2026-08-01),"\
+               " but resolved '$active'. The RUSTUP_TOOLCHAIN override was lost and"\
+               " rust-toolchain.toml won."; exit 1 ;;
+          esac
+          # And the EXACT dated channel, not merely some nightly. The arm above
+          # catches a silent demotion to the MSRV floor; this one catches the
+          # different failure of drifting onto a floating nightly, which would look
+          # identical in the log while making the campaign unreproducible.
+          expected_nightly='nightly-2026-08-01'
+          case "$active" in
+            "$expected_nightly"-*) ;;
+            *) echo "::error::expected the pinned ${expected_nightly} toolchain but"\
+               " resolved '$active'. Bump the pin on the install step above and this"\
+               " assertion together, or restore the one that was changed."; exit 1 ;;
+          esac
+          # And that the channel arrived with the two components step 4 needs. The
+          # probes carry their own handler rather than being left to `set -e` so the
+          # log names WHICH input went missing and WHICH gate that disarms; both are
+          # reported before exiting, because losing one input loses both components
+          # and a half-diagnosis would send a reader back for a second run.
+          #
+          # `|| { ... }` rather than `if ! ...; then`: the probe must keep `--version`
+          # as its own token. `cargo clippy` is a graph-resolving subcommand, and
+          # the `--locked` contract test in `src/lib.rs` exempts a version query by
+          # reading the argument that FOLLOWS the subcommand - `--version;` is not
+          # `--version`, so the semicolon form would read as an unlocked clippy run.
+          echo "components installed on the pinned nightly:"
+          rustup component list --installed
+          missing=0
+          cargo fmt --version || {
+            echo "::error::cargo fmt does not resolve on ${expected_nightly}. The"\
+                 " 'components:' input on the install step above no longer requests"\
+                 " rustfmt, so the format check in step 4 would fail on a missing"\
+                 " shim instead of on the harness sources it exists to read."
+            missing=1
+          }
+          cargo clippy --version || {
+            echo "::error::cargo clippy does not resolve on ${expected_nightly}. The"\
+                 " 'components:' input on the install step above no longer requests"\
+                 " clippy, so both clippy gates in step 4 would fail on a missing"\
+                 " shim and the deny-level lints in fuzz/Cargo.toml would again have"\
+                 " no enforcer."
+            missing=1
+          }
+          [ "$missing" -eq 0 ] || exit 1
 
-      # 4. Build every fuzz target first. This compiles all libFuzzer harnesses
+      # 3. Install the cargo-fuzz subcommand (the libFuzzer front-end) from an
+      #    INTEGRITY-VERIFIED source tree rather than straight off the network.
+      #
+      #    Version 0.13.2 is pinned and asserted. Floating meant every run built and
+      #    executed an unreviewed binary; an upstream break under a pin is loud,
+      #    diagnosable and fixed by one commit, whereas a compromised or merely
+      #    regressed floating release is neither. If nightly ever moves past what
+      #    0.13.2 accepts, this step fails with a clear error and the pin is bumped
+      #    deliberately.
+      #
+      #    Four properties, none of which `cargo install cargo-fuzz` alone gives:
+      #      * the crate file's sha256 is checked against the `cksum` the sparse
+      #        index publishes for exactly this version, so a substituted tarball
+      #        fails before anything is compiled;
+      #      * `--precise` overrides lift two of cargo-fuzz's own dependencies onto
+      #        patched releases (see the RUSTSEC ids inline);
+      #      * `--locked` builds precisely the resolution produced above, so the
+      #        graph that was verified is the graph that is built;
+      #      * `--path .` builds from the extracted tree, never re-downloading.
+      #
+      #    Unprefixed on purpose: the job-level `RUSTUP_TOOLCHAIN` selects the pinned
+      #    nightly and step 2a has already asserted it, so the installed binary is
+      #    built by the same toolchain it will drive. See step 2 for the date pin.
+      - name: Prepare and verify the cargo-fuzz 0.13.2 dependency graph
+        run: |
+          set -euo pipefail
+          name=cargo-fuzz
+          version=0.13.2
+          cksum="$(curl -fsSL "https://index.crates.io/${name:0:2}/${name:2:2}/$name" \
+            | python3 -c "import json,sys; print(next(e['cksum'] for e in map(json.loads, sys.stdin) if e['vers'] == '$version'))")"
+          test -n "$cksum"
+          work="$RUNNER_TEMP/tools"
+          mkdir -p "$work"
+          curl -fsSL -o "$work/$name-$version.crate" \
+            "https://static.crates.io/crates/$name/$name-$version.crate"
+          echo "$cksum  $work/$name-$version.crate" | sha256sum -c -
+          tar xzf "$work/$name-$version.crate" -C "$work"
+          cd "$work/$name-$version"
+          cargo update -p crossbeam-epoch --precise 0.9.20  # RUSTSEC-2026-0204
+          cargo update -p anyhow --precise 1.0.103          # RUSTSEC-2026-0190
+          echo "cargo-fuzz $version graph resolved; lockfile sha256 $(sha256sum Cargo.lock | cut -d' ' -f1)"
+
+      # 3a. THE TOOL GRAPH IS AUDITED BEFORE IT IS BUILT.
+      #
+      #     `audit.yml` audits cargo-audit's and cargo-deny's own graphs, but nothing
+      #     there audits cargo-fuzz's - this workflow is the only place that tool is
+      #     installed, so this is the only place its graph can be checked. Pinning a
+      #     version and passing `--locked` fixes WHICH graph gets built; it says
+      #     nothing about whether that graph is advisory-clean. cargo-fuzz 0.13.2's
+      #     published lockfile is not, which is what the two `--precise` overrides
+      #     above address; this step is what keeps that list honest. If a new advisory
+      #     lands on the refreshed graph, or an override is dropped, the job fails
+      #     here and names the crate instead of quietly building and then EXECUTING an
+      #     advisory-affected binary over untrusted input for the rest of the campaign.
+      #
+      #     cargo-deny is installed the same integrity-verified way it is in
+      #     `audit.yml`: sparse-index sha256 on a hand-fetched tarball, then
+      #     `--path ... --locked`. Its own published lock is advisory-clean, so it
+      #     needs no override.
+      - name: Install cargo-deny 0.20.2 from an integrity-verified source tree
+        run: |
+          set -euo pipefail
+          name=cargo-deny
+          version=0.20.2
+          cksum="$(curl -fsSL "https://index.crates.io/${name:0:2}/${name:2:2}/$name" \
+            | python3 -c "import json,sys; print(next(e['cksum'] for e in map(json.loads, sys.stdin) if e['vers'] == '$version'))")"
+          test -n "$cksum"
+          work="$RUNNER_TEMP/tools"
+          mkdir -p "$work"
+          curl -fsSL -o "$work/$name-$version.crate" \
+            "https://static.crates.io/crates/$name/$name-$version.crate"
+          echo "$cksum  $work/$name-$version.crate" | sha256sum -c -
+          tar xzf "$work/$name-$version.crate" -C "$work"
+          cargo install --path "$work/$name-$version" --locked
+
+      - name: Assert the pinned cargo-deny version
+        run: |
+          set -euo pipefail
+          expected='0.20.2'
+          actual="$(cargo deny --version | awk '{ print $NF }')"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::expected cargo-deny ${expected} but resolved ${actual}."\
+                 " The --path install above did not take effect."
+            exit 1
+          fi
+          echo "cargo-deny ${actual} matches the pin"
+
+      - name: Audit the cargo-fuzz dependency graph
+        run: |
+          set -euo pipefail
+          cargo deny --locked \
+            --manifest-path "$RUNNER_TEMP/tools/cargo-fuzz-0.13.2/Cargo.toml" \
+            check advisories -D unsound -D unmaintained -D yanked
+
+      - name: Install cargo-fuzz 0.13.2 from the audited source tree
+        run: |
+          set -euo pipefail
+          cargo install --path "$RUNNER_TEMP/tools/cargo-fuzz-0.13.2" --locked
+
+      # 3a. LOCKED PREFLIGHT. `cargo fuzz` accepts no `--locked` flag and shells out
+      #     to `cargo build` without one, so it can re-resolve and rewrite
+      #     `fuzz/Cargo.lock` on the runner - after which the campaign fuzzes a
+      #     dependency set no commit contains. `cargo metadata --locked` is the
+      #     equivalent gate cargo-fuzz cannot provide: it resolves the detached fuzz
+      #     workspace under the same immutability rule and fails HERE, before any
+      #     harness is built, if the committed lockfile is incomplete or stale. The
+      #     assertions after the build and after the campaign then prove the file was
+      #     not rewritten along the way.
+      - name: Locked preflight of the fuzz workspace
+        run: cargo metadata --locked --manifest-path fuzz/Cargo.toml --format-version 1 > /dev/null
+
+      # 3a. Assert the pin, do not merely trust it. A pin that is silently not
+      #     honoured - a warm `~/.cargo/bin` from a self-hosted runner, a
+      #     differently-versioned binary earlier on PATH - would otherwise be
+      #     invisible, and this job would fuzz with a tool nobody chose.
+      - name: Assert the pinned cargo-fuzz version
+        run: |
+          set -euo pipefail
+          expected='0.13.2'
+          cargo fuzz --version
+          actual="$(cargo fuzz --version | awk '{ print $NF }')"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::expected cargo-fuzz ${expected} but resolved ${actual}."\
+                 " The corpus cache keys and the fuzzing budget flags in this workflow"\
+                 " were validated against ${expected}; re-validate before bumping."
+            exit 1
+          fi
+          echo "cargo-fuzz ${actual} matches the pin"
+
+      # 4. DETACHED-WORKSPACE QUALITY GATES.
+      #
+      #    `fuzz/Cargo.toml` carries an empty `[workspace]` table, which is what
+      #    keeps these nightly-only harnesses out of the root crate's build graph.
+      #    The cost of that isolation is that NO root-level command reaches them:
+      #    `ci.yml`'s `lint` job runs `cargo fmt --all` and
+      #    `cargo clippy --all-targets --all-features` from the repository root,
+      #    and neither can resolve a detached workspace. Without these steps the
+      #    whole harness tree - including the ONLY place in this project where a
+      #    fuzzer crosses the `unsafe` C ABI boundary - would be formatted and
+      #    linted by nothing, and the `[lints.clippy]` table in `fuzz/Cargo.toml`
+      #    (`undocumented_unsafe_blocks = "deny"`,
+      #    `multiple_unsafe_ops_per_block = "deny"`) would be a rule with no
+      #    enforcer.
+      #
+      #    They run BEFORE the build and the campaign on purpose: they are the
+      #    cheapest steps in the job (seconds against tens of minutes), and a
+      #    formatting or lint failure is worth learning about without waiting for
+      #    fuzzing.
+      #
+      #    `--manifest-path fuzz/Cargo.toml` rather than a `cd`, so the paths in
+      #    any diagnostic stay repository-relative and match what a reviewer sees.
+      #    `--locked` for the same reason every other cargo invocation in this
+      #    repository carries it: a gate that re-resolved `fuzz/Cargo.lock` would
+      #    be reporting on a graph no commit contains - and the closing steps of
+      #    this job assert that lockfile is untouched.
+      #
+      #    The `--no-default-features` pair is not a duplicate of the pair above
+      #    it. `gzip` is a FORWARDING feature declared in `fuzz/Cargo.toml`, and
+      #    with it off the harnesses' `#[cfg(feature = "gzip")]` legs compile out
+      #    while every `fuzz_target!` - and therefore every `main` - must still
+      #    link. That is a distinct compilation and a documented property of that
+      #    manifest, and only an explicit build over all five `[[bin]]` targets
+      #    proves it holds.
+      - name: Format check (detached fuzz workspace)
+        run: cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
+
+      - name: Clippy (detached fuzz workspace)
+        run: |
+          cargo clippy --manifest-path fuzz/Cargo.toml --locked \
+            --all-targets -- -D warnings
+
+      - name: Clippy (detached fuzz workspace, no default features)
+        run: |
+          cargo clippy --manifest-path fuzz/Cargo.toml --locked \
+            --all-targets --no-default-features -- -D warnings
+
+      - name: Build the harnesses with no default features
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path fuzz/Cargo.toml --locked \
+            --no-default-features
+          missing=0
+          for target in fuzz_checksum fuzz_deflate_roundtrip fuzz_ffi_roundtrip \
+                        fuzz_gzip fuzz_inflate; do
+            if [ ! -x "fuzz/target/debug/${target}" ]; then
+              echo "::error::fuzz/target/debug/${target} was not produced with"\
+                   " --no-default-features; a fuzz_target! main became conditional, so"\
+                   " that harness would silently stop existing in a gzip-off build"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          echo "all five harnesses link with the gzip legs compiled out"
+
+      # 5. Build every fuzz target first. This compiles all libFuzzer harnesses
       #    and fails fast on any build error before fuzzing begins. cargo-fuzz
       #    auto-detects the `fuzz/` crate at the repository root.
       - name: Build fuzz targets
         run: cargo fuzz build
 
-      # 5. Fuzz each target for a bounded budget. `cargo fuzz list` is captured
+      - name: Assert both lockfiles survived the harness build
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          dirty="$(git status --porcelain Cargo.lock fuzz/Cargo.lock)"
+          if [ -n "$dirty" ]; then
+            echo "::error::building the fuzz harnesses rewrote a lockfile, so the"\
+                 " audited graph is not the graph that was built: $dirty"
+            git --no-pager diff -- Cargo.lock fuzz/Cargo.lock | head -40
+            exit 1
+          fi
+          echo "Cargo.lock and fuzz/Cargo.lock are unchanged after the build"
+
+      # 6. Restore each target's libFuzzer corpus, one cache entry PER TARGET.
+      #    `cargo fuzz` keys corpora by target name under `fuzz/corpus/<target>/`,
+      #    so the paths below must match the five `[[bin]]` names in
+      #    `fuzz/Cargo.toml` character for character. Separate keys mean one
+      #    target's growth does not displace another's through the key; they do not
+      #    exempt any entry from the repository-wide cache quota, which evicts
+      #    least-recently-used entries across all keys.
+      #
+      #    The key carries `github.run_id` so the shape stays rolling; see "CORPUS
+      #    PERSISTENCE" in the header for what that does and does not guarantee.
+      #
+      #    A MISS IS NOT AN ERROR. `fuzz/corpus` is gitignored, so a cold run is
+      #    the normal first execution and the permanent fallback, and nothing here
+      #    is gated on a cache hit. The run step below creates each
+      #    `fuzz/corpus/<target>/` with `mkdir -p` before invoking the fuzzer, and
+      #    that `mkdir -p` is mandatory: passing the corpus path explicitly (so the
+      #    committed seeds can follow it as read-only inputs) means libFuzzer sees a
+      #    named directory, and a named directory that does not exist is an
+      #    argument error rather than an empty starting corpus. Only the implicit
+      #    default path is one `cargo fuzz` creates for itself.
+      #    Restoring after the build means a broken harness still fails fast.
+      - name: Restore corpus (fuzz_checksum)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: fuzz/corpus/fuzz_checksum
+          key: fuzz-corpus-fuzz_checksum-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-fuzz_checksum-
+
+      - name: Restore corpus (fuzz_deflate_roundtrip)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: fuzz/corpus/fuzz_deflate_roundtrip
+          key: fuzz-corpus-fuzz_deflate_roundtrip-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-fuzz_deflate_roundtrip-
+
+      - name: Restore corpus (fuzz_ffi_roundtrip)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: fuzz/corpus/fuzz_ffi_roundtrip
+          key: fuzz-corpus-fuzz_ffi_roundtrip-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-fuzz_ffi_roundtrip-
+
+      - name: Restore corpus (fuzz_gzip)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: fuzz/corpus/fuzz_gzip
+          key: fuzz-corpus-fuzz_gzip-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-fuzz_gzip-
+
+      - name: Restore corpus (fuzz_inflate)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: fuzz/corpus/fuzz_inflate
+          key: fuzz-corpus-fuzz_inflate-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-fuzz_inflate-
+
+      # 7. Fuzz each target for a bounded budget. `cargo fuzz list` is captured
       #    ONCE into a variable (avoids a `| head` SIGPIPE under the default
       #    `bash -eo pipefail` shell). A crash/timeout writes a reproducer under
-      #    `fuzz/artifacts` and returns non-zero, failing the pipeline. The
-      #    budget is intentionally bounded (60s/target, capped input length and
-      #    RSS) so the scheduled/PR run stays fast and deterministic.
+      #    `fuzz/artifacts` and returns non-zero, failing the pipeline.
+      #
+      #    The budget is bounded and EVENT-CONDITIONAL: 120s/target on a
+      #    `pull_request`, where the run is on the critical path of a merge, and
+      #    600s/target on `schedule` and `workflow_dispatch`, where nothing is
+      #    waiting on it. The loop is SEQUENTIAL, so the fuzzing wall clock is that
+      #    figure times five targets - roughly 10 minutes on a pull request and 50
+      #    on the weekly run. Both branches of the expression are non-empty integer
+      #    literals, and the shell default below is a second guard, because an
+      #    empty `-max_total_time=` is an argument error that would fail the job for
+      #    the wrong reason.
+      #
+      #    `-max_len` and `-rss_limit_mb` are deliberately NOT parameterised, for two
+      #    DIFFERENT reasons. `-max_len=65536` is an input-size ceiling the harnesses
+      #    are written against and must stay synchronised with their buffer sizing, so
+      #    raising it would turn a harness OOM into something that looks exactly like a
+      #    genuine finding. `-rss_limit_mb=2048` is libFuzzer's per-process memory cap -
+      #    a runner resource bound, unrelated to harness sizing. The resolved budget is
+      #    echoed so the run log, rather than this comment, is the record of what was
+      #    actually used.
+      #
+      #    THE COMMITTED SEEDS ARE PASSED TO libFuzzer. Eleven authored seeds live
+      #    in `fuzz/seeds/fuzz_inflate/`, and they exist for a specific, checkable
+      #    reason: `fuzz_inflate`'s round-trip probe is gated on bits `16..=19` of a
+      #    selector that is a pure function of the first eight input bytes, so an
+      #    input either always opens that gate or never does. Every one of the
+      #    eleven opens it, one per accepted compression level. Passing them here is
+      #    what makes them reachable at all: `cargo fuzz run <target>` with no
+      #    corpus argument reads only the default writable corpus, which would leave
+      #    the committed tree tracked, documented, and inert.
+      #
+      #    ORDER IS THE CONTRACT, not a preference: libFuzzer treats the FIRST
+      #    corpus directory as writable and every later one as read-only input. So
+      #    `fuzz/corpus/<target>` comes first (it is the cached, growing corpus
+      #    restored above, and what the post-job hook saves), and
+      #    `fuzz/seeds/<target>` comes second so nothing is ever written back into
+      #    a tracked directory. That is exactly the invocation
+      #    `fuzz/fuzz_targets/fuzz_inflate.rs` documents in its "Committed seed
+      #    corpus" section.
+      #
+      #    The pairing is BY DIRECTORY NAME, and it is verified by a PRE-FLIGHT pass
+      #    that runs before any budget is spent: every directory under `fuzz/seeds`
+      #    must name a target that `cargo fuzz list` reports, and must actually hold
+      #    inputs. A directory whose name does not match a target fails the job in
+      #    seconds instead of being skipped in silence after a 50-minute campaign,
+      #    and a committed-but-empty directory fails too, since that is a seeding
+      #    claim with nothing behind it. The count comparison after the loop is kept
+      #    as a second, independent witness: it can only fire if the loop and the
+      #    pre-flight ever disagree about the pairing, and it costs nothing.
+      #
+      #    `mkdir -p` on the corpus is required once a corpus path is passed
+      #    explicitly: with no argument cargo-fuzz creates its own default
+      #    directory, but an explicit path that does not exist is an argument error
+      #    on a cold cache - i.e. on the first run of any new branch.
+      #
+      #    EVERY TARGET IS FUZZED EVEN WHEN AN EARLIER ONE FAILS, and this is the
+      #    difference between one finding and a silent coverage hole. `set -e` makes
+      #    a failing command abort the whole step, so with a bare invocation the loop
+      #    stopped at the first red target and every target after it in
+      #    `cargo fuzz list` order received ZERO budget - a real leak in
+      #    `fuzz_ffi_roundtrip`, third of five, deleted `fuzz_gzip` and
+      #    `fuzz_inflate` from the run entirely while the job reported only the one
+      #    failure it happened to reach. The cost of a finding was therefore 40% of
+      #    the fuzzing surface, and nothing in the log said so.
+      #
+      #    The invocation is consequently placed in an `if` condition, which is the
+      #    one context `set -e` does not treat as fatal. A failure names its target
+      #    and its exit status, is accumulated, and the loop continues; the
+      #    accumulated list is re-raised after the loop so the step still exits
+      #    non-zero and the job is still red. The `::endgroup::` is emitted on both
+      #    paths so a failing target's log group closes properly. Ordering the
+      #    re-raise AFTER the seeded/available reconciliation keeps a harness
+      #    pairing bug - which invalidates the whole run - reported ahead of the
+      #    findings that run produced.
       - name: Run bounded fuzzing (all targets)
+        env:
+          MAX_TOTAL_TIME: ${{ (github.event_name == 'pull_request') && '120' || '600' }}
         run: |
+          set -euo pipefail
+          : "${MAX_TOTAL_TIME:=120}"
           targets="$(cargo fuzz list)"
           echo "Fuzz targets: ${targets}"
+          echo "Event: ${GITHUB_EVENT_NAME}; per-target budget: ${MAX_TOTAL_TIME}s"
+          # PRE-FLIGHT: validate the committed seed tree BEFORE spending any of the
+          # budget, so a misnamed or empty seed directory costs seconds instead of a
+          # full campaign. Every directory under fuzz/seeds must name a target that
+          # `cargo fuzz list` reports and must actually hold inputs.
+          available=0
+          for seeds in fuzz/seeds/*/; do
+            [ -d "${seeds}" ] || continue
+            available=$((available + 1))
+            name="${seeds#fuzz/seeds/}"
+            name="${name%/}"
+            count="$(find "${seeds}" -type f | wc -l)"
+            if [ "${count}" -eq 0 ]; then
+              echo "::error::fuzz/seeds/${name} is committed but empty, so it seeds nothing."\
+                   " Either add the inputs it claims to hold or delete the directory."
+              exit 1
+            fi
+            matched=0
+            for target in ${targets}; do
+              if [ "${target}" = "${name}" ]; then
+                matched=1
+              fi
+            done
+            if [ "${matched}" -eq 0 ]; then
+              echo "::error::fuzz/seeds/${name} does not name any target reported by"\
+                   " 'cargo fuzz list', so its ${count} committed seed(s) would never reach"\
+                   " libFuzzer. Rename the directory to the target it seeds."
+              exit 1
+            fi
+            echo "seed directory fuzz/seeds/${name} -> target ${name} (${count} input(s))"
+          done
+          echo "Committed seed directories under fuzz/seeds: ${available}"
+          seeded=0
+          fuzzed=0
+          # Space-separated rather than an array: target names are crate binary
+          # names and cannot contain whitespace, and a plain string has no
+          # empty-expansion pitfall under `set -u`.
+          failures=""
           for target in ${targets}; do
             echo "::group::Fuzzing ${target}"
-            cargo fuzz run "${target}" -- \
-              -max_total_time=60 -max_len=65536 -rss_limit_mb=2048
+            corpus="fuzz/corpus/${target}"
+            mkdir -p "${corpus}"
+            corpora=("${corpus}")
+            seeds="fuzz/seeds/${target}"
+            if [ -d "${seeds}" ]; then
+              echo "seeding ${target} with read-only input(s) from ${seeds}"
+              corpora+=("${seeds}")
+              seeded=$((seeded + 1))
+            fi
+            fuzzed=$((fuzzed + 1))
+            # `if <cmd>` is the one construct `set -e` does not treat as fatal, so
+            # this is what lets a red target be recorded instead of aborting the
+            # step and starving every target after it. `status=$?` must be the
+            # FIRST statement in the else branch - anything before it, `echo`
+            # included, would overwrite the status being captured.
+            if cargo fuzz run "${target}" "${corpora[@]}" -- \
+                 -max_total_time="${MAX_TOTAL_TIME}" -max_len=65536 -rss_limit_mb=2048; then
+              echo "${target}: spent its ${MAX_TOTAL_TIME}s budget with no finding"
+            else
+              status=$?
+              failures="${failures} ${target}(exit ${status})"
+              echo "::error::fuzz target ${target} failed with exit ${status}. Its"\
+                   " reproducer, if libFuzzer wrote one, is under fuzz/artifacts and is"\
+                   " published by the 'Upload crash artifacts' step. The remaining"\
+                   " targets are still being fuzzed, so this run reports every finding"\
+                   " rather than stopping at the first."
+            fi
             echo "::endgroup::"
           done
+          echo "targets fuzzed: ${fuzzed} of $(echo "${targets}" | wc -w)"
+          if [ "${fuzzed}" -ne "$(echo "${targets}" | wc -w)" ]; then
+            echo "::error::only ${fuzzed} of the $(echo "${targets}" | wc -w) target(s)"\
+                 " reported by 'cargo fuzz list' were reached. Every target must receive"\
+                 " its budget on every run; a short count means the loop exited early and"\
+                 " the missing targets were not fuzzed at all."
+            exit 1
+          fi
+          if [ "${seeded}" -ne "${available}" ]; then
+            echo "::error::${available} seed directory(ies) exist under fuzz/seeds but only"\
+                 " ${seeded} reached libFuzzer, which the pre-flight check above should have"\
+                 " made impossible. The loop and the pre-flight disagree about the"\
+                 " directory-name-to-target pairing; fix that before trusting this run."
+            exit 1
+          fi
+          # Re-raise the accumulated findings last, so a harness pairing bug above -
+          # which invalidates the whole campaign - is reported before the findings
+          # that campaign produced.
+          if [ -n "${failures}" ]; then
+            echo "::error::bounded fuzzing finished with finding(s) in:${failures}."\
+                 " Every target received its full ${MAX_TOTAL_TIME}s budget, so this list"\
+                 " is complete rather than truncated at the first failure."
+            exit 1
+          fi
+          echo "fuzzing complete; ${seeded} of ${available} committed seed directory(ies) used"
 
-      # 6. On failure (a crash/timeout reproducer was written), publish the
+      # 6a. The closing half of the locked-preflight contract. `cargo fuzz run`
+      #     also invokes Cargo without `--locked`, so the campaign itself is a
+      #     second opportunity for a lockfile rewrite. `!cancelled()` keeps this
+      #     verified on the failure path - the run in which a stray rewrite would
+      #     otherwise hide behind an unrelated red result.
+      - name: Assert both lockfiles are unchanged
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          dirty="$(git status --porcelain Cargo.lock fuzz/Cargo.lock)"
+          if [ -n "$dirty" ]; then
+            echo "::error::the fuzzing campaign rewrote a lockfile, so it did not"\
+                 " fuzz the dependency graph this commit pins: $dirty"
+            git --no-pager diff -- Cargo.lock fuzz/Cargo.lock | head -40
+            exit 1
+          fi
+          echo "Cargo.lock and fuzz/Cargo.lock are byte-identical to the commit under test"
+
+      # 8. On failure (a crash/timeout reproducer was written), publish the
       #    cargo-fuzz artifacts directory so the offending input is retrievable.
       - name: Upload crash artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: failure()
         with:
           name: fuzz-artifacts

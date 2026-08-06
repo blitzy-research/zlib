@@ -1,0 +1,88 @@
+# clippy.toml — the lint-configuration contract for the `zlib-rs` crate.
+#
+# clippy reads this file from the crate root on every invocation and uses it to
+# PARAMETERISE the lints it runs. It is the companion to `rustfmt.toml`: that file
+# freezes FORMATTING behaviour, this one freezes LINT behaviour, and the pair is what
+# keeps the configurable lint and format inputs from depending on unpinned tool
+# defaults (migration gap D11). The gate it serves is
+# `cargo clippy --all-targets [--all-features] -- -D warnings`, which is blocking.
+#
+# WHAT THIS FILE CANNOT DO. `clippy.toml` configures lints; it cannot ENABLE or
+# DISABLE them. There is no `warn`/`deny`/`allow` key, and clippy rejects such a key
+# outright rather than ignoring it. Lint LEVELS live in exactly two places: the
+# crate-root inner attributes in `src/lib.rs` (`#![warn(missing_docs)]`,
+# `#![warn(clippy::undocumented_unsafe_blocks)]`, `#![deny(unsafe_code)]`) and the
+# `-D warnings` on the command line that promotes those warnings to hard errors. So
+# nothing here can weaken the `unsafe`-containment or documentation guarantees, and
+# this file must never acquire a key that could if a future release offers one.
+#
+# A KEY BELONGS HERE ONLY IF you can name the specific lint it configures AND the
+# gate has been OBSERVED to exit 0 with the key present on every clippy that reads
+# this file. A key must NEVER be added to make a diagnostic go away: raising a
+# threshold to silence a finding leaves the finding in place, invisible, and covers
+# every future occurrence too. When clippy is right, fix the code; when it is wrong
+# about one specific site, put a narrowly scoped `#[expect(..)]` or `#[allow(..)]`
+# WITH A REASON at that site, where a reviewer can see it. The `unsafe` boundary in
+# particular is architectural, so the correct response to a finding on it is to
+# restructure — never to configure a lint away.
+#
+# AN UNRECOGNISED KEY IS FATAL, AND THE VOCABULARY IS VERSIONED. clippy does not
+# ignore a key it cannot recognise, and it treats a wrong type the same way:
+#
+#     error: error reading Clippy's configuration file: unknown field `<key>`,
+#            expected one of ...
+#
+# One stale or misspelled key therefore breaks `cargo clippy` for everyone, the CI
+# `lint` job included. Three different clippy releases read this one file — the floor
+# pinned by `rust-toolchain.toml`, current stable, and the nightly `cargo-fuzz` needs
+# (`rustup` discovery walks up from `fuzz/`, so this file governs that detached
+# workspace too) — and the recognised-key vocabulary differs between them. Only keys
+# every one accepts may appear here; to learn what a release accepts, hand it a
+# deliberately bogus key and read its "expected one of" list. Always run the gate on
+# all three and read stderr as well as the exit code.
+#
+# TWO KEYS STAY OMITTED ON PURPOSE. `avoid-breaking-exported-api` keeps its `true`
+# default: at `false` clippy suggests changes to the public API, and this crate's
+# public API is a frozen C ABI — the `zlib.map` `global:` symbols, the `#[repr(C)]`
+# `z_stream_s` and `gz_header_s` layouts, the `gzFile_s { have, next, pos }` prefix
+# that C's `gzgetc` *macro* dereferences, and the five versioned `*Init*_` entry
+# points — so a suggestion to "improve" one is drop-in-breaking at worst and noise at
+# best. `check-private-items` stays omitted because setting it `true` extends
+# `clippy::missing_safety_doc` and `missing_panics_doc` to private items, which adds
+# findings; this file must never be the thing that turns a green gate red.
+
+# The Minimum Supported Rust Version clippy reasons about — the one key here, and the
+# reason this file exists at all.
+#
+# WHAT IT BUYS. With an MSRV known, clippy stops suggesting APIs newer than it, and
+# `clippy::incompatible_msrv` flags any already in the code. Without one, a
+# contributor on current stable gets suggestions that look correct, apply cleanly, and
+# pass their local build — then fail the CI `msrv` job on a compiler they never ran.
+#
+# WHY IT IS NOT REDUNDANT WITH `Cargo.toml`. clippy honours `rust-version` only
+# because CARGO forwards it as `CARGO_PKG_RUST_VERSION` to the compiler process it
+# spawns, so any invocation that does not go through cargo has NO MSRV at all: an
+# editor or language-server check-on-save wired straight to `clippy-driver`, a
+# pre-commit hook, a one-off `clippy-driver src/deflate/slow.rs`. This key is the only
+# MSRV declaration that survives a cargo-less invocation.
+#
+# THE VALUE MUST EQUAL `Cargo.toml`'s `rust-version`, because this key OVERRIDES it
+# when both are present, so a mismatch silently lints against a version the crate does
+# not claim to support. clippy does report the disagreement —
+#
+#     warning: the MSRV in `clippy.toml` and `Cargo.toml` differ;
+#              using `<this file's value>` from `clippy.toml`
+#
+# — but that is a configuration-reader warning rather than a rustc lint, so
+# `-D warnings` does not promote it. Keeping the two in step is a human obligation CI
+# will not catch. Raising the MSRV is a FOUR-place change in ONE commit:
+# `rust-version` in `Cargo.toml`, `channel` in `rust-toolchain.toml`, the
+# `RUSTUP_TOOLCHAIN` / `@<ref>` / `+<ref>` pins in the CI `msrv` job, and this key.
+# They are the same fact stated four times; if they drift, three of them are lying.
+#
+# 1.85.0 specifically because the pairing is forced: `Cargo.toml` declares
+# `edition = "2024"`, and 1.85.0 is the release in which edition 2024 became
+# available, making it the tightest self-consistent MSRV this crate can declare. The
+# full three-component form is used so a mechanical diff against the other three
+# declarations is possible.
+msrv = "1.85.0"

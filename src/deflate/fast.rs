@@ -26,7 +26,7 @@
 //!
 //! # Safety
 //!
-//! This module contains **zero** `unsafe` (AAP §0.6.2, §0.7.2): all window and
+//! This module contains **zero** `unsafe` (AAP §0.6.2, §0.7.2 standard S2): all window and
 //! buffer access goes through bounds-checked indexing, and all cleanup is
 //! handled by ownership in [`DeflateState`]. The two `usize` subtractions that
 //! could in principle underflow — `strstart - hash_head` and
@@ -192,21 +192,28 @@ pub fn deflate_fast(s: &mut DeflateState, io: &mut IoContext, flush: i32) -> Blo
                 // the next `match_length - 1` positions. Faithful port of C's
                 // `match_length--; do { strstart++; INSERT_STRING(...); }
                 // while (--match_length != 0); strstart++;`.
-                s.match_length -= 1; // string at strstart already in table
-                loop {
-                    s.strstart += 1;
-                    // The returned chain head is unused here (the C macro stores
-                    // it into `hash_head`, which is never read again this
-                    // iteration); only the insertion side effect matters.
-                    s.insert_string(s.strstart);
-                    // `strstart` never exceeds `window_size - MIN_LOOKAHEAD`
-                    // here, so there are always MIN_MATCH bytes ahead to hash.
-                    s.match_length -= 1;
-                    if s.match_length == 0 {
-                        break;
-                    }
-                }
-                s.strstart += 1;
+                // C's `do { strstart++; INSERT_STRING(...); }
+                // while (--match_length != 0);` visits the `match_length - 1`
+                // consecutive positions `strstart + 1 ..= strstart + run`, leaves
+                // `match_length` at zero, and advances `strstart` once per
+                // iteration plus once more afterwards. The bulk form inserts the
+                // same positions in the same ascending order with the same
+                // `prev`-before-`head` write order, so the chain topology — and
+                // therefore the emitted token stream — is unchanged
+                // (AAP §0.6.4 decision (c)); it merely materializes the three
+                // window buffers once instead of once per position (§0.6.3).
+                //
+                // The chain head the C macro stores into `hash_head` is unused
+                // here (it is never read again this iteration); only the
+                // insertion side effect matters.
+                //
+                // `strstart` never exceeds `window_size - MIN_LOOKAHEAD` here, so
+                // there are always MIN_MATCH bytes ahead of every inserted
+                // position to hash.
+                let run = s.match_length - 1; // string at strstart already in table
+                s.insert_string_run(s.strstart + 1, run);
+                s.strstart += run + 1;
+                s.match_length = 0;
             } else {
                 // The match is too long to re-insert, or too little lookahead
                 // remains. Advance past the match and prime the rolling hash

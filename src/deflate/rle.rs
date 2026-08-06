@@ -161,11 +161,11 @@ fn rle_match_length(window: &[u8], strstart: usize, lookahead: usize) -> usize {
         scan += 1;
     }
 
-    // deflate.c L2117: match_length = MAX_MATCH - (strend - scan). `scan` never
+    // deflate.c L2115: match_length = MAX_MATCH - (strend - scan). `scan` never
     // exceeds `strend`, so the inner subtraction cannot underflow.
     let mut len = MAX_MATCH - (strend - scan);
 
-    // deflate.c L2118-L2119: never claim more than the available lookahead.
+    // deflate.c L2116-L2117: never claim more than the available lookahead.
     if len > lookahead {
         len = lookahead;
     }
@@ -455,5 +455,124 @@ mod tests {
         assert_eq!(state, BlockState::FinishDone);
         // An empty final block is still emitted (BFINAL + alignment).
         assert!(io.next_out > 0);
+    }
+
+    #[test]
+    fn run_of_exactly_two_is_not_a_match() {
+        // The three-byte gate (`deflate.c` L2107) seen from the other side: a
+        // two-byte run must score 0, not 2, so the caller emits literals. This
+        // is the complement of `run_of_exactly_three_is_a_match_not_literals`
+        // and together they pin the gate from both directions.
+        let w = window_with_run(10, 0xAA, 2, 0x55);
+        assert_eq!(rle_match_length(&w, 10, 200), 0);
+    }
+
+    #[test]
+    fn every_run_length_scans_exactly_and_never_off_by_one() {
+        // Exhaustive regression pin for the off-by-one documented on
+        // `rle_match_length`. The C scan checks its `scan < strend` bound only
+        // once per eight comparisons, so every one of the 32 eight-byte group
+        // boundaries between `strstart + 2` and `strend` is a place a mistaken
+        // bound could hide. Sweeping *every* run length from 0 through 400
+        // crosses all of them, including the exact-`strend` landing at 258.
+        //
+        // The expectation is derived independently of the implementation's
+        // `MAX_MATCH - (strend - scan)` arithmetic: a run shorter than
+        // MIN_MATCH scores 0, and any other run scores itself capped at
+        // MAX_MATCH. A single misplaced index would break at least one length.
+        for run in 0..=400usize {
+            let w = window_with_run(10, 0xAA, run, 0x55);
+            let expected = if run < MIN_MATCH {
+                0
+            } else if run > MAX_MATCH {
+                MAX_MATCH
+            } else {
+                run
+            };
+            assert_eq!(
+                rle_match_length(&w, 10, 512),
+                expected,
+                "run of {run} bytes scanned incorrectly"
+            );
+        }
+    }
+
+    #[test]
+    fn lookahead_clamp_holds_for_every_lookahead() {
+        // Companion sweep for the `match_length > lookahead` clamp
+        // (`deflate.c` L2116-L2117), which is applied *after* the length
+        // formula. With a 300-byte run present, the unclamped length is always
+        // MAX_MATCH, so the result must be `min(MAX_MATCH, lookahead)` for
+        // every lookahead at or above MIN_MATCH, and 0 below it.
+        let w = window_with_run(10, 0xAA, 300, 0x55);
+        for lookahead in 0..=300usize {
+            let expected = if lookahead < MIN_MATCH {
+                0
+            } else {
+                lookahead.min(MAX_MATCH)
+            };
+            assert_eq!(
+                rle_match_length(&w, 10, lookahead),
+                expected,
+                "clamp wrong for lookahead {lookahead}"
+            );
+        }
+    }
+
+    #[test]
+    fn length_code_of_a_maximal_run_is_exactly_u8_max() {
+        // `deflate_rle` narrows the length to `u8` as `match_length -
+        // MIN_MATCH`. Because the emit branch requires `match_length >=
+        // MIN_MATCH` and the scan caps at MAX_MATCH, the code spans 0..=255
+        // exactly — `258 - 3 == 255` leaves zero slack above `u8::MAX`, so the
+        // cast is lossless by construction. This pins both ends of that range.
+        let maximal = window_with_run(10, 0xAA, MAX_MATCH, 0x55);
+        assert_eq!(rle_match_length(&maximal, 10, 512), MAX_MATCH);
+        assert_eq!((MAX_MATCH - MIN_MATCH) as u8, u8::MAX);
+
+        let minimal = window_with_run(10, 0xAA, MIN_MATCH, 0x55);
+        assert_eq!(rle_match_length(&minimal, 10, 512), MIN_MATCH);
+        assert_eq!((MIN_MATCH - MIN_MATCH) as u8, 0);
+    }
+
+    #[test]
+    fn deflate_rle_emits_only_distance_one_matches() {
+        // The defining property of Z_RLE, asserted directly on the symbol
+        // buffer rather than inferred from the compressed size: every match
+        // `deflate_rle` records must carry distance exactly 1.
+        //
+        // `_tr_tally_dist`/`_tr_tally_lit` write three bytes per symbol —
+        // distance low, distance high, then the length code (matches) or the
+        // literal byte (literals) — so a triple with a zero distance is a
+        // literal and any non-zero distance is a match. Flushing is avoided by
+        // driving the producer with Z_NO_FLUSH, which returns `NeedMore` once
+        // the input is exhausted and therefore leaves `sym_next` intact.
+        let mut s = DeflateState::new(6, 8, 15, 8, Strategy::Rle, 0).unwrap();
+        trees::_tr_init(&mut s);
+
+        let input = vec![b'Q'; 2000];
+        let mut output = vec![0u8; 8192];
+        let mut io = IoContext::new(&input, &mut output);
+
+        let state = deflate_rle(&mut s, &mut io, Z_NO_FLUSH);
+
+        // Input exhausted with the symbol buffer far from full, so no flush ran
+        // and the tallied symbols are still available for inspection.
+        assert_eq!(state, BlockState::NeedMore);
+        assert!(s.sym_next > 0, "expected tallied symbols");
+        assert_eq!(s.sym_next % 3, 0, "symbol buffer holds 3-byte triples");
+
+        let mut matches = 0usize;
+        for triple in (0..s.sym_next).step_by(3) {
+            let dist = u16::from(s.sym(triple)) | (u16::from(s.sym(triple + 1)) << 8);
+            if dist != 0 {
+                assert_eq!(dist, 1, "Z_RLE emitted a match at distance {dist}");
+                // The length code is `match_length - MIN_MATCH`; a run this
+                // long always saturates the scan at MAX_MATCH.
+                assert_eq!(s.sym(triple + 2), (MAX_MATCH - MIN_MATCH) as u8);
+                matches += 1;
+            }
+        }
+        assert!(matches > 0, "expected at least one distance-1 match");
     }
 }

@@ -23,7 +23,8 @@
 //! | `int fd`                         | owned [`File`] (RAII close)            |
 //! | `unsigned char *in` / `*out`     | owned [`Vec<u8>`] buffers             |
 //! | `unsigned char *next` (moving)   | [`usize`] index into `out_buf`        |
-//! | `char *path` / `char *msg`       | [`String`] / [`Option<String>`]       |
+//! | `char *path`                     | owned [`Vec<u8>`] (raw bytes)         |
+//! | `char *msg`                      | [`CString`] + [`Option<String>`]      |
 //! | `z_stream strm` (in place)       | owned [`ZStream`] (in place)          |
 //! | `free`/`inflateEnd`/`close(fd)`  | `Drop` (RAII)                          |
 //!
@@ -105,6 +106,345 @@ pub(crate) enum How {
     Gzip = 2,
 }
 
+/// A descriptor whose byte I/O is performed by raw platform calls rather than by
+/// a [`File`], because it cannot be represented as one *soundly*.
+///
+/// # Why this capability exists
+///
+/// [`File`] is the natural owner for anything the standard library opened, and
+/// [`GzFile::Owned`] uses it for exactly that. But `gzdopen` receives a bare C
+/// `int` from a caller, and two cases make [`File`] the wrong owner for it:
+///
+/// * **An unproven descriptor.** `File::from_raw_fd` requires the descriptor to
+///   be *open*; `zlib.h` L1422-L1426 requires `gzdopen` to *accept* a descriptor
+///   that is not (anything except `-1`) and to surface the failure later as
+///   [`Z_ERRNO`](ReturnCode::ErrNo). Wrapping an unproven descriptor to satisfy
+///   the second requirement would violate the first.
+/// * **A borrowed OS handle.** On Windows the CRT owns the `HANDLE` behind an
+///   `int` descriptor and `_get_osfhandle` only *lends* it, so wrapping that
+///   handle in a `File` creates a second owner and a later double close.
+///
+/// Both are resolved by owning the raw descriptor directly and doing the I/O
+/// through the same platform entry points reference zlib uses. The trait is
+/// declared here, in the safe core, and implemented in `src/ffi/gz.rs`, which is
+/// the crate's only `unsafe` module (AAP §0.6.2): the core calls these methods
+/// without ever naming a raw descriptor.
+///
+/// # Contract
+///
+/// * The implementor owns the descriptor for its whole life and closes it in
+///   [`Drop`], so the idiomatic `gzclose_*` path (which simply drops the state)
+///   leaks nothing.
+/// * [`close`](Self::close) performs that close *explicitly* and reports the
+///   platform result, which is what makes C's `Z_ERRNO` observable; it must
+///   suppress the [`Drop`] close so the descriptor is closed exactly once.
+/// * [`relinquish`](Self::relinquish) gives the descriptor back to the caller
+///   **without** closing it, for the `gzdopen` failure paths on which C leaves
+///   the caller's descriptor open.
+/// * Every method must *fail* rather than panic when the descriptor is not
+///   usable, so an invalid descriptor produces C's deferred error.
+pub(crate) trait RawFileIo {
+    /// Reads into `buf`, with [`std::io::Read::read`] semantics.
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
+
+    /// Writes from `buf`, with [`std::io::Write::write`] semantics.
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize>;
+
+    /// Flushes buffered state. Raw descriptors buffer nothing, so this matches
+    /// `File::flush` (a no-op) rather than issuing an `fsync`, which reference
+    /// zlib never does either.
+    fn flush(&mut self) -> std::io::Result<()>;
+
+    /// Repositions the descriptor, with [`std::io::Seek::seek`] semantics.
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64>;
+
+    /// The raw descriptor number, for the `fcntl` reconciliation C applies to an
+    /// adopted descriptor (`gzlib.c` L253-L263).
+    ///
+    /// Unix-only, because that reconciliation is: C's two `fcntl` calls are POSIX
+    /// descriptor operations with no Windows counterpart, so on Windows nothing
+    /// ever needs the number and requiring it would be dead weight in the contract.
+    #[cfg(unix)]
+    fn raw_descriptor(&self) -> core::ffi::c_int;
+
+    /// Closes the descriptor and reports whether the platform close succeeded,
+    /// consuming the owner so no [`Drop`] close can follow.
+    fn close(self: Box<Self>) -> bool;
+
+    /// Ends ownership **without** closing, handing the descriptor back exactly as
+    /// it was received.
+    fn relinquish(self: Box<Self>);
+}
+
+/// The owned OS file handle, with an explicit **release** path so a close can be
+/// made *fallible* — the safe-Rust stand-in for the C `int fd` member.
+///
+/// # Why a wrapper rather than a plain [`File`]
+///
+/// RAII closes a descriptor from [`Drop`], which cannot report failure: the
+/// standard library's `File::drop` discards the `close(2)` result. Reference zlib
+/// *does* report it — `gzclose_w` returns [`Z_ERRNO`](ReturnCode::ErrNo) when
+/// `close(state->fd) == -1` (`gzwrite.c` L695-L696, overriding whatever status
+/// the flush accumulated), and `gzclose_r` returns it via
+/// `return ret ? Z_ERRNO : err;` (`gzread.c` L665-L667). Matching that requires
+/// handing the descriptor *out* of the state so the C-ABI boundary can close it
+/// itself and inspect the result.
+///
+/// The wrapper also decides *how* the descriptor is owned. Anything the standard
+/// library opened is an [`Owned`](Self::Owned) [`File`]; a descriptor handed in
+/// through `gzdopen` that cannot be soundly represented as a [`File`] is an
+/// [`Adopted`](Self::Adopted) [`RawFileIo`] owner instead. Both answer
+/// [`Read`](std::io::Read), [`Write`](std::io::Write) and [`Seek`](std::io::Seek),
+/// so `state.file.read(..)`, `.write(..)` and `.seek(..)` read identically at
+/// every call site regardless of which one is in play.
+///
+/// # Invariant
+///
+/// The handle is present for the whole useful life of a [`GzState`].
+/// [`release`](Self::release) is called exactly once, by the close finalizers in
+/// `src/gz/close.rs`, as the last act before the state is dropped — so no code
+/// can observe a released handle. The I/O impls document that as their panic
+/// condition; it is unreachable by construction and covered by tests.
+///
+/// The one other moment at which the handle is absent is *before* the useful
+/// life begins: [`pending`](Self::pending) exists so `gz_open` can allocate the
+/// state in C's order — struct first, then the path name, then the `open(2)` —
+/// and install the handle only once the file is actually open. That window is
+/// confined to `gz_open`'s own body and no I/O occurs inside it.
+pub(crate) enum GzFile {
+    /// No handle yet: the window inside `gz_open` between allocating the state
+    /// and opening the file. See [`pending`](Self::pending).
+    Pending,
+    /// A handle the standard library owns — `gzopen`'s own `open(2)`, or a
+    /// descriptor whose openness was *proven* before it was adopted.
+    Owned(File),
+    /// A descriptor owned through raw platform calls; see [`RawFileIo`].
+    Adopted(Box<dyn RawFileIo>),
+    /// The handle has been handed out by [`release`](Self::release) for an
+    /// explicit, fallible close. Terminal: the state is dropped immediately
+    /// afterwards.
+    Released,
+}
+
+/// A handle taken out of a [`GzFile`] by [`GzFile::release`], preserving which
+/// kind of owner it came from so the C-ABI boundary can close it the matching
+/// way.
+pub(crate) enum ReleasedFile {
+    /// Came from [`GzFile::Owned`]; closed through the platform close applied to
+    /// a [`File`].
+    Owned(File),
+    /// Came from [`GzFile::Adopted`]; closed through
+    /// [`RawFileIo::close`](RawFileIo::close).
+    Adopted(Box<dyn RawFileIo>),
+}
+
+impl ReleasedFile {
+    /// Ends ownership without closing, leaving the descriptor exactly as it was
+    /// received — the `gzdopen`-failure contract, on which C never closes the
+    /// caller's descriptor.
+    ///
+    /// For an [`Owned`](Self::Owned) handle the caller must dissolve the [`File`]
+    /// itself (that step needs a platform primitive and therefore lives in
+    /// `src/ffi/gz.rs`), so this returns it; an
+    /// [`Adopted`](Self::Adopted) owner relinquishes itself and [`None`] comes
+    /// back.
+    #[inline]
+    pub(crate) fn relinquish(self) -> Option<File> {
+        match self {
+            Self::Owned(file) => Some(file),
+            Self::Adopted(raw) => {
+                raw.relinquish();
+                None
+            }
+        }
+    }
+
+    /// Closes the handle and reports whether the platform close succeeded — C's
+    /// `close(state->fd)` step, whose result becomes
+    /// [`Z_ERRNO`](ReturnCode::ErrNo).
+    ///
+    /// An [`Adopted`](Self::Adopted) owner closes itself; an
+    /// [`Owned`](Self::Owned) [`File`] is passed to `close_file`, because closing
+    /// one *and observing the result* needs a platform primitive that lives in
+    /// `src/ffi/gz.rs`. Taking it as a callback keeps this layer free of `unsafe`
+    /// while leaving the close decision in one place.
+    #[inline]
+    pub(crate) fn close_with(self, close_file: impl FnOnce(File) -> bool) -> bool {
+        match self {
+            Self::Owned(file) => close_file(file),
+            Self::Adopted(raw) => raw.close(),
+        }
+    }
+}
+
+/// Panic message for using the handle before `gz_open` installed it. Unreachable
+/// by construction — the window is confined to `gz_open`'s own body.
+const HANDLE_PENDING: &str = "gz file handle used before it was opened";
+
+/// Panic message for using the handle after [`GzFile::release`] took it.
+/// Unreachable by construction — release is the last act of a close finalizer.
+const HANDLE_RELEASED: &str = "gz file handle used after release";
+
+impl GzFile {
+    /// Wraps an owned [`File`] (the descriptor C stores in `state->fd`).
+    #[inline]
+    pub(crate) const fn new(handle: File) -> Self {
+        Self::Owned(handle)
+    }
+
+    /// Wraps a raw-descriptor owner, for a `gzdopen` descriptor that cannot be
+    /// soundly represented as a [`File`]. See [`RawFileIo`].
+    ///
+    /// Platform-gated to state a contract rather than to silence a diagnostic:
+    /// owning a raw C `int` descriptor needs `close(2)` on unix and the CRT
+    /// `_read`/`_write`/`_lseeki64`/`_close` family on Windows, and no portable
+    /// `std` equivalent exists anywhere else — so on any other target the C-ABI
+    /// `gzdopen` returns null unconditionally and nothing constructs this variant.
+    #[cfg(any(unix, windows))]
+    #[inline]
+    pub(crate) const fn adopted(owner: Box<dyn RawFileIo>) -> Self {
+        Self::Adopted(owner)
+    }
+
+    /// Creates a wrapper with **no** handle yet, for the brief window inside
+    /// `gz_open` between allocating the state and opening the file.
+    ///
+    /// Reference zlib allocates `gz_state` *before* it opens anything
+    /// (`gzlib.c`: `malloc(sizeof(gz_state))`, then `malloc` for the path name,
+    /// then `open`), so a failure of either allocation returns `NULL` having
+    /// touched no file at all. Reproducing that order requires a state value that
+    /// can exist before its descriptor does — C simply leaves `state->fd`
+    /// uninitialised until the `open` succeeds, and this is the safe equivalent.
+    ///
+    /// The resulting value must have a real handle installed (by assigning
+    /// [`GzFile::new`] or [`GzFile::adopted`]) before anything performs I/O on it;
+    /// `gz_open` does so on the only path that returns the state to a caller, so
+    /// no live [`GzState`] is ever observable in this condition.
+    #[inline]
+    pub(crate) const fn pending() -> Self {
+        Self::Pending
+    }
+
+    /// Reinstalls a handle previously taken by [`release`](Self::release),
+    /// preserving its ownership kind.
+    ///
+    /// Platform-gated for the same reason as [`adopted`](Self::adopted): its only
+    /// caller is the `gzdopen` shim's fallible boxing step, which exists only where
+    /// a raw descriptor can be adopted at all.
+    #[cfg(any(unix, windows))]
+    #[inline]
+    pub(crate) fn restore(released: ReleasedFile) -> Self {
+        match released {
+            ReleasedFile::Owned(file) => Self::Owned(file),
+            ReleasedFile::Adopted(raw) => Self::Adopted(raw),
+        }
+    }
+
+    /// Hands the owned handle to the caller so it can perform an explicit,
+    /// *fallible* close, returning [`None`] if it was already released (or never
+    /// installed).
+    ///
+    /// After this the wrapper closes nothing: the descriptor's lifetime belongs
+    /// entirely to the returned [`ReleasedFile`]. The state must not be used
+    /// afterwards.
+    #[inline]
+    pub(crate) fn release(&mut self) -> Option<ReleasedFile> {
+        match core::mem::replace(self, Self::Released) {
+            Self::Owned(file) => Some(ReleasedFile::Owned(file)),
+            Self::Adopted(raw) => Some(ReleasedFile::Adopted(raw)),
+            Self::Pending | Self::Released => None,
+        }
+    }
+
+    /// The raw descriptor number backing this handle, for the `fcntl`
+    /// reconciliation C applies at open time (`gzlib.c` L246-L263).
+    ///
+    /// [`None`] while the handle is absent, which no caller can observe.
+    #[cfg(unix)]
+    #[inline]
+    pub(crate) fn raw_descriptor(&self) -> Option<core::ffi::c_int> {
+        use std::os::fd::AsRawFd;
+
+        match self {
+            Self::Owned(file) => Some(file.as_raw_fd()),
+            Self::Adopted(raw) => Some(raw.raw_descriptor()),
+            Self::Pending | Self::Released => None,
+        }
+    }
+
+    /// The underlying [`File`], when this handle is one. Used by tests that
+    /// inspect the descriptor directly.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn as_file(&self) -> Option<&File> {
+        match self {
+            Self::Owned(file) => Some(file),
+            Self::Adopted(_) | Self::Pending | Self::Released => None,
+        }
+    }
+}
+
+impl std::io::Read for GzFile {
+    /// # Panics
+    ///
+    /// If the handle is absent — before `gz_open` installs it, or after
+    /// [`release`](GzFile::release) takes it. Unreachable by construction: release
+    /// happens only in the close finalizers, immediately before the owning
+    /// [`GzState`] is dropped.
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Owned(file) => std::io::Read::read(file, buf),
+            Self::Adopted(raw) => raw.read(buf),
+            Self::Pending => panic!("{HANDLE_PENDING}"),
+            Self::Released => panic!("{HANDLE_RELEASED}"),
+        }
+    }
+}
+
+impl std::io::Write for GzFile {
+    /// # Panics
+    ///
+    /// If the handle is absent; see [`Read::read`](std::io::Read::read).
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Owned(file) => std::io::Write::write(file, buf),
+            Self::Adopted(raw) => raw.write(buf),
+            Self::Pending => panic!("{HANDLE_PENDING}"),
+            Self::Released => panic!("{HANDLE_RELEASED}"),
+        }
+    }
+
+    /// # Panics
+    ///
+    /// If the handle is absent; see [`Read::read`](std::io::Read::read).
+    #[inline]
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Owned(file) => std::io::Write::flush(file),
+            Self::Adopted(raw) => raw.flush(),
+            Self::Pending => panic!("{HANDLE_PENDING}"),
+            Self::Released => panic!("{HANDLE_RELEASED}"),
+        }
+    }
+}
+
+impl std::io::Seek for GzFile {
+    /// # Panics
+    ///
+    /// If the handle is absent; see [`Read::read`](std::io::Read::read).
+    #[inline]
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        match self {
+            Self::Owned(file) => std::io::Seek::seek(file, pos),
+            Self::Adopted(raw) => raw.seek(pos),
+            Self::Pending => panic!("{HANDLE_PENDING}"),
+            Self::Released => panic!("{HANDLE_RELEASED}"),
+        }
+    }
+}
+
 /// The complete internal state of an open gzip file — the safe-Rust port of the
 /// C `gz_state` structure from `gzguts.h`.
 ///
@@ -150,14 +490,27 @@ pub struct GzState {
     /// The owned OS file handle (replaces the C `int fd`).
     ///
     /// All I/O is performed through the safe [`std::io::Read`],
-    /// [`std::io::Write`], and [`std::io::Seek`] traits on this handle; dropping
-    /// the `GzState` closes the descriptor (the RAII replacement for the C
-    /// `close(fd)`).
-    pub(crate) file: File,
+    /// [`std::io::Write`], and [`std::io::Seek`] traits on this handle, which the
+    /// `GzFile` wrapper exposes by [`Deref`](core::ops::Deref). Dropping the
+    /// `GzState` closes the descriptor (the RAII replacement for the C
+    /// `close(fd)`) *unless* a close finalizer has released it first so the C-ABI
+    /// boundary can perform a fallible close — see `GzFile`.
+    pub(crate) file: GzFile,
 
     /// The path (or synthetic `<fd:N>` name from `gzdopen`) used when building
     /// error messages (C `char *path`).
-    pub(crate) path: String,
+    ///
+    /// Held as **raw bytes**, not a [`String`], because these bytes are handed
+    /// back verbatim through the C `gzerror` message. On unix a path is an
+    /// arbitrary byte string that need not be UTF-8, and C stores it with no
+    /// transformation at all (`gzlib.c` L199-L222: `malloc(len + 1)` at L206 and
+    /// `snprintf(state->path, len + 1, "%s", path)` at L222). Decoding it into a
+    /// [`String`] would replace every invalid subsequence with U+FFFD and
+    /// therefore change the bytes a C caller reads out of `gzerror`. The lossy
+    /// rendering still exists — [`error`](Self::error) produces it for the
+    /// idiomatic [`msg`](Self::msg) — but the C mirror is built from these raw
+    /// bytes, never from it.
+    pub(crate) path: Vec<u8>,
 
     /// The size of each allocated I/O buffer, or `0` when the buffers have not
     /// been allocated yet (C `unsigned size`).
@@ -257,6 +610,83 @@ pub struct GzState {
     /// so the next write reinitialises the deflate stream for a new member.
     pub(crate) reset: bool,
 
+    /// Number of *compressed* bytes already produced by `deflate` but not yet
+    /// handed to the operating system. Together with
+    /// [`out_start`](Self::out_start) it names the pending window exactly:
+    /// `out_buf[out_start .. out_start + out_pending]`.
+    ///
+    /// # Why this field exists
+    ///
+    /// Reference zlib tracks the same thing with the pointer pair
+    /// `state->x.next` (first unwritten byte) and `strm->next_out` (one past the
+    /// last produced byte): `gz_init` seeds `state->x.next = strm->next_out`, and
+    /// `gz_comp`'s drain loop `while (strm->next_out > state->x.next)` advances
+    /// `state->x.next += writ` after every successful `write(2)`
+    /// (`gzwrite.c` L114-L124). Because the cursor lives on the state, a write
+    /// that stops early — a short write, or `EAGAIN`/`EWOULDBLOCK` on a
+    /// non-blocking descriptor — leaves the unwritten remainder addressable, and
+    /// the next `gz*` call resumes exactly where it stopped.
+    ///
+    /// This crate's idiomatic [`ZStream`] deliberately carries no
+    /// `next_out`/`avail_out` fields (output is handed to the engine as a slice
+    /// on every call and progress is reported back explicitly), so the write
+    /// driver must remember the unwritten remainder itself — the output-side
+    /// counterpart of [`in_next`](Self::in_next)/[`in_avail`](Self::in_avail) on
+    /// the read side. Without it a stalled drain would abandon the bytes it had
+    /// not yet written, the following `deflate` call would overwrite them, and
+    /// the file would receive a spliced, undecodable DEFLATE stream.
+    ///
+    /// # Why a cursor pair rather than a single front-anchored count
+    ///
+    /// The window is addressed by an explicit start offset because that is what
+    /// makes a run of short writes cost `O(N)` in total, exactly as C's
+    /// `state->x.next += writ` does. Reducing it to a single count would force
+    /// every partial write to slide the unwritten remainder back down to
+    /// `out_buf[0]`, so a destination that accepts one byte at a time would copy
+    /// `(N-1) + (N-2) + … + 1` bytes to deliver `N` — quadratic work that a
+    /// flow-controlled pipe or socket can provoke from ordinary input. Advancing
+    /// an offset instead touches no bytes at all.
+    ///
+    /// `deflate` receives only the free tail beyond the frontier,
+    /// `out_buf[out_start + out_pending .. size]`, so output that is still
+    /// pending is never handed back to the engine as scratch space.
+    pub(crate) out_pending: usize,
+
+    /// Offset into [`out_buf`](Self::out_buf) of the first *compressed* byte the
+    /// operating system has not accepted yet — the write-side counterpart of the
+    /// read side's [`next`](Self::next), and the port of C's `state->x.next`
+    /// pointer as used by the write path (`gzwrite.c` L114-L127).
+    ///
+    /// # Invariants
+    ///
+    /// * The pending window is exactly
+    ///   `out_buf[out_start .. out_start + out_pending]`, which is always within
+    ///   bounds because [`out_pending`](Self::out_pending) only ever counts bytes
+    ///   `deflate` produced into `out_buf[..size]`.
+    /// * `out_start + out_pending` is the *produced-bytes frontier* — C's
+    ///   `strm->next_out` — and never exceeds `size`. `deflate` is handed
+    ///   `out_buf[out_start + out_pending .. size]`, i.e. C's `avail_out`, so it
+    ///   can never overwrite a byte the operating system has not accepted.
+    /// * `out_start` returns to `0` only when the scratch area is both **full**
+    ///   and **fully written** — C's `if (strm->avail_out == 0) { strm->avail_out
+    ///   = state->size; strm->next_out = state->out; state->x.next = state->out; }`
+    ///   (`gzwrite.c` L125-L128). A drain provoked by a *flush* leaves the
+    ///   frontier exactly where it was, precisely as C leaves `next_out`.
+    ///   `out_pending == 0` therefore does **not** imply `out_start == 0`: it
+    ///   implies only that the operating system has accepted everything produced
+    ///   so far, i.e. C's `state->x.next == strm->next_out`.
+    ///
+    /// Because the reclaim is governed solely by the frontier reaching `size` —
+    /// never by how the destination chunked its acceptance — the sequence of
+    /// output slices handed to the engine, and hence the compressed byte
+    /// sequence, is identical to reference zlib's.
+    ///
+    /// Only `write.rs` mutates this: its drain loop advances it as the operating
+    /// system accepts bytes, and its compress loop performs the reclaim under C's
+    /// guard. It is additionally zeroed by `gz_init` when the buffers are
+    /// (re)allocated and by `open.rs`'s `gz_reset` when a stream starts over.
+    pub(crate) out_start: usize,
+
     // -- shared --------------------------------------------------------------
     /// The pending seek amount, in bytes (C `z_off64_t skip`): data to skip on
     /// the next read, or zeros to write on the next write. Already rewound if
@@ -270,7 +700,10 @@ pub struct GzState {
     /// The last error message (C `char *msg`), or [`None`] when there is no
     /// message.
     ///
-    /// Populated by [`error`](Self::error) as `"{path}: {message}"`. For
+    /// Populated by [`error`](Self::error) as `"{path}: {message}"`, with any
+    /// non-UTF-8 bytes in the path rendered lossily (U+FFFD). The exact C bytes
+    /// live in [`msg_c`](Self::msg_c); this field is the idiomatic Rust view of
+    /// the same message. For
     /// [`ReturnCode::MemError`] this is deliberately left [`None`]: the public
     /// `gzerror` synthesises the literal `"out of memory"` instead of storing a
     /// heap string, matching the C behaviour of not allocating while out of
@@ -314,8 +747,11 @@ impl Drop for GzState {
     /// * `strm` (`ZStream`) runs its own `Drop`, which performs
     ///   the `inflateEnd`/`deflateEnd`-equivalent teardown of the engine state;
     ///   and
-    /// * `file` (`File`) closes the underlying descriptor —
-    ///   subsuming the C `close(fd)`.
+    /// * `file` (`GzFile`) closes the underlying descriptor —
+    ///   subsuming the C `close(fd)` — *unless* a close finalizer already
+    ///   `released` it so the C-ABI boundary could close it
+    ///   explicitly and report a failure as [`Z_ERRNO`](ReturnCode::ErrNo), which
+    ///   reference zlib does and an error-discarding `Drop` cannot.
     ///
     /// This explicit `Drop` therefore exists to *document* the RAII contract
     /// (and to give the sibling modules a single place to reason about
@@ -331,6 +767,38 @@ impl Drop for GzState {
     fn drop(&mut self) {
         // No manual work: `Vec`, `ZStream`, and `File` each release themselves.
     }
+}
+
+/// Decodes `raw` as UTF-8, replacing each maximal invalid subsequence with a
+/// single U+FFFD, **fallibly**.
+///
+/// This is the [`String::from_utf8_lossy`] transformation with every growth step
+/// routed through [`String::try_reserve`], so an exhausted allocator produces
+/// [`None`] instead of the process abort an infallible allocation would cause.
+/// It exists because the raw bytes are the authority — [`GzState::path`] holds a
+/// path exactly as the caller supplied it — while the idiomatic
+/// [`GzState::msg`] must still be a Rust [`String`].
+fn try_lossy_string(raw: &[u8]) -> Option<String> {
+    let mut out = String::new();
+    // One reservation for the common all-valid-UTF-8 case; the loop still
+    // reserves for anything it appends, so a short reservation here is only a
+    // performance detail, never a correctness one.
+    out.try_reserve(raw.len()).ok()?;
+
+    for chunk in raw.utf8_chunks() {
+        let valid = chunk.valid();
+        out.try_reserve(valid.len()).ok()?;
+        out.push_str(valid);
+
+        if !chunk.invalid().is_empty() {
+            // `char::REPLACEMENT_CHARACTER` is 3 bytes in UTF-8.
+            out.try_reserve(char::REPLACEMENT_CHARACTER.len_utf8())
+                .ok()?;
+            out.push(char::REPLACEMENT_CHARACTER);
+        }
+    }
+
+    Some(out)
 }
 
 impl GzState {
@@ -359,7 +827,11 @@ impl GzState {
     ///    out of memory is exactly what must be avoided); the public `gzerror`
     ///    returns the literal `"out of memory"` for that code.
     /// 6. Otherwise the stored message is `"{path}: {message}"`, matching the C
-    ///    `snprintf(..., "%s%s%s", path, ": ", msg)`.
+    ///    `snprintf(..., "%s%s%s", path, ": ", msg)`. The C-facing
+    ///    [`msg_c`](Self::msg_c) is assembled from the **raw** path bytes, so it
+    ///    is byte-identical to what C produces even for a path that is not valid
+    ///    UTF-8; the idiomatic [`msg`](Self::msg) is a lossy decoding of exactly
+    ///    those bytes.
     ///
     /// # Parameters
     ///
@@ -394,15 +866,60 @@ impl GzState {
             return;
         }
 
-        // 6. Construct the "path: message" detail string.
-        let detail = format!("{}: {msg}", self.path);
+        // 6. Construct the "path: message" detail string — fallibly, because C
+        //    checks this very allocation and *downgrades the reported error* when
+        //    it fails:
+        //
+        //        if ((state->msg = malloc(strlen(state->path) + strlen(msg) + 3))
+        //                == NULL) {
+        //            state->err = Z_MEM_ERROR;
+        //            return;
+        //        }
+        //
+        //    (`gzlib.c` L576-L581, in `gz_error`.) `format!` would instead
+        //    terminate the process, which would be a particularly poor failure
+        //    mode here: this is the function every other error path calls to
+        //    *report* itself, so an abort would replace a diagnosable error with
+        //    process death at the exact moment the caller was about to be told
+        //    what went wrong.
+        //
+        //    C's request is `strlen(path) + strlen(msg) + 3` — the two strings
+        //    plus `": "` plus the NUL. `detail_len` below is that figure minus the
+        //    NUL, because a Rust `String` carries none; the reservation adds the
+        //    byte back so the total matches C's exactly.
+        //
+        //    The C-facing bytes are assembled first, from the **raw** path, so
+        //    that `gzerror` reports exactly what C reports even when the path is
+        //    not valid UTF-8. A real gzip path and error detail contain no
+        //    interior NUL, so `CString::new` succeeds; were one ever present,
+        //    `.ok()` yields `None` and the FFI `gzerror` falls back to the empty
+        //    string rather than exposing a truncated pointer.
+        //
+        //    `c_bytes` is reserved with room for that terminator, so
+        //    `CString::new` — which appends the NUL to the `Vec` it is given —
+        //    does not reallocate and cannot abort.
+        let detail_len = self.path.len() + 2 + msg.len();
+        let mut c_bytes: Vec<u8> = Vec::new();
+        if c_bytes.try_reserve_exact(detail_len + 1).is_err() {
+            self.err = ReturnCode::MemError;
+            return;
+        }
+        // Infallible from here: the exact capacity is already reserved.
+        c_bytes.extend_from_slice(&self.path);
+        c_bytes.extend_from_slice(b": ");
+        c_bytes.extend_from_slice(msg.as_bytes());
+        debug_assert_eq!(c_bytes.len(), detail_len);
 
-        // Keep the FFI-facing NUL-terminated mirror in lockstep with `msg`. The
-        // detail is `path` + `": "` + `msg`; a real gzip path and error detail
-        // contain no interior NUL, so `CString::new` succeeds. Were an interior
-        // NUL ever present, `.ok()` yields `None` and the FFI `gzerror` falls
-        // back to the empty string rather than exposing a truncated pointer.
-        self.msg_c = CString::new(detail.as_bytes()).ok();
+        // The idiomatic Rust view is the same bytes, decoded lossily. C makes one
+        // allocation because a C string *is* the message; this port needs the
+        // second buffer only because it also keeps a native `String`, and it is
+        // held to the same "check it, do not abort" rule.
+        let Some(detail) = try_lossy_string(&c_bytes) else {
+            self.err = ReturnCode::MemError;
+            return;
+        };
+
+        self.msg_c = CString::new(c_bytes).ok();
         self.msg = Some(detail);
     }
 
@@ -442,8 +959,8 @@ mod tests {
             next: 0,
             pos: 0,
             mode: GzMode::Read,
-            file,
-            path: String::from(path),
+            file: GzFile::new(file),
+            path: path.as_bytes().to_vec(),
             size: 0,
             want: 0,
             in_buf: Vec::new(),
@@ -460,6 +977,8 @@ mod tests {
             level: 0,
             strategy: 0,
             reset: false,
+            out_pending: 0,
+            out_start: 0,
             skip: 0,
             err: ReturnCode::Ok,
             msg: None,
@@ -554,6 +1073,48 @@ mod tests {
         assert_eq!(s.msg.as_deref(), Some("/tmp/data.gz: boom"));
     }
 
+    /// The C-facing message is assembled from the **raw** path bytes, so a path
+    /// that is not valid UTF-8 reaches `gzerror` unchanged.
+    ///
+    /// C stores the path verbatim (`gzlib.c` L199-L222) and renders the message
+    /// with `snprintf(..., "%s%s%s", state->path, ": ", msg)` (L583-L584), so the
+    /// bytes a C caller reads back are the caller's own. Decoding the path into a
+    /// Rust `String` first would replace each invalid run with U+FFFD
+    /// (`ef bf bd`) and change those bytes.
+    #[test]
+    fn the_c_message_carries_the_raw_path_bytes() {
+        let mut s = test_state("placeholder");
+        s.path = b"/tmp/\xff\xfe.gz".to_vec();
+        s.error(ReturnCode::DataError, Some("boom"));
+
+        let c_msg = s
+            .msg_c
+            .as_ref()
+            .expect("a C mirror is stored for a non-OOM error")
+            .as_bytes();
+        assert_eq!(
+            c_msg, b"/tmp/\xff\xfe.gz: boom",
+            "the C message is the raw path bytes, then \": \", then the detail"
+        );
+        assert!(
+            !c_msg.windows(3).any(|w| w == [0xef, 0xbf, 0xbd]),
+            "no U+FFFD may appear anywhere in the C message"
+        );
+
+        // The idiomatic Rust view is exactly those bytes, decoded lossily.
+        assert_eq!(
+            s.msg.as_deref(),
+            Some(String::from_utf8_lossy(c_msg).as_ref()),
+            "`msg` is the lossy decoding of the C bytes"
+        );
+        assert_ne!(
+            s.msg.as_deref().map(str::as_bytes),
+            Some(c_msg),
+            "the two renderings genuinely differ here, so the C mirror cannot be \
+             the Rust string re-encoded"
+        );
+    }
+
     #[test]
     fn clear_error_resets_code_and_message() {
         let mut s = test_state("archive.gz");
@@ -564,5 +1125,733 @@ mod tests {
         s.clear_error();
         assert_eq!(s.err, ReturnCode::Ok);
         assert_eq!(s.msg, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // The `GzFile` release hand-off
+    // -----------------------------------------------------------------------
+
+    /// [`GzFile`] must behave as the owned handle everywhere except for the one
+    /// explicit hand-off: [`GzFile::release`] yields the [`File`] exactly once, and
+    /// the released handle is still open so the FFI layer can close it itself and
+    /// observe the result (C `close(state->fd)`).
+    #[test]
+    fn gz_file_releases_its_handle_exactly_once() {
+        let mut s = test_state("archive.gz");
+
+        // Before release the wrapper reaches a live `File`.
+        assert!(
+            s.file
+                .as_file()
+                .expect("an opened state holds an Owned handle")
+                .metadata()
+                .is_ok(),
+            "the wrapper must reach a live File before release"
+        );
+
+        let released = s
+            .file
+            .release()
+            .expect("the first release yields the handle");
+        let ReleasedFile::Owned(released) = released else {
+            panic!("an opened state releases an Owned handle");
+        };
+        assert!(
+            released.metadata().is_ok(),
+            "the released descriptor must still be open"
+        );
+
+        // A second release yields nothing: the hand-off is single-shot, so the
+        // descriptor can never be closed twice through this path.
+        assert!(
+            s.file.release().is_none(),
+            "release must be single-shot so no double close is possible"
+        );
+
+        // Dropping the state after a release must not attempt any close — the
+        // descriptor's lifetime now belongs entirely to `released`.
+        drop(s);
+        assert!(
+            released.metadata().is_ok(),
+            "dropping a released state must not close the handed-off descriptor"
+        );
+    }
+
+    /// Use-after-release panics with the documented message. Unreachable in
+    /// production (release happens only as the last act of a close finalizer), but
+    /// pinned so the invariant fails loudly rather than silently if that changes.
+    #[test]
+    #[should_panic(expected = "gz file handle used after release")]
+    fn deref_after_release_panics() {
+        let mut s = test_state("archive.gz");
+        let _released = s.file.release().expect("handle present");
+        let _ = std::io::Seek::stream_position(&mut s.file);
+    }
+
+    /// The same invariant on the other side of the useful life: touching the
+    /// handle inside `gz_open`'s pre-open window names its own distinct message,
+    /// so a regression there cannot be mistaken for a release-ordering bug.
+    #[test]
+    #[should_panic(expected = "gz file handle used before it was opened")]
+    fn use_before_open_panics_with_its_own_message() {
+        let mut pending = GzFile::pending();
+        let _ = std::io::Seek::stream_position(&mut pending);
+    }
+
+    /// [`GzFile::restore`] must put a released handle back with its ownership kind
+    /// intact — the step `gzdopen`'s boxing performs once the handle exists.
+    #[test]
+    fn restore_reinstalls_the_released_handle() {
+        let mut s = test_state("archive.gz");
+        let released = s.file.release().expect("handle present");
+
+        s.file = GzFile::restore(released);
+        assert!(
+            s.file
+                .as_file()
+                .expect("an Owned handle must come back as Owned")
+                .metadata()
+                .is_ok(),
+            "the restored descriptor must still be open"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The non-finishing `Drop` contract
+    //
+    // `impl Drop for GzState` (above) is deliberately empty of finishing logic:
+    // a destructor cannot surface a deferred compression or I/O error, so the
+    // final `deflate(..., Z_FINISH)` flush and the gzip trailer are emitted only
+    // by an explicit `gzclose`/`gzclose_w`. That mirrors reference zlib, whose
+    // `gzclose_w` performs `gz_comp(state, Z_FINISH)` (`gzwrite.c` L685-L686)
+    // and reports its error to the caller.
+    //
+    // The decision reads like a defect to a Rust engineer, and "fixing" it would
+    // silently change the bytes this library writes without breaking compilation
+    // or any round-trip that closes properly. The pair of tests below pin it from
+    // both sides: the negative case proves a dropped writer leaves an
+    // *unfinished* member on disk, and the control case proves the very same data
+    // round-trips once `gzclose_w` is called. If a future `Drop` ever finished the
+    // stream, the negative test fails.
+    //
+    // Both tests write to a uniquely named temporary file inside a private,
+    // freshly created directory guarded by [`TempGz`], which removes the file and
+    // the directory on every exit path — normal return, early return, or unwind.
+    // -----------------------------------------------------------------------
+
+    use crate::gz::close::gzclose_w;
+    use crate::gz::test_decode::{Decoded, GZIP_WINDOW_BITS, decode};
+    use crate::gz::write::gz_write;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Reduce an arbitrary ambient string to a single safe path component.
+    ///
+    /// `CLONE_INDEX` is ambient input read from the environment, so its value is
+    /// outside this crate's control. Interpolating it into a path unfiltered is a
+    /// directory-traversal defect (CWE-22): a value such as
+    /// `slot/../../security_target` escapes the temporary directory lexically and
+    /// resolves somewhere else entirely.
+    ///
+    /// Only ASCII alphanumerics, `_`, and `-` survive. That drops every character
+    /// which could end the component or refer to a parent — `/`, `\`, `.` (so
+    /// `..` collapses away entirely), `:`, NUL, and every non-ASCII byte. The
+    /// result is truncated so an absurdly long value cannot push the path past a
+    /// filesystem limit, and an input that filters down to nothing becomes `x`, so
+    /// the caller always receives a usable component.
+    fn safe_component(raw: &str) -> String {
+        let filtered: String = raw
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .take(32)
+            .collect();
+        if filtered.is_empty() {
+            "x".to_owned()
+        } else {
+            filtered
+        }
+    }
+
+    /// Create `path` as a new, private directory, failing if anything is already
+    /// there.
+    ///
+    /// Non-recursive on purpose: unlike `create_dir_all`, this reports
+    /// [`std::io::ErrorKind::AlreadyExists`] when the name is taken — including
+    /// when it is taken by a symlink someone else planted — which is what lets
+    /// [`TempGz::new`] move to the next candidate instead of following the link or
+    /// deleting it. On Unix the `0o700` mode is handed to `mkdir(2)` itself, so the
+    /// directory is never even briefly group- or world-accessible and there is no
+    /// `set_permissions` window to race. Both properties describe the moment of
+    /// creation; on non-Unix targets the mode is the platform default.
+    fn create_private_dir(path: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new().mode(0o700).create(path)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::DirBuilder::new().create(path)
+        }
+    }
+
+    /// An owned temporary `.gz` file inside a private directory, both removed when
+    /// the guard is dropped.
+    ///
+    /// The **directory** carries the uniqueness: the `blitzy_adhoc_test_` prefix
+    /// (so nothing here can be mistaken for a tracked artifact), a
+    /// [`safe_component`]-sanitized `CLONE_INDEX`, the process id, a monotonic
+    /// counter, and a retry ordinal. That keeps it distinct across parallel test
+    /// threads, across concurrent `cargo test` invocations, and across sibling
+    /// clones of this repository sharing one `/tmp`.
+    ///
+    /// Creating the directory with create-new semantics is what makes the file
+    /// inside it safe to write. Nothing pre-existing is ever removed — an occupied
+    /// candidate name is skipped rather than deleted — so a symlink or file planted
+    /// at a predictable path is neither destroyed nor followed. The payload name is
+    /// then predictable *within* a directory that did not exist a moment earlier
+    /// and, on Unix, was owner-only from `mkdir(2)` onwards; the file is opened
+    /// `create_new` regardless, so a name that somehow is taken fails loudly rather
+    /// than being truncated. These are creation-time properties: the guard holds
+    /// paths rather than open handles, so it makes no claim about the directory
+    /// still being the same object later, and on non-Unix targets the directory's
+    /// mode is whatever the platform applies.
+    struct TempGz {
+        dir: PathBuf,
+        path: PathBuf,
+    }
+
+    impl TempGz {
+        fn new(tag: &str) -> Self {
+            static CTR: AtomicU32 = AtomicU32::new(0);
+            let n = CTR.fetch_add(1, Ordering::Relaxed);
+            let clone = safe_component(&std::env::var("CLONE_INDEX").unwrap_or_default());
+            let tag = safe_component(tag);
+            let pid = std::process::id();
+            let base = std::env::temp_dir();
+
+            // Retry only advances the candidate name; it never deletes.
+            for attempt in 0..64u32 {
+                let candidate = base.join(format!(
+                    "blitzy_adhoc_test_gzdrop_{tag}_{clone}_{pid}_{n}_{attempt}"
+                ));
+                match create_private_dir(&candidate) {
+                    Ok(()) => {
+                        let path = candidate.join("payload.gz");
+                        return Self {
+                            dir: candidate,
+                            path,
+                        };
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("failed to create the private temp directory: {e}"),
+                }
+            }
+            panic!("could not find an unused temp directory name after 64 attempts");
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn exists(&self) -> bool {
+            self.path.exists()
+        }
+
+        /// The bytes currently on disk, or empty if the file does not exist.
+        fn bytes(&self) -> Vec<u8> {
+            std::fs::read(&self.path).unwrap_or_default()
+        }
+    }
+
+    impl Drop for TempGz {
+        fn drop(&mut self) {
+            // The recursion rests on `dir` not having existed before `TempGz::new`
+            // created it with create-new semantics, so the removal set starts from a
+            // path this guard brought into existence rather than one it adopted, and
+            // on Unix from one no other user could enter. It does not rest on the
+            // path still resolving to that same directory, which a path-based guard
+            // cannot establish. Best effort on every route out, including an
+            // unwinding one: failing to clean up must never mask the original
+            // failure.
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// `safe_component` must collapse every traversal and separator form to a
+    /// single harmless component.
+    ///
+    /// The first case is the traversal shape that matters: interpolated raw,
+    /// `slot/../../security_target` names a path two levels above the temporary
+    /// directory. Sanitized, it can only ever name a child of that directory.
+    #[test]
+    fn safe_component_neutralizes_traversal_and_separators() {
+        for raw in [
+            "slot/../../security_target",
+            "../../../etc/passwd",
+            "..",
+            ".",
+            "/absolute",
+            "back\\slash",
+            "c:\\windows\\system32",
+            "with space",
+            "semi;colon",
+            "new\nline",
+            "nul\0byte",
+            "tilde~",
+            "dollar$sign",
+            "\u{00e9}\u{4f60}\u{597d}",
+        ] {
+            let got = safe_component(raw);
+            assert!(!got.is_empty(), "{raw:?} must yield a usable component");
+            assert!(
+                got.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "{raw:?} yielded {got:?}, which still contains a disallowed character"
+            );
+            assert!(
+                !got.contains(".."),
+                "{raw:?} yielded {got:?}, still traversing"
+            );
+            // The decisive property: joining it descends exactly one level.
+            let joined = Path::new("/tmp").join(&got);
+            assert_eq!(
+                joined.parent(),
+                Some(Path::new("/tmp")),
+                "{raw:?} yielded {got:?}, which does not stay one level below the base"
+            );
+        }
+    }
+
+    /// Inputs that filter down to nothing, and inputs that are far too long, must
+    /// still produce a usable bounded component.
+    #[test]
+    fn safe_component_is_total_and_bounded() {
+        assert_eq!(safe_component(""), "x", "an unset variable must still work");
+        assert_eq!(safe_component("///"), "x", "separators only");
+        assert_eq!(safe_component("...."), "x", "dots only");
+        assert_eq!(safe_component("\u{4f60}\u{597d}"), "x", "non-ASCII only");
+
+        let long = "a".repeat(4096);
+        assert_eq!(
+            safe_component(&long).len(),
+            32,
+            "an over-long value must be truncated"
+        );
+
+        // Characters that are safe are preserved in order.
+        assert_eq!(safe_component("clone-07_b"), "clone-07_b");
+    }
+
+    /// A [`TempGz`] must own a freshly created, private, single-level child of the
+    /// system temporary directory, and must place its payload inside it.
+    #[test]
+    fn temp_gz_uses_a_private_new_directory_and_create_new_file() {
+        let a = TempGz::new("hygiene");
+        assert!(a.dir.is_dir(), "the private directory must exist");
+        assert_eq!(
+            a.dir.parent(),
+            Some(std::env::temp_dir().as_path()),
+            "the private directory must sit directly under the temp directory"
+        );
+        assert_eq!(
+            a.path().parent(),
+            Some(a.dir.as_path()),
+            "the payload must live inside the private directory"
+        );
+        assert!(
+            !a.exists(),
+            "`TempGz::new` must not create the payload file; `create_new` does"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&a.dir)
+                .expect("stat the private directory")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o700,
+                "the directory must be owner-only from the moment it exists"
+            );
+        }
+
+        // Two guards taken back to back must never collide.
+        let b = TempGz::new("hygiene");
+        assert_ne!(a.dir, b.dir, "concurrent guards must be distinct");
+
+        // Create-new semantics: the directory name is now taken, so a second
+        // attempt at exactly that path must be refused rather than reused.
+        let err = create_private_dir(&a.dir).expect_err("the path is already taken");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "an occupied name must report AlreadyExists so the caller can skip it"
+        );
+
+        // The state builder must open the payload with create-new semantics, and a
+        // second attempt on the same path must therefore be refused rather than
+        // truncating what the first one wrote.
+        let state = drop_contract_write_state(a.path());
+        assert!(a.exists(), "the payload file must now exist");
+        drop(state);
+        let second = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(a.path());
+        assert_eq!(
+            second.expect_err("the payload already exists").kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "the payload must never be reopened with truncation"
+        );
+
+        let dir_a = a.dir.clone();
+        drop(a);
+        assert!(!dir_a.exists(), "Drop must remove the private directory");
+    }
+
+    /// Builds a fresh write-mode [`GzState`] backed by a real, truncated file.
+    ///
+    /// `size` is left `0` so the write path lazily allocates its buffers and
+    /// initializes the deflate engine on first use, exactly as a real `gzopen`
+    /// would — matching C's `state->size = 0` sentinel (`gzguts.h` L172).
+    fn drop_contract_write_state(path: &Path) -> Box<GzState> {
+        // `create_new(true)` rather than a truncating `File::create`: the file must
+        // not already exist, and if something is squatting on the name this must
+        // fail loudly instead of truncating it. That is the guarantee relied on
+        // here; `TempGz` additionally created the enclosing directory fresh and, on
+        // Unix, owner-only, which makes a squatter unlikely rather than impossible.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create a new writable temp file");
+        Box::new(GzState {
+            have: 0,
+            next: 0,
+            pos: 0,
+            mode: GzMode::Write,
+            file: GzFile::new(file),
+            path: path.as_os_str().as_encoded_bytes().to_vec(),
+            size: 0,
+            want: DROP_CONTRACT_WANT,
+            in_buf: Vec::new(),
+            out_buf: Vec::new(),
+            direct: 0,
+            how: How::Look,
+            junk: 0,
+            again: false,
+            in_next: 0,
+            in_avail: 0,
+            start: 0,
+            eof: false,
+            past: false,
+            level: 6,
+            strategy: 0,
+            reset: false,
+            out_pending: 0,
+            out_start: 0,
+            skip: 0,
+            err: ReturnCode::Ok,
+            msg: None,
+            msg_c: None,
+            strm: ZStream::new(),
+        })
+    }
+
+    /// The write buffer size used by [`drop_contract_write_state`].
+    ///
+    /// `gz_init` copies `want` into `size`, and `size` is what `gz_write`
+    /// compares each incoming write against, so this single constant fixes both
+    /// the state under test and the branch-coverage invariant asserted over it.
+    const DROP_CONTRACT_WANT: usize = 8192;
+
+    /// Number of payload bytes the two `Drop`-contract tests write.
+    ///
+    /// Deliberately far larger than the [`DROP_CONTRACT_WANT`]-byte `want`
+    /// buffer so that several `gz_comp(Z_NO_FLUSH)` rounds reach the file before
+    /// the state is dropped. A payload small enough to sit entirely in `in_buf`
+    /// would leave only the 10-byte gzip header on disk, and the negative test
+    /// would then prove merely "nothing was written" rather than the much
+    /// stronger and more relevant "a real member was started and left
+    /// unfinished".
+    const DROP_CONTRACT_LEN: usize = 500_000;
+
+    /// Incompressible pseudo-random payload from a fixed-seed LCG.
+    ///
+    /// Incompressible on purpose: highly compressible input would let `deflate`
+    /// buffer almost everything internally under `Z_NO_FLUSH`, so little or
+    /// nothing would reach the file before the drop. Deterministic on purpose:
+    /// the assertions must not depend on a random seed.
+    fn drop_contract_payload() -> Vec<u8> {
+        let mut lcg: u32 = 0x1234_5678;
+        (0..DROP_CONTRACT_LEN)
+            .map(|_| {
+                lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (lcg >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// Feeds `payload` through `gz_write` in `chunk` -sized pieces, asserting
+    /// full acceptance of each.
+    ///
+    /// The chunk size selects which branch of `gz_write` runs, and both matter
+    /// here. A chunk smaller than `state.size` takes the buffer-then-
+    /// compress-when-full branch (C L205-L226); a chunk at least as large takes
+    /// the feed-the-engine-directly branch (C L229-L247). The `Drop` contract must
+    /// hold on both, so [`assert_bare_drop_leaves_member_unfinished`] drives each.
+    fn feed(state: &mut GzState, payload: &[u8], chunk: usize) {
+        for piece in payload.chunks(chunk) {
+            assert_eq!(
+                gz_write(state, piece),
+                piece.len(),
+                "gz_write must accept the whole chunk"
+            );
+        }
+    }
+
+    /// Drives one bare-drop scenario at the given `gz_write` chunk size and
+    /// asserts every property of an unfinished member.
+    fn assert_bare_drop_leaves_member_unfinished(tag: &str, chunk: usize) {
+        let temp = TempGz::new(tag);
+        let payload = drop_contract_payload();
+
+        {
+            let mut state = drop_contract_write_state(temp.path());
+            feed(&mut state, &payload, chunk);
+            // The whole point: no `gzclose_w`, no `gzflush`, no `Z_FINISH`. Only
+            // `Drop` runs, and `Drop` must not finish the member.
+            drop(state);
+        }
+
+        let bytes = temp.bytes();
+
+        // A real member was *started*: the gzip magic and the DEFLATE method byte
+        // reached the file, so this test is not passing merely because nothing was
+        // written.
+        assert!(
+            bytes.len() > 1024,
+            "the writer must have flushed real compressed output before the drop,              got {} bytes",
+            bytes.len()
+        );
+        assert_eq!(
+            &bytes[..3],
+            &[0x1f, 0x8b, 0x08],
+            "RFC 1952 magic and CM=deflate must be present"
+        );
+        // The payload must be genuinely incompressible for the assertions below to
+        // mean anything: a compressible payload would fit entirely in the write
+        // buffer and reach disk only at close, degrading this test into the far
+        // weaker "nothing was written". Pinning the *property* rather than the
+        // generator's seed keeps the test honest if the payload is ever changed.
+        assert!(
+            bytes.len() * 5 > payload.len() * 4,
+            "payload compressed to {} of {} bytes, so it is not incompressible;              this test needs an incompressible payload to prove that a real member              was started and then abandoned",
+            bytes.len(),
+            payload.len()
+        );
+
+        // ...and it was left *unfinished*. A gzip decoder cannot complete it,
+        // because the final DEFLATE block and the 8-byte CRC-32/ISIZE trailer were
+        // never emitted. The verdict has to distinguish the two ways a decode can
+        // fail: running out of input is the property under test, while an outright
+        // rejection would mean the bytes already on disk are corrupt, which is a
+        // different — and worse — bug than the one this test pins.
+        let recovered = match decode(&bytes, GZIP_WINDOW_BITS) {
+            Decoded::Truncated(partial) => partial,
+            Decoded::Complete(_) => panic!(
+                "a dropped-without-close writer must not leave a decodable gzip \
+                 member; if this now succeeds, `Drop for GzState` has started \
+                 finishing the stream, which silently swallows the write errors \
+                 `gzclose_w` exists to report"
+            ),
+            Decoded::Rejected(code, partial) => panic!(
+                "the member must fail as truncated, not as corrupt: the decoder \
+                 rejected it with {code:?} after {} recovered byte(s)",
+                partial.len()
+            ),
+        };
+        assert!(
+            recovered.len() < payload.len(),
+            "an unfinished member cannot yield the whole payload ({} of {})",
+            recovered.len(),
+            payload.len()
+        );
+        // Whatever the decoder did recover must still be a correct prefix — the
+        // bytes already on disk are valid, they are merely incomplete.
+        assert_eq!(
+            recovered.as_slice(),
+            &payload[..recovered.len()],
+            "the truncated member's contents must be a prefix of the payload"
+        );
+
+        // The trailer specifically is absent. Reference zlib appends CRC-32 then
+        // ISIZE, both little-endian; neither can be sitting at the end of the
+        // file, because `Drop` emitted no trailer at all.
+        let mut trailer = [0u8; 8];
+        trailer[..4].copy_from_slice(&crate::checksum::crc32::crc32(0, &payload).to_le_bytes());
+        trailer[4..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        assert_ne!(
+            &bytes[bytes.len() - 8..],
+            &trailer[..],
+            "no CRC-32/ISIZE trailer may be present after a bare drop"
+        );
+
+        assert!(
+            temp.exists(),
+            "the temporary file must still exist for the guard to remove"
+        );
+    }
+
+    #[test]
+    fn dropping_a_writer_without_gzclose_leaves_the_member_unfinished() {
+        // Both `gz_write` branches: buffered small writes, and a single write
+        // large enough to be handed straight to the engine. Neither may end up
+        // with a finished member, because neither calls `gzclose_w`.
+        // Both `gz_write` branches must be exercised. The branch is selected by
+        // `buf.len() < state.size` (`src/gz/write.rs`, porting `gzwrite.c`
+        // L205-L247): a short write is staged in `in_buf` and drained by
+        // `gz_comp`, while a write at or above the buffer size is handed to
+        // `gz_comp_slice` directly. A bare drop must leave the member unfinished
+        // on *either* path, so the table below is asserted to straddle the
+        // predicate -- deleting a row fails the invariant rather than silently
+        // shrinking coverage.
+        const SCENARIOS: [(&str, usize); 2] = [
+            ("nofinish_buffered", 3_000),
+            ("nofinish_direct", DROP_CONTRACT_LEN),
+        ];
+
+        let threshold = DROP_CONTRACT_WANT;
+        assert!(
+            SCENARIOS.iter().any(|&(_, chunk)| chunk < threshold),
+            "no scenario exercises gz_write's buffered branch (chunk < {threshold})"
+        );
+        assert!(
+            SCENARIOS.iter().any(|&(_, chunk)| chunk >= threshold),
+            "no scenario exercises gz_write's direct branch (chunk >= {threshold})"
+        );
+
+        // Count what was actually exercised rather than trusting the loop: this
+        // guards against the table straddling the predicate while the iteration
+        // skips a row.
+        let mut buffered = 0_usize;
+        let mut direct = 0_usize;
+        for (tag, chunk) in SCENARIOS {
+            assert_bare_drop_leaves_member_unfinished(tag, chunk);
+            if chunk < threshold {
+                buffered += 1;
+            } else {
+                direct += 1;
+            }
+        }
+        assert!(
+            buffered > 0 && direct > 0,
+            "both gz_write branches must actually run, got {buffered} buffered and \
+             {direct} direct"
+        );
+        assert_eq!(
+            buffered + direct,
+            SCENARIOS.len(),
+            "every scenario in the table must be exercised"
+        );
+    }
+
+    #[test]
+    fn gzclose_w_finishes_the_member_that_a_bare_drop_leaves_unfinished() {
+        let temp = TempGz::new("finish");
+        let payload = drop_contract_payload();
+
+        let mut state = drop_contract_write_state(temp.path());
+        feed(&mut state, &payload, 3_000);
+        // The control: the same state, the same payload, closed explicitly.
+        assert_eq!(
+            gzclose_w(state),
+            ReturnCode::Ok.as_c_int(),
+            "gzclose_w must report success"
+        );
+
+        let bytes = temp.bytes();
+        assert_eq!(&bytes[..3], &[0x1f, 0x8b, 0x08]);
+
+        let recovered = match decode(&bytes, GZIP_WINDOW_BITS) {
+            Decoded::Complete(bytes) => bytes,
+            Decoded::Truncated(partial) => panic!(
+                "an explicitly closed member must decode, but the decoder \
+                 exhausted its input after {} recovered byte(s)",
+                partial.len()
+            ),
+            Decoded::Rejected(code, partial) => panic!(
+                "an explicitly closed member must decode, but the decoder rejected \
+                 it with {code:?} after {} recovered byte(s)",
+                partial.len()
+            ),
+        };
+        assert_eq!(
+            recovered, payload,
+            "the closed member must round-trip byte-for-byte"
+        );
+
+        // And the trailer this time *is* the correct CRC-32/ISIZE pair — the
+        // exact eight bytes the bare-drop test asserted were absent.
+        let mut trailer = [0u8; 8];
+        trailer[..4].copy_from_slice(&crate::checksum::crc32::crc32(0, &payload).to_le_bytes());
+        trailer[4..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        assert_eq!(
+            &bytes[bytes.len() - 8..],
+            &trailer[..],
+            "gzclose_w must append the RFC 1952 CRC-32 and ISIZE trailer"
+        );
+
+        assert!(temp.exists());
+    }
+
+    #[test]
+    fn the_temporary_file_guard_cleans_up_on_every_path() {
+        // Normal return.
+        let path = {
+            let temp = TempGz::new("cleanup_ok");
+            let mut state = drop_contract_write_state(temp.path());
+            feed(&mut state, b"a short write that stays buffered", 3_000);
+            drop(state);
+            assert!(
+                temp.exists(),
+                "the file must exist while the guard is alive"
+            );
+            temp.path().to_path_buf()
+        };
+        assert!(
+            !path.exists(),
+            "{} must be removed when the guard is dropped",
+            path.display()
+        );
+
+        // Unwinding path. `cargo` forces `panic = "unwind"` for the test profile
+        // regardless of `[profile.dev] panic = "abort"`, so a guard's `Drop` does
+        // run while a test unwinds — which is exactly the path a failing
+        // assertion in the two tests above would take.
+        let escaped: PathBuf = {
+            let leaked = std::sync::Arc::new(std::sync::Mutex::new(PathBuf::new()));
+            let sink = std::sync::Arc::clone(&leaked);
+            let outcome = std::panic::catch_unwind(move || {
+                let temp = TempGz::new("cleanup_panic");
+                let mut state = drop_contract_write_state(temp.path());
+                feed(&mut state, b"pending output that is never finished", 3_000);
+                drop(state);
+                *sink.lock().expect("poison-free mutex") = temp.path().to_path_buf();
+                panic!("deliberate unwind to exercise the guard");
+            });
+            assert!(outcome.is_err(), "the closure must have unwound");
+            leaked.lock().expect("poison-free mutex").clone()
+        };
+        assert_ne!(escaped, PathBuf::new(), "the path must have been recorded");
+        assert!(
+            !escaped.exists(),
+            "{} must be removed even when the scope unwinds",
+            escaped.display()
+        );
     }
 }

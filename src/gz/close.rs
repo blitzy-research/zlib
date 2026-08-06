@@ -36,20 +36,65 @@
 //! deliberately does *not* flush, so that write errors remain observable), and
 //! the reconstruction of zlib's integer return-code contract.
 //!
-//! The `#[no_mangle] extern "C"` shim in `src/ffi/gz.rs` bridges the raw
+//! # The `close(2)` result and the `*_release` variants
+//!
+//! There is one thing RAII cannot express at all: reference zlib reports a
+//! failing `close(2)` as [`Z_ERRNO`](ReturnCode::ErrNo). `gzclose_w` does so with
+//! `if (close(state->fd) == -1) ret = Z_ERRNO;` (`gzwrite.c` L695-L696), which
+//! *overrides* whatever status the finalize flush accumulated, and `gzclose_r`
+//! does so with `return ret ? Z_ERRNO : err;` (`gzread.c` L665-L667) — two
+//! spellings of the same rule: a failing close yields `Z_ERRNO`, a succeeding one
+//! yields the accumulated status. [`File`](std::fs::File)'s [`Drop`] discards the `close(2)`
+//! result outright, and this module cannot call `close(2)` itself because it
+//! contains no `unsafe`.
+//!
+//! Each finalizer therefore exists in two forms:
+//!
+//! * [`gzclose_r`] / [`gzclose_w`] / [`gzclose`] — the public idiomatic API. They
+//!   perform every step C performs *except* the fallible close, then drop the
+//!   released [`File`](std::fs::File) so RAII closes it, discarding the result. An idiomatic
+//!   Rust caller who wants to observe a close failure closes the descriptor
+//!   itself; these functions keep the infallible, ergonomic contract.
+//! * [`gzclose_r_release`] / [`gzclose_w_release`] / [`gzclose_release`] — the
+//!   crate-internal forms that perform the identical work but hand the still-open
+//!   [`File`](std::fs::File) back to the caller alongside the accumulated status, so the C-ABI
+//!   shim in `src/ffi/gz.rs` can close it explicitly and apply C's precedence.
+//!
+//! Splitting the finalizers this way is what keeps the fallible close — and its
+//! single `unsafe` `close(2)` call — inside the FFI boundary (AAP §0.6.2, §0.8.1
+//! D-6) while still honoring the C return-code contract on the C-ABI path. It
+//! also leaves [`GzState`]'s [`Drop`] non-finishing, as AAP §0.8.2 Divergence 5
+//! requires: `gzclose` remains mandatory precisely because a destructor cannot
+//! surface either the finalize-flush error or the close error.
+//!
+//! # Direction validation precedes ownership
+//!
+//! Every function here consumes its handle by value, so the wrong-direction
+//! rejection — [`Z_STREAM_ERROR`](ReturnCode::StreamError) — necessarily drops
+//! the handle it was given. C does the opposite: its `state->mode` test precedes
+//! every `free` and the `close` (`gzread.c` L650-L651, `gzwrite.c` L677-L678), so
+//! a wrong-direction call is a pure no-op and the caller still holds a valid,
+//! fully live `gzFile` to retry with the correct closer. The C-ABI shim
+//! reproduces that by reading the direction through a *borrow* and reclaiming the
+//! owning `Box` only once it matches; see `take_for_close` in `src/ffi/gz.rs`.
+//! Only an idiomatic Rust caller — who owns the [`Box<GzState>`] by value and
+//! therefore cannot double-free or use-after-free it — can reach the consuming
+//! rejection path in this module.
+//!
+//! The `#[unsafe(no_mangle)] extern "C"` shim in `src/ffi/gz.rs` bridges the raw
 //! `gzFile` pointer to these owned-handle functions: it validates the pointer
 //! (rejecting `NULL` with `Z_STREAM_ERROR`, the check that C performs at the top
-//! of each function) and reconstructs the `Box` with `Box::from_raw` before
-//! calling in. Because that pointer bookkeeping is confined to the FFI layer,
-//! this module contains **zero `unsafe`**, enforced by the
-//! `#![deny(unsafe_code)]` attribute below.
+//! of each function), validates the direction, and only then reconstructs the
+//! `Box`. Because that pointer bookkeeping is confined to the FFI layer, this
+//! module contains **zero `unsafe`**, enforced by the `#![deny(unsafe_code)]`
+//! attribute below.
 
 #![deny(unsafe_code)]
 
 use crate::constants::FlushMode;
 use crate::error::ReturnCode;
 use crate::gz::read::finish_read;
-use crate::gz::state::{GzMode, GzState};
+use crate::gz::state::{GzMode, GzState, ReleasedFile};
 use crate::gz::write::{gz_comp, gz_zero};
 
 /// Finalizes and closes a gzip file opened for **writing** — port of C
@@ -75,16 +120,56 @@ use crate::gz::write::{gz_comp, gz_zero};
 ///   error code if the pending-seek zero-fill or the `Z_FINISH` flush failed
 ///   (a later error in this sequence overrides an earlier one, matching C).
 ///
-/// Note: reference zlib additionally reports [`Z_ERRNO`](ReturnCode::ErrNo)
-/// when `close(fd)` itself fails. In this safe layer the descriptor is closed
-/// by [`File`](std::fs::File)'s [`Drop`], which cannot surface a `close(2)`
-/// error, so the exact `Z_ERRNO`-on-close path is deferred to the raw-descriptor
-/// FFI boundary (`src/ffi/gz.rs`). This function therefore returns the
-/// accumulated flush status, matching the C non-error close path.
-pub fn gzclose_w(mut file: Box<GzState>) -> i32 {
-    // C L676-L677: reject a handle that is not open for writing.
+/// Reference zlib additionally reports [`Z_ERRNO`](ReturnCode::ErrNo) when
+/// `close(fd)` itself fails (C L695-L696), overriding the accumulated status.
+/// This function closes the descriptor through [`File`](std::fs::File)'s [`Drop`], which
+/// discards the `close(2)` result, so it never returns `Z_ERRNO` — the value is
+/// always the accumulated stream status, which equals the C result whenever the
+/// close succeeds. Callers that must observe a close failure use
+/// `gzclose_w_release`, which returns the still-open [`File`](std::fs::File) instead; that is
+/// what the `gzclose`/`gzclose_w` C-ABI shims do, so the C ABI *does* report
+/// `Z_ERRNO`. See the module documentation for why the split exists.
+pub fn gzclose_w(file: Box<GzState>) -> i32 {
+    let (ret, handle) = gzclose_w_release(file);
+
+    // Close through RAII, discarding the `close(2)` result. This is the only
+    // difference from the C contract on the idiomatic path.
+    drop(handle);
+
+    ret
+}
+
+/// Finalizes a gzip write handle and **releases** its file descriptor instead of
+/// closing it — the `Z_ERRNO`-capable half of C `gzclose_w`
+/// (`gzwrite.c` L667-L700).
+///
+/// Performs every step of [`gzclose_w`] except the final close: the direction
+/// check, the pending-seek zero fill, the mandatory `Z_FINISH` flush, and the
+/// buffer/stream teardown. The still-open [`File`](std::fs::File) is handed back so the caller
+/// can close it explicitly and apply C's precedence — a failing close yields
+/// [`Z_ERRNO`](ReturnCode::ErrNo), a succeeding one yields the returned status.
+///
+/// # Return value
+///
+/// A pair of the accumulated raw zlib return code (identical to what
+/// [`gzclose_w`] returns) and the released descriptor:
+///
+/// * `(Z_STREAM_ERROR, None)` if the handle was not opened for writing. Nothing
+///   is finalized and no descriptor is released — but note that this function
+///   consumes the handle, so the descriptor closes when the box drops. The C-ABI
+///   shim never reaches this arm: it validates the direction through a borrow
+///   before taking ownership, exactly as C tests `state->mode` before any `free`.
+/// * `(status, Some(file))` otherwise, where `status` is `Z_OK` or the stream's
+///   recorded error if the zero fill or the `Z_FINISH` flush failed (a later
+///   error overrides an earlier one, matching C).
+pub(crate) fn gzclose_w_release(mut file: Box<GzState>) -> (i32, Option<ReleasedFile>) {
+    // C L676-L677: reject a handle that is not open for writing. C performs this
+    // test before any `free` or `close`, so the caller's handle survives intact;
+    // the C-ABI shim reproduces that by validating the direction through a borrow
+    // before reclaiming the box, which is why this arm is unreachable from the
+    // C ABI (see the module docs).
     if file.mode != GzMode::Write {
-        return ReturnCode::StreamError.as_c_int();
+        return (ReturnCode::StreamError.as_c_int(), None);
     }
 
     // C L671: the running result, defaulting to success.
@@ -105,16 +190,17 @@ pub fn gzclose_w(mut file: Box<GzState>) -> i32 {
         ret = file.err;
     }
 
-    // C L695-L698: `if (close(fd) == -1) ret = Z_ERRNO; ... free(state);`.
-    // Dropping the box frees the I/O buffers, ends the deflate stream, and
-    // closes the descriptor via RAII. `File`'s `Drop` cannot surface a
-    // `close(2)` error to safe Rust, so we do not fabricate one here — the exact
-    // `Z_ERRNO`-on-close reporting is deferred to the raw-descriptor FFI
-    // boundary (`src/ffi/gz.rs`). We return the accumulated flush status, which
-    // matches the C result whenever `close(fd)` succeeds.
+    // C L688-L694: `if (state->size) { deflateEnd(...); free(state->out); }
+    // free(state->in); gz_error(state, Z_OK, NULL); free(state->path);` — all
+    // performed by the field `Drop`s when the box below is released. Hand the
+    // descriptor out *first* so it survives that teardown, leaving the caller to
+    // perform C L695-L698 (`if (close(state->fd) == -1) ret = Z_ERRNO;` followed
+    // by `free(state)`). Releasing before the drop also preserves C's ordering:
+    // the buffers are freed before the descriptor is closed.
+    let handle = file.file.release();
     drop(file);
 
-    ret.as_c_int()
+    (ret.as_c_int(), handle)
 }
 
 /// Closes a gzip file opened for **reading** — port of C `gzclose_r`
@@ -135,16 +221,55 @@ pub fn gzclose_w(mut file: Box<GzState>) -> i32 {
 ///   was a buffer error (C preserves this one code across close), otherwise
 ///   [`Z_OK`](ReturnCode::Ok).
 ///
-/// Note: reference zlib additionally reports [`Z_ERRNO`](ReturnCode::ErrNo)
-/// when `close(fd)` fails (C `return ret ? Z_ERRNO : err;`). In this safe layer
-/// the descriptor is closed by [`File`](std::fs::File)'s [`Drop`], which cannot
-/// surface a `close(2)` error, so the exact `Z_ERRNO`-on-close path is deferred
-/// to the raw-descriptor FFI boundary (`src/ffi/gz.rs`). This function returns
-/// the accumulated read status, matching the C non-error close path.
+/// Reference zlib additionally reports [`Z_ERRNO`](ReturnCode::ErrNo) when
+/// `close(fd)` fails (C `return ret ? Z_ERRNO : err;`). This function closes the
+/// descriptor through [`File`](std::fs::File)'s [`Drop`], which discards the `close(2)` result,
+/// so it never returns `Z_ERRNO` — the value is always the accumulated read
+/// status, which equals the C result whenever the close succeeds. Callers that
+/// must observe a close failure use `gzclose_r_release`, which returns the
+/// still-open [`File`](std::fs::File) instead; that is what the `gzclose`/`gzclose_r` C-ABI
+/// shims do, so the C ABI *does* report `Z_ERRNO`. See the module documentation
+/// for why the split exists.
 pub fn gzclose_r(file: Box<GzState>) -> i32 {
-    // C L650-L651: reject a handle that is not open for reading.
+    let (ret, handle) = gzclose_r_release(file);
+
+    // Close through RAII, discarding the `close(2)` result. This is the only
+    // difference from the C contract on the idiomatic path.
+    drop(handle);
+
+    ret
+}
+
+/// Closes a gzip read handle's stream and **releases** its file descriptor
+/// instead of closing it — the `Z_ERRNO`-capable half of C `gzclose_r`
+/// (`gzread.c` L645-L668).
+///
+/// Performs every step of [`gzclose_r`] except the final close: the direction
+/// check, the `Z_BUF_ERROR`-preserving status computation, and the buffer/stream
+/// teardown. The still-open [`File`](std::fs::File) is handed back so the caller can close it
+/// explicitly and apply C's `return ret ? Z_ERRNO : err;` precedence.
+///
+/// # Return value
+///
+/// A pair of the accumulated raw zlib return code (identical to what
+/// [`gzclose_r`] returns) and the released descriptor:
+///
+/// * `(Z_STREAM_ERROR, None)` if the handle was not opened for reading. Nothing
+///   is torn down and no descriptor is released — but note that this function
+///   consumes the handle, so the descriptor closes when the box drops. The C-ABI
+///   shim never reaches this arm: it validates the direction through a borrow
+///   before taking ownership, exactly as C tests `state->mode` before any `free`.
+/// * `(status, Some(file))` otherwise, where `status` is
+///   [`Z_BUF_ERROR`](ReturnCode::BufError) if that was the stream's last recorded
+///   error and [`Z_OK`](ReturnCode::Ok) in every other case.
+pub(crate) fn gzclose_r_release(mut file: Box<GzState>) -> (i32, Option<ReleasedFile>) {
+    // C L650-L651: reject a handle that is not open for reading. C performs this
+    // test before any `free` or `close`, so the caller's handle survives intact;
+    // the C-ABI shim reproduces that by validating the direction through a borrow
+    // before reclaiming the box, which is why this arm is unreachable from the
+    // C ABI (see the module docs).
     if file.mode != GzMode::Read {
-        return ReturnCode::StreamError.as_c_int();
+        return (ReturnCode::StreamError.as_c_int(), None);
     }
 
     // C L662: `err = state->err == Z_BUF_ERROR ? Z_BUF_ERROR : Z_OK;`.
@@ -153,16 +278,17 @@ pub fn gzclose_r(file: Box<GzState>) -> i32 {
     // the read-specific finalization owned by `read.rs`.
     let status = finish_read(&file);
 
-    // C L665-L667: `ret = close(state->fd); free(state); return ret ? Z_ERRNO
-    // : err;`. Dropping the box ends the inflate stream, frees buffers, and
-    // closes the descriptor via RAII. `File`'s `Drop` cannot surface a
-    // `close(2)` error to safe Rust, so we do not fabricate one here — the exact
-    // `Z_ERRNO`-on-close reporting is deferred to the raw-descriptor FFI
-    // boundary (`src/ffi/gz.rs`). We return the accumulated read status, which
-    // matches the C result whenever `close(fd)` succeeds.
+    // C L656-L664: `if (state->size) { inflateEnd(...); free(state->out);
+    // free(state->in); } gz_error(state, Z_OK, NULL); free(state->path);` — all
+    // performed by the field `Drop`s when the box below is released. Hand the
+    // descriptor out *first* so it survives that teardown, leaving the caller to
+    // perform C L665-L667 (`ret = close(state->fd); free(state); return ret ?
+    // Z_ERRNO : err;`). Releasing before the drop also preserves C's ordering:
+    // the buffers are freed before the descriptor is closed.
+    let handle = file.file.release();
     drop(file);
 
-    status.as_c_int()
+    (status.as_c_int(), handle)
 }
 
 /// Closes a gzip file, dispatching to the reader or writer finalizer — port of
@@ -182,11 +308,31 @@ pub fn gzclose_r(file: Box<GzState>) -> i32 {
 ///
 /// # Return value
 ///
-/// The raw zlib integer return code produced by the selected finalizer.
+/// The raw zlib integer return code produced by the selected finalizer. As with
+/// [`gzclose_r`] and [`gzclose_w`], the descriptor is closed through [`File`](std::fs::File)'s
+/// [`Drop`] and a close failure is therefore not reported; `gzclose_release` is
+/// the variant that makes it observable, and it is what the C-ABI shim uses.
 pub fn gzclose(file: Box<GzState>) -> i32 {
+    let (ret, handle) = gzclose_release(file);
+
+    // Close through RAII, discarding the `close(2)` result. This is the only
+    // difference from the C contract on the idiomatic path.
+    drop(handle);
+
+    ret
+}
+
+/// Closes a gzip file and **releases** its file descriptor instead of closing it
+/// — the `Z_ERRNO`-capable half of C `gzclose` (`gzclose.c` L11-L23).
+///
+/// Dispatches to [`gzclose_r_release`] or [`gzclose_w_release`] using the same
+/// `state->mode == GZ_READ ? gzclose_r(file) : gzclose_w(file)` ternary C uses,
+/// and forwards their `(status, descriptor)` pair unchanged so the caller can
+/// perform the fallible close and apply C's precedence.
+pub(crate) fn gzclose_release(file: Box<GzState>) -> (i32, Option<ReleasedFile>) {
     match file.mode {
-        GzMode::Read => gzclose_r(file),
-        _ => gzclose_w(file),
+        GzMode::Read => gzclose_r_release(file),
+        _ => gzclose_w_release(file),
     }
 }
 
@@ -194,52 +340,69 @@ pub fn gzclose(file: Box<GzState>) -> i32 {
 mod tests {
     //! Unit tests for the close family: direction dispatch, the C return-code
     //! contract, and — for the write path — that the mandatory `Z_FINISH` flush
-    //! produces a complete, independently decodable gzip member.
+    //! produces a complete, well-formed gzip member.
     //!
     //! Write-path tests finalize a stream and then decompress the resulting file
-    //! with the reference `flate2` decoder (its pure-Rust `miniz_oxide` backend),
-    //! proving that valid gzip (RFC 1952) framing — header, DEFLATE body, and
-    //! CRC-32/ISIZE trailer — is emitted. All buffer handling here is safe Rust;
-    //! there is **zero `unsafe`** in this module.
+    //! with the crate's own inflate engine through
+    //! [`crate::gz::test_decode::gunzip`], proving that valid gzip (RFC 1952)
+    //! framing — header, DEFLATE body, and CRC-32/ISIZE trailer — is emitted: the
+    //! helper demands `Z_STREAM_END`, which the decoder reports only after both
+    //! trailer fields verify against the payload it recovered. Decoding in-crate
+    //! is what AAP §0.5.2 requires — no `use` of `flate2`, `quickcheck`, `rand`,
+    //! or `criterion` under `src/**` — and the independent cross-decoder check
+    //! against `flate2` lives in `tests/gzip_compat.rs`. All buffer handling here
+    //! is safe Rust; there is **zero `unsafe`** in this module.
 
     use super::*;
 
-    use crate::gz::state::How;
+    use crate::gz::state::{GzFile, How};
+    use crate::gz::test_decode::gunzip;
+    use crate::gz::test_temp::{TempFile, create_new_file};
     use crate::gz::write::gz_write;
     use crate::stream::ZStream;
     use std::fs::File;
-    use std::io::Read;
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::path::Path;
 
-    use flate2::read::GzDecoder;
-
-    /// Generates a unique, process- and counter-tagged temporary file path. The
-    /// `blitzy_adhoc_test_` prefix keeps these files out of any commit and makes
-    /// them trivial to clean up.
-    fn temp_path(tag: &str) -> PathBuf {
-        static CTR: AtomicU32 = AtomicU32::new(0);
-        let n = CTR.fetch_add(1, Ordering::Relaxed);
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "blitzy_adhoc_test_gzclose_{tag}_{}_{n}.gz",
-            std::process::id()
-        ));
-        p
+    /// Names a temporary `.gz` file inside a freshly created, caller-private
+    /// directory, removed together with that directory when the guard drops.
+    ///
+    /// # Why not a bare path in the shared temporary directory
+    ///
+    /// A path such as `temp_dir()/<tag>_<pid>_<n>.gz`, opened by the state builders
+    /// below with a truncating [`File::create`], is computable by any other user on
+    /// the host in both halves — and `File::create` opens `O_CREAT | O_TRUNC`
+    /// *without* `O_EXCL`, following a final-component symlink. A link planted at
+    /// the predicted name would therefore redirect the finalized gzip member to a
+    /// target of the planter's choosing and truncate it first (CWE-377, CWE-59).
+    /// Trailing `remove_file` calls make that worse rather than better: a failing
+    /// assertion unwinds straight past them, leaving the name in place for the next
+    /// run to reuse.
+    ///
+    /// Uniqueness therefore rides on a directory created with `mkdir(2)` create-new
+    /// semantics — atomic, never following a symlink, and failing rather than
+    /// adopting or deleting an occupied name — with [`Drop`]-owned cleanup that also
+    /// runs while unwinding. See [`crate::gz::test_temp`] for the full rationale.
+    ///
+    /// Callers keep the returned guard bound for the whole test and must **not** call
+    /// `remove_file` themselves.
+    fn temp_gz(tag: &str) -> TempFile {
+        TempFile::new(&std::format!("gzclose_{tag}"))
     }
 
     /// Builds a fresh write-mode [`GzState`] backed by a real, truncated temp
     /// file. `size` is left `0` so the finalize path lazily allocates buffers
     /// and initializes the deflate stream, exactly as a real `gzopen` would.
     fn write_state(path: &Path) -> Box<GzState> {
-        let file = File::create(path).expect("create writable temp file");
+        // Exclusive creation inside the guard's private directory: nothing is
+        // truncated and no symlink at this name is followed.
+        let file = create_new_file(path);
         Box::new(GzState {
             have: 0,
             next: 0,
             pos: 0,
             mode: GzMode::Write,
-            file,
-            path: path.display().to_string(),
+            file: GzFile::new(file),
+            path: path.as_os_str().as_encoded_bytes().to_vec(),
             size: 0,
             want: 8192,
             in_buf: Vec::new(),
@@ -256,6 +419,8 @@ mod tests {
             level: 6,
             strategy: 0,
             reset: false,
+            out_pending: 0,
+            out_start: 0,
             skip: 0,
             err: ReturnCode::Ok,
             msg: None,
@@ -268,15 +433,15 @@ mod tests {
     /// opened read-only, with the given last-recorded error code so the status
     /// mapping can be exercised.
     fn read_state(path: &Path, err: ReturnCode) -> Box<GzState> {
-        File::create(path).expect("materialize temp file");
+        drop(create_new_file(path));
         let file = File::open(path).expect("open readable temp file");
         Box::new(GzState {
             have: 0,
             next: 0,
             pos: 0,
             mode: GzMode::Read,
-            file,
-            path: path.display().to_string(),
+            file: GzFile::new(file),
+            path: path.as_os_str().as_encoded_bytes().to_vec(),
             size: 0,
             want: 8192,
             in_buf: Vec::new(),
@@ -293,6 +458,8 @@ mod tests {
             level: 6,
             strategy: 0,
             reset: false,
+            out_pending: 0,
+            out_start: 0,
             skip: 0,
             err,
             msg: None,
@@ -301,35 +468,27 @@ mod tests {
         })
     }
 
-    /// Reads the whole file at `path`, then removes it, returning the bytes.
-    fn read_and_remove(path: &Path) -> Vec<u8> {
-        let bytes = std::fs::read(path).expect("read compressed output");
-        let _ = std::fs::remove_file(path);
-        bytes
-    }
-
-    /// Decompresses a complete gzip member with the reference `flate2` decoder.
-    fn gunzip(compressed: &[u8]) -> Vec<u8> {
-        let mut decoder = GzDecoder::new(compressed);
-        let mut out = Vec::new();
-        decoder
-            .read_to_end(&mut out)
-            .expect("output is a valid gzip member");
-        out
+    /// Reads the whole file at `path`.
+    ///
+    /// Deliberately does *not* remove it: the [`TempFile`] guard owns cleanup and
+    /// performs it on the unwinding path too, which a manual `remove_file` here
+    /// could not.
+    fn read_output(path: &Path) -> Vec<u8> {
+        std::fs::read(path).expect("read compressed output")
     }
 
     #[test]
     fn gzclose_w_finalizes_empty_member() {
         // Closing a write handle that received no data must still emit a valid,
         // empty gzip member (header + empty block + zeroed trailer).
-        let path = temp_path("empty");
+        let path = temp_gz("empty");
         let ret = gzclose_w(write_state(&path));
         assert_eq!(
             ret,
             ReturnCode::Ok.as_c_int(),
             "an empty finalize returns Z_OK"
         );
-        let bytes = read_and_remove(&path);
+        let bytes = read_output(&path);
         assert_eq!(
             gunzip(&bytes),
             Vec::<u8>::new(),
@@ -340,9 +499,10 @@ mod tests {
     #[test]
     fn gzclose_finalizes_written_data_via_dispatch() {
         // `gzclose` on a write handle must dispatch to `gzclose_w`, whose
-        // `Z_FINISH` flush yields a member decodable by an independent decoder.
+        // `Z_FINISH` flush yields a complete, decodable member — final block and
+        // verifying CRC-32/ISIZE trailer included.
         const DATA: &[u8] = b"The quick brown fox jumps over the lazy dog.\n";
-        let path = temp_path("data");
+        let path = temp_gz("data");
         let mut file = write_state(&path);
         let n = gz_write(&mut file, DATA);
         assert_eq!(n, DATA.len(), "all input bytes are accepted");
@@ -354,50 +514,45 @@ mod tests {
             "finalize through gzclose returns Z_OK"
         );
 
-        let bytes = read_and_remove(&path);
+        let bytes = read_output(&path);
         assert_eq!(gunzip(&bytes), DATA, "the data round-trips exactly");
     }
 
     #[test]
     fn gzclose_r_returns_ok_on_clean_read() {
-        let path = temp_path("read_ok");
+        let path = temp_gz("read_ok");
         let ret = gzclose_r(read_state(&path, ReturnCode::Ok));
         assert_eq!(ret, ReturnCode::Ok.as_c_int());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn gzclose_r_preserves_buf_error() {
         // C L662: a lingering Z_BUF_ERROR is the one code preserved across close.
-        let path = temp_path("read_buf");
+        let path = temp_gz("read_buf");
         let ret = gzclose_r(read_state(&path, ReturnCode::BufError));
         assert_eq!(ret, ReturnCode::BufError.as_c_int());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn gzclose_r_maps_other_errors_to_ok() {
         // C L662: any non-buffer error collapses to Z_OK at close time.
-        let path = temp_path("read_data_err");
+        let path = temp_gz("read_data_err");
         let ret = gzclose_r(read_state(&path, ReturnCode::DataError));
         assert_eq!(ret, ReturnCode::Ok.as_c_int());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn gzclose_r_rejects_a_write_handle() {
-        let path = temp_path("wrongdir_r");
+        let path = temp_gz("wrongdir_r");
         let ret = gzclose_r(write_state(&path));
         assert_eq!(ret, ReturnCode::StreamError.as_c_int());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn gzclose_w_rejects_a_read_handle() {
-        let path = temp_path("wrongdir_w");
+        let path = temp_gz("wrongdir_w");
         let ret = gzclose_w(read_state(&path, ReturnCode::Ok));
         assert_eq!(ret, ReturnCode::StreamError.as_c_int());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -405,9 +560,114 @@ mod tests {
         // Routing proof: a read handle carrying Z_BUF_ERROR must come back as
         // Z_BUF_ERROR (the reader's contract); had it gone to `gzclose_w` the
         // wrong-direction check would have produced Z_STREAM_ERROR instead.
-        let path = temp_path("dispatch_read");
+        let path = temp_gz("dispatch_read");
         let ret = gzclose(read_state(&path, ReturnCode::BufError));
         assert_eq!(ret, ReturnCode::BufError.as_c_int());
-        let _ = std::fs::remove_file(&path);
+    }
+
+    // -- the descriptor-releasing variants ----------------------------------
+
+    /// Confirms a released handle is genuinely **still open**: an `fstat` through
+    /// it must succeed. This is what lets the FFI layer call `close(2)` itself and
+    /// report a failure as `Z_ERRNO`.
+    ///
+    /// Every state built by this module opens its file through the standard
+    /// library, so the release is always the `Owned` arm; a raw-descriptor owner
+    /// reaches this path only from `gzdopen`, whose lifecycle is covered in
+    /// `src/ffi/gz.rs`.
+    fn assert_still_open(released: &ReleasedFile) {
+        let ReleasedFile::Owned(file) = released else {
+            panic!("a state opened through std releases an Owned handle");
+        };
+        assert!(
+            file.metadata().is_ok(),
+            "the released descriptor must still be open"
+        );
+    }
+
+    #[test]
+    fn gzclose_w_release_finalizes_and_hands_back_the_descriptor() {
+        let path = temp_gz("release_w");
+        let mut state = write_state(&path);
+        assert_eq!(gz_write(&mut state, b"released write path"), 19);
+
+        let (ret, released) = gzclose_w_release(state);
+        assert_eq!(ret, ReturnCode::Ok.as_c_int());
+        let file = released.expect("a writer releases its descriptor");
+        assert_still_open(&file);
+        drop(file);
+
+        // The finalize flush ran, so the member on disk is complete.
+        assert_eq!(gunzip(&read_output(&path)), b"released write path".to_vec());
+    }
+
+    #[test]
+    fn gzclose_r_release_hands_back_the_descriptor_and_maps_the_status() {
+        // Clean read -> Z_OK, descriptor released and still open.
+        let path = temp_gz("release_r_ok");
+        let (ret, released) = gzclose_r_release(read_state(&path, ReturnCode::Ok));
+        assert_eq!(ret, ReturnCode::Ok.as_c_int());
+        assert_still_open(&released.expect("a reader releases its descriptor"));
+
+        // A pending Z_BUF_ERROR is preserved, exactly as in the non-release form.
+        let path = temp_gz("release_r_buf");
+        let (ret, released) = gzclose_r_release(read_state(&path, ReturnCode::BufError));
+        assert_eq!(ret, ReturnCode::BufError.as_c_int());
+        assert_still_open(&released.expect("a reader releases its descriptor"));
+    }
+
+    #[test]
+    fn release_variants_reject_the_wrong_direction_without_releasing() {
+        // C tests `state->mode` before any teardown, so a refusal releases nothing
+        // and the FFI layer's `finish_close` has no descriptor to close — which is
+        // what makes `Z_STREAM_ERROR` outrank a close failure.
+        let path = temp_gz("release_wrong_r");
+        let (ret, released) = gzclose_r_release(write_state(&path));
+        assert_eq!(ret, ReturnCode::StreamError.as_c_int());
+        assert!(released.is_none(), "a refusal must release no descriptor");
+
+        let path = temp_gz("release_wrong_w");
+        let (ret, released) = gzclose_w_release(read_state(&path, ReturnCode::Ok));
+        assert_eq!(ret, ReturnCode::StreamError.as_c_int());
+        assert!(released.is_none(), "a refusal must release no descriptor");
+    }
+
+    #[test]
+    fn gzclose_release_dispatches_like_gzclose() {
+        // Reader: routed to the read finalizer, so a pending Z_BUF_ERROR survives.
+        let path = temp_gz("release_dispatch_r");
+        let (ret, released) = gzclose_release(read_state(&path, ReturnCode::BufError));
+        assert_eq!(ret, ReturnCode::BufError.as_c_int());
+        assert_still_open(&released.expect("reader releases its descriptor"));
+
+        // Writer: routed to the write finalizer, which finalizes the member.
+        let path = temp_gz("release_dispatch_w");
+        let mut state = write_state(&path);
+        assert_eq!(gz_write(&mut state, b"dispatch"), 8);
+        let (ret, released) = gzclose_release(state);
+        assert_eq!(ret, ReturnCode::Ok.as_c_int());
+        assert_still_open(&released.expect("writer releases its descriptor"));
+        assert_eq!(gunzip(&read_output(&path)), b"dispatch".to_vec());
+    }
+
+    /// The public wrappers must remain byte-for-byte equivalent to the release
+    /// variants plus an RAII drop — same status, same on-disk output.
+    #[test]
+    fn public_wrappers_match_the_release_variants() {
+        let payload = b"wrapper equivalence";
+
+        let path_a = temp_gz("equiv_wrapper");
+        let mut state = write_state(&path_a);
+        assert_eq!(gz_write(&mut state, payload), payload.len());
+        let wrapper_ret = gzclose_w(state);
+
+        let path_b = temp_gz("equiv_release");
+        let mut state = write_state(&path_b);
+        assert_eq!(gz_write(&mut state, payload), payload.len());
+        let (release_ret, released) = gzclose_w_release(state);
+        drop(released);
+
+        assert_eq!(wrapper_ret, release_ret);
+        assert_eq!(read_output(&path_a), read_output(&path_b));
     }
 }

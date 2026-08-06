@@ -1,0 +1,179 @@
+# rustfmt.toml — the source-formatting contract for the `zlib-rs` crate.
+#
+# Governs every Rust source in the crate: the modules under `src/`, the integration
+# tests under `tests/`, the criterion benches under `benches/`, and `build.rs`. It
+# owns the formatting half of migration gap D11 ("lint and format behavior depends on
+# unpinned tool defaults") and `clippy.toml` owns the lint half.
+#
+# The defect it addresses is drift, not style: without a pinned configuration the
+# repository's formatting is whatever a contributor's rustfmt happens to think it
+# should be. That is harmless right up to the release in which rustfmt changes a
+# default — at which point the next `cargo fmt` rewrites tens of thousands of lines
+# and the blocking `lint` gate fails on code nobody touched.
+#
+# THE GOVERNING RULE — READ BEFORE ADDING ANYTHING
+# ================================================
+# Every option here pins a value the tree ALREADY satisfies. This file FREEZES the
+# current style; it does not impose a new one. Because `cargo fmt --all -- --check` is
+# a BLOCKING gate, one non-default option added here breaks the build for everyone
+# until every affected file is rewritten. Changing the house style is a deliberate,
+# standalone, whole-tree commit — never a drive-by line in this file.
+#
+# The authoring procedure follows directly: add ONE key, run
+# `cargo fmt --all -- --check`, and observe the exit code. If it is not 0, the value
+# you chose is not the current default — DELETE THE KEY rather than reformatting the
+# tree to satisfy it.
+#
+# THE SUPPORTED TOOLCHAIN RANGE IS PART OF THE CONTRACT
+# =====================================================
+# The range runs from `Cargo.toml`'s `rust-version = "1.85.0"` (pinned locally by
+# `rust-toolchain.toml`, and by the CI `msrv` job) up to current stable, plus the
+# nightly `cargo-fuzz` requires — and `rustup` discovery walks up from `fuzz/` to this
+# same file. A config that is clean at one end and noisy at the other is worse than
+# none, so every key must be accepted with NO DIAGNOSTIC across the whole range. No
+# unstable option may appear: on a stable rustfmt an unstable key is a WARNING rather
+# than an error, so the run still exits 0 while the option does nothing, and a
+# silently ignored option is a lie in the configuration. The acceptance test for a key
+# is therefore empty stderr, not merely exit 0:
+#
+#       cargo fmt --all -- --check                      # the pinned MSRV floor
+#       cargo +stable fmt --all -- --check              # what the CI `lint` job runs
+#       cargo +nightly-2026-08-01 fmt --all -- --check  # what `cargo-fuzz` uses
+#
+# To check a value against the tool's own defaults, ask rustfmt rather than the docs:
+#
+#       rustfmt --print-config default src/lib.rs
+#       rustfmt --edition 2024 --print-config current src/lib.rs
+#
+# MAINTENANCE RULES
+# =================
+# * THE EDITION HERE MUST MATCH `Cargo.toml`. It is the same fact stated twice; if the
+#   two drift, one is lying. An edition bump is a multi-file change (`Cargo.toml`,
+#   this file, `rust-toolchain.toml`'s floor, the CI `msrv` pin) in one commit.
+# * NEVER ENABLE THE COMMENT-REWRITING FAMILY (`wrap_comments`, `comment_width`,
+#   `normalize_comments`, `format_code_in_doc_comments`, `normalize_doc_attributes`).
+#   Every module in this crate carries a documentation header that cites its C
+#   provenance line by line and quotes C macro bodies verbatim; reflowing that prose
+#   would rewrite every module to no benefit and corrupt exactly the citations the
+#   port is audited against. They are unstable today, so they would be silently
+#   ignored — which is not a reason to add them.
+# * DO NOT WEAKEN THE GATE'S REACH. `disable_all_formatting`, `skip_children`,
+#   `format_generated_files = false`, and `ignore` all exist to stop rustfmt from
+#   looking at code. None belongs in a repository whose formatting gate is blocking
+#   and green. `fuzz/` needs no `ignore` entry: it is a detached workspace, so a root
+#   `cargo fmt --all` never reaches it, and running `cargo fmt` from inside it finds
+#   this file by walking up.
+
+
+# ---------------------------------------------------------------------------
+# EDITION AND STYLE EDITION — the two load-bearing keys
+# ---------------------------------------------------------------------------
+
+# The Rust edition rustfmt PARSES with. Required, not merely tidy: rustfmt's own
+# default is `"2015"`, and while `cargo fmt` masks that by passing `--edition`
+# from `Cargo.toml`, a DIRECT `rustfmt` invocation gets no such help —
+# format-on-save, a language-server request, a pre-commit hook, a one-off
+# `rustfmt src/deflate/slow.rs`. For this crate the divergence is concrete:
+# `src/ffi/**` is built out of `unsafe extern "C"` blocks and
+# `#[unsafe(no_mangle)]` attributes, which are edition-2024 constructs.
+#
+# Kept byte-identical to `Cargo.toml`'s `edition = "2024"`.
+edition = "2024"
+
+# The FORMATTING RULES, as distinct from the parser — and the single most
+# important key here for freezing layout against future tool releases. rustfmt
+# guarantees that default formatting changes only when a NEW style edition is
+# introduced, never within one, so pinning this is what actually prevents an
+# upgrade from reformatting the tree.
+#
+# It is spelled out even though `edition = "2024"` implies it, because the
+# implication is a convenience rather than a contract and does not survive a
+# command-line `--edition` override, whereas this key does. `style_edition`
+# stabilised in Rust 1.85 — precisely this crate's MSRV — so it is the newest key
+# this file can safely contain. The older spelling `version = "Two"` is NOT used:
+# it is still unstable and would be silently ignored on stable.
+style_edition = "2024"
+
+
+# ---------------------------------------------------------------------------
+# WIDTH AND WHITESPACE — all rustfmt defaults, pinned against drift
+# ---------------------------------------------------------------------------
+
+# Maximum line width, and the input from which `use_small_heuristics` derives
+# every sub-width, so changing this one number cascades through the whole layout.
+max_width = 100
+
+# Spaces, never tab characters.
+hard_tabs = false
+
+# Four spaces per indent level.
+tab_spaces = 4
+
+# Preserve whatever line endings a file already uses. `"Unix"` was considered and
+# REJECTED: it is a non-default value, and on a Windows checkout with
+# `core.autocrlf = true` it would make rustfmt rewrite the line endings of every
+# file it touches, turning a green gate red on that platform alone. Deterministic
+# line endings are a `.gitattributes` concern, not a rustfmt one.
+newline_style = "Auto"
+
+# The bundle of width heuristics deciding when a call, array, struct literal, or
+# method chain may stay on one line. The eight widths it derives are deliberately
+# NOT restated as individual keys: they are outputs of this setting and of
+# `style_edition`, so pinning them would duplicate a derivation and would
+# silently override the heuristic if a future style edition retuned it.
+use_small_heuristics = "Default"
+
+
+# ---------------------------------------------------------------------------
+# IMPORTS AND MODULE ORDER
+#
+# The module graph is the backbone of this port and `src/lib.rs` is its
+# authoritative description, so deterministic ordering is what keeps a diff that
+# adds one `use` from looking like a rewrite of the whole block.
+# ---------------------------------------------------------------------------
+
+# Sort `use` declarations within each group.
+reorder_imports = true
+
+# Sort `mod` declarations, keeping the crate root's module list predictable as it
+# evolves. Each `#[cfg]`-gated declaration forms its own group and stays put.
+reorder_modules = true
+
+
+# ---------------------------------------------------------------------------
+# ITEM AND EXPRESSION FORMATTING — all defaults
+# ---------------------------------------------------------------------------
+
+# Merge multiple `#[derive(..)]` attributes on one item into a single list.
+merge_derives = true
+
+# Leave `try!(..)`/`?` alone. Pinned on principle: a formatting run must never
+# edit source semantics as a side effect.
+use_try_shorthand = false
+
+# Do not rewrite `Foo { bar: bar }` into `Foo { bar }` — same principle. This
+# guarantees the field-by-field constructors in `src/deflate/state.rs`,
+# `src/inflate/state.rs`, and `src/gz/state.rs`, which mirror their C
+# counterparts, keep whatever spelling their author chose.
+use_field_init_shorthand = false
+
+# Strip redundant nesting in parenthesised expressions, e.g. `((a + b))`, while
+# keeping the parentheses that carry meaning in the ported bit-manipulation code.
+remove_nested_parens = true
+
+# Never emit a leading `|` on a match arm. This shapes the largest `match` in the
+# crate: the 32-variant `InflateMode` ladder in `src/inflate/mod.rs`.
+match_arm_leading_pipes = "Never"
+
+# Always print the ABI, so `extern "C"` is never abbreviated to a bare `extern`.
+# Non-negotiable for this crate regardless of the default: `src/ffi/**` is the C
+# ABI boundary, where an implicit ABI would be actively misleading to read.
+# `unsafe` is confined to that boundary plus the private freestanding
+# `no_std_support` runtime block in `src/lib.rs` — the two `#[allow(unsafe_code)]`
+# carve-outs under the crate's `#![deny(unsafe_code)]`.
+force_explicit_abi = true
+
+# When a signature must wrap, one parameter per line. This is what keeps the wide
+# FFI entry points in `src/ffi/**` — `deflateInit2_` takes eight parameters,
+# mixing raw pointers with C integers — reviewable against `zlib.h`.
+fn_params_layout = "Tall"

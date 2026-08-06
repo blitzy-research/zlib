@@ -7,6 +7,44 @@
 # compile these nightly-only libFuzzer harnesses. cargo-fuzz builds them with a
 # nightly toolchain (it injects `-Z` sanitizer / coverage instrumentation that
 # is unavailable on stable); see `.github/workflows/fuzz.yml`.
+#
+# NIGHTLY MUST BE SELECTED EXPLICITLY, ONCE PER SHELL OR ONCE PER JOB. The
+# repository root carries a `rust-toolchain.toml` pinning the crate's MSRV — a
+# STABLE toolchain — and rustup resolves that file (precedence rank 4) by
+# searching UPWARD from the working directory, ahead of the default toolchain
+# (rank 5). A shell sitting in `fuzz/` therefore inherits the stable pin, and so
+# would a CI job left to itself: installing a nightly through
+# `dtolnay/rust-toolchain` sets the DEFAULT toolchain and does not export
+# `RUSTUP_TOOLCHAIN`, and the toolchain file outranks the default. Without an
+# override of rank 1 or 2, `cargo fuzz build` / `cargo fuzz run` fails with "the
+# option `Z` is only accepted on the nightly compiler".
+#
+# LOCALLY, prefer the environment form, because it is the one that also reaches
+# the nested `cargo build` calls `cargo-fuzz` spawns:
+#
+#     RUSTUP_TOOLCHAIN=nightly-2026-08-01 cargo fuzz build
+#     RUSTUP_TOOLCHAIN=nightly-2026-08-01 cargo fuzz list
+#     RUSTUP_TOOLCHAIN=nightly-2026-08-01 cargo fuzz run <target>
+#     RUSTUP_TOOLCHAIN=nightly-2026-08-01 cargo fmt --all -- --check
+#
+# A `cargo +nightly-2026-08-01 ...` prefix (rank 1) works for the plain cargo
+# commands. NAME THE DATE either way: a bare `+nightly` resolves to whatever was
+# published this morning, which is precisely what the pin exists to prevent.
+#
+# IN CI THERE IS EXACTLY ONE SELECTOR, AND IT IS NOT A PREFIX. The `cargo-fuzz`
+# job in `.github/workflows/fuzz.yml` sets a job-level
+# `RUSTUP_TOOLCHAIN: nightly-2026-08-01` (rank 2) and every cargo invocation in
+# that job is deliberately UNPREFIXED. Adding a `+toolchain` prefix would make
+# the job's own "Verify the resolved toolchain is nightly" assertion vacuous for
+# the commands carrying it, while cargo-fuzz's child processes would still be
+# governed by the environment variable — two mechanisms to keep in step for no
+# gain. That job asserts both that the resolution is a nightly and that it is that
+# exact dated channel before building anything, and its install step requests
+# `components: clippy, rustfmt`, which a dated nightly does not ship by default.
+#
+# Reproducing a CI result locally means naming the same dated channel; the date
+# lives on that install step and in its `expected_nightly` assertion, the two
+# move together, and `CONTRIBUTING.md` names it as well.
 
 [package]
 name = "zlib-rs-fuzz"
@@ -16,6 +54,28 @@ edition = "2021"
 
 [package.metadata]
 cargo-fuzz = true
+
+# --- Lints -----------------------------------------------------------------
+# `fuzz_ffi_roundtrip.rs` is the only place in this project where a fuzzer
+# crosses the `unsafe` C ABI boundary, so the two lints that police that
+# boundary are hard errors here rather than warn-by-default suggestions.
+#
+# Declaring them in the manifest is what makes the DETACHED workspace's own
+# clippy gate — `cargo clippy --manifest-path fuzz/Cargo.toml --locked
+# --all-targets -- -D warnings`, run twice in `fuzz.yml` (default features and
+# `--no-default-features`) under that job's nightly — enforce the same
+# discipline the library enforces on itself with
+# `#![warn(clippy::undocumented_unsafe_blocks)]` at the crate root: the
+# repository-root `clippy` invocation cannot resolve this workspace, so without
+# this table the rule would simply never be applied to the harnesses. A manifest
+# table also reaches every target at once, which a per-file inner attribute
+# could not do without adding a second `#![...]` to each `#![no_main]` binary.
+#
+# `rustc` recognises `clippy` as a registered tool namespace and ignores lint
+# names inside it, so `cargo fuzz build` under the pinned nightly is unaffected.
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
 
 # Detach from the parent package: an empty workspace table here prevents the
 # fuzz crate from being pulled into (or affecting) the root crate's build graph.
@@ -27,12 +87,64 @@ libfuzzer-sys = "0.4"
 
 [dependencies.zlib-rs]
 # Fuzz the real crate through its public API and its C FFI boundary. Default
-# features (std + gzip + gz-io + simd) give the harnesses the full surface.
+# features (std + gzip + gz-io + simd) give the harnesses the full surface; the
+# two that the gated legs actually depend on are additionally forwarded from this
+# crate's own `gzip` feature below, so they are guaranteed rather than inherited.
 path = ".."
+
+# --- Features --------------------------------------------------------------
+# `gzip` is a FORWARDING feature. It exists so the harnesses can carry
+# `#[cfg(feature = "gzip")]` on their gzip-specific imports, helpers, and legs.
+#
+# Cargo defines a `feature` predicate only for the crate it is compiling, and
+# that crate here is `zlib-rs-fuzz`, not `zlib-rs`. Without a declaration in this
+# manifest a `gzip` predicate is therefore undefined: it would be permanently
+# false — silently compiling the gzip coverage out of the gzip harness — and
+# `rustc`'s `unexpected_cfgs` lint rejects the unknown value outright ("no
+# expected values for `feature`"), which the folder's blocking
+# `clippy --all-targets -- -D warnings` gate turns into an error.
+#
+# Declaring it makes the predicate defined; forwarding it to EVERY library
+# capability the gated legs actually use is what makes it truthful. There are
+# two, and both must be named:
+#
+#   * `zlib-rs/gzip` — RFC 1952 framing in the deflate/inflate engines, which is
+#     what the `windowBits` +16 / +32 bands and `deflate_set_header` /
+#     `inflate_get_header` legs need.
+#   * `zlib-rs/gz-io` — the IDIOMATIC gzip file-I/O layer. `src/lib.rs` declares
+#     `pub mod gz` behind `#[cfg(feature = "gz-io")]` (it needs `std::fs` /
+#     `std::io`), so `fuzz_gzip.rs`'s `use zlib_rs::gz::{gzopen, gzread,
+#     gzwrite, gzclose_r, gzclose_w}` resolves only when `gz-io` is on.
+#
+# Both are named so that neither capability is merely INHERITED from the path
+# dependency's own defaults. Inheritance would leave the gz-file legs compiling
+# without anything in the feature graph requiring them to, so a `default-features
+# = false` on the dependency — or a change to `zlib-rs`'s default set — would
+# break them at a distance. `gz-io` already expands to `["std", "gzip"]` upstream,
+# so the two entries overlap by design: `gzip` stays listed explicitly so the
+# framing capability is guaranteed independently of how `gz-io` is defined.
+#
+# It is ON by default, so a plain `cargo fuzz build|run` under the pinned nightly
+# keeps the full gzip coverage. `--no-default-features` compiles the gzip-specific
+# legs out while every `fuzz_target!` — and therefore every `main` — stays
+# unconditional, so all five `[[bin]]` targets still link.
+#
+# This adds no package to the dependency graph: a lockfile records packages and
+# versions, not feature selections, so `fuzz/Cargo.lock` is unaffected.
+[features]
+default = ["gzip"]
+gzip = ["zlib-rs/gzip", "zlib-rs/gz-io"]
 
 # libFuzzer wants line-level debug info in the optimized build for actionable
 # crash reports; overflow checks stay on so arithmetic mistakes surface as
 # reproducible findings rather than silently wrapping.
+#
+# Cargo reads profiles from the workspace-root manifest of the workspace being
+# built, and inside `fuzz/` that root is THIS file. It deliberately sets no
+# `panic` key, so the fuzz build — including the `zlib-rs` path dependency
+# compiled for it — uses Cargo's default `unwind`; the root manifest's
+# `panic = "abort"` does not reach here (observable with `cargo build -v`, which
+# passes no `-C panic=` flag from this workspace).
 [profile.release]
 debug = 1
 overflow-checks = true

@@ -41,9 +41,11 @@
 //! # Safety and environment
 //!
 //! Every item in this module is safe Rust; the layer contains no `unsafe`
-//! blocks. It references neither `std` nor `alloc`, so it participates cleanly
-//! in `no_std` builds. Raw-pointer and `extern "C"` variants of the wrappers
-//! live in `crate::ffi`, not here.
+//! blocks. No exported item references `std`, so the layer participates cleanly
+//! in `no_std` builds; the `#[cfg(test)]` module at the bottom of this file uses
+//! `alloc::vec!` for scratch output buffers, which `no_std` builds also provide
+//! through the crate-root `extern crate alloc`. Raw-pointer and `extern "C"`
+//! variants of the wrappers live in `crate::ffi`, not here.
 
 /// One-call, whole-buffer compression wrappers ported from C `compress.c`.
 pub mod compress;
@@ -56,9 +58,16 @@ pub mod version;
 // Shared internal constants (ported from `zutil.h`).
 //
 // `src/constants.rs` deliberately does not define these; this module is their
-// canonical public home. Engine modules (deflate/inflate) may keep their own
-// private copies for locality - those are distinct items in distinct module
-// paths and therefore do not conflict with the public copies below.
+// canonical public home. Engine modules may keep their own differently-typed
+// aliases where the arithmetic demands it - `crate::deflate::trees` needs `i32`
+// block-type tags for `send_bits`, and `crate::deflate::state` needs `usize`
+// match bounds for indexing - and the tests at the bottom of this file assert
+// that every such alias still agrees with the canonical value here.
+//
+// `OS_CODE` is the one constant no module may re-declare: it is genuinely
+// platform-dependent, so a hard-coded copy would emit the wrong gzip OS byte on
+// some target. `crate::deflate` imports it from here (see the note above
+// `PRESET_DICT` in `src/deflate/mod.rs`).
 // ---------------------------------------------------------------------------
 
 /// Block-type tag for a *stored* (uncompressed) DEFLATE block.
@@ -96,58 +105,158 @@ pub const PRESET_DICT: u8 = 0x20;
 // ---------------------------------------------------------------------------
 // Platform `OS_CODE` selection (ported from `zutil.h` lines 98-189).
 //
-// The gzip header (RFC 1952) carries a one-byte operating-system identifier.
-// C selects it through a long `#ifdef` cascade; here it collapses to a single
-// compile-time constant chosen with `cfg` attributes. Only targets that have a
-// stable Rust `cfg` predicate are distinguished (Windows and Apple); every
-// other target - including Linux and the historical codes C enumerated
-// (Amiga = 1, VMS = 2, ATARI = 5, OS/2 = 6, old Mac OS = 7, RISC OS = 13,
-// BeOS = 16, OS/400 = 18, MS-DOS = 0) - collapses to the Unix default of 3,
-// matching C's `#ifndef OS_CODE` fallback. Exactly one variant below is
-// compiled for any given target.
+// C selects the RFC 1952 operating-system identifier through a long `#ifdef`
+// cascade; here it collapses to a single compile-time constant chosen with
+// `cfg` attributes. Only targets that have a stable Rust `cfg` predicate are
+// distinguished (Windows and Apple); every other target - including Linux and
+// the historical codes C enumerated (Amiga = 1, VMS = 2, ATARI = 5, OS/2 = 6,
+// old Mac OS = 7, RISC OS = 13, BeOS = 16, OS/400 = 18, MS-DOS = 0) -
+// collapses to the Unix default of 3, matching C's `#ifndef OS_CODE` fallback.
+// Exactly one variant below is compiled for any given target.
+//
+// WHAT CONSUMES THIS CONSTANT: the gzip encoder. `crate::deflate` imports
+// `OS_CODE` from here and writes it into the RFC 1952 header as
+// `put_byte(s, OS_CODE)`, which is exactly what `deflate.c` does with the
+// `zutil.h` macro. That is why no module may re-declare it: a private hard-coded
+// `u8 = 3` copy under this name anywhere else would shadow the cascade below, so
+// a Windows or Apple build would emit `3` where the reference C library emits
+// `10` or `19`. `src/lib.rs`'s `os_code_is_declared_in_exactly_one_module`
+// counts the declarations across the tree to keep that from happening.
+//
+// This does NOT put byte-identity at risk, and the reasoning matters because the
+// opposite conclusion is easy to reach. Byte identity (AAP §0.8.1 directive D-1)
+// is defined against the reference C library built for the SAME target, and C's
+// own `zutil.h` selects the same platform value through the same cascade. So
+// consuming this constant is what PRESERVES parity; hard-coding one value on
+// every target is what breaks it. Compressed output has never been comparable
+// across targets, because reference zlib's is not either. See the `os` field
+// documentation on [`crate::gz_header::GzHeader`] for the full
+// default/custom-header contract, including how a caller-supplied
+// [`crate::gz_header::GzHeader`] overrides this default.
+//
+// HOW THE CASCADE IS SPELLED: through `cfg_if::cfg_if!`, the crate's declared
+// stand-in for the C `#if`/`#elif`/`#else` preprocessor nests (AAP §0.5.1,
+// §0.5.3). This is the structure `zutil.h` L98-L189 actually has - a single
+// chain in which the first matching arm wins - and writing it as a chain keeps
+// that property mechanical rather than manual: `cfg_if!` derives each arm's
+// predicate by negating every arm above it, so the arms cannot overlap and
+// cannot leave a gap. The expansion is predicate-for-predicate identical to the
+// hand-written attributes it replaces (`windows`;
+// `all(not(windows), target_vendor = "apple")`;
+// `all(not(windows), not(target_vendor = "apple"))`), so the selected value is
+// unchanged on every target.
+//
+// The mirror cascade in this module's tests (`EXPECTED_OS_CODE`) is deliberately
+// left as raw `#[cfg]` attributes. It exists to derive the same answer a second,
+// independent way, and routing both through the same macro would forfeit exactly
+// that independence.
 // ---------------------------------------------------------------------------
 
-/// The gzip-header operating-system identifier byte for the current target.
-///
-/// On Windows this is `10`, mirroring the C `WIN32 && !__CYGWIN__` branch of
-/// `zutil.h` (lines 156-158). Cygwin reports the Unix code and is excluded by
-/// Rust's `cfg(windows)` predicate.
-#[cfg(windows)]
-pub const OS_CODE: u8 = 10;
+cfg_if::cfg_if! {
+    if #[cfg(windows)] {
+        /// The `zutil.h` operating-system identifier byte for the current target.
+        ///
+        /// On Windows this is `10`, mirroring the C `WIN32 && !__CYGWIN__` branch
+        /// of `zutil.h` (lines 156-158). Cygwin reports the Unix code and is
+        /// excluded by Rust's `cfg(windows)` predicate.
+        ///
+        /// Written into the gzip header by [`crate::deflate`]; see the module
+        /// note above for why that preserves byte-identity rather than
+        /// threatening it.
+        pub const OS_CODE: u8 = 10;
+    } else if #[cfg(target_vendor = "apple")] {
+        /// The `zutil.h` operating-system identifier byte for the current target.
+        ///
+        /// On Apple platforms this is `19`, mirroring the C `__APPLE__` branch of
+        /// `zutil.h` (lines 168-170). Windows is already claimed by the arm
+        /// above, which is what makes the bare `target_vendor` predicate here
+        /// equivalent to the C cascade's ordering.
+        ///
+        /// Written into the gzip header by [`crate::deflate`]; see the module
+        /// note above for why that preserves byte-identity rather than
+        /// threatening it.
+        pub const OS_CODE: u8 = 19;
+    } else {
+        /// The `zutil.h` operating-system identifier byte for the current target.
+        ///
+        /// This is the Unix default of `3`, mirroring the C `#ifndef OS_CODE`
+        /// fallback in `zutil.h` (lines 187-189). It applies to Linux and every
+        /// other target that lacks a more specific stable `cfg` predicate.
+        ///
+        /// Written into the gzip header by [`crate::deflate`]; this is the arm
+        /// every CI job compiles, which is why the shadowing bug described in the
+        /// module note above was invisible on Linux.
+        pub const OS_CODE: u8 = 3;
+    }
+}
 
-/// The gzip-header operating-system identifier byte for the current target.
-///
-/// On Apple platforms this is `19`, mirroring the C `__APPLE__` branch of
-/// `zutil.h` (lines 168-170).
-#[cfg(all(not(windows), target_vendor = "apple"))]
-pub const OS_CODE: u8 = 19;
-
-/// The gzip-header operating-system identifier byte for the current target.
-///
-/// This is the Unix default of `3`, mirroring the C `#ifndef OS_CODE` fallback
-/// in `zutil.h` (lines 187-189). It applies to Linux and every other target
-/// that lacks a more specific stable `cfg` predicate, and is the value used
-/// for byte-exact gzip-header parity in continuous integration.
-#[cfg(all(not(windows), not(target_vendor = "apple")))]
-pub const OS_CODE: u8 = 3;
+// A compile-time cross-check of the cascade above, evaluated by `const` folding
+// on every build of the library. It restates the selection as a `cfg!` chain -
+// an expression form, independent of the item-attribute form `cfg_if!` emits -
+// so a mistake in one spelling cannot be masked by the same mistake in the
+// other. Being a `const` assertion rather than a `#[test]`, it is proved by a
+// bare `cargo check --target <triple>` for a target this host cannot execute,
+// which is what makes the Windows (`10`) and Apple (`19`) arms verifiable here
+// and not merely inspectable.
+const _: () = assert!(
+    OS_CODE
+        == if cfg!(windows) {
+            10
+        } else if cfg!(target_vendor = "apple") {
+            19
+        } else {
+            3
+        },
+    "OS_CODE must equal the byte zutil.h's cascade selects for this target"
+);
 
 // ---------------------------------------------------------------------------
 // Public API re-exports.
 //
-// `src/lib.rs` re-exports these through the crate prelude so that both
-// `crate::util::<item>` and the top-level crate path resolve. Both the
-// idiomatic snake_case names and the camelCase C-parity aliases defined by the
-// child modules are surfaced. The `compress`/`uncompress` module names (type
+// `src/lib.rs` re-exports these from the crate root so that both
+// `crate::util::<item>` and the top-level crate path resolve. They are NOT in
+// `crate::prelude`, which deliberately carries only types (the public enums,
+// `ReturnCode`/`ZlibError`, `GzHeader`, `ZStream` and the allocator traits) so
+// that a glob import cannot pull free functions into scope. Both the idiomatic
+// snake_case names and the camelCase C-parity aliases defined by the child
+// modules are surfaced. The `compress`/`uncompress` module names (type
 // namespace) and the re-exported functions of the same spelling (value
 // namespace) coexist without conflict.
 // ---------------------------------------------------------------------------
 
-/// One-call compression entry points: `compress` and `compress2`, plus the
-/// output-bound helper `compress_bound` and its C-parity alias `compressBound`.
-pub use compress::{compress, compress_bound, compress2, compressBound};
+/// The output-bound helper `compress_bound` and its C-parity alias
+/// `compressBound` — the engine-free half of `compress.c`.
+pub use compress::{compress_bound, compressBound};
 
-/// One-call decompression entry points: `uncompress` and `uncompress2`.
-pub use uncompress::{uncompress, uncompress2};
+/// The engine-driving one-call compression entry points, at the `util` paths
+/// AAP §0.3.1 publishes them under.
+///
+/// These are **path aliases, not definitions**. The bodies live one layer up, in
+/// [`crate::deflate`], because *driving* an engine from layer 3 would be an
+/// upward import and the layer graph must stay acyclic (AAP §0.4.2 B2). A `pub
+/// use` is a name re-export only: this module gains no call into the engine, no
+/// engine type in any of its own signatures, and therefore no code dependency —
+/// the one-way data flow the layer graph exists to guarantee is untouched.
+///
+/// They are re-exported here because `zlib_rs::util::compress`,
+/// `::compress2`, `::uncompress`, and `::uncompress2` are part of the published
+/// surface AAP §0.3.1 enumerates, and a downstream `use zlib_rs::util::compress2;`
+/// must keep compiling. Removing a public path is a source-breaking change no
+/// matter where the item is defined, so the path is held here permanently rather
+/// than deprecated; the crate root publishes the same six names, and both spellings
+/// resolve to one function.
+///
+/// The module name `compress` (type namespace) and the function name `compress`
+/// (value namespace) coexist without conflict, which is why `[`compress`](mod@compress)`
+/// needs the `mod@` disambiguator in prose but the two `use` items above and below
+/// do not.
+pub use crate::deflate::{compress, compress2};
+
+/// The engine-driving one-call decompression entry points, at the `util` paths
+/// AAP §0.3.1 publishes them under — the [`crate::inflate`] counterparts of the
+/// compression aliases above, held here for the same reason and on the same
+/// terms.
+pub use crate::inflate::{uncompress, uncompress2};
 
 /// Version, compile-flag, and error-string reporting entry points, each paired
 /// with its camelCase C-parity alias (`zlibVersion`, `zlibCompileFlags`,
@@ -155,3 +264,72 @@ pub use uncompress::{uncompress, uncompress2};
 pub use version::{
     z_error, zError, zlib_compile_flags, zlib_version, zlibCompileFlags, zlibVersion,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shared `zutil.h` constants, asserted against their C values.
+    ///
+    /// These are wire-format and ABI values: preservation directive D-2 forbids
+    /// altering them, and a changed value would silently corrupt output rather
+    /// than fail to compile, so each is pinned to the literal from the C header.
+    #[test]
+    fn shared_constants_match_the_c_header() {
+        // zutil.h L87-L89 — DEFLATE block-type tags.
+        assert_eq!(STORED_BLOCK, 0, "STORED_BLOCK (zutil.h L87)");
+        assert_eq!(STATIC_TREES, 1, "STATIC_TREES (zutil.h L88)");
+        assert_eq!(DYN_TREES, 2, "DYN_TREES (zutil.h L89)");
+        // zutil.h L92-L93 — LZ77 match-length bounds.
+        assert_eq!(MIN_MATCH, 3, "MIN_MATCH (zutil.h L92)");
+        assert_eq!(MAX_MATCH, 258, "MAX_MATCH (zutil.h L93)");
+        // zutil.h L96 — FDICT flag bit in the zlib header FLG byte.
+        assert_eq!(PRESET_DICT, 0x20, "PRESET_DICT (zutil.h L96)");
+
+        // The tags are three consecutive values, which is what lets `trees.rs`
+        // emit a block type as `(tag << 1) + last` in three bits.
+        assert_eq!(STATIC_TREES, STORED_BLOCK + 1);
+        assert_eq!(DYN_TREES, STATIC_TREES + 1);
+        // 258 == 3 + 255: the maximum match is representable as the minimum plus
+        // a full byte of extension, which is why the length codes cover it.
+        assert_eq!(MAX_MATCH - MIN_MATCH, 255);
+    }
+
+    /// The expected gzip OS byte for the target this test is compiled for,
+    /// derived from the same `cfg` predicates `OS_CODE` itself uses.
+    ///
+    /// Written as a `cfg`-selected constant rather than a runtime `if` so that
+    /// **every** target gets exactly one value and the assertions below can never
+    /// be vacuous: on a target where no arm applied the constant would not exist
+    /// and the test would fail to compile.
+    #[cfg(windows)]
+    const EXPECTED_OS_CODE: u8 = 10;
+    #[cfg(all(not(windows), target_vendor = "apple"))]
+    const EXPECTED_OS_CODE: u8 = 19;
+    #[cfg(all(not(windows), not(target_vendor = "apple")))]
+    const EXPECTED_OS_CODE: u8 = 3;
+
+    /// `OS_CODE` is the platform value C's `#ifdef` cascade would have selected:
+    /// `10` on Windows (`zutil.h` L156-L158), `19` on Apple (L168-L170), and the
+    /// `3` "assume Unix" fallback otherwise (L187-L189).
+    #[test]
+    fn os_code_is_the_platform_value() {
+        assert_eq!(OS_CODE, EXPECTED_OS_CODE);
+
+        // Cross-check against the cfg cascade a second, independent way, so a
+        // mistake in a single `cfg` attribute cannot make both sides agree.
+        if cfg!(windows) {
+            assert_eq!(OS_CODE, 10, "Windows uses the C WIN32 code");
+        } else if cfg!(target_vendor = "apple") {
+            assert_eq!(OS_CODE, 19, "Apple targets use the C __APPLE__ code");
+        } else {
+            assert_eq!(OS_CODE, 3, "every other target assumes Unix");
+        }
+
+        // Whatever the target, the byte must be one C can produce.
+        assert!(
+            [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13, 16, 18, 19].contains(&OS_CODE),
+            "OS_CODE {OS_CODE} is not one of the codes zutil.h defines"
+        );
+    }
+}

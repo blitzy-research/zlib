@@ -1,0 +1,173 @@
+# Cargo per-project configuration for `zlib-rs`: the documented home for
+# target-specific linker, runner, and rustflags settings (migration gap D7).
+#
+# Section references of the form `AAP 0.8.1` point at the Agent Action Plan for
+# the C-to-Rust migration of zlib 1.3.2.1-motley; the section sign is spelled out
+# so the file stays plain ASCII. Any directive or standard they cite is one of
+# that plan's own commitments, never a user-supplied rule.
+#
+# SCOPE. Cargo binds configuration to a DIRECTORY, not to a package: it walks up
+# from the invocation directory reading a `.cargo/config.toml` at every level,
+# deepest wins per key. This file therefore governs every `cargo` invocation at
+# or below the repository root, including the detached `fuzz/` workspace that the
+# root gates never touch. A global `[build]` or `[env]` setting here would reshape
+# an instrumented nightly `cargo fuzz` build no gate covers, so only per-triple
+# anchors appear below.
+#
+# WHY EVERY TABLE IS EMPTY. An anchor needs a key only for a triple some row
+# LINKS or EXECUTES for. Native rows build and run with their own host linker
+# (`build-test` spans `ubuntu-latest`, `windows-latest`, `macos-latest`); cross
+# rows only type-check and lint (`cross-targets` runs `cargo check` and
+# `cargo clippy` for four triples, `build-script-tests` checks the big-endian arms
+# on `s390x-unknown-linux-gnu`), and neither `check` nor `clippy` links; the
+# bare-metal row only builds, so it needs no `runner`. An override no row
+# exercises is indistinguishable from one that is wrong, so do not add a key
+# speculatively -- and a `linker` or `runner` named here must exist wherever the
+# build runs, or every build becomes a link failure.
+#
+# RUSTFLAGS PRECEDENCE -- the sources do NOT concatenate. Cargo takes rustflags
+# from the first source present and ignores the rest: `RUSTFLAGS` (with
+# `CARGO_ENCODED_RUSTFLAGS` outranking even that), then `target.<triple>.rustflags`
+# / `target.<cfg>.rustflags` (which join with each other but, as one source, still
+# lose to the environment), then `build.rustflags`; `rustdocflags` behaves the same
+# way with `RUSTDOCFLAGS`. Rustflags are part of every unit's fingerprint, so a
+# change forces a full recompile, and under cross-compilation they apply to TARGET
+# artifacts only, leaving host-compiled `build.rs` unconfigurable this way.
+#
+# DO NOT ADD -- each item breaks something specific:
+#  1. No `[build]` table: `target` retargets every invocation in this tree, and
+#     `rustflags`/`rustdocflags` reach every target, reviewed or not.
+#  2. No `[profile.*]` table: a config profile OVERRIDES the manifest's, so it
+#     wins silently over the reviewed settings in `Cargo.toml`.
+#  3. Nothing touching the panic strategy. `Cargo.toml` sets `panic = "abort"` in
+#     both profiles because a stable-toolchain `no_std` `cdylib`/`staticlib` cannot
+#     link an unwinding runtime, and the library's switch is
+#     `#![cfg_attr(all(not(feature = "std"), not(test), panic = "abort"), no_std)]`.
+#     Overriding it drops `#![no_std]` and, with it, the private allocator and
+#     panic handler gated on the same predicate.
+#  4. No codegen tuning -- no `-C target-cpu`/`target-feature`/`opt-level`/`lto`/
+#     `codegen-units`, no `-Z`. Byte-identical compressed output, not throughput,
+#     is this migration's acceptance criterion (AAP 0.8.1 D-1), so a faster build
+#     emitting different bytes is a regression.
+#  5. Nothing weakening a diagnostic -- no `-A`, no `--cap-lints`. The gate is
+#     `cargo clippy --locked --all-targets --all-features -- -D warnings` and stays
+#     exactly that strict. `--locked` is part of the gate, not a convenience:
+#     clippy resolves the graph before it lints, so without it a lint-clean run can
+#     be a run against a resolution no commit contains.
+#  6. No `[alias]` table: an alias shadowing `fmt`/`clippy`/`test`/`doc` can drop
+#     `-D warnings` or `--all-targets` and make a gate look green.
+#  7. No `[env]` table. `[env]` reaches build scripts as well as compilation, here
+#     and in `fuzz/`, so a key here changes what a build script sees without
+#     appearing on any command line -- turning `build.rs`'s explicit, per-invocation
+#     `ZLIB_RS_VERSION_SCRIPT` opt-in into an ambient default for this whole tree.
+#     Pass it on the invocation that wants it.
+#  8. No `[source]`, `[patch]`, `[registries]`, or `[net] offline`: resolution must
+#     not move, `Cargo.lock` must stay byte-identical, and `deny.toml` allows only
+#     the crates.io index.
+#  9. No unstable Cargo key -- it needs `-Z` and a nightly Cargo, breaking the
+#     `msrv` job. Use only keys valid on both the pinned MSRV
+#     (`rust-toolchain.toml`) and current stable.
+# 10. No `runner` for the host triple: it routes the whole host test suite through
+#     a wrapper.
+# 11. Inside `[target.<triple>]`, nothing but `linker`, `runner`, `rustflags`,
+#     `rustdocflags`, `ar`. Neither mistake is loud: Cargo reads a
+#     `[target.<triple>.<name>]` SUB-table as a build-script link override for a
+#     crate declaring `links = "<name>"`, and accepts an unrecognised scalar key
+#     silently. A wrong name does nothing, or something else, never errors.
+# 12. No credentials, tokens, or secrets anywhere under `.cargo/`. `Cargo.toml`'s
+#     `exclude` list does not cover `.cargo/**`, so this file SHIPS in the
+#     published `.crate`.
+# 13. No legacy extensionless `.cargo/config` beside this file; Cargo warns when
+#     both exist.
+#
+# `cargo build --all-targets` is not a usable gate for this crate, independently of
+# anything here: the profiles set `panic = "abort"` while Cargo forces `unwind` for
+# libtest harnesses, so the test targets refuse to link against the abort-strategy
+# library. CI uses `cargo test` and `cargo check --all-targets`.
+#
+# SYMBOL VERSIONING (gap D8) IS WIRED IN `build.rs`, NOT HERE. Only GNU `ld` and
+# `lld` understand `--version-script`: Mach-O's `ld64` wants
+# `-exported_symbols_list` and MSVC's `link.exe` wants a `.def` file, and the
+# upstream C build draws the same boundary. Reproducing `zlib.map` is therefore an
+# opt-in that defaults to off, which is AAP 0.8.2 Divergence 4 -- the exported
+# symbol SET is already exact without it, so a drop-in replacement links, resolves
+# through `pkg-config`, and `LD_PRELOAD`s with no version tags. The wiring belongs
+# in `build.rs` because it must be conditional on a runtime probe (a readable
+# `zlib.map`, an `ld.bfd` on PATH), must generate files into `OUT_DIR` and name
+# them by absolute path, and must be scoped to the `cdylib` alone through
+# `cargo:rustc-cdylib-link-arg`, whereas a `rustflags` or `linker` entry here would
+# push a linker prefix and flavour onto every test and bench binary too.
+#
+# `deny.toml` is NOT a companion list and must not be coupled to these anchors. It
+# sets `[graph] targets = []`, naming no platform at all, deliberately: an empty
+# list makes cargo-deny evaluate every crate for EVERY platform, so no target-gated
+# crate escapes licence and ban review. Naming triples there PRUNES the graph --
+# measured, a nine-triple list cuts coverage from 89 crates to 86, dropping the
+# `spirv`-only and `uefi`-only leaves.
+
+[target.x86_64-unknown-linux-gnu]
+# Host triple of local development and of every `ubuntu-latest` CI job. Empty so
+# the host build uses stock defaults, which is what keeps the gates reproducible
+# and the compressed output byte-identical to reference zlib.
+
+[target.aarch64-unknown-linux-gnu]
+# Cross type-checked by `cross-targets`, which links nothing and runs nothing.
+# This is the anchor most likely to need wiring first, because the two things
+# `check` omits are exactly the two a key would supply: a linking cross build
+# wants an `aarch64-linux-gnu` linker, and executing these tests under emulation
+# wants a `qemu-aarch64` runner.
+
+[target.x86_64-pc-windows-msvc]
+# Reached natively by `build-test`'s `windows-latest` row and cross type-checked
+# with `--all-features` by `cross-targets`; neither lane links from a foreign host,
+# so neither needs a key. Anchored because it is the only triple that COMPILES two
+# Windows-only paths: `gzopen_w` in `src/ffi/gz.rs`, the single
+# `#[cfg(windows)]`-gated symbol behind 96 declared `#[unsafe(no_mangle)]`
+# functions against 95 emitted `T` symbols on Linux; and the `#[cfg(windows)]` arm
+# of `src/util/mod.rs`'s `OS_CODE`, which the gzip encoder consumes as
+# `put_byte(s, OS_CODE)` exactly as `deflate.c` does. Emitting an OS byte of `10`
+# here instead of `3` is correct, not a byte-identity defect: C's `zutil.h` selects
+# the same platform value, and byte identity (AAP 0.8.1 D-1) is defined against a
+# reference C library built for the SAME target. `zlib.map` is inapplicable here in
+# any case -- `link.exe` uses `.def` files.
+
+[target.aarch64-apple-darwin]
+# The triple `build-test`'s `macos-latest` row builds and tests for; that row
+# asserts `host: aarch64-apple-darwin` against `rustc -vV`, so naming it here is a
+# checked fact. A native runner needs no key. The row compiles the
+# `cfg(all(not(windows), target_vendor = "apple"))` arm of `OS_CODE` (emitting `19`,
+# as a macOS-built reference `libz` does) and is the only place `O_NONBLOCK` takes
+# its BSD value. As with MSVC, `zlib.map` does not apply: `ld64` has no
+# `--version-script`.
+
+[target.thumbv7em-none-eabihf]
+# Bare-metal Cortex-M4F target for the `no_std` validation (D10), built by
+# `bare-metal-no-std`. Build-only -- there is no host to run libtest on -- so no
+# `runner`, and no `linker` either: this row exercises the private libc-backed
+# global allocator and abort panic handler in `src/lib.rs`, which resolve against
+# `malloc`/`calloc`/`realloc`/`free`/`posix_memalign`, and a library build links no
+# final binary, so those references are correctly left undefined. A freestanding
+# libc linker (`arm-none-eabi` GCC with newlib) would be needed only if a row ever
+# linked an executable for this target. The residual gap this row does not close is
+# EXECUTION on real hardware.
+
+# BIG-ENDIAN: no big-endian triple is anchored, even though `build-script-tests`
+# and a `cross-targets` row both compile for `s390x-unknown-linux-gnu`. An anchor
+# is only ever needed for a `linker` or a `runner`, and a cross `cargo check`
+# supplies neither, so the entry would carry no key and change no behaviour. Add a
+# sixth anchor only if a big-endian triple is promoted to a row that LINKS or
+# EXECUTES.
+#
+# The two halves of endian handling differ, so be precise about what is covered.
+# `build.rs` performs no host or target detection: it emits BOTH braid table
+# families unconditionally -- `CRC_TABLE`/`CRC_BRAID_TABLE` for little-endian and
+# `CRC_BIG_TABLE`/`CRC_BRAID_BIG_TABLE` for big-endian -- so its output is
+# byte-identical on every platform. `src/checksum/crc32.rs` then chooses between
+# those families with `cfg!(target_endian)`, which is a compile-time constant for
+# the target being built: the unselected arm and its tables are dropped during
+# compilation rather than tested for at run time, so a big-endian target compiles
+# code and table indices a little-endian target never contains. Both are
+# type-checked today (`s390x-unknown-linux-gnu` is cross-checked in two jobs) and
+# `src/checksum/crc32.rs` asserts anchors from both generated families on every
+# target; what remains uncovered is EXECUTION of the big-endian arm, which is the
+# residual gap AAP 0.6.6 records and gap D3 exists to close.

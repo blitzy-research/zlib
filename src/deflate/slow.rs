@@ -174,7 +174,11 @@ pub fn deflate_slow(s: &mut DeflateState, io: &mut IoContext, flush: i32) -> Blo
 
         // Find the longest match, discarding those <= prev_length.
         s.prev_length = s.match_length;
-        s.prev_match = s.match_start as u16;
+        // C `deflate.c` L1985 copies `match_start` into `prev_match` at full
+        // width (`uInt` into `IPos`, both `unsigned`). The copy must not narrow:
+        // see the `DeflateState::prev_match` documentation for why a wrapped
+        // `match_start` still yields the correct distance below.
+        s.prev_match = s.match_start;
         s.match_length = MIN_MATCH - 1;
 
         if hash_head != NIL as usize
@@ -211,7 +215,16 @@ pub fn deflate_slow(s: &mut DeflateState, io: &mut IoContext, flush: i32) -> Blo
             // Emit the previous match. Its distance is `strstart - 1 -
             // prev_match` (the match started one position back) and its length
             // code is `prev_length - MIN_MATCH`.
-            let dist = s.strstart - 1 - (s.prev_match as usize);
+            //
+            // C evaluates this in wrapping `unsigned` arithmetic (`deflate.c`
+            // L2019). The wrapping is load-bearing: `fill_window` slides the
+            // window by subtracting `w_size` from both `strstart` and
+            // `match_start` (`deflate.c` L288), and `match_start` is allowed to
+            // be stale and therefore to wrap. Because both operands are reduced
+            // by the same amount on every slide, the wrap cancels and the
+            // difference is the true distance. Reproducing that here keeps the
+            // emitted distance identical to reference zlib for every input.
+            let dist = s.strstart.wrapping_sub(1).wrapping_sub(s.prev_match);
             let len_code = (s.prev_length - MIN_MATCH) as u8;
             let bflush = trees::_tr_tally_dist(s, dist, len_code);
 
@@ -221,17 +234,36 @@ pub fn deflate_slow(s: &mut DeflateState, io: &mut IoContext, flush: i32) -> Blo
             // hash table.
             s.lookahead -= s.prev_length - 1;
             s.prev_length -= 2;
-            loop {
-                s.strstart += 1;
-                if s.strstart <= max_insert {
-                    let str_idx = s.strstart;
-                    s.insert_string(str_idx);
-                }
-                s.prev_length -= 1;
-                if s.prev_length == 0 {
-                    break;
-                }
-            }
+
+            // C's `do { if (++s->strstart <= max_insert) INSERT_STRING(s,
+            // s->strstart, hash_head); } while (--s->prev_length != 0);` walks the
+            // `run` consecutive positions `strstart + 1 ..= strstart + run` in
+            // ascending order, inserting only those at or below `max_insert`, and
+            // leaves `prev_length` at zero.
+            //
+            // `max_insert` is fixed for the whole run (it was computed above from
+            // the pre-decrement `lookahead`), so the guard is monotone over an
+            // ascending index and the inserted positions are exactly the prefix
+            // `first ..= min(first + run - 1, max_insert)`. The bulk form inserts
+            // that prefix in the same order with the same `prev`-before-`head`
+            // write order, so the chain topology — and therefore the emitted
+            // token stream — is unchanged (AAP §0.6.4 decision (c)); it merely
+            // materializes the three window buffers once for the run instead of
+            // once per position (§0.6.3).
+            //
+            // `prev_length >= MIN_MATCH` on this branch, so `run >= 1` and the
+            // run is never empty, exactly as C's do-while always executes once.
+            let run = s.prev_length;
+            let first = s.strstart + 1;
+            let inserted = if max_insert >= first {
+                core::cmp::min(run, max_insert - first + 1)
+            } else {
+                0
+            };
+            s.insert_string_run(first, inserted);
+            s.strstart += run;
+            s.prev_length = 0;
+
             s.match_available = false;
             s.match_length = MIN_MATCH - 1;
             s.strstart += 1;

@@ -9,25 +9,34 @@
 //!
 //! # Unsafe policy
 //!
-//! `src/inflate/fast.rs` is the *only* file in `src/inflate/` that is permitted
-//! to contain `unsafe`, and only for hot-path bounds-check elision. Per the
-//! project's "prefer a fully-safe implementation first" directive, this port is
-//! written entirely in **safe Rust**: it uses bounds-checked slice indexing
+//! This module contains **zero `unsafe`**, as does every other file in
+//! `src/inflate/`. In this crate `unsafe` is confined to `src/ffi/**` and the
+//! private no-`std` runtime-support block of `src/lib.rs` (AAP §0.6.2,
+//! preservation directive D-6); the crate root's `#![deny(unsafe_code)]` makes
+//! that boundary a compile-time guarantee. This port is written entirely in
+//! **safe Rust**: it uses bounds-checked slice indexing
 //! throughout. The entry contract documented on [`inflate_fast`] guarantees
 //! that at most six input bytes and at most 258 output bytes are touched per
 //! loop iteration, so — for a well-formed stream honoring that contract — the
-//! bounds checks never fail. Should profiling ever justify unchecked indexing,
-//! this module is the designated (and sole) location for it, and every such
-//! block must carry a `// SAFETY:` justification. None is required today.
+//! bounds checks never fail. Unchecked indexing is *not* available here, and it
+//! is not warranted either: introducing it would violate User Constraint 3 ("zero
+//! unsafe blocks in core compression logic") and fail the crate-root
+//! `#![deny(unsafe_code)]`. Where per-byte checking did cost measurable
+//! throughput — the overlapping back-reference copy — the answer was a better
+//! *algorithm* rather than unchecked access: `copy_within_output` moves whole
+//! blocks with one bounds check each instead of one per byte. This module carries
+//! no `// SAFETY:` justification and needs none.
 //!
 //! # Byte-exact output
 //!
 //! The decode sequence, the bit-refill schedule, and — crucially — the
 //! *overlapping* LZ77 back-reference copy are reproduced exactly so that output
-//! is byte-identical to reference zlib (AAP §0.6.4, §0.7.1). The overlapping
-//! copy (when `dist < len`) is performed forward, one byte at a time, so that
-//! freshly written bytes are re-read; a `memcpy`/`copy_from_slice` would be
-//! incorrect there.
+//! is byte-identical to reference zlib (AAP §0.6.4, §0.8.1 directive D-1). The
+//! overlapping copy (when `dist < len`) must re-read freshly written bytes, so a
+//! single `copy_from_slice`/`copy_within` over the whole run would be *incorrect*
+//! there; `copy_within_output` instead materializes the periodic run in
+//! geometrically growing blocks that provably read only already-final bytes, and
+//! documents the equivalence with C's byte loop in full.
 
 use crate::inflate::state::{InflateMode, InflateState};
 use crate::inflate::tables::Code;
@@ -84,10 +93,31 @@ const INFLATE_FAST_MIN_OUTPUT: usize = 258;
 /// * `input.len() - *in_pos >= 6` (at least six input bytes available)
 /// * `output.len() - *out_pos >= 258` (at least 258 output bytes available)
 /// * `start >= output.len() - *out_pos` (`start` ≥ current `avail_out`)
-/// * `state.bits < 8`
 ///
 /// These invariants are what make the bounds-checked indexing provably
 /// panic-free for a well-formed stream, and are asserted in debug builds.
+///
+/// The C header comment additionally lists `state->bits < 8` among its entry
+/// assumptions (`inffast.c` L29). That one is **prose only: C never enforces it,
+/// and the C driver does not in fact guarantee it.** The driver's own slow-path
+/// code lookups pull *whole speculative bytes* — `for (;;) { here =
+/// lencode[BITS(lenbits)]; if (here.bits <= bits) break; PULLBYTE(); }`
+/// (`inflate.c` L924-L928, and identically at L976-L980 for the distance code) —
+/// and then drop only the width of the code actually decoded (`DROPBITS(here.bits)`,
+/// `inflate.c` L940 / L992). A short code decoded after a speculative pull
+/// therefore leaves a whole buffered byte, and the very next `case LEN` iteration
+/// re-enters this routine as soon as `have >= 6 && left >= 258` (`inflate.c`
+/// L914-L922) — with `bits >= 8`. The same is true across an `inflate()` call
+/// boundary, since the driver's `inf_leave` epilogue does not normalize `bits` the
+/// way this routine's does. Reference C decodes such streams byte-exactly, so
+/// entering with a whole buffered byte is ordinary rather than exceptional.
+///
+/// The real invariant — the one this loop depends on and the one asserted below —
+/// is that `hold` carries `bits` valid bits with `bits <= 32`, the capacity of the
+/// `u32` accumulator. Asserting the stricter C comment instead would abort debug
+/// builds on valid input, so it is deliberately not asserted; the epilogue that
+/// returns whole buffered bytes to the input is written to stay correct for
+/// `bits >= 8` as well.
 ///
 /// # Return value
 ///
@@ -127,7 +157,15 @@ pub fn inflate_fast(
         output.len() - *out_pos >= INFLATE_FAST_MIN_OUTPUT,
         "inflate_fast entry: at least {INFLATE_FAST_MIN_OUTPUT} output bytes required"
     );
-    debug_assert!(state.bits < 8, "inflate_fast entry: state.bits must be < 8");
+    // The accumulator invariant: `hold` carries `bits` valid bits and `bits`
+    // never exceeds the width of the `u32` holding them. C's header comment also
+    // claims `state->bits < 8` on entry, but nothing in C enforces or guarantees
+    // that (see the `# Entry assumptions` note above) — entering with a whole
+    // buffered byte is normal, so asserting it would abort on valid input.
+    debug_assert!(
+        state.bits <= 32,
+        "inflate_fast entry: state.bits must be <= 32 (u32 accumulator capacity)"
+    );
     debug_assert!(
         start >= output.len() - *out_pos,
         "inflate_fast entry: start must be >= avail_out"
@@ -384,12 +422,40 @@ pub fn inflate_fast(
     }
 
     // ---- epilogue: return unused whole bytes to the input (C L290-L294) ------
-    // On entry `bits < 8`, so backing up over the whole bytes we buffered never
-    // moves `in_idx` before where it started.
-    let unused = (bits >> 3) as usize;
-    in_idx -= unused;
-    bits -= (unused as u32) << 3;
-    hold &= (1u32 << bits) - 1;
+    // C is `len = bits >> 3; in -= len; bits -= len << 3; hold &= (1U << bits) - 1;`
+    // — an unconditional rewind of a raw pointer, justified by the comment-only
+    // claim that `bits < 8` on entry. That claim is *not* enforced by the C driver:
+    // entering with whole bytes already buffered is ordinary (`inflatePrime` alone
+    // guarantees it), and C then moves `in` to before `strm->next_in`, handing back
+    // bytes that a previous call consumed. It never dereferences them, so C gets
+    // away with it.
+    //
+    // `in_idx` is an index into `input`, so "before the slice" is not expressible
+    // here. The rewind is therefore split in two:
+    //
+    // * `give` — the part that lands inside `input`. Bounded by `in_idx` (index
+    //   zero), NOT by the fast-path entry offset: every byte of `input` already
+    //   consumed by *this* `inflate` call is legitimately returnable, and bounding
+    //   by the entry offset was under-returning on exactly those bytes.
+    // * `rewound` — the remainder, which belongs to the caller's buffer *behind*
+    //   `input`. Only a caller whose buffer really extends backwards can honour it,
+    //   so it is published in `state.rewound` for the C ABI boundary to apply to
+    //   `next_in`/`avail_in`/`total_in` (see `inflate_take_input_history_rewind`).
+    //
+    // The bits for `rewound` deliberately stay in `hold` here. Dropping them would
+    // desynchronise the bitstream for any caller that cannot re-feed the bytes they
+    // came from; the boundary drops them at the same moment it moves the pointer
+    // back, so the two halves of C's `in -= len; bits -= len << 3;` pair always
+    // commit together.
+    let owed = (bits >> 3) as usize;
+    let give = owed.min(in_idx);
+    in_idx -= give;
+    bits -= (give as u32) << 3;
+    state.rewound = (owed - give) as u32;
+    // `bits == 32` (a completely full accumulator) makes `1u32 << bits` overflow,
+    // so the all-ones mask is produced without shifting: `checked_shl` yields
+    // `None`, and `0u32.wrapping_sub(1)` is `u32::MAX`.
+    hold &= 1u32.checked_shl(bits).unwrap_or(0).wrapping_sub(1);
 
     // ---- RESTORE: write locals back into the state and the caller's cursors --
     state.hold = hold;
@@ -417,25 +483,75 @@ fn copy_from_window(output: &mut [u8], out: &mut usize, window: &[u8], wpos: usi
 }
 
 /// Copies `n` bytes within `output` from `src` to `*out`, advancing `*out` by
-/// `n`.
+/// `n`, reproducing the LZ77 back-reference semantics of C's forward
+/// byte-at-a-time `do { *out++ = *from++; } while (--len);`.
 ///
-/// The copy is performed forward, one byte at a time, so it is correct for the
-/// overlapping LZ77 back-references that make `dist < n` meaningful: each byte
-/// is read only after all nearer bytes have been written, so a short-distance
-/// reference correctly repeats the just-written pattern. A `copy_within` /
-/// `copy_from_slice` (memmove/memcpy) would be *incorrect* here because it would
-/// not observe the freshly written bytes.
+/// # Why this is not a plain `copy_within`
+///
+/// The reference is *self-observing* whenever `dist = *out - src` is smaller
+/// than `n`: byte `d + dist` must read the byte just written at `d`, so the
+/// pattern of `dist` bytes repeats. A single `copy_within` (a `memmove`) would
+/// copy the pre-existing bytes instead and produce different output, which is why
+/// the naive spelling is wrong here.
+///
+/// # Strategy (byte-for-byte equivalent to the C byte loop)
+///
+/// Reference `inffast.c` L236-L259 does not copy byte-at-a-time either — it runs
+/// a 3-way-unrolled pointer copy. This port goes one step further and moves whole
+/// blocks, which is what closes the measured gap against C on the short-distance
+/// range that dominates real streams (distances 3-24; see the module header). All
+/// three arms below emit exactly the bytes the C loop emits:
+///
+/// * `dist == 1` — every output byte equals `output[src]`, so the run is a
+///   `memset`. This is the RLE case and by far the cheapest.
+/// * `dist >= n` — the source range `[src, src + n)` ends at or before `*out`, so
+///   nothing self-observes: one `copy_within` (a `memmove` over disjoint ranges)
+///   is exactly the byte loop. This covers every *non*-overlapping match, which
+///   is the common case for ordinary text.
+/// * otherwise — the run is periodic with period `dist`, and it is materialized
+///   in geometrically growing blocks. With `copied` bytes already written, the
+///   already-final bytes form the run `output[src .. *out + copied]`, whose length
+///   is `dist + copied`; copying `chunk = min(dist + copied, n - copied)` bytes
+///   from `src` to `*out + copied` therefore reads **only already-final bytes**
+///   (the source range ends at or before the destination start, so the two ranges
+///   are disjoint and `copy_within` is exact). Correctness of each individual byte
+///   needs the source to be the periodic continuation, i.e. `copied` must be a
+///   multiple of `dist`: it is, because `chunk` is `dist` on the first pass and
+///   `dist + copied` (itself a multiple) on every later pass — the only pass that
+///   can break the multiple is the one truncated by `n - copied`, and that pass
+///   ends the loop. The block size doubles every pass, so at most
+///   `log2(n / dist) + 1` moves are issued (nine for the worst case
+///   `n = 258, dist = 2`).
+///
+/// # Panics
+///
+/// Panics if `src >= *out` (not a back-reference) or if `*out + n` exceeds
+/// `output.len()`, both of which are prevented by [`inflate_fast`]'s entry
+/// contract. `src < *out` is the invariant that makes `dist` non-zero.
 #[inline]
 fn copy_within_output(output: &mut [u8], out: &mut usize, src: usize, n: usize) {
-    let mut d = *out;
-    let mut s = src;
-    let end = d + n;
-    while d < end {
-        output[d] = output[s];
-        d += 1;
-        s += 1;
+    let d = *out;
+    debug_assert!(
+        src < d,
+        "copy_within_output: a back-reference must start strictly before the write cursor"
+    );
+    let dist = d - src;
+
+    if dist == 1 {
+        // RLE run: one byte repeated `n` times (a `memset`).
+        let b = output[src];
+        output[d..d + n].fill(b);
+    } else {
+        // One pass when `dist >= n` (disjoint ranges), geometric growth otherwise.
+        let mut copied = 0usize;
+        while copied < n {
+            let chunk = core::cmp::min(dist + copied, n - copied);
+            output.copy_within(src..src + chunk, d + copied);
+            copied += chunk;
+        }
     }
-    *out = d;
+
+    *out = d + n;
 }
 
 #[cfg(test)]
@@ -800,5 +916,294 @@ mod tests {
         assert_eq!(msg, Some("invalid distance too far back"));
         // Only the single literal was emitted before the error.
         assert_eq!(out, b"x");
+    }
+
+    /// Like [`decode_fast`], but enters the loop the way the driver actually does
+    /// after speculatively pulling whole bytes into the bit accumulator:
+    /// `prebuffered` bytes beyond the header byte are already sitting in `hold`,
+    /// so entry `bits` is `5 + 8 * prebuffered` rather than `5`.
+    ///
+    /// `input` is the slice the routine may address and `in_pos` its starting
+    /// cursor within it, so a caller can also model the case where the buffered
+    /// bits came from a *previous* input buffer (`in_pos == 0`).
+    ///
+    /// Returns the decoded bytes, the exit mode, any error message, and the final
+    /// `(in_pos, bits)` pair — from which the total number of stream bits consumed
+    /// is `in_pos * 8 - bits`.
+    fn decode_fast_prebuffered(
+        state: &mut InflateState,
+        prebuffer: &[u8],
+        input: &[u8],
+        in_pos_start: usize,
+        out_cap: usize,
+    ) -> (Vec<u8>, InflateMode, Option<&'static str>, usize, u32) {
+        // Three header bits consumed out of `prebuffer[0]`, then every remaining
+        // `prebuffer` byte pulled whole on top. `hold` therefore carries exactly
+        // `bits` valid bits with all higher bits clear — the accumulator invariant.
+        state.hold = (prebuffer[0] as u32) >> 3;
+        state.bits = 5;
+        for &byte in &prebuffer[1..] {
+            state.hold |= (byte as u32) << state.bits;
+            state.bits += 8;
+        }
+        let mut in_pos = in_pos_start;
+        let mut output = alloc::vec![0u8; out_cap];
+        let mut out_pos = 0usize;
+        let start = output.len();
+        let msg = inflate_fast(
+            state,
+            input,
+            &mut in_pos,
+            &mut output,
+            &mut out_pos,
+            start,
+            &LENFIX,
+            &DISTFIX,
+        );
+        let mode = state.mode;
+        output.truncate(out_pos);
+        (output, mode, msg, in_pos, state.bits)
+    }
+
+    /// Entering with a whole buffered byte or more must decode identically.
+    ///
+    /// C's `inffast.c` header comment lists `state->bits < 8` as an entry
+    /// assumption, but nothing in C enforces it and the C driver does not provide
+    /// it: its slow-path code lookups pull whole speculative bytes
+    /// (`inflate.c` L924-L928) and then drop only the width of the code actually
+    /// decoded (`inflate.c` L940), so `case LEN` can re-enter this routine with
+    /// `bits >= 8`. This pins that case.
+    ///
+    /// The strong invariant asserted here is that the *total stream bits consumed*
+    /// — `in_pos * 8 - bits` on return — is identical no matter how many whole
+    /// bytes were pre-buffered on entry. That can only hold if the epilogue hands
+    /// back exactly the bytes it may (never more than this call pulled, so the
+    /// input index cannot move behind where it started) and keeps `hold`/`bits`
+    /// mutually consistent. Output equality alone would not catch a lost or
+    /// double-counted byte at the boundary.
+    #[test]
+    fn decodes_identically_when_entered_with_whole_buffered_bytes() {
+        // A mixed token stream: literals, an overlapping match, a long match with
+        // length extra bits, and a wide distance — so the loop takes the literal,
+        // second-level-free length, distance-extra and copy paths before the
+        // end-of-block code. The 32-byte pad keeps at least six input bytes
+        // available for the duration, which is this routine's real entry
+        // requirement.
+        let tokens = [
+            Tok::Lit(b'z'),
+            Tok::Lit(b'l'),
+            Tok::Lit(b'i'),
+            Tok::Lit(b'b'),
+            Tok::Match(4, 4),
+            Tok::Lit(0xC3),
+            Tok::Match(24, 3),
+            Tok::Lit(b'!'),
+            Tok::Match(131, 9),
+        ];
+        let stream = encode_fixed_block(&tokens, 32);
+
+        // Baseline: the C-documented entry condition (`bits == 5`, i.e. < 8).
+        let mut base_state = primed_fixed_state();
+        let (baseline_out, baseline_mode, baseline_msg, base_in, base_bits) =
+            decode_fast_prebuffered(&mut base_state, &stream[..1], &stream, 1, 1024);
+        let baseline_consumed = base_in * 8 - base_bits as usize;
+        assert_eq!(
+            baseline_msg, None,
+            "the baseline stream must decode cleanly"
+        );
+        assert_eq!(
+            baseline_mode,
+            InflateMode::Type,
+            "must stop at end-of-block"
+        );
+        assert!(
+            !baseline_out.is_empty(),
+            "the baseline must actually produce output"
+        );
+        // C normalizes the accumulator to under one whole byte on exit, and with
+        // nothing carried in the port must do exactly the same.
+        assert!(
+            base_bits < 8,
+            "with no bytes carried in, exit bits must be < 8, got {base_bits}",
+        );
+
+        // `prebuffered` pushes entry `bits` to 13, 21 and 29 respectively —
+        // spanning one, two and three whole buffered bytes, the range the driver
+        // can reach with a `u32` accumulator.
+        for prebuffered in 1..=3usize {
+            let mut state = primed_fixed_state();
+            // The header byte plus `prebuffered` whole bytes are already in the
+            // accumulator, so the routine receives its cursor just past them.
+            let entry_in_pos = prebuffered + 1;
+            let (out, mode, msg, in_pos, bits) = decode_fast_prebuffered(
+                &mut state,
+                &stream[..entry_in_pos],
+                &stream,
+                entry_in_pos,
+                1024,
+            );
+            let entry_bits = 5 + 8 * prebuffered;
+            assert_eq!(msg, None, "entry bits = {entry_bits}: must decode cleanly");
+            assert_eq!(
+                mode, baseline_mode,
+                "entry bits = {entry_bits}: exit mode must match the baseline",
+            );
+            assert_eq!(
+                out, baseline_out,
+                "entry bits = {entry_bits}: output must be byte-identical",
+            );
+            assert_eq!(
+                in_pos * 8 - bits as usize,
+                baseline_consumed,
+                "entry bits = {entry_bits}: total stream bits consumed must match \
+                 the baseline — the epilogue must neither lose nor double-count \
+                 a buffered byte",
+            );
+            // The cursor may never be handed back behind where this call received
+            // it: those bytes belong to whatever ran before.
+            assert!(
+                in_pos >= entry_in_pos,
+                "entry bits = {entry_bits}: in_pos went behind its entry value",
+            );
+            // At most the whole bytes carried in may still be buffered on exit;
+            // with `prebuffered == 0` this degenerates to C's `bits < 8`.
+            assert!(
+                (bits as usize) / 8 <= prebuffered,
+                "entry bits = {entry_bits}: exit bits {bits} keeps more whole bytes \
+                 buffered than were carried in",
+            );
+        }
+    }
+
+    /// The epilogue splits C's give-back into an in-slice move and a recorded
+    /// residue; it must never underflow the slice, and must never *lose* the debt.
+    ///
+    /// C's byte-return step is `len = bits >> 3; in -= len;` (`inffast.c` L291),
+    /// justified solely by its unenforced `bits < 8` entry claim. When bits *are*
+    /// carried in — which happens across an `inflate()` call boundary, because the
+    /// driver's `inf_leave` does not normalize `bits` the way this routine's
+    /// epilogue does — C walks `strm->next_in` *behind* the buffer the caller
+    /// handed to this call, into bytes an earlier call consumed. A Rust slice index
+    /// cannot go there, so the part that fits moves `in_pos` and the remainder is
+    /// recorded in [`InflateState::rewound`] for the driver to settle against the
+    /// caller's `z_stream` (`crate::inflate::inflate_take_input_history_rewind`).
+    ///
+    /// Discarding that remainder — the obvious "clamp and move on" reading — is a
+    /// silent divergence: a C caller observes `next_in` before its own buffer,
+    /// `avail_in` *larger* than it passed in, and a `total_in` that wrapped at
+    /// 2^32. Only the pairing is what makes the split sound; the bits backing the
+    /// residue deliberately stay in `hold` so both halves of C's
+    /// `in -= len; bits -= len << 3;` still commit together.
+    ///
+    /// The stream is chosen so the loop pulls **nothing** (29 bits carried in cover
+    /// both the literal and the end-of-block code), leaving `in_pos == 0` with a
+    /// whole byte still buffered — the exact case in which C's unclamped
+    /// `in_pos -= 1` would underflow: a subtract-overflow panic in a debug build,
+    /// and in a release build a wrapped `usize` the driver then indexes with.
+    #[test]
+    fn give_back_never_underflows_the_slice_and_records_the_residue() {
+        // One literal plus end-of-block: 3 header + 8 literal + 7 EOB = 18 bits.
+        // The pad guarantees the six addressable input bytes this routine requires
+        // even after four bytes have been set aside as the "previous" buffer.
+        let stream = encode_fixed_block(&[Tok::Lit(b'Q')], 16);
+        let prebuffer = &stream[..4]; // header byte + 3 whole bytes => 29 bits
+        let input = &stream[4..];
+        assert!(
+            input.len() >= INFLATE_FAST_MIN_INPUT,
+            "the fixture must still satisfy the six-input-byte entry requirement",
+        );
+
+        let mut state = primed_fixed_state();
+        let (out, mode, msg, in_pos, bits) =
+            decode_fast_prebuffered(&mut state, prebuffer, input, 0, 1024);
+
+        assert_eq!(msg, None, "the stream must decode cleanly");
+        assert_eq!(mode, InflateMode::Type, "must stop at end-of-block");
+        assert_eq!(out, b"Q", "the literal must be emitted");
+        assert_eq!(
+            in_pos, 0,
+            "no addressable input byte was pulled, so none may be moved out of the \
+             slice; index zero is the floor",
+        );
+        // The block header was consumed setting the state up, so this call spends
+        // 8 (literal) + 7 (end-of-block) = 15 of the 29 bits carried in, leaving
+        // 14 buffered — and none of the 29 came from `input`.
+        assert_eq!(
+            bits,
+            29 - 15,
+            "the bits still buffered must be exactly those the decode did not use",
+        );
+        // 14 buffered bits is one whole byte owed. `in_pos` could not absorb it, so
+        // the whole debt must be recorded rather than dropped: this is the
+        // assertion that distinguishes the C-faithful split from a silent clamp.
+        assert_eq!(
+            state.rewound, 1,
+            "the give-back that did not fit in the slice must be recorded for the \
+             driver to settle",
+        );
+        // The residue's bits stay in `hold` until settlement, so the pair
+        // `in -= len; bits -= len << 3;` is still applied atomically.
+        assert_eq!(
+            (bits / 8) as usize,
+            state.rewound as usize,
+            "every recorded byte must still be backed by whole bits in the \
+             accumulator",
+        );
+    }
+
+    /// The reference model for [`copy_within_output`]: C's forward
+    /// byte-at-a-time back-reference copy,
+    /// `do { *out++ = *from++; } while (--len);` (`inffast.c` L236-L259 in its
+    /// unrolled form, semantically one byte at a time).
+    fn byte_loop_reference(output: &mut [u8], out: &mut usize, src: usize, n: usize) {
+        let mut d = *out;
+        let mut s = src;
+        let end = d + n;
+        while d < end {
+            output[d] = output[s];
+            d += 1;
+            s += 1;
+        }
+        *out = d;
+    }
+
+    /// The block-moving [`copy_within_output`] must be *byte-for-byte* the C
+    /// byte loop for every distance and length a DEFLATE stream can produce —
+    /// this is the property byte-identity (AAP §0.8.1 directive D-1) rests on,
+    /// so it is checked exhaustively rather than sampled.
+    ///
+    /// Coverage: every distance `1..=64` (which spans the `dist == 1` RLE arm,
+    /// the geometric arm for `dist < n`, and the single-move arm for
+    /// `dist >= n`) crossed with every length `0..=MAX_MATCH`, i.e. 16,576
+    /// cases, plus the maximum coded distance 32,768.
+    #[test]
+    fn copy_within_output_is_byte_identical_to_the_c_byte_loop() {
+        /// A deterministic, non-repeating prefix so a wrong source offset
+        /// cannot accidentally produce the right bytes.
+        fn seed(buf: &mut [u8]) {
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+            }
+        }
+
+        const PRE: usize = 40_000; // > 32_768 so the maximum distance fits
+        for dist in (1..=64usize).chain([1 << 15]) {
+            for n in 0..=INFLATE_FAST_MIN_OUTPUT {
+                let mut got = alloc::vec![0u8; PRE + INFLATE_FAST_MIN_OUTPUT];
+                seed(&mut got[..PRE]);
+                let mut want = got.clone();
+
+                let mut out_got = PRE;
+                let mut out_want = PRE;
+                copy_within_output(&mut got, &mut out_got, PRE - dist, n);
+                byte_loop_reference(&mut want, &mut out_want, PRE - dist, n);
+
+                assert_eq!(out_got, out_want, "cursor mismatch (dist={dist}, n={n})");
+                assert_eq!(
+                    got, want,
+                    "output mismatch against the C byte loop (dist={dist}, n={n})",
+                );
+            }
+        }
     }
 }

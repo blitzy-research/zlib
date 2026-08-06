@@ -48,10 +48,16 @@
 /// 01000000 - invalid code  (64)
 /// ```
 ///
-/// Each entry is exactly four bytes. The `#[repr(C)]` layout
-/// `{ op: u8, bits: u8, val: u16 }` is required so that the FFI layer and the
-/// statically generated fixed tables (`inffixed.h` → `fixed.rs`) share an
-/// identical memory representation.
+/// Each entry is exactly four bytes. `#[repr(C)]` pins the field order and
+/// padding of `{ op: u8, bits: u8, val: u16 }` to the retained C `struct code`
+/// (`inftrees.h` L27-L31), so the port's decode tables have the same layout and
+/// the same four-byte size as the C ones. That is what makes the statically
+/// generated fixed tables (`inffixed.h` → `fixed.rs`) transcribable entry for
+/// entry, and it lets a decode table be diffed against the C oracle's during
+/// cross-validation. This type is *not* exposed across the FFI boundary — no
+/// module under `src/ffi/` references `Code`, because `zlib.h` keeps the decode
+/// tables entirely inside the opaque `internal_state` — so the layout guarantee
+/// is about C *parity*, not about an ABI contract.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Code {
@@ -86,14 +92,14 @@ pub const ENOUGH_DISTS: usize = 592;
 
 /// Maximum total number of decode-table entries: `ENOUGH_LENS + ENOUGH_DISTS`.
 ///
-/// This equals **1444** (852 + 592). Decode-table arenas (e.g.
-/// `InflateState.codes: [Code; ENOUGH]`) must be sized to this value to match
-/// the C memory footprint and the table-overflow checks in [`inflate_table`].
-///
-/// NOTE (blueprint correction): `doc/technical-specifications.md` §0.5.1
-/// erroneously states `ENOUGH = 2048`. The verified `inftrees.h` source value
-/// is **1444**; that is what is used here so the overflow guards and memory
-/// layout match reference zlib exactly.
+/// This equals **1444** (852 + 592), the value `inftrees.h` derives at L38-L48
+/// and fixes in the L49-L51 macros, and which AAP §0.6.6 records for all three
+/// constants. Decode-table arenas (e.g. `InflateState.codes: [Code; ENOUGH]`)
+/// must be sized to exactly this value: understating it lets an adversarial
+/// stream overflow the arena, overstating it wastes memory on every stream, and
+/// preservation directive D-2 forbids altering it in either direction.
+/// [`inflate_table`] enforces the bound directly through its table-overflow
+/// checks.
 pub const ENOUGH: usize = ENOUGH_LENS + ENOUGH_DISTS;
 
 /// The type of code to build for [`inflate_table`].
@@ -166,9 +172,11 @@ const DEXT: [u16; 32] = [
 ///
 /// The code lengths are `lens[0..codes]`; each length corresponds to symbol
 /// `0..codes`. A length of `0` means the symbol does not occur in the code; a
-/// length of `1..=MAXBITS` is that code's length. This routine assumes (but
-/// does not check) that every entry in `lens` is in `0..=MAXBITS`; the caller
-/// must guarantee that.
+/// length of `1..=MAXBITS` is that code's length. Unlike the C routine — which
+/// documents these as unchecked caller obligations and indexes blindly — this
+/// port validates them and reports a typed error, because it is a *public* safe
+/// function reachable by arbitrary Rust callers (see
+/// [Input validation](#input-validation)).
 ///
 /// The resulting tables are written into `table` (the decode-table arena)
 /// starting at offset `*table_index`. On return, `*table_index` is advanced by
@@ -186,14 +194,49 @@ const DEXT: [u16; 32] = [
 /// * `Err(InflateTableError::Invalid)` for an over-subscribed or incomplete
 ///   set of code lengths (the C routine returns `-1`).
 /// * `Err(InflateTableError::Enough)` when the tables would exceed the
-///   `ENOUGH_LENS` / `ENOUGH_DISTS` space (the C routine returns `+1`).
+///   `ENOUGH_LENS` / `ENOUGH_DISTS` space (the C routine returns `+1`), or when
+///   the supplied `table` arena cannot hold them.
+///
+/// # Input validation
+///
+/// The reference C implementation trusts its caller completely: it indexes
+/// `count[lens[i]]`, `work[]`, and `table[]` without bounds checks because the
+/// only caller is `inflate()` itself, which cannot produce out-of-range values.
+/// This port exposes the routine publicly (the fixed-table generator in
+/// [`crate::inflate::fixed`] and the `infcover.c` coverage port both call it
+/// directly), so a malformed direct call must yield an error rather than a
+/// panic. The following are rejected up front:
+///
+/// * `codes` exceeding the alphabet size of `code_type` — `19` for
+///   [`CodeType::Codes`], `288` for [`CodeType::Lens`] (the `lbase`/`lext`
+///   tables cover symbols `257..=287`), `32` for [`CodeType::Dists`] (`dbase` /
+///   `dext` cover symbols `0..=31`) — as [`InflateTableError::Invalid`];
+/// * `codes` exceeding `lens.len()` or `work.len()`, as
+///   [`InflateTableError::Invalid`];
+/// * any of `lens[0..codes]` greater than [`MAXBITS`], as
+///   [`InflateTableError::Invalid`];
+/// * a `table`/`table_index` combination with fewer than two free entries, or a
+///   root/sub-table set that would not fit in the free space, as
+///   [`InflateTableError::Enough`].
+///
+/// `bits` needs no check: it is clamped into `min..=max` (and therefore into
+/// `1..=MAXBITS`) before it is used to size anything, exactly as in C.
+///
+/// **These checks cannot fire on any in-crate call.** `inflate` and
+/// `inflateBack` always pass `codes` of `19`/`nlen`/`ndist` (bounded by the
+/// DEFLATE header at `19`/`288`/`32`), lengths decoded from the 19-symbol
+/// code-length alphabet (always `0..=15`), a `[u16; 288]` work area, and a
+/// `[Code; ENOUGH]` arena whose free space is `1444` for the root tables and at
+/// least `592` for the distance table. The ordinary decode path is therefore
+/// bit-for-bit unchanged.
 ///
 /// # Panics
 ///
-/// Panics (via slice bounds checks) if `table` is too small for the code being
-/// built or if `work`/`lens` are shorter than `codes`. Callers size `table` as
-/// `[Code; ENOUGH]` for `Lens`/`Dists` codes; the `Enough` error is the guard
-/// that keeps a valid code within that arena.
+/// Only through a slice bounds check, and only for a `table` that is large enough
+/// to pass the free-entry check above yet still too small for the code being
+/// built. For a code that is otherwise valid the
+/// [`Enough`](InflateTableError::Enough) error — not a panic — is the guard that
+/// keeps it inside the `ENOUGH`-sized arena.
 pub fn inflate_table(
     code_type: CodeType,
     lens: &[u16],
@@ -203,12 +246,40 @@ pub fn inflate_table(
     bits: &mut usize,
     work: &mut [u16],
 ) -> Result<(), InflateTableError> {
+    // Validate the caller-supplied geometry before any indexing (see the
+    // "Input validation" section above). Unreachable from `inflate`/
+    // `inflateBack`, so the ordinary decode path is unaffected.
+    let max_codes = match code_type {
+        CodeType::Codes => 19,
+        CodeType::Lens => 288,
+        CodeType::Dists => 32,
+    };
+    if codes > max_codes || codes > lens.len() || codes > work.len() {
+        return Err(InflateTableError::Invalid);
+    }
+    // A length above MAXBITS would index `count[]` out of bounds below, and is
+    // not a legal DEFLATE code length in any case.
+    if lens[..codes]
+        .iter()
+        .any(|&len_val| len_val as usize > MAXBITS)
+    {
+        return Err(InflateTableError::Invalid);
+    }
+    // Free entries available in the caller's arena from `*table_index` onwards.
+    // `checked_sub` also rejects a `table_index` past the end of the slice.
+    let avail = match table.len().checked_sub(*table_index) {
+        // The `max == 0` branch writes two entries unconditionally, so anything
+        // smaller cannot be served at all.
+        Some(free) if free >= 2 => free,
+        _ => return Err(InflateTableError::Enough),
+    };
+
     // `count[len]` = number of codes of each length; `offs[len]` = offset into
     // the sorted symbol table for each length. Indices 0..=MAXBITS are used.
     let mut count = [0u16; MAXBITS + 1];
     let mut offs = [0u16; MAXBITS + 1];
 
-    // Accumulate lengths for codes (assumes lens[] are all in 0..=MAXBITS).
+    // Accumulate lengths for codes (lens[] validated above to be 0..=MAXBITS).
     // (inftrees.c L116-L119)
     for &len_val in lens.iter().take(codes) {
         count[len_val as usize] += 1;
@@ -311,7 +382,14 @@ pub fn inflate_table(
     let mask: usize = used - 1; // mask for comparing low bits
 
     // Check available table space for the root table. (inftrees.c L215-L218)
-    if (code_type == CodeType::Lens && used > ENOUGH_LENS)
+    //
+    // The `used > avail` term is this port's addition: C has no equivalent
+    // because its caller always supplies a `code[ENOUGH]` arena, whereas a
+    // direct Rust caller may pass a shorter slice (and `CodeType::Codes` has no
+    // `ENOUGH_*` budget of its own). It never fires on an in-crate call, where
+    // `avail` is at least the corresponding `ENOUGH_*` value.
+    if used > avail
+        || (code_type == CodeType::Lens && used > ENOUGH_LENS)
         || (code_type == CodeType::Dists && used > ENOUGH_DISTS)
     {
         return Err(InflateTableError::Enough);
@@ -409,8 +487,10 @@ pub fn inflate_table(
             }
 
             // Check for enough space. (inftrees.c L283-L287)
+            // `used > avail` is the same arena-capacity addition as at the root.
             used += 1usize << curr;
-            if (code_type == CodeType::Lens && used > ENOUGH_LENS)
+            if used > avail
+                || (code_type == CodeType::Lens && used > ENOUGH_LENS)
                 || (code_type == CodeType::Dists && used > ENOUGH_DISTS)
             {
                 return Err(InflateTableError::Enough);
@@ -550,7 +630,8 @@ mod tests {
 
     #[test]
     fn code_layout_is_four_bytes_repr_c() {
-        // The FFI layer and the fixed tables rely on the exact 4-byte layout.
+        // The transcribed fixed tables and the C-oracle cross-validation rely on
+        // the exact 4-byte `#[repr(C)]` layout of the retained C `struct code`.
         assert_eq!(core::mem::size_of::<Code>(), 4);
         assert_eq!(core::mem::align_of::<Code>(), 2);
         assert_eq!(
@@ -856,5 +937,293 @@ mod tests {
                 val: 0
             }
         );
+    }
+
+    /// A code length above [`MAXBITS`] must be reported as
+    /// [`InflateTableError::Invalid`], not indexed into the internal `count`
+    /// array.
+    ///
+    /// This is the canonical malformed direct call: `lens = [16]` used to index
+    /// `count[16]` on a `[u16; 16]` array and abort the process through a public
+    /// API. `inflate()` itself can never produce a length above 15 — the
+    /// code-length alphabet only encodes `0..=15` — so this is reachable solely
+    /// from a direct Rust caller.
+    #[test]
+    fn oversized_code_length_is_invalid_not_a_panic() {
+        for bad in [16u16, 17, 255, u16::MAX] {
+            let lens = [bad];
+            let mut table = [Code::default(); ENOUGH];
+            let mut work = [0u16; 1];
+            let mut index = 0usize;
+            let mut bits = 7usize;
+            assert_eq!(
+                inflate_table(
+                    CodeType::Codes,
+                    &lens,
+                    1,
+                    &mut table,
+                    &mut index,
+                    &mut bits,
+                    &mut work,
+                ),
+                Err(InflateTableError::Invalid),
+                "code length {bad} > MAXBITS must be rejected"
+            );
+            // Nothing was written and the caller's cursor is untouched.
+            assert_eq!(index, 0);
+            assert_eq!(table[0], Code::default());
+        }
+
+        // A length above MAXBITS anywhere in `lens[0..codes]` is rejected, while
+        // one beyond `codes` is ignored exactly as C ignores it.
+        let lens = [1u16, 1, 16];
+        let mut table = [Code::default(); ENOUGH];
+        let mut work = [0u16; 3];
+        let mut index = 0usize;
+        let mut bits = 7usize;
+        assert_eq!(
+            inflate_table(
+                CodeType::Codes,
+                &lens,
+                3,
+                &mut table,
+                &mut index,
+                &mut bits,
+                &mut work
+            ),
+            Err(InflateTableError::Invalid)
+        );
+        index = 0;
+        bits = 7;
+        assert!(
+            inflate_table(
+                CodeType::Codes,
+                &lens,
+                2,
+                &mut table,
+                &mut index,
+                &mut bits,
+                &mut work
+            )
+            .is_ok(),
+            "a length past `codes` must not be examined"
+        );
+    }
+
+    /// `codes` larger than the alphabet, than `lens`, or than `work` must be
+    /// reported as [`InflateTableError::Invalid`].
+    ///
+    /// Without the alphabet bound, a `CodeType::Lens` call with `codes > 288`
+    /// could index the 31-entry `lext`/`lbase` tables out of range; without the
+    /// slice bounds, the symbol sort would panic writing into `work`.
+    #[test]
+    fn out_of_range_code_counts_are_invalid() {
+        let mut table = [Code::default(); ENOUGH];
+
+        // `codes` beyond the code-length alphabet (19).
+        let lens = [1u16; 32];
+        let mut work = [0u16; 32];
+        let mut index = 0usize;
+        let mut bits = 7usize;
+        assert_eq!(
+            inflate_table(
+                CodeType::Codes,
+                &lens,
+                20,
+                &mut table,
+                &mut index,
+                &mut bits,
+                &mut work
+            ),
+            Err(InflateTableError::Invalid)
+        );
+
+        // `codes` beyond the distance alphabet (32).
+        let lens33 = [1u16; 33];
+        let mut work33 = [0u16; 33];
+        index = 0;
+        bits = 6;
+        assert_eq!(
+            inflate_table(
+                CodeType::Dists,
+                &lens33,
+                33,
+                &mut table,
+                &mut index,
+                &mut bits,
+                &mut work33
+            ),
+            Err(InflateTableError::Invalid)
+        );
+
+        // `codes` beyond `lens.len()`.
+        let short_lens = [1u16, 1];
+        let mut work4 = [0u16; 4];
+        index = 0;
+        bits = 7;
+        assert_eq!(
+            inflate_table(
+                CodeType::Codes,
+                &short_lens,
+                4,
+                &mut table,
+                &mut index,
+                &mut bits,
+                &mut work4
+            ),
+            Err(InflateTableError::Invalid)
+        );
+
+        // `codes` beyond `work.len()`.
+        let lens4 = [1u16, 1, 2, 2];
+        let mut short_work = [0u16; 2];
+        index = 0;
+        bits = 7;
+        assert_eq!(
+            inflate_table(
+                CodeType::Codes,
+                &lens4,
+                4,
+                &mut table,
+                &mut index,
+                &mut bits,
+                &mut short_work
+            ),
+            Err(InflateTableError::Invalid)
+        );
+    }
+
+    /// A `table`/`table_index` pair that cannot hold the result must be reported
+    /// as [`InflateTableError::Enough`], not indexed past the end.
+    ///
+    /// Three shapes are covered: an arena with fewer than the two entries the
+    /// `max == 0` branch writes, a `table_index` at or past the end of the slice
+    /// (including a hostile out-of-range value), and an arena that is large
+    /// enough to start but too small for the root table.
+    #[test]
+    fn insufficient_table_space_is_enough_not_a_panic() {
+        // (a) An all-zero code takes the `max == 0` branch and writes two
+        // entries; a one-entry arena cannot serve it.
+        let zeros = [0u16; 4];
+        let mut tiny = [Code::default(); 1];
+        let mut work = [0u16; 4];
+        let mut index = 0usize;
+        let mut bits = 7usize;
+        assert_eq!(
+            inflate_table(
+                CodeType::Codes,
+                &zeros,
+                4,
+                &mut tiny,
+                &mut index,
+                &mut bits,
+                &mut work
+            ),
+            Err(InflateTableError::Enough)
+        );
+        // A two-entry arena is exactly enough for that branch.
+        let mut pair = [Code::default(); 2];
+        index = 0;
+        bits = 7;
+        assert!(
+            inflate_table(
+                CodeType::Codes,
+                &zeros,
+                4,
+                &mut pair,
+                &mut index,
+                &mut bits,
+                &mut work
+            )
+            .is_ok()
+        );
+        assert_eq!(index, 2);
+
+        // (b) A `table_index` at, or well past, the end of the arena.
+        let dist_lens = [5u16; 32];
+        let mut table = [Code::default(); ENOUGH];
+        let mut work32 = [0u16; 32];
+        for hostile in [ENOUGH, ENOUGH + 1, usize::MAX] {
+            let mut idx = hostile;
+            let mut b = 5usize;
+            assert_eq!(
+                inflate_table(
+                    CodeType::Dists,
+                    &dist_lens,
+                    32,
+                    &mut table,
+                    &mut idx,
+                    &mut b,
+                    &mut work32
+                ),
+                Err(InflateTableError::Enough),
+                "table_index {hostile} must be rejected"
+            );
+            assert_eq!(idx, hostile, "a rejected call must not move the cursor");
+        }
+
+        // (c) An arena with room to start but not for the 32-entry root table.
+        let mut small = [Code::default(); 16];
+        let mut idx = 0usize;
+        let mut b = 5usize;
+        assert_eq!(
+            inflate_table(
+                CodeType::Dists,
+                &dist_lens,
+                32,
+                &mut small,
+                &mut idx,
+                &mut b,
+                &mut work32
+            ),
+            Err(InflateTableError::Enough)
+        );
+
+        // (d) The same code in a full-size arena still succeeds, proving the new
+        // capacity term does not perturb a valid build.
+        let mut ok_idx = 0usize;
+        let mut ok_bits = 5usize;
+        assert!(
+            inflate_table(
+                CodeType::Dists,
+                &dist_lens,
+                32,
+                &mut table,
+                &mut ok_idx,
+                &mut ok_bits,
+                &mut work32
+            )
+            .is_ok()
+        );
+        assert_eq!(ok_idx, 32);
+        assert_eq!(ok_bits, 5);
+    }
+
+    /// The arena-capacity term must not change the outcome of a build whose free
+    /// space is exactly the corresponding `ENOUGH_*` budget — the situation the
+    /// real decoder is in when it appends the distance table after the
+    /// literal/length table.
+    #[test]
+    fn exact_enough_budget_still_builds() {
+        // A distance table placed so that exactly ENOUGH_DISTS entries remain.
+        let dist_lens = [5u16; 32];
+        let mut table = [Code::default(); ENOUGH];
+        let mut work = [0u16; 32];
+        let mut index = ENOUGH - ENOUGH_DISTS; // == ENOUGH_LENS
+        let mut bits = 5usize;
+        assert!(
+            inflate_table(
+                CodeType::Dists,
+                &dist_lens,
+                32,
+                &mut table,
+                &mut index,
+                &mut bits,
+                &mut work
+            )
+            .is_ok(),
+            "a build that exactly fits the remaining arena must succeed"
+        );
+        assert_eq!(index, ENOUGH_LENS + 32);
     }
 }

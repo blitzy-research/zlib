@@ -6,7 +6,21 @@
 //! re-exported from the crate root (`lib.rs`). Every compression or
 //! decompression operation borrows a `&mut ZStream`; the concrete engine logic
 //! lives in [`crate::deflate`] and [`crate::inflate`], which operate on the
-//! [`DeflateState`] / [`InflateState`] this handle owns.
+//! engine state this handle owns.
+//!
+//! # Layering: why the engine state is opaque here
+//!
+//! This module is layer 5 of the seven-layer graph (AAP §0.3.1 / §0.4.2 B2) and
+//! the compression engines are layer 6, so imports must run *downward only*:
+//! `stream` may not name `DeflateState` or `InflateState`. It therefore owns its
+//! engine through the layer-local `EngineState` trait object and exposes
+//! type-generic accessors (`ZStream::engine_state`,
+//! `ZStream::engine_state_mut`, …). Each engine implements `EngineState` in
+//! its own module and publishes a typed view of it there
+//! (`crate::deflate::state::DeflateStream`, `crate::inflate::state::InflateStream`),
+//! which is where the concrete names legitimately live. Ownership, `Drop`
+//! semantics, and the "at most one engine" invariant are unchanged — only the
+//! direction of the naming is.
 //!
 //! # Relationship to the C `z_stream`
 //!
@@ -21,12 +35,15 @@
 //!   (use-after-free / double-free).
 //!
 //! Here the engine state is owned through a `StreamState` enum that holds
-//! *at most one* boxed engine (`None`, `Deflate(Box<…>)`, or
-//! `Inflate(Box<…>)`), so "no state", "deflate state", and "inflate state" are
-//! distinct, checked cases (AAP §0.3.2 Type-State / Ownership). Because the box
-//! and every owned buffer inside it are released by `Drop`, RAII fully subsumes
-//! `deflateEnd`/`inflateEnd` (AAP §0.3.2 RAII / §0.6.3 Memory Ownership Model) —
-//! there is nothing for the caller to remember to free.
+//! *at most one* boxed engine (`None` or `Engine(Box<dyn EngineState>)`), and
+//! every installed engine reports its direction through
+//! `EngineState::engine_kind`, so "no state", "deflate state", and "inflate
+//! state" are distinct, checked cases (AAP §0.3.2 Type-State / Ownership). The
+//! typed accessors are keyed on the concrete engine type, so an inflate routine
+//! handed a deflate stream observes [`None`] rather than a mistyped state.
+//! Because the box and every owned buffer inside it are released by `Drop`, RAII
+//! fully subsumes `deflateEnd`/`inflateEnd` (AAP §0.3.2 RAII / §0.6.3 Memory
+//! Ownership Model) — there is nothing for the caller to remember to free.
 //!
 //! ## Field mapping (`z_stream` → [`ZStream`])
 //!
@@ -69,41 +86,282 @@
 //! the compression/decompression logic and requires **no** `unsafe` on their
 //! side.
 //!
+//! ## Implementing [`Allocator`] outside this crate
+//!
+//! [`Allocator`] has **no** required items. Both allocation entry points,
+//! [`allocate_zeroed`](Allocator::allocate_zeroed) and
+//! [`allocate_zeroed_items`](Allocator::allocate_zeroed_items), as well as
+//! [`hook`](Allocator::hook), are *provided* methods that default to the hook
+//! path, so a downstream crate implements the trait by overriding whichever of
+//! the two allocation methods it wants to serve and leaving
+//! [`hook`](Allocator::hook) at its inactive default:
+//!
+//! ```
+//! use zlib_rs::stream::{AllocBuffer, Allocator};
+//!
+//! #[derive(Default)]
+//! struct CountingAllocator {
+//!     // A real implementation would use a `Cell`/atomic; kept trivial here.
+//! }
+//!
+//! impl Allocator for CountingAllocator {
+//!     fn allocate_zeroed_items<T>(&self, items: usize, item_size: usize) -> Option<AllocBuffer<T>>
+//!     where
+//!         T: Copy + Default + zlib_rs::stream::ZeroValid + 'static,
+//!     {
+//!         // Refuse anything larger than 64 KiB to demonstrate a bounded arena.
+//!         let bytes = items.checked_mul(item_size)?;
+//!         if bytes > 64 * 1024 {
+//!             return None;
+//!         }
+//!         AllocBuffer::try_zeroed_items(items, item_size, self.hook())
+//!     }
+//! }
+//!
+//! let alloc = CountingAllocator::default();
+//! assert!(alloc.allocate_zeroed_items::<u8>(1, 16).is_some());
+//! assert!(alloc.allocate_zeroed_items::<u8>(1, 1 << 20).is_none());
+//! ```
+//!
+//! Every engine buffer and every engine-state footprint is requested through
+//! those two methods — never through the global allocator directly — so a
+//! downstream implementation genuinely governs a stream's memory. Which method
+//! serves which C `ZALLOC` is tabulated on [`Allocator`] itself.
+//!
+//! ## Three surface properties that are easy to trip over
+//!
+//! The crate version is **not** a SemVer channel for the Rust API: it mirrors the
+//! upstream C release identity the ABI reports — `zlibVersion()` yields
+//! `"1.3.2.1-motley"` and `ZLIB_VERNUM` is `0x1321` (AAP §0.6.6) — and SemVer
+//! cannot express the four-component motley string, so the crate version is
+//! pinned to the C identity by design and says nothing about this module's Rust
+//! surface. Three properties of that surface are therefore worth stating outright:
+//!
+//! * **An *active* hook is constructed only inside the `unsafe` zone.**
+//!   [`AllocHook::none`] is the safe, inactive constructor;
+//!   [`crate::ffi::types::alloc_hook_from_parts`] is the `unsafe` one, because
+//!   building an active hook asserts a four-clause contract about two raw C
+//!   function pointers (see that function's `# Safety`) that no safe constructor
+//!   could check. It therefore belongs in the crate's only `unsafe` zone
+//!   (AAP §0.6.2, directive D-6), and this module keeps `#![deny(unsafe_code)]`.
+//! * **Duplicating a buffer is fallible.** [`AllocBuffer`] has no [`Clone`] impl;
+//!   [`AllocBuffer::try_clone`] is the way to copy one. Cloning a foreign buffer
+//!   re-enters the caller's `zalloc`, which may report out-of-memory, and an
+//!   infallible `Clone` could only abort or silently switch allocators. Returning
+//!   [`None`] keeps the failure visible and preserves C's allocation count and
+//!   failure timing (AAP §0.6.5).
+//! * **The element-type set is sealed.** Buffer elements are
+//!   `T: Copy + Default + ZeroValid + 'static`. [`ZeroValid`] is a sealed marker
+//!   implemented for the twelve integer primitives; the engines request `u8` and
+//!   `u16`. Sealing keeps the set fixed and auditable inside this crate — see that
+//!   trait for exactly what it does and does not assert.
+//!
+//! ## When the allocator is bound — a documented divergence from C
+//!
+//! **The allocator is captured once, at initialization, and never re-read.** A
+//! stream's `zalloc`/`zfree`/`opaque` triple is read by `deflateInit*` /
+//! `inflateInit*` / `inflateBackInit*` and stored in the buffers those calls
+//! create. Mutating `strm.zalloc` or `strm.zfree` *after* a successful init has no
+//! effect: allocations that happen later — most visibly inflate's window, which is
+//! deferred until the first block that needs it — still go through whatever
+//! allocator was in force at init.
+//!
+//! Reference C behaves differently. Its `ZALLOC` macro expands to
+//! `(*((strm)->zalloc))((strm)->opaque, …)`, re-reading the field on every call, so
+//! a hook installed after init *does* serve a later allocation. The divergence is
+//! therefore real and measurable: install a counting `zalloc` after
+//! `inflateInit2_` and drive a stream far enough to need its window, and C reports
+//! one hook allocation where this crate reports none.
+//!
+//! **This is out of contract, and the divergence is deliberate.** `zlib.h`
+//! documents the fields as inputs to the init call; it never sanctions changing
+//! them on a live stream. Honouring a late change is not merely unnecessary, it is
+//! unsound in a way C demonstrates on itself. In the measured comparison above,
+//! C's own ledger records **one** allocation from the caller's `zalloc` but
+//! **two** pointers handed back to the caller's `zfree` — because the stream's
+//! internal state had already been allocated by C's built-in `zcalloc` before the
+//! hooks were installed. C thus mixes two allocators inside a single stream and
+//! passes a foreign pointer to a caller-supplied deallocator, which is undefined
+//! behaviour for any allocator that validates its arguments.
+//!
+//! This crate cannot reproduce that outcome, and the reason is structural rather
+//! than a policy choice: **one buffer, one allocator.** Every [`AllocBuffer`]
+//! frees through the very hook that allocated it, so there is no representation in
+//! which a buffer is allocated by one allocator and released by another. Rebinding
+//! mid-stream would require exactly that.
+//!
+//! Nothing observable to a conforming caller changes. Every supported path — hooks
+//! installed *before* init, which is the only way `zlib.h` describes — allocates,
+//! frees and decodes identically to C, and the decompressed payload is
+//! byte-identical in the divergent case too. See also the corresponding note on
+//! [`crate::ffi::types::alloc_hook_from_parts`] and the divergence list in
+//! `README.md`.
+//!
 //! # Safety, `no_std`
 //!
-//! This module contains **zero `unsafe`** (enforced by `#![deny(unsafe_code)]`
-//! below). The raw-pointer work for a caller-`zalloc`'d region — invoking the C
-//! `zalloc`/`zfree` function pointers, materializing a slice over the returned
-//! memory, and freeing it on drop — is defined entirely in the sanctioned
-//! `crate::ffi::alloc` zone behind the safe [`ForeignBuffer`] trait (M6). The
+//! This module contains **no executable `unsafe`** — no `unsafe` block, no
+//! `unsafe fn`, no `unsafe impl` — which `#![deny(unsafe_code)]` below enforces.
+//! The word appears here exactly twice, and both occurrences are *declarative*:
+//! the [`ZallocFn`] and [`ZfreeFn`] type aliases must spell out
+//! `unsafe extern "C" fn` because that is the type of the C hook pointers this
+//! module has to name in order to interoperate with them. Naming a function
+//! type performs no unsafe operation.
+//!
+//! The raw-pointer work for a caller-`zalloc`'d region — invoking those C
+//! function pointers, materializing a slice over the returned memory, and
+//! freeing it on drop — is defined entirely in the sanctioned
+//! `crate::ffi::alloc` zone behind the safe [`ForeignBuffer`] trait. The
 //! [`Foreign`](AllocBuffer::Foreign) arm holds a `Box<dyn ForeignBuffer<T>>` and
 //! delegates every access to that safe interface. Consequently the **core
-//! compression engine** (`src/deflate/**`) also contains **zero `unsafe`** (user
-//! rule R3) — its buffer fields are [`AllocBuffer`]s accessed purely through
-//! safe slice operations, and the compression-logic files
-//! (`slow.rs`/`stored.rs`/`trees.rs`) remain under `#![deny(unsafe_code)]`.
+//! compression engine** (`src/deflate/**`) also contains zero `unsafe` (User
+//! Constraint 3 / AAP §0.6.2 and standard S2) — its buffer fields are
+//! [`AllocBuffer`]s accessed purely through safe slice operations, and the
+//! compression-logic files (`slow.rs`/`stored.rs`/`trees.rs`) remain under
+//! `#![deny(unsafe_code)]`.
 //!
 //! Allocation is **fallible** at the boundary: when a caller installs a bounded
 //! allocator whose `zalloc` reports out-of-memory, buffer construction returns
-//! [`None`] and the init paths surface `Z_MEM_ERROR` (M7) rather than silently
-//! using the global allocator. The module is `no_std` + `alloc` compatible: it
-//! references only `core`, `alloc`, and the crate's own modules.
+//! [`None`] and the init paths surface `Z_MEM_ERROR` rather than silently using
+//! the global allocator — preserving C's allocation count and failure timing
+//! (AAP §0.6.3 has-hook clause, §0.6.5). The module is `no_std` + `alloc`
+//! compatible: it references only `core`, `alloc`, and the crate's own modules.
 #![deny(unsafe_code)]
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::any::Any;
 use core::ffi::{c_uint, c_void};
 use core::fmt;
+use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 
 use crate::constants::DataType;
-use crate::deflate::state::DeflateState;
 use crate::error::ReturnCode;
-use crate::inflate::state::InflateState;
 
 // ===========================================================================
 // Allocator abstraction (replaces the C `zalloc`/`zfree`/`opaque` triple)
 // ===========================================================================
+
+// ---------------------------------------------------------------------------
+// ZeroValid — the sealed element-type set a foreign zero-fill may materialize
+// ---------------------------------------------------------------------------
+
+/// Sealing module for [`ZeroValid`].
+///
+/// Because [`ZeroValid`] has a private supertrait, it can neither be named nor
+/// implemented from outside this crate. The set of element types that may be
+/// materialized from a caller-`zalloc`'d region is therefore fixed here and
+/// cannot be widened by a downstream crate.
+mod sealed {
+    /// Private sealing marker; see [`super::ZeroValid`].
+    pub trait ZeroValidSealed {}
+}
+
+/// Marker for element types whose **all-zero bit pattern is a valid value that
+/// equals [`Default::default`]**.
+///
+/// # Why this bound exists
+///
+/// [`AllocBuffer::try_zeroed`] may route a working buffer's storage through a
+/// caller-supplied C `zalloc` hook. The sanctioned `crate::ffi::alloc` bridge
+/// initializes that region by **writing a `T::default()` value into every slot**
+/// — `fill_default` over a `&mut [MaybeUninit<T>]`, never a memset of raw zero
+/// bytes — and only then hands it back as `&[T]` / `&mut [T]`. That step is
+/// therefore already correct for any `T: Copy + Default`, including a type whose
+/// all-zero bit pattern would be an invalid value, and it does not depend on this
+/// marker for its soundness.
+///
+/// What the bound adds is **defence in depth**: it restricts the element types a
+/// foreign region may be materialized as to a small set audited inside this crate,
+/// so the two sanctioned remedies for the hazard — value initialization and a
+/// narrow element-type set — are both in force rather than one of them. Concretely
+/// it means that
+///
+/// * a change to the foreign path that reverted to zero-filling raw bytes would
+///   still be sound for every type the API admits, instead of becoming unsound at
+///   a distance; and
+/// * a downstream crate cannot widen the set, because [`ZeroValid`] is sealed
+///   behind a private supertrait — an `enum`, `bool`, `char`, `NonZero*`,
+///   reference or function-pointer element type is rejected at compile time on
+///   every call site, whatever its representation.
+///
+/// [`AllocBuffer::try_zeroed`] is a *safe* function, so keeping that guarantee
+/// structural rather than reviewer-enforced is what makes it durable.
+///
+/// # Implementation contract
+///
+/// A type may implement `ZeroValid` only when **all** of the following hold:
+///
+/// 1. every bit pattern of the type is a valid value (no niches, no padding
+///    bytes, no uninhabited variants);
+/// 2. the all-zero bit pattern equals `Self::default()`;
+/// 3. the type has no drop glue — guaranteed here by the [`Copy`] supertrait.
+///
+/// Every primitive integer type satisfies all three, and those are exactly the
+/// types implemented below. The compression and decompression engines only ever
+/// request `u8` and `u16` buffers; the wider set costs nothing and keeps the
+/// marker's contract stated in terms of the type property rather than of today's
+/// call sites.
+///
+/// # Examples
+///
+/// The engines' element types are accepted:
+///
+/// ```
+/// # use zlib_rs::stream::{AllocBuffer, AllocHook};
+/// let bytes = AllocBuffer::<u8>::try_zeroed(4, AllocHook::none()).unwrap();
+/// let words = AllocBuffer::<u16>::try_zeroed(4, AllocHook::none()).unwrap();
+/// assert_eq!(&bytes[..], &[0u8; 4]);
+/// assert_eq!(&words[..], &[0u16; 4]);
+/// ```
+///
+/// A type outside the sealed set is rejected at compile time. Sealing is what
+/// does the rejecting, so this holds for *every* downstream type regardless of its
+/// representation — the example below simply picks the case the marker's contract
+/// is named for:
+///
+/// ```compile_fail
+/// # use zlib_rs::stream::{AllocBuffer, AllocHook};
+/// #[derive(Clone, Copy)]
+/// #[repr(u8)]
+/// enum OneOnly {
+///     One = 1,
+/// }
+///
+/// impl Default for OneOnly {
+///     fn default() -> Self {
+///         OneOnly::One
+///     }
+/// }
+///
+/// // `OneOnly` is `Copy + Default` but cannot be `ZeroValid`, because the trait
+/// // is sealed and no downstream type may implement it. This line fails to
+/// // compile.
+/// let _ = AllocBuffer::<OneOnly>::try_zeroed(1, AllocHook::none());
+/// ```
+pub trait ZeroValid: sealed::ZeroValidSealed + Copy + Default {}
+
+/// Implements the sealing marker and [`ZeroValid`] for each listed type.
+///
+/// Only invoked with primitive integer types, which satisfy every clause of the
+/// [`ZeroValid`] implementation contract.
+macro_rules! impl_zero_valid {
+    ($($t:ty),+ $(,)?) => {
+        $(
+            impl sealed::ZeroValidSealed for $t {}
+            impl ZeroValid for $t {}
+        )+
+    };
+}
+
+// Every primitive integer type: all bit patterns valid, no padding, all-zero
+// equals `Default::default()`, and no drop glue. Deliberately excludes `bool`,
+// `char`, floating-point types, references, function pointers, `NonZero*`, and
+// every `enum` — for those, either zero is not a valid value or zero is not the
+// `Default`.
+impl_zero_valid!(
+    u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize
+);
 
 // ---------------------------------------------------------------------------
 // Caller-allocator hook (the C `zalloc`/`zfree`/`opaque` triple)
@@ -126,10 +384,41 @@ pub type ZfreeFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
 /// allocator carries [`AllocHook::none`], so the historical global-allocator
 /// path is entirely unchanged.
 ///
-/// A hook is *active* only when **both** `zalloc` and `zfree` are present — a
-/// caller that supplies one without the other does not get a usable custom
-/// allocator (matching zlib, which uses the built-in allocator unless both are
-/// set), and allocation falls back to the global allocator.
+/// A hook is *active* only when **both** `zalloc` and `zfree` are present, since
+/// a region obtained from one must be released through the other. Only two
+/// configurations can reach this type from a C caller, because the C
+/// initialization boundary completes a partial pair before any hook is built:
+///
+/// * **Neither half supplied** — the hook is inactive and allocation uses the
+///   global allocator. That is this port's built-in allocator, exactly as
+///   `zcalloc`/`zcfree` are C's, and it is what AAP §0.6.3's "otherwise
+///   `std::alloc` is used" clause prescribes for a wholly absent pair.
+/// * **Both halves present** — the hook is active and every working buffer is
+///   carved from the caller's `zalloc` and released through their `zfree`. An
+///   active `zalloc` that reports out-of-memory is propagated as an allocation
+///   failure; there is deliberately no global-allocator fallback on that path.
+///
+/// A pair with **exactly one half supplied** never becomes an `AllocHook`: C's
+/// three `*Init*_` prologues substitute the library's own built-in for whichever
+/// half is missing — `zcalloc` for a null `zalloc` (also clearing `opaque`),
+/// `zcfree` for a null `zfree` (`inflate.c` L183-L196, `deflate.c` L400-L414,
+/// `infback.c` L37-L50) — and `crate::ffi::types::init_allocator_prologue`
+/// reproduces that substitution before constructing anything, so the hook this
+/// type sees is already complete. The caller's own half is honored in full,
+/// which is what keeps a deliberately failing `zalloc` observable as
+/// `Z_MEM_ERROR` instead of being silently bypassed.
+///
+/// # Constructing one
+///
+/// Only [`AllocHook::none`] is reachable from outside the crate. Building an
+/// *active* hook requires the crate-private `AllocHook::new`, whose
+/// documentation states the obligations the raw-pointer code in
+/// `crate::ffi::alloc` then relies on. Keeping that constructor private is
+/// what makes those obligations enforceable: the sole caller is
+/// `src/ffi/types.rs`, converting a `z_stream` whose validity the FFI entry
+/// point has already established. An out-of-crate [`Allocator`] implementation
+/// therefore cannot smuggle arbitrary C function pointers into `unsafe` code
+/// through safe API.
 #[derive(Clone, Copy)]
 pub struct AllocHook {
     /// The caller's allocation hook (`z_stream.zalloc`), or `None`.
@@ -154,9 +443,62 @@ impl AllocHook {
     }
 
     /// Builds a hook from a caller's `zalloc`/`zfree`/`opaque` triple.
+    ///
+    /// # Construction contract
+    ///
+    /// This constructor is deliberately **crate-private**. It is safe to call,
+    /// yet the values it captures are later dereferenced by `unsafe` code in
+    /// [`crate::ffi::alloc`], so an *active* hook (both halves present) is only
+    /// sound when every clause below holds. Nothing in the type system can
+    /// check them, which is exactly why the constructor is not public: the only
+    /// caller is `src/ffi/types.rs`, which builds a hook straight out of a
+    /// `z_stream` whose validity the FFI entry point has already established
+    /// from its own documented `# Safety` contract.
+    ///
+    /// 1. **Callable pointers.** If `Some`, each of `zalloc`/`zfree` must be a
+    ///    live `extern "C"` function with the C `alloc_func`/`free_func`
+    ///    signature, callable for as long as any buffer derived from this hook
+    ///    is alive.
+    /// 2. **zlib `zalloc` semantics.** `zalloc(opaque, items, size)` must
+    ///    return either null (out of memory) or a pointer to at least
+    ///    `items * size` writable bytes, aligned for the element type of the
+    ///    buffer being reserved, and not aliased by any other live reference.
+    ///    The engines request `u8` and `u16`; the sealed [`ZeroValid`] set bounds
+    ///    what any other caller in this crate can ask for. A region that does not
+    ///    satisfy the alignment is returned through `zfree` and reported as an
+    ///    allocation failure rather than used.
+    /// 3. **Matching deallocator.** `zfree` must be the deallocator paired with
+    ///    that `zalloc`, and must accept any pointer that `zalloc` returned
+    ///    together with the same `opaque`.
+    /// 4. **`opaque` lifetime.** `opaque` is forwarded verbatim to both hooks
+    ///    and must remain valid for them until every buffer allocated through
+    ///    this hook — including buffers produced by a `deflateCopy`-style
+    ///    [`Clone`] — has been dropped.
+    ///
+    /// A hook with `zalloc` or `zfree` set to [`None`] is
+    /// [inactive](Self::is_active) and carries no obligation at all: it can
+    /// never reach the raw-pointer path. That is the guarantee callers outside
+    /// the crate get, since [`AllocHook::none`] is the only constructor they
+    /// can reach.
+    ///
+    /// # What is enforced mechanically
+    ///
+    /// Every precondition that *can* be checked is checked before the hooks are
+    /// used: `crate::ffi::alloc` validates the requested
+    /// [`core::alloc::Layout`] (rejecting an overflowing or
+    /// `isize::MAX`-exceeding request), rejects a size that is not representable
+    /// in the C `uInt` hook ABI, rejects a null return, and rejects a returned
+    /// pointer that is not correctly aligned for the element type — releasing it
+    /// through `zfree` so nothing leaks and reporting the request as an
+    /// allocation failure. A hook that misbehaves in any of those ways therefore
+    /// produces `Z_MEM_ERROR`, never undefined behavior. Clauses 1, 3 and 4
+    /// above are the residue that cannot be verified mechanically, and they are
+    /// precisely the guarantees `zlib.h` already requires of
+    /// `alloc_func`/`free_func` (`zlib.h` L85-L86); violating them is a defect in
+    /// the caller's allocator, not in this crate.
     #[inline]
     #[must_use]
-    pub const fn new(
+    pub(crate) const fn new(
         zalloc: Option<ZallocFn>,
         zfree: Option<ZfreeFn>,
         opaque: *mut c_void,
@@ -198,20 +540,68 @@ impl AllocHook {
         self.opaque
     }
 
-    /// Allocates a zero-initialized foreign buffer of `count` elements through
-    /// this (active) hook, delegating to the sanctioned [`crate::ffi::alloc`]
-    /// zone where the raw-pointer `unsafe` is confined (M6).
+    /// Allocates a foreign buffer of `count` elements — each holding `T`'s
+    /// [`Default`] value — through this (active) hook.
     ///
-    /// Returns [`None`] when the caller's `zalloc` reports out-of-memory (or the
-    /// size is unrepresentable); there is **no** global-allocator fallback, so
-    /// the init paths can surface `Z_MEM_ERROR` (M7).
+    /// The request is served by the [`ForeignAlloc`] capability, which this
+    /// module *declares* and the sanctioned `crate::ffi::alloc` zone
+    /// *implements*; that is where the raw-pointer `unsafe`, the layout
+    /// validation, and the alignment check are confined (AAP §0.6.2). The
+    /// dependency therefore points one way only — the boundary implements a
+    /// core-owned interface and this module names no `ffi` item (AAP §0.3.2 C4).
+    ///
+    /// Returns [`None`] when the caller's `zalloc` reports out-of-memory, or when
+    /// the request cannot be honored soundly (an unrepresentable size, or an
+    /// address that does not satisfy `T`'s alignment); there is **no**
+    /// global-allocator fallback, so the init paths can surface `Z_MEM_ERROR`
+    /// (AAP §0.6.5).
     #[inline]
-    pub(crate) fn try_alloc_zeroed<T: Copy + Default + 'static>(
+    pub(crate) fn try_alloc_zeroed<T: Copy + Default + ZeroValid + 'static>(
         &self,
         count: usize,
     ) -> Option<Box<dyn ForeignBuffer<T>>> {
-        crate::ffi::alloc::try_alloc_foreign::<T>(*self, count)
+        // C's element-shaped `ZALLOC(strm, n, sizeof(Pos))` splits the request
+        // exactly this way, so the hook sees `(count, size_of::<T>())`.
+        <T as ForeignAlloc>::try_alloc_foreign(*self, count)
     }
+
+    /// Allocates a zero-initialized foreign buffer through this (active) hook,
+    /// forwarding the `(items, item_size)` pair to the caller's `zalloc`
+    /// verbatim so it sees the same arguments C's `ZALLOC(strm, items, size)`
+    /// passes (AAP §0.6.2).
+    ///
+    /// The materialized element count is `items * item_size / size_of::<T>()`.
+    /// Returns [`None`] on caller-`zalloc` out-of-memory, on an unrepresentable
+    /// or non-multiple size, or if the returned region is not aligned for `T`;
+    /// there is **no** global-allocator fallback (AAP §0.6.5).
+    #[inline]
+    pub(crate) fn try_alloc_zeroed_items<T: Copy + Default + ZeroValid + 'static>(
+        &self,
+        items: usize,
+        item_size: usize,
+    ) -> Option<Box<dyn ForeignBuffer<T>>> {
+        <T as ForeignAlloc>::try_alloc_foreign_items(*self, items, item_size)
+    }
+}
+
+/// Allocates a single `T` on the Rust global heap **fallibly**, yielding [`None`]
+/// instead of aborting when the heap is exhausted.
+///
+/// [`Box::new`] aborts the process on allocation failure, whereas zlib reports a
+/// failed state allocation as `Z_MEM_ERROR`. The engine-state constructors
+/// (`DeflateState::new_in`, `InflateState::try_new_in`) route their single global
+/// allocation through here so heap exhaustion becomes a return code rather than
+/// an abort (AAP §0.6.5). The raw-pointer work lives behind the
+/// [`FallibleBoxAlloc`] capability, which this module *declares* and the
+/// sanctioned `crate::ffi::alloc` zone *implements*, so this module stays free of
+/// `unsafe` and names no `ffi` item (AAP §0.6.2, §0.3.2 C4).
+///
+/// `value` is dropped normally if the allocation fails, releasing any working
+/// buffers it already owns.
+#[inline]
+#[must_use]
+pub(crate) fn try_box<T>(value: T) -> Option<Box<T>> {
+    value.try_box_fallible()
 }
 
 // ---------------------------------------------------------------------------
@@ -225,21 +615,355 @@ impl AllocHook {
 /// `crate::ffi::alloc` zone, which confines the raw-pointer hook invocation,
 /// the slice materialization, and the `zfree`-on-drop (migration
 /// unsafe-isolation rule / AAP §0.6.2). [`AllocBuffer::Foreign`] holds one as a
-/// `Box<dyn ForeignBuffer<T>>` and delegates [`Deref`]/[`DerefMut`]/[`Clone`] to
-/// these methods, so neither this module nor the compression engines contain any
-/// `unsafe` (M6).
-pub trait ForeignBuffer<T: Copy + Default> {
+/// `Box<dyn ForeignBuffer<T>>` and delegates [`Deref`]/[`DerefMut`] and
+/// [`try_clone`](AllocBuffer::try_clone) to these methods, so neither this
+/// module nor the compression engines contain any `unsafe` (AAP §0.6.2).
+pub trait ForeignBuffer<T: Copy + Default + ZeroValid> {
     /// The buffer contents as a shared slice of `T`.
     fn as_slice(&self) -> &[T];
 
     /// The buffer contents as a unique (mutable) slice of `T`.
     fn as_mut_slice(&mut self) -> &mut [T];
 
-    /// Deep-clones into a fresh foreign region allocated through the same hook
-    /// (matching C `deflateCopy`), or [`None`] if that allocation reports OOM —
-    /// in which case [`AllocBuffer::clone`] performs a sound global-allocator
-    /// copy so [`Clone`] remains infallible.
+    /// The element count, answered **without materializing a slice**.
+    ///
+    /// [`AllocBuffer::len`](AllocBuffer::len) forwards here rather than measuring
+    /// `as_slice().len()`, and the distinction is a soundness requirement, not a
+    /// micro-optimization. One foreign region — the caller-supplied `inflateBack`
+    /// window, adopted by a bare pointer store exactly as `infback.c` L59 does —
+    /// is *not* initialized at adoption time. A length query that reached for
+    /// `as_slice()` would create a `&[T]` over abstract-uninitialized bytes before
+    /// anything had written them, which is validity UB regardless of whether the
+    /// resulting slice is ever read. Every implementor therefore records its own
+    /// element count and returns it directly.
+    fn len(&self) -> usize;
+
+    /// Whether the buffer holds no elements, derived from
+    /// [`len`](ForeignBuffer::len) and therefore equally slice-free.
+    ///
+    /// Every foreign region in this crate is non-empty by construction (a
+    /// zero-length request is rejected before a buffer is built), so this exists
+    /// to keep the length accessor idiomatic rather than to serve a real caller.
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Deep-clones into a fresh foreign region allocated through the **same**
+    /// hook, with the same `(items, item_size)` pair the original was requested
+    /// with (matching C `deflateCopy`/`inflateCopy`, which `ZALLOC` their new
+    /// buffers), or [`None`] if that allocation reports out-of-memory.
+    ///
+    /// [`None`] is an **allocation failure**, never a request to substitute
+    /// different storage: [`AllocBuffer::try_clone`](AllocBuffer::try_clone)
+    /// propagates it verbatim and the copy entry points report `Z_MEM_ERROR`,
+    /// exactly as C does. There is deliberately **no** global-allocator fallback:
+    /// a caller who installed a bounded allocator must observe the failure rather
+    /// than silently receive a copy living in the global heap (AAP §0.6.3,
+    /// §0.6.5).
     fn clone_foreign(&self) -> Option<Box<dyn ForeignBuffer<T>>>;
+}
+
+// ---------------------------------------------------------------------------
+// Core-declared allocation capabilities — implemented by the `ffi` boundary
+// ---------------------------------------------------------------------------
+//
+// The AAP's layer ordering runs one way for this pair: `ffi` (layer 8) may
+// depend on `stream` (layer 5), never the reverse (AAP §0.3.1, §0.6.2). The two
+// primitives below need raw-pointer `unsafe`, which is permitted only inside
+// `src/ffi/**`, yet they are needed *by* this module. The resolution is
+// dependency inversion, the same pattern [`ForeignBuffer`] already uses: this
+// module owns the interface, and the boundary supplies the implementation. No
+// item under `crate::ffi` is named anywhere in the shipped half of this file, so
+// the shipped graph carries no `stream -> ffi` edge (AAP §0.3.2 C4).
+//
+// The `#[cfg(test)]` module at the bottom does name one: a real C
+// `alloc_func`/`free_func` pair is raw-pointer machinery, so the counting hook
+// used to assert the has-hook contract lives in `crate::ffi::alloc::test_hook`
+// and is merely *driven* from here. That reference is confined to a compilation
+// configuration that is never built into the library, and it is enumerated in
+// `TEST_ONLY_CROSS_LAYER_EXCEPTIONS` in `src/lib.rs`, where the module-graph
+// test rejects any test-only inversion that is not on that list.
+//
+// Both traits are `pub(crate)`, so they are neither nameable nor implementable
+// from outside the crate: the blanket implementations in `crate::ffi::alloc` are
+// the only ones that can ever exist, and callers cannot substitute a different
+// allocation runtime.
+
+/// Fallible single-value heap boxing — the capability behind [`try_box`].
+///
+/// Declared here and implemented for every `Sized` type by a blanket
+/// implementation in the sanctioned `crate::ffi::alloc` zone, where the
+/// `core::alloc` call and the `Box::from_raw` reconstruction are confined.
+///
+/// Implementations must return [`None`] — never abort — when the global heap
+/// cannot satisfy a `Layout::new::<Self>()` request, and must drop `self` in that
+/// case so any buffers it owns are released (AAP §0.6.5).
+pub(crate) trait FallibleBoxAlloc: Sized {
+    /// Moves `self` onto the global heap, or returns [`None`] on exhaustion.
+    fn try_box_fallible(self) -> Option<Box<Self>>;
+}
+
+/// Foreign (caller-`zalloc`'d) buffer allocation — the capability behind
+/// [`AllocHook::try_alloc_zeroed`] and [`AllocHook::try_alloc_zeroed_items`].
+///
+/// Declared here and implemented for the whole [`ZeroValid`] element set by a
+/// blanket implementation in the sanctioned `crate::ffi::alloc` zone, which owns
+/// the `(items, item_size)` validation, the hook invocation, the alignment check,
+/// the `T::default()` fill, and the `zfree`-on-drop.
+///
+/// Implementations must forward `(items, item_size)` to the caller's `zalloc`
+/// verbatim so the hook observes exactly the arguments C's
+/// `ZALLOC(strm, items, size)` passes, and must return [`None`] — with the region
+/// already released through `zfree` if one was obtained — rather than falling
+/// back to the global allocator (AAP §0.6.2, §0.6.3 has-hook clause, §0.6.5).
+pub(crate) trait ForeignAlloc: Copy + Default + ZeroValid + 'static {
+    /// Allocates `count` elements through `hook`, requesting them as
+    /// `(count, size_of::<Self>())` — the split C uses for its element-shaped
+    /// `ZALLOC(strm, n, sizeof(Pos))` requests.
+    fn try_alloc_foreign(hook: AllocHook, count: usize) -> Option<Box<dyn ForeignBuffer<Self>>>;
+
+    /// Allocates `items * item_size` bytes through `hook`, materialized as
+    /// `items * item_size / size_of::<Self>()` elements holding
+    /// [`Default::default`].
+    fn try_alloc_foreign_items(
+        hook: AllocHook,
+        items: usize,
+        item_size: usize,
+    ) -> Option<Box<dyn ForeignBuffer<Self>>>;
+}
+
+/// The byte count reference zlib charges a caller's allocator for one engine
+/// state — the `size` half of C's `ZALLOC(strm, 1, sizeof(deflate_state))`
+/// (`deflate.c` L440) and `ZALLOC(strm, 1, sizeof(struct inflate_state))`
+/// (`inflate.c` L198, `infback.c` L51) — the capability behind
+/// [`EngineReservation`].
+///
+/// Reference zlib does not put its engine state on some private heap: it charges
+/// the caller's allocator for it, exactly once, *before* any working buffer, and
+/// hands the region back through `zfree` last. A caller who installs a bounded
+/// arena sizes that arena from C's `sizeof`, so a drop-in replacement has to ask
+/// for C's pair: an allocator that serves `(1, 5968)` for deflate and
+/// `(1, 7160)` for inflate and refuses anything larger must still initialize.
+/// Requesting this port's own, legitimately larger `size_of::<Self>()` made such
+/// an allocator report `Z_MEM_ERROR` where reference zlib succeeds — an exact
+/// drop-in allocator-behaviour defect, not merely a cosmetic one.
+///
+/// This trait is what keeps the request C-exact: [`EngineReservation::take`]
+/// charges `(1, Self::C_STATE_SIZE)`, computed from the engine's field-exact
+/// `#[repr(C)]` layout mirror so it tracks C's `sizeof` on every target and
+/// pointer width, while the Rust state value lives on the global heap beside the
+/// charge. That split is required rather than merely convenient: a block of C's
+/// smaller `sizeof` cannot hold this port's state, so charging C's byte count and
+/// hosting the state in the same region are mutually exclusive. What a caller's
+/// allocator can observe — the request count, the argument pair, the position in
+/// the sequence, the failure timing, and the release order (AAP §0.6.5) — is
+/// preserved in full; only the address the state happens to occupy differs, and
+/// no zlib contract exposes that.
+pub(crate) trait EngineFootprint: Sized + 'static {
+    /// C's `sizeof` for this engine's state struct — 5968 for `deflate_state`
+    /// and 7160 for `struct inflate_state` on LP64.
+    ///
+    /// Implementors forward their own `C_LAYOUT_SIZE`, the size of the
+    /// field-exact `#[repr(C)]` ABI mirror, so this value moves with the target
+    /// exactly as C's `sizeof` does.
+    const C_STATE_SIZE: usize;
+}
+
+/// The single owning handle for an engine state: the state value itself plus the
+/// allocator charge reference zlib makes for it — the state-shaped counterpart of
+/// [`AllocBuffer`].
+///
+/// Both engines hand their state to a stream as a [`BoxedEngine`], and both
+/// recover it the same way, so exactly one code path exists regardless of which
+/// allocator is installed. Dereferencing is a field access and never a type
+/// lookup, which matters because the decoder touches its state hundreds of times
+/// per call.
+///
+/// # Cost of the uniform handle
+///
+/// This adds one small allocation per stream — the `Box` holding this handle — on
+/// top of the `Box<E>` that already existed. That is deliberate: it is what lets
+/// `StreamState` stay a single non-generic `Box<dyn EngineState>` while still
+/// carrying the caller's state charge to its `zfree` at the right moment. Nothing
+/// observes it, because the extra `Box` comes from the global heap, which exposes
+/// no allocation accounting to a zlib caller.
+pub(crate) struct EngineBox<E: EngineState + 'static> {
+    /// The state itself, on the Rust heap.
+    engine: Box<E>,
+    /// The caller's charge for the state footprint — C's
+    /// `ZALLOC(strm, 1, sizeof(deflate_state))` region — or an **empty** buffer
+    /// with a no-op drop when no allocator asked to be charged (the historical
+    /// global-allocator path; see [`EngineReservation`]).
+    ///
+    /// Declared *after* `engine` so it is released after the state's working
+    /// buffers, which is C's `deflateEnd`/`inflateEnd` order — state last.
+    ///
+    /// Named with a leading underscore because it is a pure drop guard: nothing
+    /// ever reads it, its whole job is to reach the allocator's `zfree` at the
+    /// right moment.
+    _footprint: AllocBuffer<u8>,
+}
+
+/// An engine state boxed for installation into a [`ZStream`].
+///
+/// The extra `Box` is what erases `E` so [`StreamState`] can stay non-generic;
+/// see [`EngineBox`].
+pub(crate) type BoxedEngine<E> = Box<EngineBox<E>>;
+
+impl<E: EngineState + 'static> EngineBox<E> {
+    /// Moves `engine` onto the global heap fallibly, yielding [`None`] rather
+    /// than aborting when it cannot be satisfied.
+    #[inline]
+    pub(crate) fn try_owned(engine: E) -> Option<BoxedEngine<E>> {
+        Self::try_owned_charged(engine, AllocBuffer::default())
+    }
+
+    /// [`try_owned`](Self::try_owned) while holding an accounting reservation a
+    /// custom Rust [`Allocator`] insisted on being charged for.
+    #[inline]
+    fn try_owned_charged(engine: E, footprint: AllocBuffer<u8>) -> Option<BoxedEngine<E>> {
+        let engine = try_box(engine)?;
+        try_box(EngineBox {
+            engine,
+            _footprint: footprint,
+        })
+    }
+
+    /// `true` when a caller's `zalloc` was charged for this state's footprint —
+    /// the C-ABI path, where the charge is C's
+    /// `ZALLOC(strm, 1, sizeof(deflate_state))` region held for `zfree`.
+    ///
+    /// This is what makes the charge assertable from a test: `false` means the
+    /// handle carries the empty drop guard of the historical global-allocator
+    /// path, `true` means the caller's arena really was billed for the state.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn is_charged(&self) -> bool {
+        !self._footprint.is_empty()
+    }
+}
+
+impl<E: EngineState + 'static> Deref for EngineBox<E> {
+    type Target = E;
+
+    #[inline]
+    fn deref(&self) -> &E {
+        &self.engine
+    }
+}
+
+impl<E: EngineState + 'static> DerefMut for EngineBox<E> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut E {
+        &mut self.engine
+    }
+}
+
+impl<E: EngineState + 'static> EngineState for EngineBox<E> {
+    #[inline]
+    fn engine_kind(&self) -> EngineKind {
+        (**self).engine_kind()
+    }
+
+    /// Delegates to the wrapped state, so a downcast asks for `E` — the concrete
+    /// engine — and not for this wrapper. That is what keeps
+    /// [`ZStream::engine_state`] unchanged by the introduction of this type.
+    #[inline]
+    fn as_any(&self) -> &dyn Any {
+        (**self).as_any()
+    }
+
+    #[inline]
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        (**self).as_any_mut()
+    }
+
+    /// Returns *this wrapper*, not the wrapped state: the owning view has to stay
+    /// the handle, because moving the state out of it would strand the caller's
+    /// footprint charge, whose `zfree` must happen after the state's working
+    /// buffers. `downcast::<EngineBox<E>>` is therefore the spelling the engines
+    /// use, and it is allocation-free.
+    #[inline]
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+/// The reservation half of engine-state allocation: the charge is made where C
+/// makes its state `ZALLOC`, and travels with the state once the state value is
+/// complete.
+///
+/// Which of the two arms is taken is decided entirely by the allocator:
+///
+/// | `reserves_state_footprint()` | Arm | Who reaches it |
+/// |---|---|---|
+/// | `false` | [`Global`](Self::Global) | [`DefaultAllocator`]; a C caller with null `zalloc`/`zfree`, where zlib itself uses its built-in allocator |
+/// | `true` | [`Charged`](Self::Charged) | every C caller with an installed hook, and any custom Rust [`Allocator`] that opts in |
+///
+/// The second row is the one the C ABI takes, and it is what bills the caller's
+/// `zalloc` for the `deflate_state` / `inflate_state` with C's own
+/// `(1, sizeof(...))` pair. The charge is a region the allocator hands over and
+/// this port holds — unread — until the matching `zfree`; the Rust state value
+/// sits beside it on the global heap, because an [`Allocator`] hands out typed
+/// slice buffers and this port's state is legitimately larger than C's struct, so
+/// C's byte count and hosting the state in the same block are mutually exclusive
+/// (see [`EngineFootprint`]). Everything the caller's allocator can observe — the
+/// request count, the argument pair, its position in the sequence, the failure
+/// timing, and the release order — is C-exact (AAP §0.6.5).
+pub(crate) enum EngineReservation<E: EngineState + EngineFootprint + 'static> {
+    /// The allocator was charged for the state footprint; the state is boxed
+    /// globally and the charge travels with it, reaching `zfree` after the
+    /// state's working buffers.
+    Charged(AllocBuffer<u8>),
+    /// No charge: the `Box` already *is* the allocation.
+    ///
+    /// `PhantomData` rides on this arm so the reservation stays bound to the
+    /// engine it was taken for; the binding is what lets [`take`](Self::take)
+    /// charge `E`'s C-exact `size` and [`fill`](Self::fill) accept only that same
+    /// engine, making a state/charge mismatch unrepresentable.
+    Global(PhantomData<fn() -> E>),
+}
+
+impl<E: EngineState + EngineFootprint + 'static> EngineReservation<E> {
+    /// Charges `alloc` for one engine footprint if it reserves them, in C's
+    /// position in the allocation sequence — first, before any working buffer.
+    ///
+    /// The request is shaped `(1, E::C_STATE_SIZE)`: C's `items` and C's `size`,
+    /// so an allocator sized from `sizeof(deflate_state)` or
+    /// `sizeof(struct inflate_state)` serves it exactly as it serves reference
+    /// zlib's. This is a hard drop-in requirement, not a nicety — asking for this
+    /// port's larger `size_of::<E>()` made a conforming C-sized allocator refuse
+    /// and turned a successful `deflateInit2_` into `Z_MEM_ERROR`.
+    ///
+    /// Returns [`None`] only when a charge was attempted and refused — the
+    /// `Z_MEM_ERROR` C reports from its failed state `ZALLOC`, at C's moment.
+    #[inline]
+    pub(crate) fn take<A: Allocator>(alloc: &A) -> Option<Self> {
+        if !alloc.reserves_state_footprint() {
+            return Some(Self::Global(PhantomData));
+        }
+        Some(Self::Charged(
+            alloc.allocate_zeroed_items::<u8>(1, E::C_STATE_SIZE)?,
+        ))
+    }
+
+    /// Boxes `engine` on the global heap and attaches the charge taken by
+    /// [`take`](Self::take).
+    ///
+    /// Returns [`None`] whenever the global heap cannot hold the small owning
+    /// handles this port needs to keep the state's memory type-erased. The
+    /// caller's charge was already secured by [`take`](Self::take) and is never
+    /// re-requested here, so C's request *count* is unaffected either way; a
+    /// refusal is reported as `Z_MEM_ERROR` exactly as C reports a refused
+    /// `ZALLOC`, and never aborts.
+    #[inline]
+    pub(crate) fn fill(self, engine: E) -> Option<BoxedEngine<E>> {
+        match self {
+            Self::Charged(footprint) => EngineBox::try_owned_charged(engine, footprint),
+            Self::Global(_) => EngineBox::try_owned(engine),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -267,20 +991,31 @@ pub trait ForeignBuffer<T: Copy + Default> {
 /// When an active hook's `zalloc` reports out-of-memory (or the request is an
 /// unrepresentable size), [`try_zeroed`](Self::try_zeroed) returns [`None`]
 /// rather than silently falling back to the global allocator; callers propagate
-/// that as `Z_MEM_ERROR` (M7). The only place a foreign buffer degrades to an
-/// owned one is [`Clone`] under memory pressure (see its docs), which must stay
-/// infallible.
+/// that as `Z_MEM_ERROR` (AAP §0.6.5). A foreign buffer **never** degrades to an owned
+/// one: copying is performed by the fallible
+/// [`try_clone`](Self::try_clone) — this type deliberately does not implement
+/// [`Clone`] — so a caller who installed a bounded arena observes the failure
+/// instead of silently receiving a copy in the global heap (AAP §0.6.5).
 ///
-/// # Zeroing and `unsafe` isolation
+/// # Initialization and `unsafe` isolation
 ///
-/// A foreign region is zero-filled inside `crate::ffi::alloc`, reproducing C
-/// `zcalloc`'s post-`zalloc` `zmemzero`. `T` is bounded `Copy + Default`, and the
-/// element types the engines request (`u8`, `u16`, `u32`) all have an all-zero
-/// bit pattern equal to their [`Default`] value, so the zero-fill is a correct
-/// initialization. **This module contains no `unsafe`**: every raw-pointer
-/// operation for the [`Foreign`](Self::Foreign) arm is behind the safe
-/// [`ForeignBuffer`] interface (M6).
-pub enum AllocBuffer<T: Copy + Default> {
+/// Both arms hand back `count` elements that hold `T`'s [`Default`] value. The
+/// [`Owned`](Self::Owned) arm builds them with `vec![T::default(); count]`; a
+/// foreign region is filled inside `crate::ffi::alloc` by *writing valid
+/// `T::default()` values*, which for the integer element types the engines
+/// request (`u8` and `u16`, whose `Default` is `0`) is byte-for-byte the
+/// `zmemzero` that C `zcalloc` performs after its `zalloc`. Writing values rather
+/// than zeroing bytes is deliberate: the `Copy + Default` bound alone does not
+/// make an all-zero bit pattern a *valid* `T`. As an independent, compile-time
+/// line of defence the element-type set is additionally sealed by the
+/// [`ZeroValid`] marker, so the two sanctioned remedies for that hazard are both
+/// in force. That zone also validates the request as a
+/// [`core::alloc::Layout`] and verifies the address the hook returns against
+/// `T`'s alignment, so a slice over the region is always sound.
+/// **This module contains no `unsafe`**: every raw-pointer operation for the
+/// [`Foreign`](Self::Foreign) arm is behind the safe [`ForeignBuffer`] interface
+/// (AAP §0.6.2).
+pub enum AllocBuffer<T: Copy + Default + ZeroValid> {
     /// Global-allocator storage (the default / null-hook path).
     Owned(Vec<T>),
     /// Caller-`zalloc`'d storage, accessed through the safe [`ForeignBuffer`]
@@ -290,32 +1025,159 @@ pub enum AllocBuffer<T: Copy + Default> {
     Foreign(Box<dyn ForeignBuffer<T>>),
 }
 
-impl<T: Copy + Default> AllocBuffer<T> {
-    /// Allocates a zero-initialized buffer of `count` elements, routing through
-    /// the caller's `zalloc` when `hook` is active (see the type-level
-    /// [backing-store selection](AllocBuffer#backing-store-selection)).
+impl<T: Copy + Default + ZeroValid> AllocBuffer<T> {
+    /// Allocates a buffer of `count` elements holding `T`'s [`Default`] value,
+    /// routing through the caller's `zalloc` when `hook` is active (see the
+    /// type-level [backing-store selection](AllocBuffer#backing-store-selection)).
     ///
-    /// Returns [`None`] when an active hook's `zalloc` reports out-of-memory (or
-    /// the requested size is unrepresentable in the C `uInt` hook ABI); callers
-    /// propagate that as `Z_MEM_ERROR` (M7). The null-hook and empty-count paths
-    /// always succeed via the global allocator, byte-for-byte reproducing the
-    /// historical behavior. All raw-pointer work for the active-hook path is
-    /// confined to the sanctioned `crate::ffi::alloc` zone (M6), so this method
-    /// contains no `unsafe`.
+    /// Returns [`None`] when an active hook's `zalloc` reports out-of-memory, or
+    /// when the request cannot be served through that hook soundly — a size that
+    /// is unrepresentable in the C `uInt` hook ABI or as a
+    /// [`core::alloc::Layout`], or an address from the hook that does not satisfy
+    /// `T`'s alignment — and also when the global-allocator path cannot reserve
+    /// `count` elements. Callers propagate every one of those as `Z_MEM_ERROR`
+    /// (AAP §0.6.5), exactly as C reports a failed `ZALLOC`. The null-hook,
+    /// empty-count, and zero-sized-`T` paths are served from the global allocator,
+    /// byte-for-byte reproducing the historical behavior. All raw-pointer work for
+    /// the active-hook path is confined to the sanctioned `crate::ffi::alloc` zone
+    /// (AAP §0.6.2), so this contains no `unsafe`.
+    ///
+    /// The hook sees the request as `(count, size_of::<T>())`, which is the pair
+    /// C passes for the element-shaped `ZALLOC`s (`prev` and `head`, both
+    /// `ZALLOC(strm, n, sizeof(Pos))`). Use
+    /// [`try_zeroed_items`](Self::try_zeroed_items) where C uses a different
+    /// `(items, size)` split for the same byte count.
     #[must_use]
     pub fn try_zeroed(count: usize, hook: AllocHook) -> Option<Self>
     where
         T: 'static,
     {
-        // Fast path / default: no custom allocator, or an empty request.
-        // `vec![T::default(); count]` matches C `zcalloc`'s zero fill and is the
-        // exact historical (global-allocator) behavior.
+        // Fast path / default: an inactive hook (a C caller who supplied neither
+        // half; a half-present pair is *completed* with the crate's built-in at
+        // the `*Init*_` boundary, so it arrives here already active), an empty
+        // request, or a zero-sized element type.
+        // `try_owned` matches C `zcalloc`'s zero fill and
+        // is the exact historical (global-allocator) behavior, but reserves
+        // fallibly so global-heap exhaustion is reported rather than aborting; for
+        // a zero-sized `T` it allocates nothing at all, which is why such a request
+        // is served here rather than being pushed through a C hook that has no way
+        // to express a zero element size.
+        if !hook.is_active() || count == 0 || core::mem::size_of::<T>() == 0 {
+            return Self::try_owned(count);
+        }
+        // Active hook: delegate to the sanctioned `ffi` allocator zone, which
+        // validates the layout and the returned address before any slice exists.
+        // `None` (OOM / unrepresentable size / unusable address) propagates — no
+        // global fallback (AAP §0.6.5).
+        hook.try_alloc_zeroed::<T>(count).map(AllocBuffer::Foreign)
+    }
+
+    /// Reserves `count` default-initialized elements on the Rust global heap
+    /// **fallibly**.
+    ///
+    /// `vec![T::default(); count]` aborts the process when the heap cannot
+    /// satisfy the request, whereas zlib reports a failed working-buffer
+    /// allocation as `Z_MEM_ERROR`. Reserving first and filling afterwards turns
+    /// an unsatisfiable request (an absurd `count`, or genuine exhaustion) into
+    /// [`None`] (AAP §0.6.5). The resulting contents are identical to the historical
+    /// `vec![T::default(); count]` spelling.
+    fn try_owned(count: usize) -> Option<Self> {
+        let mut vec: Vec<T> = Vec::new();
+        vec.try_reserve_exact(count).ok()?;
+        vec.resize(count, T::default());
+        Some(AllocBuffer::Owned(vec))
+    }
+
+    /// Allocates a zero-initialized buffer described as `items * item_size`
+    /// bytes, forwarding that exact pair to an active `zalloc` so the caller
+    /// observes the same arguments C's `ZALLOC(strm, items, size)` passes.
+    ///
+    /// zlib does not always split a request as `(element_count, element_size)`:
+    /// `deflateInit2_` asks for the window as `ZALLOC(strm, s->w_size, 2 *
+    /// sizeof(Byte))` (`deflate.c` L458) and the pending buffer as
+    /// `ZALLOC(strm, s->lit_bufsize, LIT_BUFS)` (`deflate.c` L505). A bounded
+    /// caller allocator can legitimately inspect both arguments, so preserving
+    /// the split is part of the has-hook contract (AAP §0.6.3, §0.6.5).
+    ///
+    /// The materialized element count is `items * item_size / size_of::<T>()`.
+    /// Returns [`None`] when the product overflows, when it is not an exact
+    /// multiple of `size_of::<T>()`, when an active `zalloc` reports
+    /// out-of-memory or an unrepresentable size, or when the global-allocator
+    /// path cannot reserve the elements (AAP §0.6.5). There is **no** global fallback
+    /// for an active hook.
+    #[must_use]
+    pub fn try_zeroed_items(items: usize, item_size: usize, hook: AllocHook) -> Option<Self>
+    where
+        T: 'static,
+    {
+        let elem = core::mem::size_of::<T>();
+        // Zero-sized `T` has no meaningful buffer geometry. Every member of the
+        // sealed `ZeroValid` set is a non-zero-sized integer primitive (the engines
+        // request `u8` and `u16`), so this is unreachable in practice and is
+        // rejected rather than silently mis-sized.
+        if elem == 0 {
+            return None;
+        }
+        let total = items.checked_mul(item_size)?;
+        if total % elem != 0 {
+            return None;
+        }
+        let count = total / elem;
+
+        // Fast path / default: an inactive hook (neither half supplied; a
+        // half-present pair is *completed* with the crate's built-in at the
+        // `*Init*_` boundary and so arrives active), or an empty request.
         if !hook.is_active() || count == 0 {
-            return Some(AllocBuffer::Owned(alloc::vec![T::default(); count]));
+            return Self::try_owned(count);
         }
         // Active hook: delegate to the sanctioned `ffi` allocator zone. `None`
-        // (OOM / unrepresentable size) propagates — no global fallback (M7).
-        hook.try_alloc_zeroed::<T>(count).map(AllocBuffer::Foreign)
+        // (OOM / unrepresentable size) propagates — no global fallback (AAP §0.6.5).
+        hook.try_alloc_zeroed_items::<T>(items, item_size)
+            .map(AllocBuffer::Foreign)
+    }
+
+    /// Fallible, **allocator-preserving** deep copy — the safe analogue of the
+    /// `ZALLOC`-then-`zmemcpy` sequence in C `deflateCopy`/`inflateCopy`.
+    ///
+    /// An [`Owned`](Self::Owned) buffer is copied through a fallible reservation,
+    /// so global-heap exhaustion is reported rather than aborting. A
+    /// [`Foreign`](Self::Foreign) buffer allocates a fresh region through the
+    /// **same** [`AllocHook`] via [`ForeignBuffer::clone_foreign`] — with the same
+    /// `(items, item_size)` pair — and copies the contents across, so the copy
+    /// lives in the same arena as the original.
+    ///
+    /// # Why this is fallible instead of [`Clone`]
+    ///
+    /// AAP §0.6.5 requires that "the clone path must route through the same
+    /// `AllocHook` — otherwise a caller that supplied a custom arena would find
+    /// the copy living in the global heap". An infallible [`Clone`] cannot honor
+    /// that: when the caller's `zalloc` reports out-of-memory mid-copy its only
+    /// options are to panic or to silently fall back to the global allocator, and
+    /// the fallback turns a caller-visible `Z_MEM_ERROR` into a spurious success —
+    /// returning `Z_OK` where C returns `Z_MEM_ERROR` and leaving a
+    /// caller-supplied arena silently escaped.
+    /// [`AllocBuffer`] therefore deliberately does **not** implement [`Clone`];
+    /// this method returns [`None`] on out-of-memory and the C copy entry points
+    /// translate that into `Z_MEM_ERROR`. C behaves identically: `deflateCopy`
+    /// (`deflate.c` L1317-L1377, L1348-L1350) and `inflateCopy` (`inflate.c`
+    /// L1340-L1350) both return `Z_MEM_ERROR` when a `ZALLOC` fails during the
+    /// copy, so making the failure visible in the type is what keeps the has-hook
+    /// clause (AAP §0.6.3) and allocation-failure parity (AAP §0.6.5) intact.
+    #[must_use]
+    pub fn try_clone(&self) -> Option<Self> {
+        match self {
+            AllocBuffer::Owned(v) => {
+                let mut fresh: Vec<T> = Vec::new();
+                fresh.try_reserve_exact(v.len()).ok()?;
+                fresh.extend_from_slice(v);
+                Some(AllocBuffer::Owned(fresh))
+            }
+            // The concrete implementor reproduces the original `(items, size)`
+            // pair through the same hook; `None` means the caller's `zalloc`
+            // refused. Propagate it verbatim — no global-allocator fallback
+            // (AAP §0.6.5).
+            AllocBuffer::Foreign(b) => b.clone_foreign().map(AllocBuffer::Foreign),
+        }
     }
 
     /// Wraps an existing [`Vec`] as an [`Owned`](Self::Owned) buffer (used by
@@ -333,7 +1195,11 @@ impl<T: Copy + Default> AllocBuffer<T> {
     pub fn len(&self) -> usize {
         match self {
             AllocBuffer::Owned(v) => v.len(),
-            AllocBuffer::Foreign(b) => b.as_slice().len(),
+            // `ForeignBuffer::len`, never `as_slice().len()`: the caller-supplied
+            // `inflateBack` window is adopted uninitialized (C `infback.c` L59 is
+            // a bare pointer store), so measuring it through a slice would form a
+            // reference over uninitialized bytes.
+            AllocBuffer::Foreign(b) => b.len(),
         }
     }
 
@@ -343,22 +1209,76 @@ impl<T: Copy + Default> AllocBuffer<T> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Whether the backing store is a caller-`zalloc`'d
+    /// [`Foreign`](Self::Foreign) region rather than an
+    /// [`Owned`](Self::Owned) [`Vec`].
+    ///
+    /// Test-only: the engines deliberately cannot observe which backing store is
+    /// active, but the allocator-contract tests must assert that the has-hook
+    /// clause selected the arm they expect and that a copy stayed in the caller's
+    /// arena instead of silently relocating to the global heap.
+    #[cfg(test)]
+    #[inline]
+    #[must_use]
+    pub(crate) const fn is_foreign(&self) -> bool {
+        matches!(self, AllocBuffer::Foreign(_))
+    }
+
+    /// Materialize the backing store as a shared slice.
+    ///
+    /// Identical to `&*self` through [`Deref`], and offered as a named method so
+    /// that a hot loop can state at its head that it is materializing the buffer
+    /// **once** for the whole loop.
+    ///
+    /// # Why materializing once matters
+    ///
+    /// On the [`Owned`](Self::Owned) arm this resolves to a `Vec` pointer load
+    /// that the optimizer hoists on its own. On the [`Foreign`](Self::Foreign)
+    /// arm — the caller-supplied `zalloc`/`zfree` path — it is a *dynamic* call
+    /// through `Box<dyn ForeignBuffer<T>>`, which no inliner can remove because
+    /// the concrete implementor is not known until the C caller installs its
+    /// hooks. A loop that indexes the buffer through [`Deref`] therefore pays one
+    /// virtual call per element, which is what made the caller-hook deflate path
+    /// run at roughly half the speed of the global-allocator path.
+    ///
+    /// The rule the engines follow, per AAP §0.6.3: **bind the slice once outside
+    /// the loop, index the binding inside it.** Because the borrow is held for
+    /// the loop's duration the compiler enforces that nothing reallocates or
+    /// re-tags the buffer underneath it, so the transformation is observably
+    /// identical — it cannot move a single emitted byte (§0.8.1 directive D-1).
+    #[inline]
+    #[must_use]
+    pub fn as_slice(&self) -> &[T] {
+        self
+    }
+
+    /// Materialize the backing store as a mutable slice.
+    ///
+    /// The [`DerefMut`] counterpart of [`as_slice`](Self::as_slice); see that
+    /// method for why hot loops bind the slice once rather than indexing through
+    /// [`Deref`] per element.
+    #[inline]
+    #[must_use]
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        self
+    }
 }
 
-impl<T: Copy + Default> Deref for AllocBuffer<T> {
+impl<T: Copy + Default + ZeroValid> Deref for AllocBuffer<T> {
     type Target = [T];
     #[inline]
     fn deref(&self) -> &[T] {
         match self {
             AllocBuffer::Owned(v) => v.as_slice(),
             // Delegates to the safe `ForeignBuffer` interface; the raw-pointer
-            // slice materialization is confined to `crate::ffi::alloc` (M6).
+            // slice materialization is confined to `crate::ffi::alloc`.
             AllocBuffer::Foreign(b) => b.as_slice(),
         }
     }
 }
 
-impl<T: Copy + Default> DerefMut for AllocBuffer<T> {
+impl<T: Copy + Default + ZeroValid> DerefMut for AllocBuffer<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
         match self {
@@ -369,33 +1289,7 @@ impl<T: Copy + Default> DerefMut for AllocBuffer<T> {
     }
 }
 
-impl<T: Copy + Default> Clone for AllocBuffer<T> {
-    /// Deep-clones the buffer. An [`Owned`](Self::Owned) buffer clones its
-    /// [`Vec`]; a [`Foreign`](Self::Foreign) buffer allocates a fresh region
-    /// through the same hook (re-invoking the caller's `zalloc`, matching C
-    /// `deflateCopy` which `ZALLOC`s new buffers) via
-    /// [`ForeignBuffer::clone_foreign`] and copies the contents across.
-    ///
-    /// [`Clone`] cannot fail, so if the caller's `zalloc` reports OOM during the
-    /// copy, this degrades to a **sound global-allocator copy** of the live
-    /// contents (the fresh buffer becomes [`Owned`](Self::Owned)). The data is
-    /// correct; only the backing allocator differs. This is the single
-    /// documented boundary where a foreign buffer may become owned — the fallible
-    /// INIT paths ([`try_zeroed`](Self::try_zeroed)) are the M7 target and still
-    /// surface `Z_MEM_ERROR`; only this infallible `deflateCopy`-style clone
-    /// tolerates the fallback.
-    fn clone(&self) -> Self {
-        match self {
-            AllocBuffer::Owned(v) => AllocBuffer::Owned(v.clone()),
-            AllocBuffer::Foreign(b) => match b.clone_foreign() {
-                Some(fresh) => AllocBuffer::Foreign(fresh),
-                None => AllocBuffer::Owned(b.as_slice().to_vec()),
-            },
-        }
-    }
-}
-
-impl<T: Copy + Default> Default for AllocBuffer<T> {
+impl<T: Copy + Default + ZeroValid> Default for AllocBuffer<T> {
     /// An empty [`Owned`](Self::Owned) buffer (no allocation) — the analogue of
     /// C's `state->window = Z_NULL` "not yet allocated" sentinel.
     #[inline]
@@ -408,7 +1302,7 @@ impl<T: Copy + Default> Default for AllocBuffer<T> {
 // itself through the global allocator, and the `Foreign` arm's
 // `Box<dyn ForeignBuffer<T>>` runs its implementor's `Drop` (in the sanctioned
 // `crate::ffi::alloc` zone), which calls the caller's `zfree`. Both release paths
-// are automatic, so no `unsafe` deallocation lives in this module (M6).
+// are automatic, so no `unsafe` deallocation lives in this module.
 
 /// Abstraction over the source of the library's heap buffers, replacing the C
 /// `alloc_func`/`free_func` pointers (`zlib.h` L85-L86).
@@ -434,8 +1328,35 @@ impl<T: Copy + Default> Default for AllocBuffer<T> {
 /// Implementations must return a buffer of exactly `count` elements from
 /// [`allocate_zeroed`](Allocator::allocate_zeroed), every element initialised to
 /// its [`Default`] (numerically zero) value — mirroring the zero-fill that C
-/// `zcalloc` performs. [`deallocate`](Allocator::deallocate) consumes a buffer
-/// previously produced by the same allocator.
+/// `zcalloc` performs. [`allocate_zeroed_items`](Allocator::allocate_zeroed_items)
+/// is the same operation expressed in C's `(items, size)` shape, and must yield
+/// `items * item_size / size_of::<T>()` such elements.
+/// [`deallocate`](Allocator::deallocate) consumes a buffer previously produced by
+/// the same allocator.
+///
+/// Both allocation methods are *provided*, so an implementation may override
+/// either, both, or neither. The defaults route the request through
+/// [`hook`](Allocator::hook), which is what makes overriding `hook` alone
+/// sufficient for a hook-forwarding allocator; overriding an allocation method
+/// alone is sufficient for an allocator that manages storage itself.
+///
+/// # Which method the engines call
+///
+/// The deflate and inflate init, copy, and lazy-window paths allocate **every**
+/// working buffer and the state footprint through this trait, choosing the method
+/// whose shape matches the corresponding C `ZALLOC`:
+///
+/// | C request | Method the engines call |
+/// |---|---|
+/// | `ZALLOC(strm, 1, sizeof(deflate_state))` / `sizeof(struct inflate_state)` | [`allocate_zeroed_items`](Allocator::allocate_zeroed_items) |
+/// | `ZALLOC(strm, w_size, 2 * sizeof(Byte))` (the doubled window) | [`allocate_zeroed_items`](Allocator::allocate_zeroed_items) |
+/// | `ZALLOC(strm, w_size, sizeof(Pos))` / `ZALLOC(strm, hash_size, sizeof(Pos))` | [`allocate_zeroed`](Allocator::allocate_zeroed) |
+/// | `ZALLOC(strm, lit_bufsize, LIT_BUFS)` (`pending_buf`) | [`allocate_zeroed_items`](Allocator::allocate_zeroed_items) |
+/// | `ZALLOC(strm, 1 << wbits, sizeof(unsigned char))` (the inflate window) | [`allocate_zeroed`](Allocator::allocate_zeroed) |
+///
+/// A custom allocator therefore genuinely serves engine memory: it observes the
+/// same request count, the same `(items, size)` pairs, and the same ordering a C
+/// `zalloc` would (AAP §0.6.3, §0.6.5).
 pub trait Allocator {
     /// Allocates a contiguous, zero-initialised buffer of `count` elements of
     /// type `T`, returned as an [`AllocBuffer<T>`].
@@ -445,18 +1366,73 @@ pub trait Allocator {
     /// derefs to a `[T]` slice and, when this allocator carries an active
     /// [`hook`](Allocator::hook), is backed by the caller's `zalloc`/`zfree`;
     /// otherwise it is a global-allocator [`Vec`]. `T` is constrained to
-    /// [`Copy`] + [`Default`] so the buffer can be filled with the type's zero
-    /// value without running arbitrary drop or clone logic; the buffer element
-    /// types the engines request are the plain integer types `u8`, `u16`, and
-    /// `u32`, all of whose `Default` is `0`.
+    /// [`Copy`] + [`Default`] so the buffer can be filled with the type's default
+    /// value without running arbitrary drop or clone logic, and additionally to
+    /// the sealed [`ZeroValid`] marker so the foreign path's element-type set is
+    /// restricted at compile time; the buffer element types the engines request
+    /// are the plain integers `u8` and `u16`, whose [`Default`] is `0`. The bound
+    /// is intentionally *not* relied on as a promise that an all-zero bit pattern
+    /// is a valid `T`: the foreign path initializes by writing `T::default()`
+    /// values.
     ///
-    /// Returns [`None`] when an active hook's `zalloc` reports out-of-memory;
-    /// callers translate that into `Z_MEM_ERROR` (M7). The global-allocator
-    /// default is infallible (it aborts on OOM, per Rust convention) and so
-    /// always returns [`Some`].
+    /// # Failure
+    ///
+    /// Returns [`None`] — which every caller translates into `Z_MEM_ERROR`
+    /// (AAP §0.6.5) — for either of the two independent failure sources:
+    ///
+    /// * **Hook-backed allocation.** An active hook's `zalloc` reported
+    ///   out-of-memory by returning null, or the request could not be served
+    ///   through that hook soundly: a byte count unrepresentable in the C `uInt`
+    ///   hook ABI or as a [`core::alloc::Layout`], or an address that does not
+    ///   satisfy `T`'s alignment. There is deliberately **no** fallback to the
+    ///   global allocator, so a caller who installed a bounded arena observes the
+    ///   failure (AAP §0.6.3 has-hook clause).
+    /// * **Global allocation.** With no active hook the buffer is an owned
+    ///   [`Vec`], reserved through the fallible
+    ///   [`Vec::try_reserve_exact`] path rather than an aborting
+    ///   `vec![T::default(); count]`, so an exhausted Rust heap is reported as
+    ///   [`None`] instead of aborting the process. This path is therefore *not*
+    ///   infallible, even though it is the historical default and succeeds for
+    ///   every realistic zlib buffer size.
+    ///
+    /// The default implementation forwards `(count, size_of::<T>())` to
+    /// [`hook`](Allocator::hook) — the split C uses for its element-shaped
+    /// `ZALLOC(strm, n, sizeof(Pos))` requests — so an allocator that only
+    /// overrides `hook` needs nothing else.
+    #[inline]
     fn allocate_zeroed<T>(&self, count: usize) -> Option<AllocBuffer<T>>
     where
-        T: Copy + Default + 'static;
+        T: Copy + Default + ZeroValid + 'static,
+    {
+        AllocBuffer::try_zeroed(count, self.hook())
+    }
+
+    /// Allocates a zero-initialised buffer using C's `(items, item_size)` request
+    /// shape, materialising `items * item_size / size_of::<T>()` elements.
+    ///
+    /// Several C `ZALLOC` call sites split a byte count differently from
+    /// `(count, size_of::<T>())`: the doubled sliding window is
+    /// `ZALLOC(strm, w_size, 2 * sizeof(Byte))`, the pending/symbol buffer is
+    /// `ZALLOC(strm, lit_bufsize, LIT_BUFS)`, and each engine state is
+    /// `ZALLOC(strm, 1, sizeof(...))`. A caller's `zalloc` sees both arguments, so
+    /// forwarding the pair verbatim is required for the hook to observe exactly
+    /// what C passes it (AAP §0.6.2, §0.6.5). This method exists so those
+    /// requests are expressible through the trait rather than only through the
+    /// crate-internal buffer constructor.
+    ///
+    /// Fails under the same two conditions as
+    /// [`allocate_zeroed`](Allocator::allocate_zeroed), plus when
+    /// `items * item_size` is not an exact multiple of `size_of::<T>()`.
+    ///
+    /// The default implementation forwards the pair to
+    /// [`hook`](Allocator::hook).
+    #[inline]
+    fn allocate_zeroed_items<T>(&self, items: usize, item_size: usize) -> Option<AllocBuffer<T>>
+    where
+        T: Copy + Default + ZeroValid + 'static,
+    {
+        AllocBuffer::try_zeroed_items(items, item_size, self.hook())
+    }
 
     /// Returns the caller-allocator [`AllocHook`] this allocator forwards to,
     /// or [`AllocHook::none`] (the default) when it uses the global allocator.
@@ -464,9 +1440,56 @@ pub trait Allocator {
     /// The deflate/inflate init paths read this so a state's lazily- or
     /// eagerly-allocated working buffers can be routed through the caller's
     /// `zalloc`/`zfree` (AAP §0.6.3).
+    ///
+    /// A Rust-native allocator has no reason to override this: it manages storage
+    /// itself and should override
+    /// [`allocate_zeroed`](Allocator::allocate_zeroed) /
+    /// [`allocate_zeroed_items`](Allocator::allocate_zeroed_items) instead, which
+    /// the engines call for every buffer. The default ([`AllocHook::none`]) is
+    /// then correct.
+    ///
+    /// An implementation that genuinely needs to forward to a pair of C
+    /// `zalloc`/`zfree` function pointers builds an *active* hook with
+    /// [`crate::ffi::types::alloc_hook_from_parts`], the `unsafe` constructor at
+    /// the FFI boundary. `AllocHook::new` itself is crate-private on purpose:
+    /// constructing an active hook carries raw-pointer obligations that must be
+    /// discharged by the caller, so the constructor lives in the layer where
+    /// `unsafe` is permitted rather than in this `#![deny(unsafe_code)]` module
+    /// (AAP §0.6.2).
     #[inline]
     fn hook(&self) -> AllocHook {
         AllocHook::none()
+    }
+
+    /// Whether the engines must charge the **engine-state footprint** to this
+    /// allocator as an explicit request, mirroring C's
+    /// `ZALLOC(strm, 1, sizeof(deflate_state))` (`deflate.c` L440) and
+    /// `ZALLOC(strm, 1, sizeof(struct inflate_state))` (`inflate.c` L198).
+    ///
+    /// In C the engine state *is* a caller allocation, so a custom `zalloc` sees
+    /// it first and a tight budget makes `deflateInit2_`/`inflateInit2_` fail
+    /// before any working buffer is requested. Here the state lives in a Rust
+    /// [`Box`], so the init paths additionally reserve an equally sized region
+    /// through this trait purely to keep that accounting and failure timing
+    /// identical (AAP §0.6.5).
+    ///
+    /// The default is `true`: an allocator that was deliberately installed is
+    /// assumed to want C-equivalent accounting. The crate's own
+    /// [`DefaultAllocator`] returns `false`, because there the `Box` already *is*
+    /// the global-allocator request and a second reservation would double each
+    /// stream's fixed overhead — the historical memory bounds must not change.
+    /// The FFI allocator returns whether its hook is active, for the same reason:
+    /// a C caller who left `zalloc`/`zfree` null must observe exactly the
+    /// pre-existing footprint.
+    ///
+    /// When this returns `false` the reservation is skipped entirely and the
+    /// state's reservation field stays empty; a copy
+    /// ([`deflateCopy`](crate::deflate::deflate_copy) /
+    /// [`inflateCopy`](crate::inflate::inflate_copy)) re-requests exactly what the
+    /// source held, so the two paths cannot disagree.
+    #[inline]
+    fn reserves_state_footprint(&self) -> bool {
+        true
     }
 
     /// Releases a buffer previously produced by
@@ -480,7 +1503,7 @@ pub trait Allocator {
     #[inline]
     fn deallocate<T>(&self, buffer: AllocBuffer<T>)
     where
-        T: Copy + Default,
+        T: Copy + Default + ZeroValid,
     {
         // Dropping the `AllocBuffer` runs its `Drop`, which routes to the
         // correct deallocator (global for `Owned`, the caller's `zfree` for
@@ -501,58 +1524,185 @@ pub trait Allocator {
 pub struct DefaultAllocator;
 
 impl Allocator for DefaultAllocator {
+    // Both allocation methods use the trait default. `hook` yields
+    // `AllocHook::none`, so they produce owned, global-allocator `Vec` storage —
+    // byte-for-byte the historical behavior — and the sole failure source is an
+    // exhausted Rust heap, which `try_reserve_exact` reports as `None` rather
+    // than aborting.
+
+    /// `false`: the engine state's `Box` *is* the global-allocator request here,
+    /// so reserving a second region of the same size would double every stream's
+    /// fixed overhead. The historical memory bounds are preserved (AAP §0.6.5).
     #[inline]
-    fn allocate_zeroed<T>(&self, count: usize) -> Option<AllocBuffer<T>>
-    where
-        T: Copy + Default + 'static,
-    {
-        // The default allocator has no hook, so this is always an owned,
-        // global-allocator `Vec` (byte-for-byte the historical behavior) and
-        // therefore always `Some`. Routing through `try_zeroed` with the "none"
-        // hook keeps the single source of truth for buffer construction.
-        AllocBuffer::try_zeroed(count, AllocHook::none())
+    fn reserves_state_footprint(&self) -> bool {
+        false
+    }
+}
+
+/// An [`Allocator`] that forwards every request to one fixed [`AllocHook`].
+///
+/// This is the adapter that lets the hook-taking engine constructors
+/// (`DeflateState::new_in`, `InflateState::try_new_in`,
+/// [`crate::inflate::back::inflate_back_init_in`]) share a single implementation
+/// with their allocator-taking counterparts: the engines allocate exclusively
+/// through the [`Allocator`] trait, and a bare [`AllocHook`] becomes an
+/// `Allocator` by wrapping it here.
+///
+/// With [`AllocHook::none`] this behaves exactly like [`DefaultAllocator`]
+/// (global-allocator storage). With an active hook — built at the FFI boundary
+/// with [`crate::ffi::types::alloc_hook_from_parts`] — every buffer is carved
+/// from the caller's `zalloc` and released through their `zfree`, and an
+/// out-of-memory report propagates as `Z_MEM_ERROR` with no global fallback
+/// (AAP §0.6.3 has-hook clause, §0.6.5).
+#[derive(Copy, Clone)]
+pub struct HookAllocator(AllocHook);
+
+impl fmt::Debug for HookAllocator {
+    /// Reports only whether the wrapped hook is active. The hook's function
+    /// pointers and `opaque` cookie are deliberately not printed: they are raw
+    /// caller-owned values whose addresses carry no useful diagnostic information
+    /// and would make debug output non-deterministic.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HookAllocator")
+            .field("active", &self.0.is_active())
+            .finish()
+    }
+}
+
+impl HookAllocator {
+    /// Wraps `hook` as an [`Allocator`].
+    ///
+    /// Safe: every raw-pointer obligation was discharged when the *active* hook
+    /// was constructed (see [`crate::ffi::types::alloc_hook_from_parts`]), and an
+    /// inactive hook simply selects the global allocator.
+    #[inline]
+    #[must_use]
+    pub const fn new(hook: AllocHook) -> Self {
+        Self(hook)
+    }
+}
+
+impl Default for HookAllocator {
+    /// The global-allocator adapter — equivalent to [`DefaultAllocator`].
+    #[inline]
+    fn default() -> Self {
+        Self(AllocHook::none())
+    }
+}
+
+impl Allocator for HookAllocator {
+    /// Forwards to the wrapped hook, so both allocation methods route through it.
+    #[inline]
+    fn hook(&self) -> AllocHook {
+        self.0
     }
 
-    // `hook` uses the trait default (`AllocHook::none`): the global allocator.
+    /// Only an **active** hook is charged for the state footprint. An inactive
+    /// hook is the global-allocator path, which must keep
+    /// [`DefaultAllocator`]'s footprint exactly (AAP §0.6.5).
+    #[inline]
+    fn reserves_state_footprint(&self) -> bool {
+        self.0.is_active()
+    }
 }
 
 // ===========================================================================
 // StreamState — the owned engine state (replaces the C `internal_state *`)
 // ===========================================================================
 
-/// The engine state owned by a [`ZStream`], replacing the C
+/// Which direction an installed engine drives.
+///
+/// This is layer 5's *complete* knowledge of the layer-6 engines: enough to
+/// answer `is_deflate()` / `is_inflate()` and to render [`fmt::Debug`], and
+/// nothing more. It deliberately does not name either engine type (AAP §0.3.1 /
+/// §0.4.2 B2 — imports run downward only).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum EngineKind {
+    /// A compression engine (`crate::deflate`).
+    Deflate,
+    /// A decompression engine (`crate::inflate`).
+    Inflate,
+}
+
+impl EngineKind {
+    /// Returns a short, allocation-free label, used by [`fmt::Debug`] on
+    /// [`StreamState`] and [`ZStream`].
+    #[inline]
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            EngineKind::Deflate => "Deflate",
+            EngineKind::Inflate => "Inflate",
+        }
+    }
+}
+
+/// The opaque engine state a [`ZStream`] owns — the replacement for the C
 /// `internal_state *state` pointer (`zlib.h` L99).
 ///
-/// A stream is in exactly one of three states, and the enum makes that a
-/// type-level invariant:
+/// The two compression engines live one layer *above* this module, so `stream`
+/// cannot name `DeflateState` or `InflateState` without introducing an upward
+/// edge into the module graph (AAP §0.3.1, §0.4.2 B2). Instead each engine
+/// implements this trait in its own module, and `stream` owns it as
+/// `Box<dyn EngineState>`. Callers that need the concrete engine recover it with
+/// [`ZStream::engine_state`] / [`ZStream::engine_state_mut`], which downcast on
+/// the engine's own [`TypeId`](core::any::TypeId): asking for the wrong engine
+/// yields [`None`], so the C hazard of dispatching an inflate routine on a
+/// deflate state remains unrepresentable.
+///
+/// [`as_any`](EngineState::as_any) and its siblings exist because trait
+/// *upcasting* (`&dyn EngineState` → `&dyn Any`) only became available in Rust
+/// 1.86 and this crate's MSRV is 1.85.0 (`Cargo.toml` `rust-version`); the
+/// explicit accessors are the portable spelling of the same coercion.
+pub(crate) trait EngineState: Any {
+    /// Which direction this engine drives.
+    fn engine_kind(&self) -> EngineKind;
+
+    /// Shared [`Any`] view, used by [`ZStream::engine_state`] to downcast.
+    fn as_any(&self) -> &dyn Any;
+
+    /// Mutable [`Any`] view, used by [`ZStream::engine_state_mut`].
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    /// Owning [`Any`] view, used when an engine is taken out of the stream and
+    /// must be recovered as its concrete boxed type.
+    fn into_any(self: Box<Self>) -> Box<dyn Any>;
+}
+
+/// The engine slot of a [`ZStream`]: either empty or holding exactly one engine.
+///
+/// A stream is in exactly one of three states, and the type makes that an
+/// invariant:
 ///
 /// * [`StreamState::None`] — not yet initialised for either direction
 ///   (equivalent to a C `state == Z_NULL`).
-/// * [`StreamState::Deflate`] — owns a [`DeflateState`] for compression.
-/// * [`StreamState::Inflate`] — owns an [`InflateState`] for decompression.
+/// * [`StreamState::Engine`] with [`EngineKind::Deflate`] — a compression engine.
+/// * [`StreamState::Engine`] with [`EngineKind::Inflate`] — a decompression engine.
 ///
-/// Modelling the two engines as one enum (rather than a pair of
-/// `Option<Box<…>>` fields, the shape sketched in AAP §0.6.3) is a deliberate
-/// tightening: it is *impossible* to simultaneously hold a deflate and an
-/// inflate state, so the C hazard of dispatching an inflate routine on a deflate
-/// state — or vice-versa — cannot be expressed. The [`Option`]-returning
-/// accessors on [`ZStream`] ([`deflate_state`](ZStream::deflate_state),
-/// [`inflate_state`](ZStream::inflate_state), …) recover the ergonomic
+/// Modelling the slot as *one* enum (rather than a pair of `Option<Box<…>>`
+/// fields, the shape sketched in AAP §0.6.3) is a deliberate tightening: it is
+/// *impossible* to simultaneously hold a deflate and an inflate state. The
+/// [`Option`]-returning accessors on [`ZStream`]
+/// ([`engine_state`](ZStream::engine_state), …) recover the ergonomic
 /// `Option<&…>` view the AAP describes.
 ///
-/// The variant payloads are [`Box`]ed because the engine states are large
-/// (deflate ~256 KB, inflate ~7 KB plus its window); boxing keeps `ZStream`
-/// itself small and matches the `Option<Box<…>>` ownership the sibling engine
-/// modules document.
+/// The payload is [`Box`]ed because the engine states are large: at the defaults
+/// a deflate state owns roughly 256 KiB of working buffers in four allocations —
+/// the same count and the same byte total as reference zlib, because the symbol
+/// region is overlaid inside `pending_buf` exactly as C overlays it — and an
+/// inflate state is about 7 KiB plus its on-demand window. Boxing keeps
+/// `ZStream` itself small, and it makes this enum the crate's single owner of an
+/// engine: `StreamState::Engine(Box<dyn EngineState>)` is where the C
+/// `internal_state *` pointer went. The engines' own buffers are
+/// [`AllocBuffer`]s, so an engine may be backed by the caller's
+/// `zalloc`/`zfree` while the `Box` around it is a global-allocator allocation.
 #[derive(Default)]
 pub(crate) enum StreamState {
     /// No engine has been initialised (C `state == Z_NULL`).
     #[default]
     None,
-    /// A compression engine is installed.
-    Deflate(Box<DeflateState>),
-    /// A decompression engine is installed.
-    Inflate(Box<InflateState>),
+    /// An engine is installed; [`EngineState::engine_kind`] says which.
+    Engine(Box<dyn EngineState>),
 }
 
 impl StreamState {
@@ -563,18 +1713,29 @@ impl StreamState {
         matches!(self, StreamState::None)
     }
 
+    /// Returns the installed engine's direction, or [`None`] when the slot is
+    /// empty.
+    #[inline]
+    #[must_use]
+    pub(crate) fn kind(&self) -> Option<EngineKind> {
+        match self {
+            StreamState::None => None,
+            StreamState::Engine(engine) => Some(engine.engine_kind()),
+        }
+    }
+
     /// Returns `true` if a compression engine is installed.
     #[inline]
     #[must_use]
     pub(crate) fn is_deflate(&self) -> bool {
-        matches!(self, StreamState::Deflate(_))
+        self.kind() == Some(EngineKind::Deflate)
     }
 
     /// Returns `true` if a decompression engine is installed.
     #[inline]
     #[must_use]
     pub(crate) fn is_inflate(&self) -> bool {
-        matches!(self, StreamState::Inflate(_))
+        self.kind() == Some(EngineKind::Inflate)
     }
 
     /// Returns a short, allocation-free label for the active variant, used by
@@ -583,19 +1744,17 @@ impl StreamState {
     #[inline]
     #[must_use]
     fn kind_str(&self) -> &'static str {
-        match self {
-            StreamState::None => "None",
-            StreamState::Deflate(_) => "Deflate",
-            StreamState::Inflate(_) => "Inflate",
+        match self.kind() {
+            None => "None",
+            Some(kind) => kind.as_str(),
         }
     }
 }
 
 impl fmt::Debug for StreamState {
-    /// Prints only the variant name. Neither [`DeflateState`] nor
-    /// [`InflateState`] implements [`Debug`] (they hold large working buffers
-    /// whose contents are not useful to dump), so the payload is deliberately
-    /// elided.
+    /// Prints only the variant name. Neither engine state implements [`Debug`]
+    /// (they hold large working buffers whose contents are not useful to dump),
+    /// so the payload is deliberately elided.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.kind_str())
     }
@@ -664,6 +1823,30 @@ pub struct ZStream<A: Allocator = DefaultAllocator> {
     ///
     /// Kept as [`u32`] because both checksums are 32-bit; the C field is
     /// `uLong` only because zlib predates fixed-width integer types.
+    ///
+    /// # Initial value
+    ///
+    /// A freshly constructed stream reports `0`, matching the `memset`-zeroed
+    /// (or statically zero-initialised) `z_stream` that every C caller hands to
+    /// `inflateInit`/`deflateInit`. Installing or resetting an *inflate* engine
+    /// then publishes the wrapper's initial checksum — but, exactly as in C,
+    /// **only when the stream is wrapped**:
+    ///
+    /// * zlib framing and automatic detection (`windowBits` `8..=15` and `+32`)
+    ///   publish `1`, the Adler-32 of the empty input.
+    /// * gzip framing (`windowBits` `+16`) publishes `0`, a fresh CRC-32
+    ///   accumulator.
+    /// * raw framing (`windowBits` `-8..=-15`) publishes *nothing*, so the field
+    ///   stays at its constructed `0`. A raw DEFLATE stream carries no checksum,
+    ///   and `inflate.c` L108-L109 guards the assignment with
+    ///   `if (state->wrap)`; that guard is reproduced verbatim by
+    ///   [`inflate_reset_keep`](crate::inflate::inflate_reset_keep), so this
+    ///   port and reference zlib agree on the observed value.
+    ///
+    /// Deflate is unconditional in both C (`deflateResetKeep` always assigns)
+    /// and this port, and its seed is `1` for raw as well as zlib framing
+    /// because `adler32(0, Z_NULL, 0) == 1`. Only the decoder therefore exhibits
+    /// the wrapper-dependent behaviour above.
     pub adler: u32,
 
     /// Last error message, or [`None`] when there is no error (C
@@ -693,24 +1876,23 @@ pub struct ZStream<A: Allocator = DefaultAllocator> {
     pub(crate) alloc: A,
 }
 
-/// The Adler-32 checksum of the empty input (`adler32(0, Z_NULL, 0) == 1`).
-///
-/// This is the value reference zlib seeds `z_stream.adler` with for the default
-/// (zlib-wrapper) framing. A freshly constructed [`ZStream`] adopts this seed;
-/// installing or resetting an engine then overwrites [`adler`](ZStream::adler)
-/// with the wrapper-appropriate value — this same `1` for Adler-32 / zlib, or
-/// `0` for CRC-32 / gzip.
-const ADLER32_INIT: u32 = 1;
-
 impl ZStream<DefaultAllocator> {
     /// Creates a new stream backed by the [`DefaultAllocator`] (the Rust global
     /// allocator), with no engine installed.
     ///
-    /// All counters start at `0`, [`data_type`](ZStream::data_type) at
-    /// `Z_BINARY`, [`adler`](ZStream::adler) at the Adler-32 seed
-    /// (`ADLER32_INIT`), and [`msg`](ZStream::msg) at [`None`]. This is the
-    /// idiomatic counterpart to a zeroed C `z_stream` prior to
-    /// `deflateInit`/`inflateInit`.
+    /// Every observable field starts at its zero value: both counters at `0`,
+    /// [`data_type`](ZStream::data_type) at `Z_BINARY` (`0`),
+    /// [`adler`](ZStream::adler) at `0`, the internal `reserved` word at `0`,
+    /// and [`msg`](ZStream::msg) at [`None`]. That makes this the exact
+    /// idiomatic counterpart to the `memset`-zeroed C `z_stream` a caller hands
+    /// to `deflateInit`/`inflateInit`, so a stream observed through this API and
+    /// the same stream observed through [`crate::ffi`] report identical values
+    /// at every point in its lifetime.
+    ///
+    /// The checksum seed is deliberately `0` rather than `1`: the wrapper's
+    /// initial checksum is published by the engine, and for raw framing C
+    /// publishes nothing at all. See [`adler`](ZStream::adler) for the full
+    /// per-wrapper contract.
     #[must_use]
     pub fn new() -> Self {
         Self::with_allocator(DefaultAllocator)
@@ -740,7 +1922,13 @@ impl<A: Allocator> ZStream<A> {
             // `z_stream`; the engine refines it to `Z_BINARY`/`Z_TEXT`
             // (deflate) or the decode state (inflate) as it runs.
             data_type: DataType::Binary.as_c_int(),
-            adler: ADLER32_INIT,
+            // `0`, not the Adler-32 of the empty input: a C caller reaches
+            // `inflateInit`/`deflateInit` with a `memset`-zeroed `z_stream`, and
+            // the engine — not the constructor — publishes the wrapper's
+            // initial checksum. Seeding `1` here would be observable for raw
+            // framing, where C's `if (state->wrap)` guard (`inflate.c`
+            // L108-L109) leaves the field untouched forever. See the field docs.
+            adler: 0,
             msg: None,
             reserved: 0,
             state: StreamState::None,
@@ -757,34 +1945,37 @@ impl<A: Allocator> ZStream<A> {
 
     // -- engine-state management (used by the deflate/inflate init routines) --
 
-    /// Installs a compression engine, replacing any previously installed state.
+    /// Installs an engine, replacing any previously installed state.
     ///
-    /// Called by the deflate initialisation path once it has built the
-    /// [`DeflateState`]. Any engine previously held is dropped (its buffers
+    /// Called by the deflate/inflate initialisation paths once they have built
+    /// their engine state. Any engine previously held is dropped (its buffers
     /// freed) as part of the assignment — the RAII replacement for the C
     /// `deflateEnd`/`inflateEnd` that would otherwise be required first.
-    #[inline]
-    pub(crate) fn set_deflate_state(&mut self, state: Box<DeflateState>) {
-        self.state = StreamState::Deflate(state);
-    }
-
-    /// Installs a decompression engine, replacing any previously installed
-    /// state. The dual of [`set_deflate_state`](Self::set_deflate_state).
-    #[inline]
-    pub(crate) fn set_inflate_state(&mut self, state: Box<InflateState>) {
-        self.state = StreamState::Inflate(state);
-    }
-
-    /// Removes and returns the current engine state, leaving the stream in the
-    /// [`StreamState::None`] state.
     ///
-    /// Used by the `deflateEnd`/`inflateEnd` shims: taking the state and letting
+    /// The engine type is generic, so this module never names either concrete
+    /// engine (AAP §0.3.1, §0.4.2 B2). The typed spellings the engines expose —
+    /// `set_deflate_state` / `set_inflate_state` — are thin forwards defined in
+    /// `crate::deflate::state` and `crate::inflate::state`.
+    #[inline]
+    pub(crate) fn set_engine_state<E: EngineState + 'static>(&mut self, state: BoxedEngine<E>) {
+        self.state = StreamState::Engine(state);
+    }
+
+    /// Removes and returns the current engine, leaving the stream in the
+    /// [`StreamState::None`] state; returns [`None`] when no engine was
+    /// installed.
+    ///
+    /// Used by the `deflateEnd`/`inflateEnd` shims: taking the engine and letting
     /// the returned value drop performs the teardown. (Simply calling
     /// [`clear_state`](Self::clear_state), or dropping the whole `ZStream`,
-    /// achieves the same release.)
+    /// achieves the same release.) It is also how `inflate()` decouples the
+    /// borrow of the engine from the borrow of the surrounding stream fields.
     #[inline]
-    pub(crate) fn take_state(&mut self) -> StreamState {
-        core::mem::take(&mut self.state)
+    pub(crate) fn take_engine_state(&mut self) -> Option<Box<dyn EngineState>> {
+        match core::mem::take(&mut self.state) {
+            StreamState::None => None,
+            StreamState::Engine(engine) => Some(engine),
+        }
     }
 
     /// Drops the current engine state, returning the stream to
@@ -794,47 +1985,58 @@ impl<A: Allocator> ZStream<A> {
         self.state = StreamState::None;
     }
 
-    /// Borrows the installed compression engine, or [`None`] if the stream holds
-    /// no state or an inflate state.
+    /// Returns the installed engine's direction, or [`None`] when the stream
+    /// holds no engine.
     #[inline]
     #[must_use]
-    pub(crate) fn deflate_state(&self) -> Option<&DeflateState> {
+    pub(crate) fn engine_kind(&self) -> Option<EngineKind> {
+        self.state.kind()
+    }
+
+    /// Borrows the installed engine as `E`, or [`None`] if the stream holds no
+    /// state or an engine of a different type.
+    ///
+    /// The downcast is on `E`'s own [`TypeId`](core::any::TypeId), so requesting
+    /// the wrong engine can never yield a mistyped reference — the type-level
+    /// replacement for C's unchecked `internal_state *` cast.
+    #[inline]
+    #[must_use]
+    pub(crate) fn engine_state<E: EngineState>(&self) -> Option<&E> {
         match &self.state {
-            StreamState::Deflate(state) => Some(state),
-            _ => None,
+            StreamState::Engine(engine) => engine.as_any().downcast_ref::<E>(),
+            StreamState::None => None,
         }
     }
 
-    /// Mutably borrows the installed compression engine, or [`None`]. The hot
-    /// path for `deflate()`, which repeatedly advances the engine.
+    /// Mutably borrows the installed engine as `E`, or [`None`]. The hot path
+    /// for `deflate()` / `inflate()`, which repeatedly advance the engine.
     #[inline]
     #[must_use]
-    pub(crate) fn deflate_state_mut(&mut self) -> Option<&mut DeflateState> {
+    pub(crate) fn engine_state_mut<E: EngineState>(&mut self) -> Option<&mut E> {
         match &mut self.state {
-            StreamState::Deflate(state) => Some(state),
-            _ => None,
+            StreamState::Engine(engine) => engine.as_any_mut().downcast_mut::<E>(),
+            StreamState::None => None,
         }
     }
 
-    /// Borrows the installed decompression engine, or [`None`] if the stream
-    /// holds no state or a deflate state.
+    /// Mutably borrows the installed engine as `E` **together with** a shared
+    /// borrow of this stream's allocator, or [`None`].
+    ///
+    /// `state` and `alloc` are distinct fields, so borrowing one mutably and the
+    /// other immutably is sound; the compiler cannot see that through two
+    /// separate accessor calls, hence this combined one. It exists so paths that
+    /// mutate the decoder *and* need to allocate — the lazy window allocation in
+    /// `updatewindow`, reached from `inflate` and `inflateSetDictionary` — can
+    /// route their allocation through the [`Allocator`] trait rather than
+    /// bypassing it (AAP §0.6.3).
     #[inline]
     #[must_use]
-    pub(crate) fn inflate_state(&self) -> Option<&InflateState> {
-        match &self.state {
-            StreamState::Inflate(state) => Some(state),
-            _ => None,
-        }
-    }
-
-    /// Mutably borrows the installed decompression engine, or [`None`]. The hot
-    /// path for `inflate()`.
-    #[inline]
-    #[must_use]
-    pub(crate) fn inflate_state_mut(&mut self) -> Option<&mut InflateState> {
+    pub(crate) fn engine_state_and_allocator<E: EngineState>(&mut self) -> Option<(&mut E, &A)> {
         match &mut self.state {
-            StreamState::Inflate(state) => Some(state),
-            _ => None,
+            StreamState::Engine(engine) => {
+                Some((engine.as_any_mut().downcast_mut::<E>()?, &self.alloc))
+            }
+            StreamState::None => None,
         }
     }
 
@@ -913,9 +2115,10 @@ impl<A: Allocator> ZStream<A> {
     /// [`data_type`](Self::data_type), or [`adler`](Self::adler).
     ///
     /// This is the shared portion of `deflateReset`/`inflateReset`: the engine
-    /// resets its own internal fields (and sets `adler`/`data_type` to their
-    /// wrapper-appropriate values), while these stream-level fields are cleared
-    /// here.
+    /// resets its own internal fields and publishes `data_type` plus — for
+    /// deflate always, and for inflate only when the stream is wrapped — the
+    /// wrapper's initial `adler`, while these stream-level fields are cleared
+    /// here. See [`adler`](Self::adler) for why raw inflate publishes nothing.
     // Reserved internal API: consumed by this module's unit tests and intended
     // as the shared stream-level portion of deflateReset/inflateReset. Retained
     // even in build configurations that wire up no production caller, so the
@@ -953,6 +2156,74 @@ mod tests {
     use super::*;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
+    // -----------------------------------------------------------------------
+    // Layer-local test engines
+    //
+    // `stream` is layer 5 and the real engines are layer 6, so these tests must
+    // not reach up to `crate::deflate::state::DeflateState` /
+    // `crate::inflate::state::InflateState` — doing so would reintroduce exactly
+    // the upward edge the production code was restructured to remove (AAP
+    // §0.3.1, §0.4.2 B2), and `the_module_graph_has_no_upward_edges` in
+    // `src/lib.rs` would fail. The engine slot is generic over `EngineState`, so
+    // the slot's own contract — install, downcast, take, replace, render — is
+    // fully exercisable with two minimal in-module engines. The real engines'
+    // integration with the slot is covered where they are defined.
+    // -----------------------------------------------------------------------
+
+    /// A minimal stand-in for a compression engine.
+    struct TestDeflateEngine {
+        /// A payload byte, so the downcast is observably returning *this* value.
+        tag: u8,
+    }
+
+    impl EngineState for TestDeflateEngine {
+        fn engine_kind(&self) -> EngineKind {
+            EngineKind::Deflate
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+        fn into_any(self: Box<Self>) -> Box<dyn Any> {
+            self
+        }
+    }
+
+    /// A minimal stand-in for a decompression engine.
+    struct TestInflateEngine {
+        /// Mirrors the real engine's `wrap` field closely enough to assert on.
+        wrap: i32,
+    }
+
+    impl EngineState for TestInflateEngine {
+        fn engine_kind(&self) -> EngineKind {
+            EngineKind::Inflate
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+        fn into_any(self: Box<Self>) -> Box<dyn Any> {
+            self
+        }
+    }
+
+    /// Installs a test decompression engine with the given `wrap`.
+    ///
+    /// Placement goes through [`EngineBox::try_owned`], the global-heap arm of the
+    /// same wrapper the real engines use, so these tests exercise the production
+    /// installation path rather than a shortcut around it.
+    fn install_inflate<A: Allocator>(strm: &mut ZStream<A>, wrap: i32) {
+        strm.set_engine_state(
+            EngineBox::try_owned(TestInflateEngine { wrap })
+                .expect("the test heap holds an engine"),
+        );
+    }
+
     #[test]
     fn new_has_expected_defaults() {
         let strm = ZStream::new();
@@ -960,16 +2231,19 @@ mod tests {
         assert_eq!(strm.total_out, 0);
         // `Z_BINARY` == 0, the zeroed default.
         assert_eq!(strm.data_type, 0);
-        // Adler-32 of the empty input.
-        assert_eq!(strm.adler, 1);
+        // `0`, matching a `memset`-zeroed C `z_stream`; the engine — not the
+        // constructor — publishes the wrapper's initial checksum, and for raw
+        // framing it publishes nothing at all.
+        assert_eq!(strm.adler, 0);
         assert_eq!(strm.msg, None);
         assert_eq!(strm.reserved, 0);
         // No engine yet, and neither direction reports a live state.
         assert!(!strm.has_state());
         assert!(!strm.is_deflate());
         assert!(!strm.is_inflate());
-        assert!(strm.deflate_state().is_none());
-        assert!(strm.inflate_state().is_none());
+        assert!(strm.engine_kind().is_none());
+        assert!(strm.engine_state::<TestDeflateEngine>().is_none());
+        assert!(strm.engine_state::<TestInflateEngine>().is_none());
     }
 
     #[test]
@@ -977,7 +2251,7 @@ mod tests {
         let strm = ZStream::default();
         assert_eq!(strm.total_in, 0);
         assert_eq!(strm.total_out, 0);
-        assert_eq!(strm.adler, 1);
+        assert_eq!(strm.adler, 0);
         assert!(!strm.has_state());
     }
 
@@ -1015,37 +2289,73 @@ mod tests {
     fn install_and_take_inflate_state() {
         let mut strm = ZStream::new();
 
-        // A raw-deflate (wrap = 0) inflate state with a 32 KiB window.
-        strm.set_inflate_state(InflateState::new(0, 15));
+        // A raw-deflate (wrap = 0) decompression engine.
+        install_inflate(&mut strm, 0);
 
         assert!(strm.has_state());
         assert!(strm.is_inflate());
         assert!(!strm.is_deflate());
-        assert!(strm.inflate_state().is_some());
-        // The deflate accessor must not see the inflate state.
-        assert!(strm.deflate_state().is_none());
+        assert_eq!(strm.engine_kind(), Some(EngineKind::Inflate));
+        assert_eq!(
+            strm.engine_state::<TestInflateEngine>().map(|s| s.wrap),
+            Some(0)
+        );
+        // Asking for the other engine must not see this one: the downcast is on
+        // the concrete type, so a wrong-direction request yields `None` instead
+        // of C's unchecked `internal_state *` reinterpretation.
+        assert!(strm.engine_state::<TestDeflateEngine>().is_none());
 
         // Mutable access resolves to the same live state.
-        assert!(strm.inflate_state_mut().is_some());
+        assert!(strm.engine_state_mut::<TestInflateEngine>().is_some());
+        assert!(strm.engine_state_mut::<TestDeflateEngine>().is_none());
 
-        // Taking the state hands back the `Inflate` variant and empties the
-        // stream; the returned box drops here, freeing the state (RAII stands in
-        // for `inflateEnd`).
-        let taken = strm.take_state();
-        assert!(taken.is_inflate());
+        // Taking the engine hands back the boxed state and empties the stream;
+        // the returned box drops here, freeing the state (RAII stands in for
+        // `inflateEnd`).
+        let taken = strm.take_engine_state().expect("an engine was installed");
+        assert_eq!(taken.engine_kind(), EngineKind::Inflate);
         assert!(!strm.has_state());
-        assert!(strm.inflate_state().is_none());
+        assert!(strm.engine_kind().is_none());
+        assert!(strm.engine_state::<TestInflateEngine>().is_none());
+        // Taking again from an empty slot reports `None` rather than panicking.
+        assert!(strm.take_engine_state().is_none());
+
+        // The removed engine is still fully usable through the opaque handle,
+        // which is what lets `inflate()` hold it across a call while `strm` stays
+        // borrowable for `msg` / `total_in` / `adler`.
+        assert_eq!(
+            taken
+                .as_any()
+                .downcast_ref::<TestInflateEngine>()
+                .map(|s| s.wrap),
+            Some(0)
+        );
+        // And it can be reinstalled through the typed setter. `into_any` on a
+        // placed engine yields the *wrapper*, not the inner state — that is what
+        // makes taking and reinstalling allocation-free even when the engine lives
+        // in caller-supplied memory — so the downcast asks for `EngineBox<E>`,
+        // exactly as `take_inflate_state` does.
+        let reboxed = taken
+            .into_any()
+            .downcast::<EngineBox<TestInflateEngine>>()
+            .expect("the kind check established the concrete type");
+        strm.set_engine_state(reboxed);
+        assert!(strm.is_inflate());
+        assert_eq!(
+            strm.engine_state::<TestInflateEngine>().map(|s| s.wrap),
+            Some(0)
+        );
     }
 
     #[test]
     fn clear_state_returns_to_none() {
         let mut strm = ZStream::new();
-        strm.set_inflate_state(InflateState::new(1, 15));
+        install_inflate(&mut strm, 1);
         assert!(strm.has_state());
 
         strm.clear_state();
         assert!(!strm.has_state());
-        assert!(strm.inflate_state().is_none());
+        assert!(strm.engine_state::<TestInflateEngine>().is_none());
     }
 
     #[test]
@@ -1053,9 +2363,28 @@ mod tests {
         // Installing a second engine drops the first without any explicit
         // teardown — the RAII replacement for a forgotten `inflateEnd`.
         let mut strm = ZStream::new();
-        strm.set_inflate_state(InflateState::new(0, 15));
-        strm.set_inflate_state(InflateState::new(2, 15));
+        install_inflate(&mut strm, 0);
+        install_inflate(&mut strm, 2);
         assert!(strm.is_inflate());
+        assert_eq!(
+            strm.engine_state::<TestInflateEngine>().map(|s| s.wrap),
+            Some(2),
+            "the second install must have replaced the first"
+        );
+
+        // Installing the *other* direction likewise replaces, and the typed
+        // accessors follow: only one engine can ever be live.
+        strm.set_engine_state(
+            EngineBox::try_owned(TestDeflateEngine { tag: 7 })
+                .expect("the test heap holds an engine"),
+        );
+        assert!(strm.is_deflate());
+        assert!(!strm.is_inflate());
+        assert_eq!(
+            strm.engine_state::<TestDeflateEngine>().map(|s| s.tag),
+            Some(7)
+        );
+        assert!(strm.engine_state::<TestInflateEngine>().is_none());
     }
 
     #[test]
@@ -1126,7 +2455,7 @@ mod tests {
     impl Allocator for CountingAllocator<'_> {
         fn allocate_zeroed<T>(&self, count: usize) -> Option<AllocBuffer<T>>
         where
-            T: Copy + Default + 'static,
+            T: Copy + Default + ZeroValid + 'static,
         {
             Some(AllocBuffer::Owned(alloc::vec![T::default(); count]))
         }
@@ -1173,7 +2502,410 @@ mod tests {
     #[test]
     fn stream_state_debug_prints_variant_name() {
         assert_eq!(alloc::format!("{:?}", StreamState::None), "None");
-        let inflate = StreamState::Inflate(InflateState::new(0, 15));
+        let inflate = StreamState::Engine(Box::new(TestInflateEngine { wrap: 0 }));
         assert_eq!(alloc::format!("{inflate:?}"), "Inflate");
+        let deflate = StreamState::Engine(Box::new(TestDeflateEngine { tag: 0 }));
+        assert_eq!(alloc::format!("{deflate:?}"), "Deflate");
+    }
+
+    // -----------------------------------------------------------------------
+    // Caller-allocator hook contract
+    //
+    // The C `alloc_func`/`free_func` pair is raw-pointer machinery, so the
+    // counting backing store lives in the crate's designated unsafe boundary
+    // (`crate::ffi::alloc::test_hook`) and is merely *driven* from here. That
+    // keeps this file's `#![deny(unsafe_code)]` intact while still asserting
+    // exact hook invocation counts and symmetric cleanup.
+    // -----------------------------------------------------------------------
+
+    /// [`Allocator::reserves_state_footprint`] decides whether the engines charge
+    /// the engine-state footprint to the allocator, and its value must be exactly
+    /// "this allocator is not the global-allocator path".
+    ///
+    /// [`DefaultAllocator`] declines (the state `Box` already *is* the global
+    /// request, so a second reservation would double every stream's fixed
+    /// overhead), an inactive [`HookAllocator`] behaves identically to it, an
+    /// active hook accepts (C charges `ZALLOC(strm, 1, sizeof(deflate_state))`),
+    /// and a bare custom implementation accepts by default so a downstream
+    /// allocator observes the request C's `zalloc` would see.
+    #[test]
+    fn state_footprint_reservation_tracks_the_allocator_kind() {
+        assert!(
+            !DefaultAllocator.reserves_state_footprint(),
+            "the global default must not double a stream's fixed overhead"
+        );
+        assert!(
+            !HookAllocator::default().reserves_state_footprint(),
+            "an inactive hook is the global path and must match DefaultAllocator"
+        );
+
+        let stats = crate::ffi::alloc::test_hook::HookStats::new();
+        let active = HookAllocator::new(stats.hook());
+        assert!(
+            active.reserves_state_footprint(),
+            "an active caller hook must be charged for the state, as C charges its zalloc"
+        );
+
+        /// A downstream-style allocator: it overrides nothing but the allocation
+        /// method, so every other item comes from the trait defaults.
+        struct Custom;
+        impl Allocator for Custom {}
+        assert!(
+            Custom.reserves_state_footprint(),
+            "a custom allocator must observe the state request by default"
+        );
+    }
+
+    /// A hook carrying only `zalloc` is **inactive** per the AAP's has-hook
+    /// clause (§0.6.3): [`AllocBuffer::try_zeroed`] must use owned
+    /// (global-allocator) storage and must never consult the caller's `zalloc`.
+    ///
+    /// This pins the *type-level* contract, which is what makes the buffer's
+    /// backing store and its deallocator provably the same: allocation and
+    /// release always come from one allocator, which is exactly what the
+    /// `frees() == 0` assertion below observes.
+    ///
+    /// It is **not** the behavior a C caller who supplies one half gets. C
+    /// defaults the two halves **independently** — `deflate.c` L400-L407 installs
+    /// `zcalloc` only when `zalloc` is null (also clearing `opaque`), and
+    /// L408-L413 installs `zcfree` only when `zfree` is null — and
+    /// `crate::ffi::types::init_allocator_prologue` reproduces that substitution
+    /// at the C boundary. Such a caller therefore arrives here with a *complete*
+    /// pair whose missing half is the crate's own `malloc`/`free`-backed built-in,
+    /// and their supplied half is honored in full. A half-present hook is
+    /// reachable only from within the crate — as here — or from a stream whose
+    /// allocator fields were mutated after initialization, which
+    /// `CAllocator::is_half_present` rejects exactly as C's `*StateCheck`
+    /// functions do.
+    #[test]
+    fn zalloc_only_is_inactive_and_uses_owned() {
+        let stats = crate::ffi::alloc::test_hook::HookStats::new();
+        let hook = stats.zalloc_only_hook();
+        assert!(
+            !hook.is_active(),
+            "one half of a hook is not a usable allocator"
+        );
+
+        let buf: AllocBuffer<u16> =
+            AllocBuffer::try_zeroed(12, hook).expect("the owned path is infallible");
+
+        assert!(
+            !buf.is_foreign(),
+            "an inactive hook must yield owned storage"
+        );
+        assert_eq!(buf.len(), 12);
+        assert_eq!(&buf[..], &[0u16; 12][..]);
+        assert_eq!(stats.allocs(), 0, "zalloc must not be consulted");
+        assert_eq!(stats.ooms(), 0);
+
+        drop(buf);
+        assert_eq!(stats.frees(), 0, "zfree must not be consulted either");
+        assert_eq!(stats.live_bytes(), 0);
+    }
+
+    /// A hook carrying only `zfree` is likewise inactive, so nothing is routed
+    /// through the caller and the buffer is released by ordinary drop glue. As
+    /// above this pins the type-level contract; a C caller who supplies only
+    /// `zfree` has the missing `zalloc` substituted at the initialization
+    /// boundary and reaches this type with a complete, active pair.
+    #[test]
+    fn zfree_only_is_inactive_and_uses_owned() {
+        let stats = crate::ffi::alloc::test_hook::HookStats::new();
+        let hook = stats.zfree_only_hook();
+        assert!(
+            !hook.is_active(),
+            "one half of a hook is not a usable allocator"
+        );
+
+        let buf: AllocBuffer<u8> =
+            AllocBuffer::try_zeroed(20, hook).expect("the owned path is infallible");
+
+        assert!(
+            !buf.is_foreign(),
+            "an inactive hook must yield owned storage"
+        );
+        assert_eq!(&buf[..], &[0u8; 20][..]);
+        assert_eq!(stats.allocs(), 0);
+
+        drop(buf);
+        assert_eq!(
+            stats.frees(),
+            0,
+            "an owned buffer must not be handed to the caller's zfree"
+        );
+        assert_eq!(stats.live_bytes(), 0);
+    }
+
+    /// [`AllocBuffer::try_clone`] on a foreign buffer allocates through the
+    /// **same** hook (two `zalloc`s, two `zfree`s) and yields a fully independent
+    /// region, satisfying AAP §0.6.5's same-arena requirement for
+    /// `deflateCopy`/`inflateCopy`.
+    #[test]
+    fn foreign_clone_uses_hook_and_is_independent() {
+        let stats = crate::ffi::alloc::test_hook::HookStats::new();
+        let hook = stats.hook();
+        assert!(hook.is_active());
+
+        {
+            let mut original: AllocBuffer<u32> =
+                AllocBuffer::try_zeroed(6, hook).expect("counting hook succeeds");
+            assert!(original.is_foreign());
+            original[0] = 0x0101_0101;
+            original[5] = 0x0202_0202;
+            assert_eq!(stats.allocs(), 1);
+
+            let mut copy = original
+                .try_clone()
+                .expect("the counting hook has unlimited budget");
+            assert!(
+                copy.is_foreign(),
+                "the copy must stay in the caller's arena, not the global heap"
+            );
+            assert_eq!(stats.allocs(), 2, "the copy must come from the same zalloc");
+            assert_eq!(&copy[..], &original[..], "the copy starts equal");
+
+            // Independence in both directions.
+            copy[0] = 0xFFFF_FFFF;
+            original[5] = 0x3333_3333;
+            assert_eq!(original[0], 0x0101_0101);
+            assert_eq!(copy[5], 0x0202_0202);
+            assert_eq!(copy[0], 0xFFFF_FFFF);
+            assert_eq!(original[5], 0x3333_3333);
+        } // <- both regions drop here
+
+        assert_eq!(stats.frees(), 2, "every foreign region must reach zfree");
+        assert_eq!(stats.live_bytes(), 0, "the caller's arena must be balanced");
+    }
+
+    /// An element count that cannot be represented in the C `uInt` hook ABI is
+    /// rejected **before** the hook is invoked, so a truncated `items`/`size`
+    /// pair can never reach a caller's allocator.
+    #[test]
+    fn foreign_allocation_rejects_count_over_c_uint_max_without_calling_hook() {
+        let stats = crate::ffi::alloc::test_hook::HookStats::new();
+        let hook = stats.hook();
+        assert!(hook.is_active());
+
+        // The smallest count that overflows `uInt`. Where `usize` is no wider
+        // than `c_uint`, no such value exists and `usize::MAX` stands in — the
+        // layout check rejects it first, and the assertion below (the hook was
+        // never consulted) holds identically, so this never degrades into a
+        // vacuous pass.
+        let over = usize::try_from(c_uint::MAX)
+            .ok()
+            .and_then(|m| m.checked_add(1))
+            .unwrap_or(usize::MAX);
+
+        let buf: Option<AllocBuffer<u8>> = AllocBuffer::try_zeroed(over, hook);
+        assert!(buf.is_none(), "an unrepresentable request must fail");
+        assert_eq!(stats.allocs(), 0, "the hook must not be consulted at all");
+        assert_eq!(
+            stats.ooms(),
+            0,
+            "rejection happens before the hook, so it is not a reported OOM"
+        );
+        assert_eq!(stats.frees(), 0);
+        assert_eq!(stats.live_bytes(), 0);
+    }
+
+    /// A byte size that overflows, or exceeds the `isize::MAX` bound a Rust slice
+    /// must respect, is rejected by the layout check before the hook is invoked.
+    #[test]
+    fn foreign_allocation_rejects_layout_overflow_without_calling_hook() {
+        let stats = crate::ffi::alloc::test_hook::HookStats::new();
+
+        for count in [usize::MAX, usize::MAX / 3, (isize::MAX as usize) / 2 + 1] {
+            let buf: Option<AllocBuffer<u32>> = AllocBuffer::try_zeroed(count, stats.hook());
+            assert!(buf.is_none(), "count {count} must be rejected");
+        }
+        assert_eq!(stats.allocs(), 0, "the hook must not be consulted");
+        assert_eq!(stats.ooms(), 0);
+        assert_eq!(stats.live_bytes(), 0);
+    }
+
+    /// An active hook reporting out-of-memory yields [`None`] so the init paths
+    /// can surface `Z_MEM_ERROR`; there is deliberately no global-allocator
+    /// fallback (AAP §0.6.5).
+    #[test]
+    fn foreign_allocation_oom_yields_none_without_global_fallback() {
+        let stats = crate::ffi::alloc::test_hook::HookStats::with_budget(0);
+
+        let buf: Option<AllocBuffer<u16>> = AllocBuffer::try_zeroed(128, stats.hook());
+        assert!(
+            buf.is_none(),
+            "OOM must not be masked by the global allocator"
+        );
+        assert_eq!(stats.ooms(), 1, "the hook reported the failure");
+        assert_eq!(stats.allocs(), 0);
+        assert_eq!(stats.frees(), 0);
+    }
+
+    /// When the caller's arena is exhausted mid-copy, [`AllocBuffer::try_clone`]
+    /// reports the failure instead of relocating the copy to the global heap, and
+    /// the source stays intact and usable.
+    #[test]
+    fn foreign_try_clone_propagates_oom_without_global_fallback() {
+        // Exactly one successful allocation: the buffer, not its copy.
+        let stats = crate::ffi::alloc::test_hook::HookStats::with_budget(1);
+
+        {
+            let mut original: AllocBuffer<u16> =
+                AllocBuffer::try_zeroed(4, stats.hook()).expect("first allocation succeeds");
+            original[2] = 0xBEEF;
+
+            assert!(
+                original.try_clone().is_none(),
+                "an exhausted arena must yield None, never a global-allocator copy"
+            );
+            assert_eq!(stats.allocs(), 1);
+            assert_eq!(stats.ooms(), 1);
+
+            // The source survives the failed copy unchanged and remains writable.
+            assert_eq!(&original[..], &[0, 0, 0xBEEF, 0][..]);
+            original[3] = 0x00FF;
+            assert_eq!(&original[..], &[0, 0, 0xBEEF, 0x00FF][..]);
+        }
+
+        assert_eq!(stats.frees(), 1, "only the one live region is freed");
+        assert_eq!(stats.live_bytes(), 0);
+    }
+
+    /// A zero-length request never reaches the hook, matching C's refusal to ask
+    /// an allocator for zero bytes, and always succeeds.
+    #[test]
+    fn empty_request_uses_owned_even_with_an_active_hook() {
+        let stats = crate::ffi::alloc::test_hook::HookStats::new();
+        let buf: AllocBuffer<u32> =
+            AllocBuffer::try_zeroed(0, stats.hook()).expect("empty requests always succeed");
+        assert!(buf.is_empty());
+        assert!(!buf.is_foreign());
+        assert_eq!(stats.allocs(), 0);
+    }
+
+    /// A foreign region holds `T::default()` in every slot, because the boundary
+    /// initializes it by *writing* that value rather than by reinterpreting
+    /// whatever bytes the hook returned. Asserted for the two element types the
+    /// engines request (`u8`, `u16`) and for `u32` as a further member of the
+    /// sealed [`ZeroValid`] set, all three of whose `Default` is `0`.
+    #[test]
+    fn zero_valid_element_types_are_default_initialized_through_the_hook() {
+        let stats = crate::ffi::alloc::test_hook::HookStats::new();
+
+        let bytes: AllocBuffer<u8> = AllocBuffer::try_zeroed(3, stats.hook()).expect("u8");
+        let words: AllocBuffer<u16> = AllocBuffer::try_zeroed(3, stats.hook()).expect("u16");
+        let longs: AllocBuffer<u32> = AllocBuffer::try_zeroed(3, stats.hook()).expect("u32");
+
+        assert_eq!(&bytes[..], &[u8::default(); 3][..]);
+        assert_eq!(&words[..], &[u16::default(); 3][..]);
+        assert_eq!(&longs[..], &[u32::default(); 3][..]);
+        assert_eq!(u8::default(), 0);
+        assert_eq!(u16::default(), 0);
+        assert_eq!(u32::default(), 0);
+
+        assert_eq!(stats.allocs(), 3);
+        drop((bytes, words, longs));
+        assert_eq!(stats.frees(), 3);
+        assert_eq!(stats.live_bytes(), 0);
+    }
+
+    /// The default allocator carries no hook, so [`Allocator::allocate_zeroed`]
+    /// is infallible and produces owned storage — the historical behaviour is
+    /// bit-for-bit unchanged by the hook plumbing.
+    #[test]
+    fn default_allocator_carries_no_hook_and_allocates_owned() {
+        let alloc = DefaultAllocator;
+        assert!(!alloc.hook().is_active());
+
+        let buf: AllocBuffer<u8> = alloc
+            .allocate_zeroed(64)
+            .expect("global allocation is infallible");
+        assert!(!buf.is_foreign());
+        assert_eq!(&buf[..], &[0u8; 64][..]);
+        alloc.deallocate(buf);
+    }
+
+    /// Regression guard: the global-allocator path must be **fallible**.
+    ///
+    /// `vec![T::default(); count]` aborts the process when the request cannot be
+    /// satisfied, whereas zlib reports a failed working-buffer allocation as
+    /// `Z_MEM_ERROR`. `try_zeroed` reserves fallibly, so an unsatisfiable request
+    /// yields [`None`] and the caller can return `Z_MEM_ERROR` (AAP §0.6.5).
+    ///
+    /// A `usize::MAX`-element request is used because it can never be satisfied
+    /// on any supported target, making the assertion deterministic and
+    /// allocation-free in practice (the reservation is rejected on the capacity
+    /// computation, before any memory is touched).
+    #[test]
+    fn try_zeroed_global_path_reports_failure_instead_of_aborting() {
+        let none = AllocHook::none();
+        assert!(!none.is_active());
+
+        let huge: Option<AllocBuffer<u16>> = AllocBuffer::try_zeroed(usize::MAX, none);
+        assert!(
+            huge.is_none(),
+            "an unsatisfiable global reservation must yield None, not abort"
+        );
+
+        // Ordinary requests are unaffected and still zero-filled.
+        let ok: AllocBuffer<u16> =
+            AllocBuffer::try_zeroed(16, none).expect("a small request succeeds");
+        assert_eq!(ok.len(), 16);
+        assert!(!ok.is_foreign(), "no hook means an Owned buffer");
+        assert!(ok.iter().all(|&w| w == 0));
+    }
+
+    /// Regression guard: `try_zeroed_items` computes the element count from the
+    /// `items * item_size` byte total and rejects geometries it cannot represent.
+    ///
+    /// The pair is forwarded to an active `zalloc` verbatim so a bounded caller
+    /// sees C's exact arguments; on the global path only the resulting byte count
+    /// matters, and these cases pin the arithmetic: an exact multiple of the
+    /// element size succeeds, a non-multiple is rejected rather than silently
+    /// truncated, and an overflowing product is rejected rather than wrapping.
+    #[test]
+    fn try_zeroed_items_geometry_is_checked() {
+        let none = AllocHook::none();
+
+        // 4 items x 2 bytes = 8 bytes = 4 u16 elements.
+        let words: AllocBuffer<u16> =
+            AllocBuffer::try_zeroed_items(4, 2, none).expect("exact multiple of size_of::<u16>()");
+        assert_eq!(words.len(), 4);
+
+        // 6 items x 1 byte = 6 bytes = 3 u16 elements (still an exact multiple).
+        let odd_split: AllocBuffer<u16> =
+            AllocBuffer::try_zeroed_items(6, 1, none).expect("6 bytes is 3 u16 elements");
+        assert_eq!(odd_split.len(), 3);
+
+        // 3 items x 1 byte = 3 bytes is not a whole number of u16 elements.
+        let ragged: Option<AllocBuffer<u16>> = AllocBuffer::try_zeroed_items(3, 1, none);
+        assert!(ragged.is_none(), "a partial element must be rejected");
+
+        // An overflowing product must not wrap into a small allocation.
+        let overflow: Option<AllocBuffer<u8>> = AllocBuffer::try_zeroed_items(usize::MAX, 2, none);
+        assert!(overflow.is_none(), "items * item_size overflow must fail");
+
+        // A zero-byte request is the allocation-free fast path in both spellings.
+        let empty: AllocBuffer<u8> =
+            AllocBuffer::try_zeroed_items(0, 4, none).expect("empty request succeeds");
+        assert!(empty.is_empty());
+    }
+
+    /// Regression guard: `try_clone` copies an owned buffer's contents exactly and
+    /// keeps it owned, so the fallible copy path is a drop-in for `Clone` on the
+    /// global-allocator path.
+    ///
+    /// The foreign-arm behavior (duplicate through the same hook, report a
+    /// refusal) needs C hooks and is covered in `crate::ffi::types`, which is the
+    /// module allowed to write them.
+    #[test]
+    fn try_clone_preserves_owned_contents() {
+        let buf = AllocBuffer::from_vec(alloc::vec![1u8, 2, 3, 4]);
+        let copy = buf.try_clone().expect("owned copy succeeds");
+        assert!(!copy.is_foreign());
+        assert_eq!(&copy[..], &buf[..]);
+
+        let empty: AllocBuffer<u32> = AllocBuffer::default();
+        let empty_copy = empty.try_clone().expect("empty copy succeeds");
+        assert!(empty_copy.is_empty());
     }
 }

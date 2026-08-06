@@ -1,10 +1,129 @@
+# MkDocs configuration for the zlib-rs documentation site.
+#
+# `docs_dir` overrides the MkDocs default of `docs/` with the singular `doc/`,
+# because `doc/` is where the documentation lives: it is the directory the
+# retained C baseline ships, holding the normative format specifications this
+# rewrite implements (`rfc1950.txt`, `rfc1951.txt`, `rfc1952.txt`,
+# `algorithm.txt`, `txtvsbin.txt`), and the authored pages sit beside them.
+#
+# The override is load-bearing. `project-guide.md` and
+# `technical-specifications.md` exist only under `doc/`, so repointing this key
+# at `docs/` unpublishes the two largest documents in the repository and orphans
+# the RFC texts. It would also contradict `Cargo.toml`'s `exclude` commentary,
+# which records that this site builds exactly `doc/index.md`,
+# `doc/project-guide.md`, and `doc/technical-specifications.md`. Backstage
+# TechDocs builds through this same file -- `catalog-info.yaml` sets
+# `backstage.io/techdocs-ref: dir:.` -- so the MkDocs site and the TechDocs
+# component publish `doc/` from one source.
+#
+# A second, single-file `docs/` directory holds only `index.md`. It is a signpost
+# that names `doc/` as the published root and links to `doc/index.md`: it carries
+# no project substance, is unreachable from either build, and is absent from
+# `nav` deliberately, so that anyone landing on the conventional `docs/` path is
+# redirected rather than meeting a dead end. Adding it to `nav`, repointing
+# `docs_dir` at `docs`, or restoring project detail to it each recreate a second
+# landing page that can drift from the canonical one.
+#
+# There is deliberately no `site_url` key: this project has no published
+# documentation URL. Nothing in the repository names one -- no GitHub Pages job,
+# no `gh-pages` reference, and no such address in `README.md`,
+# `catalog-info.yaml`, or any page under `doc/`. TechDocs serves the site under a
+# route derived from the component identity at request time, which is not
+# knowable at build time. Setting a value would put a `<link rel="canonical">` on
+# every content page pointing at an address that does not resolve, which is worse
+# than none; the empty `<urlset>` in `sitemap.xml` is stock MkDocs behaviour and
+# is the honest output for a site whose address is unknown. Relative linking and
+# sub-path hosting work either way, so the missing URL is the only blocker. If
+# one ever exists, add `site_url: https://<host>/<path>/` beside `docs_dir` as a
+# real top-level key -- the literal text `docs_dir: doc` also appears in this
+# comment block, so an unanchored search-and-replace buries the new key in a
+# comment where it has no effect.
 docs_dir: doc
+
+# Must stay equal to `catalog-info.yaml`'s `metadata.name`. Renaming it breaks
+# the Backstage TechDocs association for this component.
 site_name: 'blitzy-zlib'
 site_description: 'zlib-rs — a memory-safe, idiomatic Rust rewrite of the zlib 1.3.2.1 compression library with a C-compatible FFI drop-in layer'
+
+# ANTI-ORPHAN INVARIANT: every Markdown file under `docs_dir` must appear in
+# `nav`, and every `nav` entry must resolve to a file that exists there. A page
+# missing from `nav` is still built but is then reachable only by guessing its
+# URL, and MkDocs reports that omission at INFO level, so `--strict` does not
+# catch it. `doc/` holds three Markdown files and `nav` lists three; keep the two
+# sides equal by hand whenever a page is added, renamed, or removed.
+#
+# Paths are relative to `docs_dir`, so `index.md` resolves to `doc/index.md`. The
+# wire-format references that ship beside those pages -- `rfc1950.txt`,
+# `rfc1951.txt`, `rfc1952.txt`, `algorithm.txt`, `txtvsbin.txt`, and
+# `crc-doc.1.0.pdf` -- are read-only inputs that are never edited and are absent
+# from `nav` because MkDocs navigation covers Markdown pages; they are copied
+# verbatim into the built site as static files.
 nav:
   - Home: index.md
   - Project Guide: project-guide.md
   - Technical Specifications: technical-specifications.md
+
+# `techdocs-core` supplies the Backstage-compatible theme and the Markdown
+# extension set, which is why no `theme:` and no `markdown_extensions:` block
+# appears here: the preset replaces a foreign `theme:` outright, resets the
+# palette, and merely logs when overridden theme settings are in use, so
+# declaring either block competes with it and is a known way to break TechDocs
+# rendering.
+#
+# SEARCH IS THE ONE THING THE PRESET DOES NOT SUPPLY WORKING, and the two keys
+# below are both required to get it. Left alone, the preset produces a site with
+# no search at all -- silently, with `--strict` still exiting 0:
+#
+#   1. `techdocs-core`'s own `use_material_search` option defaults to FALSE. In
+#      that state the preset installs MkDocs' DEFAULT-THEME search plugin
+#      (`mkdocs.contrib.search.SearchPlugin`), which appends `search/main.js` to
+#      `extra_javascript`. That script is written for the default theme and
+#      dereferences a `base_url` global which the Material theme never defines,
+#      so every built page threw `ReferenceError: base_url is not defined` at
+#      `search/main.js` line 106 and no worker, index or lunr resource ever
+#      loaded. Setting the option to `true` swaps in Material's own search plugin
+#      and stops the legacy script being injected.
+#   2. That alone is still not enough. The preset registers whichever plugin it
+#      chose under the dict key `search`, never under `material/search` -- and
+#      Material's header partial gates the entire searchbox on
+#      `{% if "material/search" in config.plugins %}`. With only key 1 applied,
+#      the ReferenceError disappears but the markup is still absent: no
+#      `.md-search`, no textbox, no search landmark, and `/`, `s` and `f` are
+#      inert. Declaring `material/search` here is what puts the canonical key in
+#      `config.plugins` and makes the header render the field.
+#
+# ORDER IS LOAD-BEARING: `material/search` must stay AFTER `techdocs-core`.
+# MkDocs dispatches `on_config` in declaration order, Material's search plugin
+# resolves its default `lang`, `separator` and `pipeline` by translating against
+# `config.theme`, and `techdocs-core` is what swaps `theme` from `mkdocs` to
+# `material` inside its own `on_config`. Listing the search plugin first would
+# make it translate against the wrong theme.
+#
+# Judge any future change here the way the defect was found -- on a BUILT page,
+# not from the config or the build log. Assert
+# `document.querySelectorAll('.md-search__input').length === 1`, that no request
+# for `search/main.js` is made, and that the console is clean.
+#
+# `mermaid2` is declared, so `mkdocs build --strict` needs the
+# `mkdocs-mermaid2-plugin` package installed -- ci.yml's `docs` job pins it at
+# 1.2.3 -- but the plugin renders nothing on the built site, and that is
+# accepted. No `pymdownx.superfences` custom fence routes `mermaid` fences to it
+# and the `techdocs-core` preset declares none, so those fences are lexed as
+# plain text and publish as highlighted source. The fenced form is the portable
+# one that GitHub and Backstage TechDocs render natively, and declaring the
+# custom fence here would mean overriding the preset's extension set to gain
+# nothing on the published site.
+#
+# The build log is not evidence that rendering is active: every `mkdocs build`
+# prints `MERMAID2 - Using javascript library (10.4.0)` with an unpkg URL at
+# configuration time, describing the library the plugin would use, and the
+# published page never requests it. A browser inspection of a `--strict` build
+# finds zero `pre.mermaid` elements, `typeof window.mermaid` "undefined", and no
+# network request matching mermaid, on both diagram pages. Judge any future
+# change here by asserting `document.querySelectorAll('pre.mermaid').length > 0`
+# on a built page, never by that log line.
 plugins:
-  - techdocs-core
+  - techdocs-core:
+      use_material_search: true
+  - material/search
   - mermaid2

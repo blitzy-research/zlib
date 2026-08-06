@@ -1,15 +1,34 @@
 //! One-call, buffer-to-buffer compression helpers — the safe-Rust port of the
 //! C `compress.c` (zlib `1.3.2.1-motley`).
 //!
-//! This module provides the three "one-shot" entry points that compress a
-//! complete source buffer into a caller-provided destination buffer in a single
-//! call, without the caller having to drive the streaming [`crate::deflate`] engine
-//! directly:
+//! This module owns the *whole* of `compress.c`'s logic:
 //!
-//! * [`compress`](compress()) — compress at the library default level.
-//! * [`compress2`] — compress at a caller-chosen level.
-//! * [`compress_bound`] (and its C-named alias [`compressBound`]) — compute the
-//!   worst-case compressed size so callers can size the destination buffer.
+//! * [`compress_bound`] (and its C-named alias [`compressBound`]) — the
+//!   bit-exact worst-case sizing formula (C `compressBound_z`, `compress.c`
+//!   L91-L99), so callers can size the destination buffer.
+//! * `compress2_tracked_with` — the complete `compress2_z` driver
+//!   (`compress.c` L24-L66): the `u32::MAX` chunking loop, the
+//!   `Z_NO_FLUSH`/`Z_FINISH` schedule, the unconditional produced-length
+//!   publication, and the `Z_STREAM_END` → `Z_OK` remap.
+//!
+//! # Layering: why the public entry points live in `crate::deflate`
+//!
+//! This module is layer 3 of the seven-layer graph and the compression engine is
+//! layer 6, so imports must run *downward only* (AAP §0.3.1, §0.4.2 B2). The
+//! driver therefore names no engine at all: it is generic over the
+//! `OneCallDeflate` port declared here, and the engine supplies the adapter.
+//! The three C-named entry points — `compress`, `compress2`, and the
+//! length-tracking `compress2_tracked` the FFI shims need — are consequently
+//! defined one layer up, in [`crate::deflate`], which is also where the C
+//! `compress.c` translation unit sits in the `#include` order (it includes
+//! `zlib.h`, not `zutil.h`). They are re-exported unchanged both from the crate
+//! root and from [`crate::util`] itself, so `zlib_rs::compress`,
+//! `zlib_rs::compress2`, `zlib_rs::compress_bound` and their
+//! `zlib_rs::util::…` spellings all resolve to exactly the names `zlib.h`
+//! publishes (AAP §0.3.1). Re-exporting a *name* upward costs the layer graph
+//! nothing — what §0.4.2 B2 forbids is a *code* dependency running upward, and
+//! neither this module nor [`crate::util`] calls an engine or mentions an engine
+//! type in any signature of its own.
 //!
 //! # Relationship to the C originals
 //!
@@ -23,28 +42,26 @@
 //!
 //! # Fidelity
 //!
-//! The compression loop in [`compress2`] is a faithful transcription of C
-//! `compress2_z` (`compress.c` L24-L66): input and output are offered to the
+//! The compression loop in `compress2_tracked_with` is a faithful transcription
+//! of C `compress2_z` (`compress.c` L24-L66): input and output are offered to the
 //! engine in `u32::MAX`-sized chunks, [`crate::constants::FlushMode::NoFlush`] is used while input
 //! remains and [`crate::constants::FlushMode::Finish`] once every byte has been handed over, and
 //! the terminal `Z_STREAM_END` is remapped to success. Preserving this exact
-//! multi-call `deflate` sequence is what keeps the emitted stream byte-identical
+//! multi-call engine sequence is what keeps the emitted stream byte-identical
 //! to reference zlib. [`compress_bound`] reproduces the sizing formula bit-for-
 //! bit — including the saturate-to-maximum overflow behavior — because callers
-//! pre-allocate their output buffers against it (AAP §0.6.4, §0.7.1).
+//! pre-allocate their output buffers against it (AAP §0.6.4, §0.8.1 directive D-1).
 //!
 //! # Safety and portability
 //!
 //! There is **zero `unsafe`** in this module and no dependency on `std`: it
-//! operates purely over slices (`&[u8]` / `&mut [u8]`) and drives the safe
-//! [`crate::deflate`] engine. It is `no_std` + `alloc` compatible (the engine performs
-//! its own allocation through the stream's allocator). Targets Rust 2024
+//! operates purely over slices (`&[u8]` / `&mut [u8]`) and drives an abstract
+//! engine through a safe trait. It is `no_std` + `alloc` compatible (the engine
+//! performs its own allocation through the stream's allocator). Targets Rust 2024
 //! edition, MSRV 1.85.0.
 
-use crate::constants::{FlushMode, Z_DEFAULT_COMPRESSION};
-use crate::deflate::{deflate, deflate_end, deflate_init};
+use crate::constants::FlushMode;
 use crate::error::ReturnCode;
-use crate::stream::ZStream;
 
 /// Returns an upper bound on the compressed size of `source_len` bytes.
 ///
@@ -59,8 +76,9 @@ use crate::stream::ZStream;
 /// incompressible data emitted as stored blocks) plus the zlib wrapper's header
 /// and trailer. The result is **bit-exact** with reference zlib for every input,
 /// so a caller that sizes its destination buffer to `compress_bound(n)` and then
-/// calls [`compress`] / [`compress2`] on `n` bytes is guaranteed enough space
-/// (AAP §0.6.4, §0.7.1).
+/// calls [`compress`](crate::deflate::compress) / [`compress2`](crate::deflate::compress2)
+/// on `n` bytes is guaranteed enough space
+/// (AAP §0.6.4, §0.8.1 directive D-1).
 ///
 /// # Overflow
 ///
@@ -103,40 +121,88 @@ pub fn compressBound(source_len: usize) -> usize {
     compress_bound(source_len)
 }
 
-/// Compresses `source` into `dest` at the given compression `level`, returning
-/// the number of bytes written to `dest`.
+/// One step of an abstract compression engine, mirroring the three values a C
+/// `deflate()` call publishes into the caller's `z_stream`.
 ///
-/// Faithful port of C `compress2_z` (`compress.c` L24-L66). `level` has the same
-/// meaning as in `deflateInit`: `0` ([`Z_NO_COMPRESSION`]) through `9`
-/// ([`Z_BEST_COMPRESSION`]), or `-1` ([`Z_DEFAULT_COMPRESSION`]) to request the
-/// library default. `dest` must be at least [`compress_bound(source.len())`]
-/// bytes for the call to be guaranteed to succeed.
+/// `consumed` is C's advance of `next_in`/`avail_in`, `produced` is the advance
+/// of `next_out`/`avail_out`, and `code` is the integer `deflate()` returned.
+pub(crate) struct OneCallStep {
+    /// Input bytes the engine took from the offered window.
+    pub(crate) consumed: usize,
+    /// Output bytes the engine wrote into the offered window.
+    pub(crate) produced: usize,
+    /// The zlib return code the step produced.
+    pub(crate) code: ReturnCode,
+}
+
+/// The abstract streaming compressor that [`compress2_tracked_with`] drives.
 ///
-/// Empty inputs are valid: an empty `source` still produces a complete zlib
-/// stream (header, one empty block, and the Adler-32 trailer), so `dest` must
-/// have room for at least those bytes. An empty `dest` therefore yields
-/// [`ReturnCode::BufError`] — matching the C behavior — because not even the
-/// two-byte header fits.
+/// This is the seam that keeps `compress.c`'s driver in layer 3 while the engine
+/// stays in layer 6 (AAP §0.3.1, §0.4.2 B2): the driver depends on this trait,
+/// and `crate::deflate` — one layer up — supplies the only implementation. The
+/// three methods are exactly the three C calls the original makes, in order:
+/// `deflateInit`, `deflate`, `deflateEnd`.
+pub(crate) trait OneCallDeflate: Sized {
+    /// C `deflateInit(&stream, level)` (`compress.c` L40-L43).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReturnCode::StreamError`] for a `level` outside `-1 | 0..=9`
+    /// and [`ReturnCode::MemError`] if the engine's working buffers cannot be
+    /// allocated — the two codes C's `deflateInit` reports here.
+    fn begin(level: i32) -> Result<Self, ReturnCode>;
+
+    /// C `deflate(&stream, flush)` (`compress.c` L58).
+    fn step(&mut self, input: &[u8], output: &mut [u8], flush: FlushMode) -> OneCallStep;
+
+    /// C `deflateEnd(&stream)` (`compress.c` L65). C discards the return value,
+    /// so this reports nothing.
+    fn end(&mut self);
+}
+
+/// Compresses `source` into `dest` at `level` using the engine `E`, reporting the
+/// produced byte count through `produced` on **every** path that reaches the
+/// deflate loop.
 ///
-/// [`compress_bound(source.len())`]: compress_bound
-/// [`Z_NO_COMPRESSION`]: crate::constants::Z_NO_COMPRESSION
-/// [`Z_BEST_COMPRESSION`]: crate::constants::Z_BEST_COMPRESSION
+/// This is the complete transcription of C `compress2_z` (`compress.c` L24-L66)
+/// and the shared core of `crate::deflate::compress`,
+/// `crate::deflate::compress2`, and `crate::deflate::compress2_tracked`.
+///
+/// The `produced` out-parameter mirrors C's *unconditional*
+/// `*destLen = (z_size_t)(stream.next_out - dest);` (`compress.c` L63). C runs
+/// that assignment after the loop and before `deflateEnd`, so it reports a
+/// partial length on the `Z_BUF_ERROR` path just as it does on success. The
+/// C-ABI shims in `src/ffi/util.rs` need that count to reproduce the behavior
+/// exactly; the `Result`-shaped wrappers simply discard it, since their `Ok` arm
+/// already carries the length.
+///
+/// `produced` is a pure out-parameter: it is seeded to `0` before initialization,
+/// matching C's `*destLen = 0;` (`compress.c` L36), so a failing `begin` leaves
+/// it at zero exactly as C leaves `*destLen` at zero when `deflateInit` fails
+/// (`compress.c` L42-L43).
 ///
 /// # Errors
 ///
 /// * [`ReturnCode::StreamError`] — `level` is outside the valid set
-///   (`-1` or `0..=9`); reported by the deflate initializer.
+///   (`-1` or `0..=9`); reported by the engine's initializer.
 /// * [`ReturnCode::BufError`] — `dest` was too small to hold the complete
 ///   compressed stream.
-///
-/// (`ReturnCode::MemError` is possible in principle if the engine cannot
-/// allocate its working buffers, mirroring C `Z_MEM_ERROR`.)
-pub fn compress2(dest: &mut [u8], source: &[u8], level: i32) -> Result<usize, ReturnCode> {
-    // Create a fresh stream and initialize the deflate engine at `level`. An
-    // invalid `level` is rejected here (C `deflateInit` → `Z_STREAM_ERROR`); the
-    // idiomatic `ZlibError` is remapped to its integer-equivalent `ReturnCode`.
-    let mut strm = ZStream::new();
-    deflate_init(&mut strm, level).map_err(ReturnCode::from)?;
+/// * [`ReturnCode::MemError`] — the engine could not allocate its working
+///   buffers, mirroring C `Z_MEM_ERROR`.
+pub(crate) fn compress2_tracked_with<E: OneCallDeflate>(
+    dest: &mut [u8],
+    source: &[u8],
+    level: i32,
+    produced: &mut usize,
+) -> Result<usize, ReturnCode> {
+    // C `compress2_z` zeroes the reported length before initializing the engine
+    // (`compress.c` L36: `*destLen = 0;`), so a failed `deflateInit` returns with
+    // a reported length of zero. Seed it identically.
+    *produced = 0;
+
+    // C `deflateInit(&stream, level)`. An invalid `level` is rejected here
+    // (`Z_STREAM_ERROR`), as is an allocation failure (`Z_MEM_ERROR`).
+    let mut engine = E::begin(level)?;
 
     // The engine's per-call I/O width is C `uInt` == `u32`, so — exactly as C
     // `compress2_z` does — the loop offers the input and output to `deflate` in
@@ -178,11 +244,10 @@ pub fn compress2(dest: &mut [u8], source: &[u8], level: i32) -> Result<usize, Re
 
         // Offer exactly the current windows; the engine advances by the returned
         // `consumed`/`produced` counts (it never exceeds the slice lengths).
-        let outcome = deflate(
-            &mut strm,
+        let outcome = engine.step(
             &source[in_pos..in_pos + avail_in],
             &mut dest[out_pos..out_pos + avail_out],
-            flush.as_c_int(),
+            flush,
         );
 
         // Advance the absolute cursors and shrink the offered windows by the
@@ -201,11 +266,18 @@ pub fn compress2(dest: &mut [u8], source: &[u8], level: i32) -> Result<usize, Re
         }
     };
 
-    // Release the engine. RAII (`Drop` on `strm`) would already free the state,
-    // but calling `deflate_end` mirrors C `deflateEnd` and is safe: it clears the
-    // state, so the later `Drop` on `strm` is a no-op (no double free). C ignores
-    // this return value, and so do we.
-    let _ = deflate_end(&mut strm);
+    // C publishes the produced byte count here — after the loop, before
+    // `deflateEnd`, and on every path (`compress.c` L63:
+    // `*destLen = (z_size_t)(stream.next_out - dest);`). Assigning outside the
+    // success test below is what makes a `Z_BUF_ERROR` report the bytes that did
+    // fit, exactly as the reference library does.
+    *produced = out_pos;
+
+    // Release the engine. RAII would already free the state, but calling
+    // `deflateEnd` mirrors C and is safe: it clears the state, so the later
+    // `Drop` is a no-op (no double free). C ignores this return value, and so do
+    // we.
+    engine.end();
 
     // C: `return err == Z_STREAM_END ? Z_OK : err`, with the produced-byte count
     // (`next_out - dest` == `out_pos`) reported to the caller on success.
@@ -216,34 +288,19 @@ pub fn compress2(dest: &mut [u8], source: &[u8], level: i32) -> Result<usize, Re
     }
 }
 
-/// Compresses `source` into `dest` at the library default compression level,
-/// returning the number of bytes written to `dest`.
-///
-/// Faithful port of C `compress_z` / `compress` (`compress.c` L77-L85): a
-/// convenience wrapper that forwards to [`compress2`] with
-/// [`Z_DEFAULT_COMPRESSION`]. As with [`compress2`], `dest` must be at least
-/// [`compress_bound(source.len())`] bytes to be guaranteed sufficient.
-///
-/// [`compress_bound(source.len())`]: compress_bound
-///
-/// # Errors
-///
-/// Returns the same errors as [`compress2`]: [`ReturnCode::BufError`] if `dest`
-/// is too small (a bad `level` cannot occur here, as the level is fixed).
-pub fn compress(dest: &mut [u8], source: &[u8]) -> Result<usize, ReturnCode> {
-    compress2(dest, source, Z_DEFAULT_COMPRESSION)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // The round-trip tests decompress with `flate2` (its pure-Rust
-    // `miniz_oxide` backend) to prove the emitted stream is valid zlib. `std` is
-    // available under `cfg(test)` even though the crate is `no_std`, so `Vec`,
-    // `vec!`, and `std::io` may be used freely here.
-    use flate2::read::ZlibDecoder;
-    use std::io::Read;
+    use crate::constants::Z_DEFAULT_COMPRESSION;
+
+    // This module is layer 3, so these tests must not reach up to the real
+    // layer-6 engine (AAP §0.3.1, §0.4.2 B2, enforced by
+    // `the_module_graph_has_no_upward_edges` in `src/lib.rs`). The sizing formula
+    // needs no engine at all, and the driver is exercised against a scripted
+    // stand-in below, which pins the chunking and accounting behaviour far more
+    // precisely than a round trip could. The real-engine round trips live with
+    // the public entry points in `crate::deflate`.
 
     // ---------------------------------------------------------------------
     // compress_bound / compressBound  (Phase 1 — bit-exact sizing contract)
@@ -290,125 +347,231 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Round-trip helpers
+    // compress2_tracked_with  (the `compress2_z` driver, C `compress.c` L24-L66)
+    //
+    // A scripted stand-in engine lets every observable of the driver be asserted
+    // exactly: how many bytes it offers per step, which flush it picks, when it
+    // stops, and what it publishes through `produced` on each exit path.
     // ---------------------------------------------------------------------
 
-    /// Decompresses a complete zlib stream with `flate2`, returning the bytes.
-    fn inflate_with_flate2(compressed: &[u8]) -> Vec<u8> {
-        let mut decoder = ZlibDecoder::new(compressed);
-        let mut out = Vec::new();
-        decoder
-            .read_to_end(&mut out)
-            .expect("compress2 must emit a valid zlib stream");
-        out
+    /// One recorded invocation of [`OneCallDeflate::step`].
+    #[derive(Debug, PartialEq, Eq)]
+    struct Offered {
+        /// Length of the input window the driver offered.
+        input: usize,
+        /// Length of the output window the driver offered.
+        output: usize,
+        /// The flush the driver selected for this step.
+        flush: FlushMode,
     }
 
-    /// Compresses `data` at `level` into a `compress_bound`-sized buffer, then
-    /// verifies it decompresses back to `data`.
-    fn assert_round_trip(level: i32, data: &[u8]) {
-        let mut buf = vec![0u8; compress_bound(data.len())];
-        let produced = compress2(&mut buf, data, level)
-            .unwrap_or_else(|err| panic!("compress2 at level {level} failed: {err:?}"));
-        let restored = inflate_with_flate2(&buf[..produced]);
-        assert_eq!(restored, data, "round-trip mismatch at level {level}");
+    /// A stand-in engine that replays a scripted sequence of outcomes and records
+    /// exactly what the driver offered it.
+    struct ScriptedEngine {
+        /// Remaining `(consumed, produced, code)` triples, front first.
+        script: alloc::vec::Vec<(usize, usize, ReturnCode)>,
+        /// What the driver offered on each step, in order.
+        offered: alloc::vec::Vec<Offered>,
+        /// Number of times [`OneCallDeflate::end`] was called.
+        ended: usize,
     }
 
-    /// Deterministic, effectively-incompressible bytes (a simple LCG), so the
-    /// tests need no `rand` dependency yet still exercise the stored-block path.
-    fn pseudo_random(len: usize) -> Vec<u8> {
-        let mut out = vec![0u8; len];
-        let mut state: u32 = 0x1234_5678;
-        for byte in &mut out {
-            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-            *byte = (state >> 24) as u8;
+    // The script the next `ScriptedEngine::begin` should replay, the offers it
+    // recorded, and how many times `end` ran. Thread-locals keep the fixture out
+    // of the trait signature, which must stay identical to the three C calls it
+    // models, and keep the tests independent when the harness runs them in
+    // parallel.
+    std::thread_local! {
+        static SCRIPT: core::cell::RefCell<Option<alloc::vec::Vec<(usize, usize, ReturnCode)>>> =
+            const { core::cell::RefCell::new(None) };
+        static RECORD: core::cell::RefCell<alloc::vec::Vec<Offered>> =
+            const { core::cell::RefCell::new(alloc::vec::Vec::new()) };
+        static ENDED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    }
+
+    impl OneCallDeflate for ScriptedEngine {
+        fn begin(level: i32) -> Result<Self, ReturnCode> {
+            // Mirror the real engine's level validation so the driver's
+            // "return before publishing anything" path is exercised for real.
+            if level != Z_DEFAULT_COMPRESSION && !(0..=9).contains(&level) {
+                return Err(ReturnCode::StreamError);
+            }
+            let script = SCRIPT
+                .with(|s| s.borrow_mut().take())
+                .expect("a script must be installed before driving the engine");
+            RECORD.with(|r| r.borrow_mut().clear());
+            ENDED.with(|e| e.set(0));
+            Ok(Self {
+                script,
+                offered: alloc::vec::Vec::new(),
+                ended: 0,
+            })
         }
-        out
-    }
 
-    // ---------------------------------------------------------------------
-    // compress2 — round-trip across representative inputs and every level
-    // ---------------------------------------------------------------------
+        fn step(&mut self, input: &[u8], output: &mut [u8], flush: FlushMode) -> OneCallStep {
+            self.offered.push(Offered {
+                input: input.len(),
+                output: output.len(),
+                flush,
+            });
+            let (consumed, produced, code) = self
+                .script
+                .first()
+                .copied()
+                .expect("the driver ran more steps than the script provides");
+            self.script.remove(0);
+            // Write recognisable bytes so the produced count is observable in the
+            // destination buffer as well as in the reported length.
+            for slot in output.iter_mut().take(produced) {
+                *slot = 0xA5;
+            }
+            OneCallStep {
+                consumed,
+                produced,
+                code,
+            }
+        }
 
-    #[test]
-    fn compress2_round_trips_all_inputs_and_levels() {
-        let empty: Vec<u8> = Vec::new();
-        let small = b"hello, zlib-rs one-call compression!".to_vec();
-        let compressible = vec![b'A'; 50_000]; // long run — compresses tiny
-        let incompressible = pseudo_random(40_000); // ~stored size
-
-        for &level in &[0i32, 1, 6, 9, Z_DEFAULT_COMPRESSION] {
-            assert_round_trip(level, &empty);
-            assert_round_trip(level, &small);
-            assert_round_trip(level, &compressible);
-            assert_round_trip(level, &incompressible);
+        fn end(&mut self) {
+            self.ended += 1;
+            ENDED.with(|e| e.set(e.get() + 1));
+            RECORD.with(|r| {
+                r.borrow_mut()
+                    .extend(self.offered.drain(..).collect::<alloc::vec::Vec<_>>())
+            });
         }
     }
 
-    #[test]
-    fn compress2_highly_compressible_shrinks() {
-        // A 50 KiB single-byte run must compress to far fewer bytes at level 9.
-        let data = vec![b'Q'; 50_000];
-        let mut buf = vec![0u8; compress_bound(data.len())];
-        let produced = compress2(&mut buf, &data, 9).expect("compress2 failed");
-        assert!(produced < data.len() / 10, "expected strong compression");
-        assert_eq!(inflate_with_flate2(&buf[..produced]), data);
+    /// Installs `script` and runs the driver over `source`/`dest` at `level`.
+    fn drive(
+        script: &[(usize, usize, ReturnCode)],
+        dest: &mut [u8],
+        source: &[u8],
+        level: i32,
+    ) -> (
+        Result<usize, ReturnCode>,
+        usize,
+        alloc::vec::Vec<Offered>,
+        usize,
+    ) {
+        SCRIPT.with(|s| *s.borrow_mut() = Some(script.to_vec()));
+        RECORD.with(|r| r.borrow_mut().clear());
+        ENDED.with(|e| e.set(0));
+        let mut produced = usize::MAX;
+        let result = compress2_tracked_with::<ScriptedEngine>(dest, source, level, &mut produced);
+        let offered = RECORD.with(|r| core::mem::take(&mut *r.borrow_mut()));
+        let ended = ENDED.with(core::cell::Cell::get);
+        (result, produced, offered, ended)
     }
 
     #[test]
-    fn compress2_empty_input_with_adequate_dest_succeeds() {
-        // 16 >= compress_bound(0) == 13, so the header + empty block + trailer fit.
-        let mut buf = [0u8; 16];
-        let produced = compress2(&mut buf, &[], 6).expect("empty-input compress2 failed");
-        assert!(
-            produced > 0,
-            "an empty input still emits header + block + trailer"
+    fn driver_offers_whole_buffers_and_finishes_in_one_step() {
+        // A single step that consumes everything and reports `Z_STREAM_END` is the
+        // ordinary case: the driver must offer the whole input and the whole
+        // output at once, pick `Z_FINISH` (all input already in the window), and
+        // report the produced length.
+        let source = [1u8; 40];
+        let mut dest = [0u8; 90];
+        let (result, produced, offered, ended) =
+            drive(&[(40, 17, ReturnCode::StreamEnd)], &mut dest, &source, 6);
+
+        assert_eq!(result, Ok(17));
+        assert_eq!(produced, 17);
+        assert_eq!(ended, 1, "`deflateEnd` runs exactly once");
+        assert_eq!(
+            offered,
+            alloc::vec![Offered {
+                input: 40,
+                output: 90,
+                flush: FlushMode::Finish
+            }]
         );
-        assert_eq!(inflate_with_flate2(&buf[..produced]), Vec::<u8>::new());
-    }
-
-    // ---------------------------------------------------------------------
-    // Error paths
-    // ---------------------------------------------------------------------
-
-    #[test]
-    fn compress2_too_small_dest_yields_buf_error() {
-        let data = vec![b'Z'; 4096];
-        // One byte cannot even hold the two-byte zlib header.
-        let mut tiny = [0u8; 1];
-        assert_eq!(compress2(&mut tiny, &data, 6), Err(ReturnCode::BufError));
+        assert!(dest[..17].iter().all(|&b| b == 0xA5));
+        assert!(dest[17..].iter().all(|&b| b == 0));
     }
 
     #[test]
-    fn compress2_invalid_level_yields_stream_error() {
-        let data = b"some data to compress";
-        let mut buf = [0u8; 64];
-        // Above the valid 0..=9 range.
-        assert_eq!(compress2(&mut buf, data, 42), Err(ReturnCode::StreamError));
-        // Below the range and not the Z_DEFAULT_COMPRESSION (-1) sentinel.
-        assert_eq!(compress2(&mut buf, data, -2), Err(ReturnCode::StreamError));
+    fn driver_refills_only_exhausted_windows_and_shrinks_the_offer() {
+        // Two steps: the first consumes half the input and produces some output,
+        // so the second must be offered exactly the REMAINDER of both windows —
+        // C's `avail_in`/`avail_out` are decremented, not re-seeded.
+        let source = [2u8; 30];
+        let mut dest = [0u8; 50];
+        let (result, produced, offered, _) = drive(
+            &[(10, 4, ReturnCode::Ok), (20, 6, ReturnCode::StreamEnd)],
+            &mut dest,
+            &source,
+            1,
+        );
+
+        assert_eq!(result, Ok(10));
+        assert_eq!(produced, 10);
+        assert_eq!(
+            offered,
+            alloc::vec![
+                Offered {
+                    input: 30,
+                    output: 50,
+                    flush: FlushMode::Finish
+                },
+                Offered {
+                    input: 20,
+                    output: 46,
+                    flush: FlushMode::Finish
+                }
+            ]
+        );
     }
 
-    // ---------------------------------------------------------------------
-    // compress — the default-level convenience wrapper
-    // ---------------------------------------------------------------------
-
     #[test]
-    fn compress_default_level_round_trips() {
-        let data = b"the quick brown fox jumps over the lazy dog. ".repeat(200);
-        let mut buf = vec![0u8; compress_bound(data.len())];
-        let produced = compress(&mut buf, &data).expect("compress failed");
-        assert_eq!(inflate_with_flate2(&buf[..produced]), data);
+    fn driver_publishes_the_partial_length_on_a_failing_path() {
+        // C assigns `*destLen` after the loop and BEFORE `deflateEnd`, on every
+        // post-init path (`compress.c` L63). A `Z_BUF_ERROR` must therefore still
+        // report the bytes that did fit.
+        let source = [3u8; 12];
+        let mut dest = [0u8; 5];
+        let (result, produced, _, ended) =
+            drive(&[(12, 5, ReturnCode::BufError)], &mut dest, &source, 9);
+
+        assert_eq!(result, Err(ReturnCode::BufError));
+        assert_eq!(
+            produced, 5,
+            "the partial length is published, not discarded"
+        );
+        assert_eq!(ended, 1, "`deflateEnd` still runs on the failure path");
     }
 
     #[test]
-    fn compress_matches_compress2_default_level() {
-        // `compress` must be exactly `compress2(.., Z_DEFAULT_COMPRESSION)`.
-        let data = b"determinism check: compress == compress2(-1)".repeat(64);
-        let mut buf_a = vec![0u8; compress_bound(data.len())];
-        let mut buf_b = vec![0u8; compress_bound(data.len())];
-        let na = compress(&mut buf_a, &data).unwrap();
-        let nb = compress2(&mut buf_b, &data, Z_DEFAULT_COMPRESSION).unwrap();
-        assert_eq!(na, nb);
-        assert_eq!(buf_a[..na], buf_b[..nb], "identical bytes expected");
+    fn driver_seeds_the_length_to_zero_before_init() {
+        // C `*destLen = 0;` precedes `deflateInit`, so a rejected level leaves the
+        // reported length at zero rather than at whatever the caller passed in.
+        let source = [4u8; 8];
+        let mut dest = [0u8; 32];
+        let mut produced = 777;
+        assert_eq!(
+            compress2_tracked_with::<ScriptedEngine>(&mut dest, &source, 42, &mut produced),
+            Err(ReturnCode::StreamError)
+        );
+        assert_eq!(produced, 0);
+    }
+
+    #[test]
+    fn driver_finishes_immediately_for_an_empty_source() {
+        // An empty input still yields a complete stream: the driver offers a
+        // zero-length input window and selects `Z_FINISH` on the very first step.
+        let mut dest = [0u8; 16];
+        let (result, produced, offered, _) =
+            drive(&[(0, 8, ReturnCode::StreamEnd)], &mut dest, &[], 6);
+
+        assert_eq!(result, Ok(8));
+        assert_eq!(produced, 8);
+        assert_eq!(
+            offered,
+            alloc::vec![Offered {
+                input: 0,
+                output: 16,
+                flush: FlushMode::Finish
+            }]
+        );
     }
 }
